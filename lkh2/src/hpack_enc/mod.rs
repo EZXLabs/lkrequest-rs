@@ -13,9 +13,9 @@ use table::{find_header, DynamicTable, TableMatch};
 /// HPACK encoder with Huffman support and configurable encoding policy.
 pub struct Encoder {
     dynamic: DynamicTable,
-    /// RFC 7541 §6.3: pending Dynamic Table Size Update to emit at the start
-    /// of the next header block.
-    pending_table_size_update: Option<usize>,
+    /// RFC 7541 §4.2: the smallest intermediate table size and the final
+    /// table size to emit at the start of the next header block.
+    pending_table_size_update: Option<(usize, usize)>,
 }
 
 impl std::fmt::Debug for Encoder {
@@ -85,9 +85,15 @@ impl Encoder {
         buf
     }
 
+    /// Resize the dynamic table and queue the corresponding Dynamic Table Size
+    /// Update for the next header block.
+    ///
     pub fn set_max_table_size(&mut self, size: usize) {
         self.dynamic.set_max_size(size);
-        self.pending_table_size_update = Some(size);
+        self.pending_table_size_update = Some(match self.pending_table_size_update {
+            Some((smallest, _)) => (smallest.min(size), size),
+            None => (size, size),
+        });
     }
 
     // ─── Internal ────────────────────────────────────────────────────
@@ -95,8 +101,11 @@ impl Encoder {
     /// RFC 7541 §6.3: emit a Dynamic Table Size Update instruction at the
     /// start of a header block if the table size has changed.
     fn emit_pending_table_size_update(&mut self, buf: &mut Vec<u8>) {
-        if let Some(new_size) = self.pending_table_size_update.take() {
-            encode_integer(new_size, 5, 0x20, buf);
+        if let Some((smallest, final_size)) = self.pending_table_size_update.take() {
+            encode_integer(smallest, 5, 0x20, buf);
+            if smallest != final_size {
+                encode_integer(final_size, 5, 0x20, buf);
+            }
         }
     }
 
@@ -383,6 +392,32 @@ mod tests {
         // Second time should be a single indexed byte (full match in dynamic table)
         assert_eq!(second.len(), 1);
         assert_ne!(second[0] & 0x80, 0, "should use indexed representation");
+    }
+
+    #[test]
+    fn test_multiple_table_size_updates_emit_smallest_then_final_size() {
+        let mut encoder = Encoder::with_default_size();
+
+        encoder.set_max_table_size(100);
+        encoder.set_max_table_size(40);
+        encoder.set_max_table_size(70);
+
+        let encoded = encoder.encode_owned::<&str, &str>(&[]);
+
+        assert_eq!(encoded, vec![0x3f, 9, 0x3f, 39]);
+    }
+
+    #[test]
+    fn test_repeated_table_size_update_to_smallest_emits_once() {
+        let mut encoder = Encoder::with_default_size();
+
+        encoder.set_max_table_size(100);
+        encoder.set_max_table_size(40);
+        encoder.set_max_table_size(40);
+
+        let encoded = encoder.encode_owned::<&str, &str>(&[]);
+
+        assert_eq!(encoded, vec![0x3f, 9]);
     }
 
     #[test]

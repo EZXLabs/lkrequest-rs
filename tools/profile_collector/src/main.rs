@@ -62,6 +62,7 @@ use lktls::extensions::quic_transport_params::{
 use md5::Md5;
 use quinn::{AsyncUdpSocket, EndpointConfig, TokioRuntime, UdpPoller};
 use quinn_udp::{RecvMeta, UdpSocketState};
+use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
@@ -314,6 +315,8 @@ enum ChromePresetVersion {
     Chrome150,
     #[value(name = "chrome_151")]
     Chrome151,
+    #[value(name = "chrome_152")]
+    Chrome152,
 }
 
 struct CaptureChromeOptions {
@@ -423,6 +426,7 @@ struct OutputExtensionSpec {
 enum OutputExtensionSource {
     Auto,
     RawBytes { data: String },
+    TrustAnchorIds { ids: Vec<String>, shuffle: bool },
     Grease,
 }
 
@@ -817,6 +821,8 @@ fn build_profile(name: &str, ch: &ParsedClientHello) -> OutputProfile {
                     0x0000 | 0x0005 | 0x000a | 0x000b | 0x000d | 0x0010 | 0x0012 | 0x0015
                     | 0x0016 | 0x0017 | 0x001b | 0x001c | 0x0022 | 0x0023 | 0x002b | 0x002d
                     | 0x0033 | 0x0039 | 0x4469 | 0x44cd | 0xfe0d | 0xff01 => None,
+                    0xca34 => extract_trust_anchor_ids(&e.data)
+                        .map(|ids| OutputExtensionSource::TrustAnchorIds { ids, shuffle: true }),
                     _ => {
                         if e.data.is_empty() {
                             None
@@ -919,8 +925,37 @@ fn output_extension_source(
         lktls::profile::types::ExtensionSource::RawBytes { data } => {
             Some(OutputExtensionSource::RawBytes { data: data.clone() })
         }
+        lktls::profile::types::ExtensionSource::TrustAnchorIds { ids, shuffle } => {
+            Some(OutputExtensionSource::TrustAnchorIds {
+                ids: ids.clone(),
+                shuffle: *shuffle,
+            })
+        }
         lktls::profile::types::ExtensionSource::Grease => Some(OutputExtensionSource::Grease),
     }
+}
+
+fn extract_trust_anchor_ids(data: &[u8]) -> Option<Vec<String>> {
+    if data.len() < 2 {
+        return None;
+    }
+    let declared = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if declared != data.len() - 2 {
+        return None;
+    }
+
+    let mut ids = Vec::new();
+    let mut offset = 2;
+    while offset < data.len() {
+        let len = data[offset] as usize;
+        offset += 1;
+        if len == 0 || offset + len > data.len() {
+            return None;
+        }
+        ids.push(hex::encode(&data[offset..offset + len]));
+        offset += len;
+    }
+    Some(ids)
 }
 
 fn output_ech_config(ech: &lktls::profile::types::EchMode) -> OutputEchConfig {
@@ -1568,18 +1603,15 @@ fn load_identity_from_files(
     let key_pem =
         fs::read(key_path).map_err(|e| format!("Failed to read private key {key_path}: {e}"))?;
 
-    let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to parse certificate PEM {cert_path}: {e}"))?;
     if certs.is_empty() {
         return Err(format!("No certificates found in {cert_path}"));
     }
 
-    let mut key_reader = std::io::BufReader::new(key_pem.as_slice());
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| format!("Failed to parse private key PEM {key_path}: {e}"))?
-        .ok_or_else(|| format!("No private key found in {key_path}"))?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| format!("Failed to parse private key PEM {key_path}: {e}"))?;
 
     let key_der = match key {
         rustls::pki_types::PrivateKeyDer::Pkcs8(key) => key.secret_pkcs8_der().to_vec(),
@@ -2234,6 +2266,7 @@ fn chrome_base_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome149 => lktls::profile::presets::chrome_149(),
         ChromePresetVersion::Chrome150 => lktls::profile::presets::chrome_150(),
         ChromePresetVersion::Chrome151 => lktls::profile::presets::chrome_151(),
+        ChromePresetVersion::Chrome152 => lktls::profile::presets::chrome_152(),
     }
 }
 
@@ -2244,6 +2277,7 @@ fn chrome_quic_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome146 => return lktls::profile::presets::chrome_146_quic(),
         ChromePresetVersion::Chrome150 => return lktls::profile::presets::chrome_150_quic(),
         ChromePresetVersion::Chrome151 => return lktls::profile::presets::chrome_151_quic(),
+        ChromePresetVersion::Chrome152 => return lktls::profile::presets::chrome_152_quic(),
         _ => {}
     }
 
@@ -2321,6 +2355,7 @@ fn chrome_h2_profile(version: ChromePresetVersion) -> lkh2::profile::H2Profile {
         ChromePresetVersion::Chrome149 => lkh2::profile::chrome_149_h2(),
         ChromePresetVersion::Chrome150 => lkh2::profile::chrome_150_h2(),
         ChromePresetVersion::Chrome151 => lkh2::profile::chrome_151_h2(),
+        ChromePresetVersion::Chrome152 => lkh2::profile::chrome_152_h2(),
     }
 }
 
@@ -2329,6 +2364,7 @@ fn chrome_quic_profile(version: ChromePresetVersion) -> lkh3::QuicProfile {
         ChromePresetVersion::Chrome146 => lkh3::chrome_146_quic(),
         ChromePresetVersion::Chrome150 => lkh3::chrome_150_quic(),
         ChromePresetVersion::Chrome151 => lkh3::chrome_151_quic(),
+        ChromePresetVersion::Chrome152 => lkh3::chrome_152_quic(),
         _ => lkh3::chrome_quic(),
     }
 }
@@ -2697,7 +2733,9 @@ fn run_tls_capture_server_once(
                     }
                     return Ok(());
                 }
-                eprintln!("  CaptureChrome H2 did not include an HTTP/2 fingerprint; waiting for another connection");
+                eprintln!(
+                    "  CaptureChrome H2 did not include an HTTP/2 fingerprint; waiting for another connection"
+                );
             }
             CaptureResult::HttpRedirected | CaptureResult::Skipped(_) => {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -3787,10 +3825,14 @@ fn print_inspect(ch: &ParsedClientHello) {
                     let (min, max) = infer_ech_payload_range(pl);
                     println!("        payload_length: {pl}");
                     if let (Some(mn), Some(mx)) = (min, max) {
-                        println!("        inferred range: payload_length_min={mn}, payload_length_max={mx}");
+                        println!(
+                            "        inferred range: payload_length_min={mn}, payload_length_max={mx}"
+                        );
                     }
                 }
-                println!("        ech_outer_extensions: [51, 10, 13, 5, 18, 16, 45, 27, 17613] (BoringSSL default)");
+                println!(
+                    "        ech_outer_extensions: [51, 10, 13, 5, 18, 16, 45, 27, 17613] (BoringSSL default)"
+                );
             }
             _ => {}
         }

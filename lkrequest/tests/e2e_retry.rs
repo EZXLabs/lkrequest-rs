@@ -256,6 +256,35 @@ async fn test_retry_max_retries_boundary() {
     );
 }
 
+/// A retryable 503 must retain the final response body after retries finish.
+#[tokio::test]
+async fn test_retry_503_preserves_response_body() {
+    let srv = start_local_https_server().await;
+    let client = chrome_client();
+    let session = client
+        .session()
+        .retry_policy(ExponentialBackoff {
+            max_retries: 1,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+            jitter: false,
+        })
+        .build();
+
+    let url = url_join(&srv.base_url, "/status-body/503");
+    let response = session
+        .get(&url)
+        .send()
+        .await
+        .expect("503 should return response");
+
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        response.text().expect("503 body should be readable"),
+        "status 503"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // POST with body preserved across retries
 // ---------------------------------------------------------------------------
@@ -291,4 +320,140 @@ async fn test_retry_post_body_preserved() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Status-code retry: replay safety (RFC 9110 §9.2.2)
+// ---------------------------------------------------------------------------
+
+/// Regression: a `POST` answered with `502` must not be replayed.
+///
+/// A `502` means a gateway got a bad answer from the origin — the origin was
+/// reached and may already have applied the request. Every retryable status
+/// used to be replayed regardless of method, so a charge or order could be
+/// submitted twice.
+#[tokio::test]
+async fn post_is_not_replayed_on_ambiguous_502() {
+    let srv = start_local_https_server().await;
+    let session = chrome_client()
+        .session()
+        .retry_policy(FixedInterval::new(3, Duration::from_millis(20)))
+        .build();
+
+    srv.request_counter.store(0, Ordering::Relaxed);
+    let url = url_join(&srv.base_url, "/status/502");
+    let resp = session
+        .post(&url)
+        .text_body("charge-the-card")
+        .send()
+        .await
+        .expect("the 502 must be returned to the caller");
+
+    assert_eq!(resp.status().as_u16(), 502);
+    assert_eq!(
+        srv.request_counter.load(Ordering::Relaxed),
+        1,
+        "a non-idempotent POST must reach the server exactly once on an \
+         ambiguous status"
+    );
+}
+
+/// The same `502` is still replayed for a safe method: a `GET` carries no side
+/// effect to duplicate.
+#[tokio::test]
+async fn get_is_still_replayed_on_502() {
+    let srv = start_local_https_server().await;
+    let session = chrome_client()
+        .session()
+        .retry_policy(FixedInterval::new(2, Duration::from_millis(20)))
+        .build();
+
+    srv.request_counter.store(0, Ordering::Relaxed);
+    let url = url_join(&srv.base_url, "/status/502");
+    let _ = session.get(&url).send().await;
+
+    assert!(
+        srv.request_counter.load(Ordering::Relaxed) > 1,
+        "safe methods keep retrying ambiguous statuses, got {} request(s)",
+        srv.request_counter.load(Ordering::Relaxed)
+    );
+}
+
+/// A `503` does not prove that an unsafe request was not applied, so a default
+/// `POST` must not be replayed.
+#[tokio::test]
+async fn post_is_not_replayed_on_503_by_default() {
+    let srv = start_local_https_server().await;
+    let session = chrome_client()
+        .session()
+        .retry_policy(FixedInterval::new(2, Duration::from_millis(20)))
+        .build();
+
+    srv.request_counter.store(0, Ordering::Relaxed);
+    let url = url_join(&srv.base_url, "/status/503");
+    let response = session
+        .post(&url)
+        .text_body("payload")
+        .send()
+        .await
+        .expect("the 503 must be returned to the caller");
+
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        srv.request_counter.load(Ordering::Relaxed),
+        1,
+        "a default POST must not be replayed on 503"
+    );
+}
+
+/// The same default replay protection applies to PATCH and 429.
+#[tokio::test]
+async fn patch_is_not_replayed_on_429_by_default() {
+    let srv = start_local_https_server().await;
+    let session = chrome_client()
+        .session()
+        .retry_policy(FixedInterval::new(2, Duration::from_millis(20)))
+        .build();
+
+    srv.request_counter.store(0, Ordering::Relaxed);
+    let url = url_join(&srv.base_url, "/status/429");
+    let response = session
+        .patch(&url)
+        .text_body("payload")
+        .send()
+        .await
+        .expect("the 429 must be returned to the caller");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        srv.request_counter.load(Ordering::Relaxed),
+        1,
+        "a default PATCH must not be replayed on 429"
+    );
+}
+
+/// An explicit idempotency declaration opts a `POST` back into replaying an
+/// ambiguous status.
+#[tokio::test]
+async fn explicit_idempotency_restores_post_replay_on_502() {
+    let srv = start_local_https_server().await;
+    let session = chrome_client()
+        .session()
+        .retry_policy(FixedInterval::new(2, Duration::from_millis(20)))
+        .build();
+
+    srv.request_counter.store(0, Ordering::Relaxed);
+    let url = url_join(&srv.base_url, "/status/502");
+    let _ = session
+        .post(&url)
+        .text_body("payload")
+        .idempotency(lkrequest::session::Idempotency::Idempotent)
+        .send()
+        .await;
+
+    assert!(
+        srv.request_counter.load(Ordering::Relaxed) > 1,
+        "an explicit Idempotency-Key opts back into replay, got {} request(s)",
+        srv.request_counter.load(Ordering::Relaxed)
+    );
 }

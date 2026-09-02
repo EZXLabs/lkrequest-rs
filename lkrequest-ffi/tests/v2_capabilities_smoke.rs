@@ -1137,7 +1137,11 @@ fn socks5_udp_probe_ffi_extensions_work() -> usize {
     2
 }
 
-fn chrome_151_preset_ffi_extensions_work() -> usize {
+fn chrome_preset_ffi_extensions_work(
+    preset_name: &str,
+    tls_profile_name: &str,
+    expect_trust_anchor_ids: bool,
+) -> usize {
     unsafe {
         let mut list_ptr = ptr::null();
         assert_eq!(lk_preset_list_json(&mut list_ptr), lk_status_t::LK_OK);
@@ -1147,20 +1151,26 @@ fn chrome_151_preset_ffi_extensions_work() -> usize {
             .as_array()
             .expect("preset list")
             .iter()
-            .any(|value| value == "chrome_151"));
+            .any(|value| value == preset_name));
 
-        let name = cstring("chrome_151");
+        let name = cstring(preset_name);
         let mut detail_ptr = ptr::null();
         let mut err = ptr::null_mut::<lk_error_t>();
         assert_eq!(
-            lk_preset_get_detail_json(name.as_ptr(), "chrome_151".len(), &mut detail_ptr, &mut err,),
+            lk_preset_get_detail_json(name.as_ptr(), preset_name.len(), &mut detail_ptr, &mut err,),
             lk_status_t::LK_OK
         );
         assert!(err.is_null());
         let detail: serde_json::Value =
             serde_json::from_str(&view_c_string(detail_ptr)).expect("preset detail json");
-        assert_eq!(detail["name"], "chrome_151");
-        assert_eq!(detail["tls_profile"]["name"], "Chrome 151");
+        assert_eq!(detail["name"], preset_name);
+        assert_eq!(detail["tls_profile"]["name"], tls_profile_name);
+        let has_trust_anchor_ids = detail["tls_profile"]["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|extension| extension["extension_type"] == 0xca34);
+        assert_eq!(has_trust_anchor_ids, expect_trust_anchor_ids);
         assert_eq!(detail["h2_profile"]["window_update"], 15_663_105);
         assert_eq!(
             detail["h2_profile"]["settings"].as_array().unwrap().len(),
@@ -1205,9 +1215,21 @@ fn socks5_udp_probe_ffi_apis_return_structured_reports() {
 }
 
 #[test]
-fn chrome_151_preset_is_exposed_through_ffi() {
+fn chrome_152_preset_is_exposed_through_ffi() {
     let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    assert_eq!(chrome_151_preset_ffi_extensions_work(), 3);
+    assert_eq!(
+        chrome_preset_ffi_extensions_work("chrome_152", "Chrome 152", true),
+        3
+    );
+}
+
+#[test]
+fn chrome_151_preset_remains_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        chrome_preset_ffi_extensions_work("chrome_151", "Chrome 151", false),
+        3
+    );
 }
 
 #[test]

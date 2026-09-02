@@ -1,21 +1,24 @@
-//! Customisation traits for the h2-native engine.
+﻿//! Customisation traits for the h2-native engine.
 //!
-//! Three layers of control over HTTP/2 wire behaviour that affect
+//! Four layers of control over HTTP/2 wire behaviour that affect
 //! deep-inspection fingerprinting beyond the Akamai H2 hash:
 //!
 //! - [`FrameWritePolicy`] — controls how outbound frames are grouped
-//!   into TLS records / TCP segments.
+//!   into socket writes and caps browser-specific DATA chunk sizes.
 //! - [`FlowControlPolicy`] — controls when and how WINDOW_UPDATE
 //!   frames are emitted in response to received DATA.
 //! - [`HpackEncodePolicy`] — controls HPACK encoding choices
 //!   (indexed vs literal, Huffman on/off) per header.
 
+/// Chromium caps each DATA payload so the 9-byte HTTP/2 frame header and
+/// payload fit in one 16 KiB socket write.
+pub const CHROMIUM_MAX_DATA_FRAME_PAYLOAD: usize = 16_384 - 9;
+
 use crate::frame::H2Frame;
 
 // ─── Frame Write Policy ──────────────────────────────────────────────────────
 
-/// A *group* of frames that should be written in a single TLS record /
-/// `write_all` call.
+/// A *group* of frames that should be issued in one `write_all` call.
 pub type FrameGroup = Vec<H2Frame>;
 
 /// Controls how outbound frames are split across TLS writes.
@@ -29,22 +32,49 @@ pub type FrameGroup = Vec<H2Frame>;
 /// - **Write 4**: `[DATA]` (if any, separate write)
 ///
 /// The default implementation (`DefaultWritePolicy`) merges all frames
-/// into a single write, which is functionally correct but produces a
-/// single large TLS record that doesn't match browser behaviour.
+/// into a single write, which is functionally correct but may not match
+/// browser write boundaries.
 pub trait FrameWritePolicy: Send + Sync + std::fmt::Debug {
     /// Split a sequence of outbound frames into groups.
     ///
-    /// Each group will be encoded and flushed as a single `write_all`
-    /// call, producing one TLS record.
+    /// Each group will be encoded and flushed as a single `write_all` call.
     fn group_frames(&self, frames: Vec<H2Frame>) -> Vec<FrameGroup>;
+
+    /// Optional DATA payload cap applied below SETTINGS_MAX_FRAME_SIZE.
+    fn max_data_frame_payload(&self) -> Option<usize> {
+        None
+    }
 
     /// Clone into a boxed trait object.
     fn box_clone(&self) -> Box<dyn FrameWritePolicy>;
 }
 
+#[derive(Debug)]
+struct DataFramePayloadOverridePolicy {
+    inner: Box<dyn FrameWritePolicy>,
+    max_data_frame_payload: Option<usize>,
+}
+
+impl FrameWritePolicy for DataFramePayloadOverridePolicy {
+    fn group_frames(&self, frames: Vec<H2Frame>) -> Vec<FrameGroup> {
+        self.inner.group_frames(frames)
+    }
+
+    fn max_data_frame_payload(&self) -> Option<usize> {
+        self.max_data_frame_payload
+    }
+
+    fn box_clone(&self) -> Box<dyn FrameWritePolicy> {
+        Box::new(Self {
+            inner: self.inner.box_clone(),
+            max_data_frame_payload: self.max_data_frame_payload,
+        })
+    }
+}
+
 /// Data-driven write policy that replaces per-browser structs.
 ///
-/// Two boolean knobs control which frame types get their own TLS record:
+/// Two boolean knobs control which frame types get their own socket write:
 ///
 /// | Browser | `split_headers` | `split_data` |
 /// |---------|-----------------|--------------|
@@ -56,6 +86,7 @@ pub trait FrameWritePolicy: Send + Sync + std::fmt::Debug {
 pub struct ConfigurableWritePolicy {
     split_headers: bool,
     split_data: bool,
+    max_data_frame_payload: Option<usize>,
 }
 
 impl ConfigurableWritePolicy {
@@ -63,6 +94,7 @@ impl ConfigurableWritePolicy {
         Self {
             split_headers,
             split_data,
+            max_data_frame_payload: None,
         }
     }
 
@@ -71,9 +103,13 @@ impl ConfigurableWritePolicy {
         Self::new(false, false)
     }
 
-    /// Chrome/Firefox: HEADERS and DATA each isolated.
+    /// Chrome: HEADERS and DATA each isolated, with DATA chunks capped so the
+    /// encoded frame fits in a 16 KiB socket write.
     pub fn chrome() -> Self {
-        Self::new(true, true)
+        Self {
+            max_data_frame_payload: Some(CHROMIUM_MAX_DATA_FRAME_PAYLOAD),
+            ..Self::new(true, true)
+        }
     }
 
     /// Safari: only DATA isolated, HEADERS batched with control frames.
@@ -115,6 +151,10 @@ impl FrameWritePolicy for ConfigurableWritePolicy {
         }
 
         groups
+    }
+
+    fn max_data_frame_payload(&self) -> Option<usize> {
+        self.max_data_frame_payload
     }
 
     fn box_clone(&self) -> Box<dyn FrameWritePolicy> {
@@ -415,6 +455,22 @@ pub struct H2Behavior {
 }
 
 impl H2Behavior {
+    /// Override the browser's outbound DATA payload cap.
+    ///
+    /// `None` follows the peer's SETTINGS_MAX_FRAME_SIZE. A positive value
+    /// applies an additional cap below that peer-advertised limit.
+    pub fn with_max_data_frame_payload(mut self, max_payload: Option<usize>) -> Self {
+        assert!(
+            max_payload != Some(0),
+            "max DATA frame payload must be greater than zero"
+        );
+        self.write_policy = Box::new(DataFramePayloadOverridePolicy {
+            inner: self.write_policy,
+            max_data_frame_payload: max_payload,
+        });
+        self
+    }
+
     /// Baseline behaviour (backward-compatible: single write, immediate
     /// flow control, default HPACK).
     pub fn default_behavior() -> Self {
@@ -428,7 +484,7 @@ impl H2Behavior {
     /// Chrome-like behaviour.
     pub fn chrome() -> Self {
         Self {
-            write_policy: Box::new(ConfigurableWritePolicy::new(true, true)),
+            write_policy: Box::new(ConfigurableWritePolicy::chrome()),
             flow_control: Box::new(ThresholdFlowControl::chrome()),
             hpack_policy: Box::new(ChromeHpackPolicy),
         }
@@ -633,16 +689,22 @@ mod tests {
         let chrome = H2Behavior::chrome();
         let wp = format!("{:?}", chrome.write_policy);
         assert!(wp.contains("split_headers: true") && wp.contains("split_data: true"));
+        assert_eq!(
+            chrome.write_policy.max_data_frame_payload(),
+            Some(CHROMIUM_MAX_DATA_FRAME_PAYLOAD)
+        );
         assert!(format!("{:?}", chrome.flow_control).contains("Threshold"));
         assert!(format!("{:?}", chrome.hpack_policy).contains("Chrome"));
 
         let ff = H2Behavior::firefox();
         let wp = format!("{:?}", ff.write_policy);
         assert!(wp.contains("split_headers: true") && wp.contains("split_data: true"));
+        assert_eq!(ff.write_policy.max_data_frame_payload(), None);
 
         let safari = H2Behavior::safari();
         let wp = format!("{:?}", safari.write_policy);
         assert!(wp.contains("split_headers: false") && wp.contains("split_data: true"));
+        assert_eq!(safari.write_policy.max_data_frame_payload(), None);
     }
 
     #[test]
@@ -651,5 +713,23 @@ mod tests {
         let cloned = chrome.clone();
         let wp = format!("{:?}", cloned.write_policy);
         assert!(wp.contains("split_headers: true"));
+        assert_eq!(
+            cloned.write_policy.max_data_frame_payload(),
+            Some(CHROMIUM_MAX_DATA_FRAME_PAYLOAD)
+        );
+    }
+
+    #[test]
+    fn data_frame_payload_override_preserves_grouping_policy() {
+        let chrome = H2Behavior::chrome().with_max_data_frame_payload(Some(8_000));
+        assert_eq!(chrome.write_policy.max_data_frame_payload(), Some(8_000));
+
+        let groups = chrome
+            .write_policy
+            .group_frames(vec![make_headers(1), make_data(1)]);
+        assert_eq!(groups.len(), 2);
+
+        let peer_max = chrome.with_max_data_frame_payload(None);
+        assert_eq!(peer_max.write_policy.max_data_frame_payload(), None);
     }
 }

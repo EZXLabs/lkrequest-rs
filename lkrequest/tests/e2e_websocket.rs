@@ -208,6 +208,96 @@ async fn ws_local_custom_headers() {
 }
 
 // ===========================================================================
+// Close-code validation (RFC 6455 §7.4.1 / §7.4.2)
+// ===========================================================================
+
+/// A code an endpoint may not send must be refused *before* it is framed:
+/// `fastwebsockets::Frame::close` does no validation, and a peer that receives
+/// e.g. 1006 fails the connection with 1002 (protocol error).
+///
+/// The connection is left untouched, which is what the follow-up echo proves —
+/// once a close frame is written, `fastwebsockets` marks the write half closed
+/// and refuses every later data frame.
+#[tokio::test]
+async fn ws_local_close_rejects_unsendable_codes() {
+    let wss = start_local_wss_server().await;
+    let client = chrome_client();
+    let session = client.session().http1_only().build();
+
+    let mut ws = session
+        .websocket(&wss.url)
+        .connect()
+        .await
+        .expect("WSS connect");
+
+    // 1005/1006/1015: "MUST NOT be set as a status code in a Close control
+    // frame by an endpoint". 1004: reserved with no defined meaning.
+    // 999/1016/5000: outside every sendable range in §7.4.2.
+    for code in [1004_u16, 1005, 1006, 1015, 999, 1016, 5000] {
+        let err = ws
+            .close(Some((code, "nope")))
+            .await
+            .expect_err("an unsendable close code must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&code.to_string()),
+            "the error should name the offending code {code}, got: {msg}"
+        );
+    }
+
+    ws.send_text("still open")
+        .await
+        .expect("the refused closes must not have touched the wire");
+    let echo = ws.recv().await.expect("recv");
+    match echo {
+        WsMessage::Text(t) => assert_eq!(t, "still open"),
+        other => panic!("expected the echo back, got: {other:?}"),
+    }
+
+    ws.close(Some((1000, "normal closure")))
+        .await
+        .expect("1000 is sendable");
+}
+
+/// RFC 6455 §5.5 caps a control frame payload at 125 bytes, so a close reason
+/// gets 123 after the 2-byte status code. `fastwebsockets` would happily frame
+/// a longer one with a 16-bit length field, which is not a legal control frame.
+#[tokio::test]
+async fn ws_local_close_rejects_oversized_reason() {
+    let wss = start_local_wss_server().await;
+    let client = chrome_client();
+    let session = client.session().http1_only().build();
+
+    let mut ws = session
+        .websocket(&wss.url)
+        .connect()
+        .await
+        .expect("WSS connect");
+
+    let too_long = "x".repeat(124);
+    let err = ws
+        .close(Some((1000, &too_long)))
+        .await
+        .expect_err("a 124-byte reason does not fit in a control frame");
+    assert!(
+        err.to_string().contains("124"),
+        "the error should report the offending length, got: {err}"
+    );
+
+    // Still untouched, and the largest legal reason goes through.
+    let at_limit = "x".repeat(123);
+    ws.close(Some((1000, &at_limit)))
+        .await
+        .expect("123 bytes is exactly the limit");
+
+    let close = ws.recv().await.expect("recv close");
+    match close {
+        WsMessage::Close(code, _) => assert_eq!(code, Some(1000)),
+        other => panic!("expected a close frame, got {other:?}"),
+    }
+}
+
+// ===========================================================================
 // Scheme validation (no server needed)
 // ===========================================================================
 

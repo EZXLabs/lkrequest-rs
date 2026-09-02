@@ -199,6 +199,17 @@ pub enum ExtensionSource {
         data: String,
     },
 
+    /// Chromium/BoringSSL trust-anchor identifiers (experimental extension
+    /// `0xca34`). The payload is a u16-length-prefixed vector of u8-length-
+    /// prefixed opaque identifiers.
+    TrustAnchorIds {
+        /// Hex-encoded trust-anchor identifiers.
+        ids: Vec<String>,
+        /// Shuffle identifier order for each ClientHello.
+        #[serde(default)]
+        shuffle: bool,
+    },
+
     /// Insert a GREASE value as extension type and/or payload.
     Grease,
 }
@@ -396,6 +407,8 @@ pub mod ext_type {
     pub const APPLICATION_SETTINGS: u16 = 0x4469;
     /// ALPS extension (newer draft, used by Chrome 132+)
     pub const APPLICATION_SETTINGS_NEW: u16 = 0x44cd;
+    /// Chromium/BoringSSL experimental trust-anchor identifiers.
+    pub const TRUST_ANCHOR_IDS: u16 = 0xca34;
     /// `renegotiation_info` — RFC 5746.
     pub const RENEGOTIATION_INFO: u16 = 0xff01;
     /// `delegated_credentials` — RFC 9345.

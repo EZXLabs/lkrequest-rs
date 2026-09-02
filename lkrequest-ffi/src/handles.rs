@@ -178,7 +178,9 @@ pub(crate) unsafe fn handle_drop<T: HandleMeta, O>(ptr: *mut O) {
         if !unregister_handle::<T, O>(ptr) {
             return;
         }
-        drop(Box::from_raw(ptr.cast::<DebugHandle<T>>()));
+        let handle = &mut *ptr.cast::<DebugHandle<T>>();
+        handle.magic = 0;
+        std::ptr::drop_in_place(&mut handle.value);
     }
 }
 
@@ -190,8 +192,8 @@ pub(crate) unsafe fn handle_drop<T, O>(ptr: *mut O) {
 }
 
 #[cfg(feature = "debug-registry")]
-fn registry() -> &'static parking_lot::Mutex<HashMap<u64, (usize, u32)>> {
-    static REGISTRY: OnceLock<parking_lot::Mutex<HashMap<u64, (usize, u32)>>> = OnceLock::new();
+fn registry() -> &'static parking_lot::Mutex<HashMap<usize, (u64, u32)>> {
+    static REGISTRY: OnceLock<parking_lot::Mutex<HashMap<usize, (u64, u32)>>> = OnceLock::new();
     REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
@@ -199,11 +201,27 @@ fn registry() -> &'static parking_lot::Mutex<HashMap<u64, (usize, u32)>> {
 fn register_handle<T: HandleMeta, O>(ptr: *mut O, gen_id: u64) {
     registry()
         .lock()
-        .insert(gen_id, (ptr as usize, T::TYPE_TAG));
+        .insert(ptr as usize, (gen_id, T::TYPE_TAG));
 }
 
 #[cfg(feature = "debug-registry")]
 fn validate_handle<T: HandleMeta, O>(ptr: *mut O) -> Result<(), FfiError> {
+    let (gen_id, type_tag) = match registry().lock().get(&(ptr as usize)).copied() {
+        Some(entry) => entry,
+        None => {
+            return Err(FfiError::new(
+                crate::abi::lk_error_code_t::LK_ERR_INVALID_HANDLE,
+                "invalid or stale handle",
+            ));
+        }
+    };
+    if type_tag != T::TYPE_TAG {
+        return Err(FfiError::new(
+            crate::abi::lk_error_code_t::LK_ERR_INVALID_HANDLE,
+            "handle type mismatch",
+        ));
+    }
+
     unsafe {
         let header = &*ptr.cast::<DebugHandle<T>>();
         if header.magic != HANDLE_MAGIC {
@@ -218,28 +236,25 @@ fn validate_handle<T: HandleMeta, O>(ptr: *mut O) -> Result<(), FfiError> {
                 "handle type mismatch",
             ));
         }
-        match registry().lock().get(&header.gen_id) {
-            Some((addr, type_tag)) if *addr == ptr as usize && *type_tag == header.type_tag => {
-                Ok(())
-            }
-            _ => Err(FfiError::new(
+        if header.gen_id != gen_id {
+            Err(FfiError::new(
                 crate::abi::lk_error_code_t::LK_ERR_INVALID_HANDLE,
                 "invalid or stale handle",
-            )),
+            ))
+        } else {
+            Ok(())
         }
     }
 }
 
 #[cfg(feature = "debug-registry")]
 fn unregister_handle<T: HandleMeta, O>(ptr: *mut O) -> bool {
-    unsafe {
-        let header = &*ptr.cast::<DebugHandle<T>>();
-        if header.magic != HANDLE_MAGIC {
-            return false;
-        }
-        matches!(
-            registry().lock().remove(&header.gen_id),
-            Some((addr, _)) if addr == ptr as usize
-        )
+    let mut registry = registry().lock();
+    let Some((_, type_tag)) = registry.get(&(ptr as usize)).copied() else {
+        return false;
+    };
+    if type_tag != T::TYPE_TAG {
+        return false;
     }
+    registry.remove(&(ptr as usize)).is_some()
 }

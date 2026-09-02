@@ -3,6 +3,7 @@ use lktls::profile::types::TlsProfile;
 
 use crate::client::ClientBuilder;
 use crate::h2::H2Profile;
+use crate::network_partition::TlsSessionCachePartitionPolicy;
 use crate::protocol::ProtocolPolicy;
 use crate::QuicProfile;
 
@@ -31,6 +32,8 @@ pub struct ClientPreset {
     pub quic_profile: Option<QuicProfile>,
     /// Default protocol-selection policy (H1/H2/H3 negotiation and fallback).
     pub default_protocol_policy: Option<ProtocolPolicy>,
+    /// TLS/QUIC session-cache partition policy for this browser family.
+    pub tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy,
     /// Request header order template applied over HTTP/1.1 and HTTP/2.
     pub header_order: Vec<HeaderName>,
     /// Optional H3-specific header order. Falls back to `header_order` when `None`.
@@ -50,12 +53,16 @@ impl ClientPreset {
             h2_profile,
             quic_profile,
             default_protocol_policy,
+            tls_session_cache_partition_policy,
             header_order,
             h3_header_order,
             cookie_order,
         } = self;
 
-        let mut builder = builder.fingerprint(tls_profile).h2_profile(h2_profile);
+        let mut builder = builder
+            .fingerprint(tls_profile)
+            .h2_profile(h2_profile)
+            .tls_session_cache_partition_policy(tls_session_cache_partition_policy);
         if let Some(quic_tls_profile) = quic_tls_profile {
             builder = builder.quic_fingerprint(quic_tls_profile);
         }
@@ -159,6 +166,16 @@ fn chrome_151_quic_profile() -> Option<QuicProfile> {
     None
 }
 
+#[cfg(feature = "quic-h3")]
+fn chrome_152_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_152_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_152_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
 /// Chrome 131 client preset.
 ///
 /// QUIC/H3 currently uses the shared generic Chromium profile.
@@ -169,6 +186,7 @@ pub fn chrome_131() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_131_h2(),
         quic_profile: default_chrome_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -186,6 +204,7 @@ pub fn chrome_144() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_144_h2(),
         quic_profile: chrome_146_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -203,6 +222,7 @@ pub fn chrome_145() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_145_h2(),
         quic_profile: chrome_146_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -220,6 +240,7 @@ pub fn chrome_146() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_146_h2(),
         quic_profile: chrome_146_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: Some(chrome_146_h3_header_order()),
         cookie_order: None,
@@ -237,6 +258,7 @@ pub fn chrome_147() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_147_h2(),
         quic_profile: chrome_146_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -254,6 +276,7 @@ pub fn chrome_148() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_148_h2(),
         quic_profile: chrome_146_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -272,6 +295,7 @@ pub fn chrome_149() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_149_h2(),
         quic_profile: chrome_146_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -290,6 +314,7 @@ pub fn chrome_150() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_150_h2(),
         quic_profile: chrome_150_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -308,6 +333,26 @@ pub fn chrome_151() -> ClientPreset {
         h2_profile: crate::h2::profile::chrome_151_h2(),
         quic_profile: chrome_151_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
+/// Chrome 152 client preset.
+///
+/// Captured from Chrome 152.0.7977.65 against public Cloudflare endpoints.
+/// TLS adds shuffled trust-anchor identifiers, H2 retains Chrome 151's stable
+/// shape, and QUIC removes the obsolete `google_initial_rtt` parameter.
+pub fn chrome_152() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_152(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_152_quic()),
+        h2_profile: crate::h2::profile::chrome_152_h2(),
+        quic_profile: chrome_152_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -325,6 +370,7 @@ pub fn firefox_133() -> ClientPreset {
         h2_profile: crate::h2::profile::firefox_133_h2(),
         quic_profile: None,
         default_protocol_policy: Some(ProtocolPolicy::crawler_throughput()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Firefox,
         header_order: header_names(crate::h2::profile::firefox_133_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -342,6 +388,7 @@ pub fn firefox_147() -> ClientPreset {
         h2_profile: crate::h2::profile::firefox_147_h2(),
         quic_profile: None,
         default_protocol_policy: Some(ProtocolPolicy::crawler_throughput()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Firefox,
         header_order: header_names(crate::h2::profile::firefox_147_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -359,6 +406,7 @@ pub fn safari_18() -> ClientPreset {
         h2_profile: crate::h2::profile::safari_18_h2(),
         quic_profile: None,
         default_protocol_policy: Some(ProtocolPolicy::crawler_throughput()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Unpartitioned,
         header_order: header_names(crate::h2::profile::safari_18_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -376,6 +424,7 @@ pub fn safari_26() -> ClientPreset {
         h2_profile: crate::h2::profile::safari_26_h2(),
         quic_profile: None,
         default_protocol_policy: Some(ProtocolPolicy::crawler_throughput()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Unpartitioned,
         header_order: header_names(crate::h2::profile::safari_26_header_order()),
         h3_header_order: None,
         cookie_order: None,
@@ -467,6 +516,21 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn chrome_152_preset_uses_public_capture_profiles() {
+        let preset = chrome_152();
+        assert_eq!(preset.tls_profile.name, "Chrome 152");
+        assert_eq!(
+            preset.quic_tls_profile.as_ref().unwrap().name,
+            "Chrome 152 QUIC"
+        );
+        assert_eq!(
+            preset.quic_profile.as_ref().unwrap(),
+            &lkh3::chrome_152_quic()
+        );
+    }
+
     #[test]
     fn firefox_147_preset_leaves_quic_profile_unspecified() {
         let preset = firefox_147();
@@ -548,6 +612,7 @@ mod tests {
             chrome_149(),
             chrome_150(),
             chrome_151(),
+            chrome_152(),
             firefox_133(),
             firefox_147(),
             safari_18(),
@@ -570,6 +635,21 @@ mod tests {
     }
 
     #[test]
+    fn browser_presets_select_session_cache_partition_policies() {
+        assert_eq!(
+            chrome_152().tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Chromium
+        );
+        assert_eq!(
+            firefox_147().tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Firefox
+        );
+        assert_eq!(
+            safari_26().tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Unpartitioned
+        );
+    }
+    #[test]
     fn apply_threads_optional_dimensions_and_disables_h3_without_a_quic_profile() {
         // A hand-built preset that takes every "optional" branch of `apply`:
         // no QUIC profile (→ disable_http3), no protocol policy, an empty header
@@ -581,6 +661,7 @@ mod tests {
             h2_profile: base.h2_profile,
             quic_profile: None,
             default_protocol_policy: None,
+            tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Unpartitioned,
             header_order: Vec::new(),
             h3_header_order: None,
             cookie_order: Some(vec!["sid".to_string(), "uid".to_string()]),

@@ -34,21 +34,11 @@ async fn h2_get(
     host: &str,
     path: &str,
 ) -> Result<(u16, String), Box<dyn std::error::Error>> {
-    // Perform the HTTP/2 handshake (sends connection preface + SETTINGS).
-    let (h2, conn) = h2::client::handshake(tls).await?;
+    let profile = lkh2::profile::chrome_144_h2();
+    let connection = lkh2::connect_h2_native(tls, &profile, None).await?;
+    let ready = connection.clone_sender().ready().await?;
 
-    // Spawn a task to drive the connection (reads frames in background).
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("h2 connection error: {e}");
-        }
-    });
-
-    // Wait until we can send a request.
-    let mut h2 = h2.ready().await?;
-
-    // Build and send the GET request.
-    let req = http::Request::builder()
+    let request = http::Request::builder()
         .method("GET")
         .uri(format!("https://{host}{path}"))
         .header("host", host)
@@ -57,24 +47,15 @@ async fn h2_get(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         )
-        .body(())
-        .unwrap();
+        .body(())?;
 
-    let (resp, _send_stream) = h2.send_request(req, true /* end of stream */)?;
-
-    // Await the response headers.
-    let resp = resp.await?;
-    let status = resp.status().as_u16();
-
-    // Read the response body.
-    let mut body_stream = resp.into_body();
+    let (response, _send_stream) = ready.send_request(request, true)?;
+    let response = response.await_response().await?;
+    let status = response.status().as_u16();
+    let mut body_stream = response.into_body();
     let mut data = Vec::new();
     while let Some(chunk) = body_stream.data().await {
-        let chunk = chunk?;
-        let len = chunk.len();
-        data.extend_from_slice(&chunk);
-        // Release flow-control capacity so the server can send more data.
-        let _ = body_stream.flow_control().release_capacity(len);
+        data.extend_from_slice(&chunk?);
     }
 
     Ok((status, String::from_utf8(data)?))

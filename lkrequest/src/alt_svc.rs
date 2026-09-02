@@ -258,6 +258,41 @@ impl AltSvcCache {
             );
         }
     }
+
+    /// Drop every cached entry that was not advertised with `persist=1`.
+    ///
+    /// RFC 7838 §3.1: an alternative service learned on one network is only
+    /// known to be reachable on that network, so a client that changes network
+    /// must forget it unless the server asked for it to persist.
+    ///
+    /// **Nothing in lkrequest calls this.** The crate deliberately has no
+    /// network-change detector — it cannot tell a Wi-Fi/cellular switch from a
+    /// quiet moment — so the trigger belongs to the embedder, which does know.
+    /// Call this from whatever observes the change (an OS reachability
+    /// callback, a VPN toggle, a proxy rotation that moves the egress path).
+    ///
+    /// Entries that survive keep their `mark_h3_validated` timestamp: that
+    /// reachability observation was also made on the old network, but treating
+    /// it as stale is a policy decision this method does not take on the
+    /// caller's behalf.
+    pub fn clear_non_persistent(&self) {
+        let mut entries = self.entries.write();
+        let mut validated = self.validated.write();
+        let before: usize = entries.values().map(Vec::len).sum();
+        entries.retain(|key, per_origin| {
+            per_origin.retain(|entry| entry.persist);
+            let keep = !per_origin.is_empty();
+            if !keep {
+                validated.remove(key);
+            }
+            keep
+        });
+        let after: usize = entries.values().map(Vec::len).sum();
+        let removed = before.saturating_sub(after);
+        if removed > 0 {
+            tracing::debug!(removed, remaining = after, "alt_svc.cleared_non_persistent");
+        }
+    }
 }
 
 /// Parsed Alt-Svc entry for an origin.
@@ -271,6 +306,16 @@ pub struct AltSvcEntry {
     pub port: u16,
     /// Lifetime advertised by the server.
     pub max_age: Duration,
+    /// RFC 7838 §3.1 `persist=1`: the server asked for this entry to survive a
+    /// change of the active network. `false` — the default, and the value for
+    /// any other `persist` value — means the entry is only valid for the
+    /// network it was learned on and should be dropped when that network
+    /// changes.
+    ///
+    /// lkrequest has no network-change detector, so nothing in this crate
+    /// consults the flag automatically. Embedders that *can* observe a network
+    /// change call [`AltSvcCache::clear_non_persistent`] at that moment.
+    pub persist: bool,
     /// When this entry was stored.
     pub stored_at: Instant,
 }
@@ -765,11 +810,18 @@ fn parse_alt_svc_item(item: &str, stored_at: Instant) -> Option<AltSvcEntry> {
         .find_map(|param| parse_max_age(param))
         .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60));
 
+    let persist = parts
+        .iter()
+        .skip(1)
+        .find_map(|param| parse_persist(param))
+        .unwrap_or(false);
+
     Some(AltSvcEntry {
         protocol,
         host,
         port,
         max_age,
+        persist,
         stored_at,
     })
 }
@@ -786,21 +838,83 @@ fn parse_max_age(param: &str) -> Option<Duration> {
     Some(duration.min(ALT_SVC_MAX_AGE_CEILING))
 }
 
+/// Parse an RFC 7838 §3 `alt-authority` into `(host, port)`.
+///
+/// `host` is `None` for the common `":443"` form, which means "same host as
+/// the origin". When present it is returned in **authority form**, so an IPv6
+/// literal keeps its brackets (`[2001:db8::1]`). That matches every other host
+/// string in this crate — they all originate from `url::Url::host_str()`,
+/// which keeps the brackets — and it is the only form the dial path can use,
+/// because that path formats `{host}:{port}` and a bare `2001:db8::1` would
+/// render the ambiguous `2001:db8::1:8443`. Callers that need the bare address
+/// (SNI, certificate identity) strip it with
+/// [`lktls::handshake::strip_ipv6_brackets`].
+///
+/// The port is mandatory in the grammar, so an authority without one is
+/// rejected rather than defaulted.
 fn parse_alt_authority(authority: &str) -> Option<(Option<String>, u16)> {
+    let authority = authority.trim();
     if authority.is_empty() {
         return None;
     }
     if let Some(port) = authority.strip_prefix(':') {
-        return port.parse::<u16>().ok().map(|port| (None, port));
+        return parse_authority_port(port).map(|port| (None, port));
     }
 
+    // Splitting at the *last* colon is correct for both `host:port` and
+    // `[v6]:port`; the checks below reject the shapes where it is not.
     let (host, port) = authority.rsplit_once(':')?;
+    let port = parse_authority_port(port)?;
     let host = host.trim();
-    let host = host.strip_prefix('[').unwrap_or(host);
-    let host = host.strip_suffix(']').unwrap_or(host);
-    let host = normalize_host(host);
-    let port = port.parse::<u16>().ok()?;
-    Some((Some(host), port))
+    if host.is_empty() {
+        return None;
+    }
+
+    if host.starts_with('[') {
+        // RFC 3986 §3.2.2 reserves brackets for IP literals. Anything else
+        // inside them — an unterminated `[`, a DNS name, an IPvFuture form we
+        // cannot dial — is a malformed authority. `strip_ipv6_brackets`
+        // returns its input unchanged in exactly those cases.
+        if lktls::handshake::strip_ipv6_brackets(host) == host {
+            return None;
+        }
+    } else if host.contains(':') {
+        // A colon still left in an unbracketed host means an IPv6 literal
+        // written without its mandatory brackets (or plain garbage). Either
+        // way the split above did not find the port separator.
+        return None;
+    }
+
+    Some((Some(normalize_host(host)), port))
+}
+
+/// Parse the port of an `alt-authority`.
+///
+/// Port 0 is rejected: RFC 6335 §6 reserves it and it names no listener, so an
+/// entry carrying it can only ever produce a failed dial — and, because a failed
+/// QUIC attempt marks the origin broken, one such advertisement would suppress
+/// H3 for that origin until the quarantine expires.
+fn parse_authority_port(port: &str) -> Option<u16> {
+    match port.trim().parse::<u16>().ok()? {
+        0 => None,
+        port => Some(port),
+    }
+}
+
+/// Parse the RFC 7838 §3.1 `persist` parameter.
+///
+/// Only the exact value `1` requests persistence across a network change; the
+/// RFC says any other value is to be ignored, which here means "not
+/// persistent". Returns `None` when `param` is some other parameter, so the
+/// caller's `find_map` keeps scanning.
+fn parse_persist(param: &str) -> Option<bool> {
+    let (name, value) = param.split_once('=')?;
+    if !name.trim().eq_ignore_ascii_case("persist") {
+        return None;
+    }
+    let value = value.trim();
+    let value = unquote_owned(value).unwrap_or_else(|| value.to_string());
+    Some(value.trim() == "1")
 }
 
 /// Strip a surrounding `"..."` and unescape RFC 7230 quoted-pair `\X` sequences.
@@ -860,17 +974,22 @@ fn split_unquoted(input: &str, delimiter: char) -> Vec<&str> {
     parts
 }
 
+/// Pick the HTTP/3 alternative to use, if any.
+///
+/// Only the final `h3` ALPN token counts. Draft tokens (`h3-29`, `h3-27`, …)
+/// are deliberately ignored, for two reasons that agree:
+///
+/// * Chrome 140+ — the behaviour these profiles reproduce — dropped draft
+///   HTTP/3 and ignores such advertisements.
+/// * We could not honour one anyway. The H3 connect path hardcodes
+///   `alpn_protocols = ["h3"]`, and nothing maps an Alt-Svc protocol token to
+///   the ALPN we offer. Accepting an `h3-29`-only advertisement therefore meant
+///   dialling the alternative endpoint and offering `h3`, which a server that
+///   speaks only the draft must reject with `no_application_protocol` — a
+///   wasted QUIC attempt plus a broken-QUIC quarantine entry for that origin,
+///   every time.
 fn select_h3(entries: &[AltSvcEntry]) -> Option<AltSvcEntry> {
-    entries
-        .iter()
-        .find(|entry| entry.protocol == "h3")
-        .cloned()
-        .or_else(|| {
-            entries
-                .iter()
-                .find(|entry| entry.protocol.starts_with("h3-"))
-                .cloned()
-        })
+    entries.iter().find(|entry| entry.protocol == "h3").cloned()
 }
 
 #[cfg(test)]
@@ -879,6 +998,56 @@ mod tests {
 
     fn direct_key(origin: &Origin) -> RouteOriginKey {
         RouteOriginKey::new(RouteKey::direct(), origin.clone())
+    }
+
+    /// A draft-HTTP/3 advertisement must not be selected.
+    ///
+    /// We offer ALPN `h3` and nothing maps an Alt-Svc token to the ALPN, so
+    /// accepting `h3-29` meant dialling the endpoint and being rejected with
+    /// `no_application_protocol` — a wasted QUIC attempt and a broken-QUIC
+    /// entry. Chrome 140+ ignores draft tokens too.
+    #[test]
+    fn alt_svc_ignores_draft_h3_versions() {
+        let cache = AltSvcCache::new();
+        let origin = Origin::https("example.com", 443);
+
+        cache.store_from_header(&origin, r#"h3-29=":443"; ma=86400"#);
+        assert!(
+            cache.find_h3(&origin).is_none(),
+            "an h3-29-only advertisement must not be selected"
+        );
+
+        // Several drafts, still nothing usable.
+        let other = Origin::https("drafts.example.com", 443);
+        cache.store_from_header(&other, r#"h3-27=":443", h3-29=":443"; ma=3600"#);
+        assert!(
+            cache.find_h3(&other).is_none(),
+            "no draft token may be selected, however many are offered"
+        );
+    }
+
+    /// Final `h3` is still selected when a draft is advertised alongside it —
+    /// the common transitional form — and the draft must not shadow it whatever
+    /// the order.
+    #[test]
+    fn alt_svc_selects_final_h3_alongside_drafts() {
+        let cache = AltSvcCache::new();
+
+        let draft_first = Origin::https("a.example.com", 443);
+        cache.store_from_header(&draft_first, r#"h3-29=":443", h3=":8443"; ma=3600"#);
+        let entry = cache
+            .find_h3(&draft_first)
+            .expect("final h3 must still be selected");
+        assert_eq!(entry.protocol, "h3");
+        assert_eq!(entry.port, 8443);
+
+        let h3_first = Origin::https("b.example.com", 443);
+        cache.store_from_header(&h3_first, r#"h3=":8443", h3-29=":443"; ma=3600"#);
+        let entry = cache
+            .find_h3(&h3_first)
+            .expect("final h3 must still be selected");
+        assert_eq!(entry.protocol, "h3");
+        assert_eq!(entry.port, 8443);
     }
 
     #[test]
@@ -967,6 +1136,190 @@ mod tests {
 
         let entry = cache.find_h3(&origin).unwrap();
         assert_eq!(entry.max_age, ALT_SVC_MAX_AGE_CEILING);
+    }
+
+    // ---- RFC 7838 §3 alt-authority parsing (D-06) ----------------------
+
+    #[test]
+    fn alt_svc_keeps_ipv6_authority_brackets() {
+        // The bracketed authority form is what every other host string in this
+        // crate carries (they come from `Url::host_str()`), and it is the only
+        // form the `{host}:{port}` dial path can render unambiguously.
+        let cache = AltSvcCache::new();
+        let origin = Origin::https("example.com", 443);
+
+        cache.store_from_header(&origin, r#"h3="[2001:db8::1]:8443"; ma=86400"#);
+
+        let entry = cache.find_h3(&origin).unwrap();
+        assert_eq!(entry.host.as_deref(), Some("[2001:db8::1]"));
+        assert_eq!(entry.port, 8443);
+        // And the bare address is one `strip_ipv6_brackets` away for the SNI /
+        // certificate-identity callers that need it.
+        assert_eq!(
+            lktls::handshake::strip_ipv6_brackets(entry.host.as_deref().unwrap()),
+            "2001:db8::1"
+        );
+        assert!(lktls::handshake::hostname_is_ip_literal(
+            entry.host.as_deref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn alt_svc_parse_authority_shapes() {
+        // Port-only: the overwhelmingly common real-world form. `None` host
+        // means "same host as the origin" and must stay `None`.
+        assert_eq!(parse_alt_authority(":443"), Some((None, 443)));
+        // Named host.
+        assert_eq!(
+            parse_alt_authority("alt.example.com:8443"),
+            Some((Some("alt.example.com".to_string()), 8443))
+        );
+        // Host normalisation still applies (case, trailing dot).
+        assert_eq!(
+            parse_alt_authority("ALT.Example.com.:8443"),
+            Some((Some("alt.example.com".to_string()), 8443))
+        );
+        // IPv6 keeps its brackets, and hex digits are lowercased.
+        assert_eq!(
+            parse_alt_authority("[2001:DB8::1]:8443"),
+            Some((Some("[2001:db8::1]".to_string()), 8443))
+        );
+        assert_eq!(
+            parse_alt_authority("[::1]:443"),
+            Some((Some("[::1]".to_string()), 443))
+        );
+    }
+
+    #[test]
+    fn alt_svc_rejects_malformed_authority() {
+        for malformed in [
+            "",                         // empty
+            ":",                        // no port digits
+            ":notaport",                // non-numeric port
+            ":99999",                   // out of u16 range
+            "alt.example.com",          // port is mandatory in the grammar
+            "alt.example.com:",         // ditto
+            "alt.example.com:notaport", // non-numeric port
+            ":-1",                      // negative port
+            "[2001:db8::1]",            // bracketed host, no port
+            "[2001:db8::1:8443",        // unterminated bracket
+            "2001:db8::1]:8443",        // unopened bracket
+            "2001:db8::1:8443",         // IPv6 without its mandatory brackets
+            "[example.com]:8443",       // RFC 3986 §3.2.2: brackets are for IP literals only
+            "[]:8443",                  // empty brackets
+            ":8443:8443",               // stray extra colon after the port marker
+        ] {
+            assert_eq!(
+                parse_alt_authority(malformed),
+                None,
+                "expected {malformed:?} to be rejected"
+            );
+        }
+    }
+
+    /// Port 0 names no listener (RFC 6335 §6 reserves it), so an entry carrying
+    /// it can only produce a failed dial. Worse, a failed QUIC attempt marks the
+    /// origin broken, so one such advertisement would suppress H3 for that
+    /// origin until the quarantine expires.
+    #[test]
+    fn alt_svc_rejects_port_zero() {
+        for authority in [":0", "alt.example.com:0", "[2001:db8::1]:0"] {
+            assert_eq!(
+                parse_alt_authority(authority),
+                None,
+                "{authority} names no listener and must be rejected"
+            );
+        }
+
+        // A real port on the same shapes is still accepted.
+        assert_eq!(parse_alt_authority(":443"), Some((None, 443)));
+        assert!(parse_alt_authority("alt.example.com:8443").is_some());
+    }
+
+    #[test]
+    fn alt_svc_malformed_authority_is_dropped_by_the_cache() {
+        let cache = AltSvcCache::new();
+        let origin = Origin::https("example.com", 443);
+
+        // Unbracketed IPv6: previously the last-colon split accepted it and
+        // produced a host that cannot be dialled.
+        cache.store_from_header(&origin, r#"h3="2001:db8::1:8443"; ma=86400"#);
+        assert!(cache.find_h3(&origin).is_none());
+
+        // A malformed entry must not take a well-formed sibling down with it.
+        cache.store_from_header(
+            &origin,
+            r#"h3="[example.com]:8443"; ma=86400, h3="[2001:db8::1]:8443"; ma=86400"#,
+        );
+        let entry = cache.find_h3(&origin).unwrap();
+        assert_eq!(entry.host.as_deref(), Some("[2001:db8::1]"));
+    }
+
+    // ---- RFC 7838 §3.1 `persist` parameter (D-07) ----------------------
+
+    #[test]
+    fn alt_svc_parses_persist_flag() {
+        let cache = AltSvcCache::new();
+
+        let persistent = Origin::https("persist.example.com", 443);
+        cache.store_from_header(&persistent, r#"h3=":443"; ma=86400; persist=1"#);
+        assert!(cache.find_h3(&persistent).unwrap().persist);
+
+        // Absent: the default is "clear me on a network change".
+        let absent = Origin::https("absent.example.com", 443);
+        cache.store_from_header(&absent, r#"h3=":443"; ma=86400"#);
+        assert!(!cache.find_h3(&absent).unwrap().persist);
+
+        // RFC 7838 §3.1: only the value `1` requests persistence.
+        let zero = Origin::https("zero.example.com", 443);
+        cache.store_from_header(&zero, r#"h3=":443"; ma=86400; persist=0"#);
+        assert!(!cache.find_h3(&zero).unwrap().persist);
+
+        let other = Origin::https("other.example.com", 443);
+        cache.store_from_header(&other, r#"h3=":443"; ma=86400; persist=true"#);
+        assert!(!cache.find_h3(&other).unwrap().persist);
+    }
+
+    #[test]
+    fn alt_svc_persist_combines_with_ma_in_either_order() {
+        let cache = AltSvcCache::new();
+
+        let ma_first = Origin::https("ma-first.example.com", 443);
+        cache.store_from_header(
+            &ma_first,
+            r#"h3="alt.example.com:8443"; ma=3600; persist=1"#,
+        );
+        let entry = cache.find_h3(&ma_first).unwrap();
+        assert_eq!(entry.max_age, Duration::from_secs(3600));
+        assert!(entry.persist);
+        assert_eq!(entry.host.as_deref(), Some("alt.example.com"));
+
+        // Parameter order is not significant, and a quoted value works too.
+        let persist_first = Origin::https("persist-first.example.com", 443);
+        cache.store_from_header(&persist_first, r#"h3=":443"; persist="1"; ma="3600""#);
+        let entry = cache.find_h3(&persist_first).unwrap();
+        assert_eq!(entry.max_age, Duration::from_secs(3600));
+        assert!(entry.persist);
+    }
+
+    #[test]
+    fn alt_svc_clear_non_persistent_keeps_only_persist_entries() {
+        let cache = AltSvcCache::new();
+        let persistent = Origin::https("persist.example.com", 443);
+        let transient = Origin::https("transient.example.com", 443);
+
+        cache.store_from_header(&persistent, r#"h3=":443"; ma=86400; persist=1"#);
+        cache.store_from_header(&transient, r#"h3=":443"; ma=86400"#);
+        cache.mark_h3_validated(&transient);
+        assert!(cache.find_h3(&persistent).is_some());
+        assert!(cache.find_h3(&transient).is_some());
+
+        cache.clear_non_persistent();
+
+        assert!(cache.find_h3(&persistent).is_some());
+        assert!(cache.find_h3(&transient).is_none());
+        assert!(!cache.entries.read().contains_key(&direct_key(&transient)));
+        assert!(cache.last_validated_at(&transient).is_none());
     }
 
     #[test]

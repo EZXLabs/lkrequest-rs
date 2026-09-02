@@ -26,15 +26,19 @@ use url::Url;
 use crate::alt_svc::{AltSvcCache, BrokenQuicPolicy, BrokenQuicTracker};
 use crate::client::Client;
 use crate::connection_pool::ConnectionPool;
+use crate::dns::HttpsRecord;
 use crate::error::Error;
 #[cfg(feature = "quic-h3")]
 use crate::error::QuicPhase;
+use crate::network_partition::{NetworkPartitionContext, PartitionedSessionStore};
 use crate::protocol::{AcquisitionPolicy, FallbackPolicy, HttpIntent, ProtocolPolicy, RacePolicy};
 use crate::proxy::ProxyConfig;
 use crate::response::HttpVersion;
 use crate::retry::RetryPolicy;
 
+#[cfg(feature = "synthetic-fp")]
 use lktls::session_store::InMemorySessionStore;
+use lktls::session_store::SessionStore;
 
 #[cfg(feature = "quic-h3")]
 pub(crate) enum H3ConnectOutcome {
@@ -447,6 +451,181 @@ pub(crate) fn next_request_id() -> u64 {
 
 pub use cookie_store::CookieStore;
 
+/// The two cookie name prefixes defined by RFC 6265bis §4.1.3.
+const SECURE_COOKIE_PREFIX: &str = "__Secure-";
+const HOST_COOKIE_PREFIX: &str = "__Host-";
+
+/// ASCII case-insensitive prefix test.  Both prefixes are pure ASCII, and
+/// browsers match them case-insensitively.
+fn starts_with_ascii_ci(name: &str, prefix: &str) -> bool {
+    let (name, prefix) = (name.as_bytes(), prefix.as_bytes());
+    name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// Was this `Set-Cookie` delivered over what RFC 6265bis calls a *secure
+/// channel*?
+///
+/// "Secure channel" here means an `https`/`wss` URL.  Browsers additionally
+/// treat `http://localhost` as a trustworthy origin; we deliberately do not,
+/// because this client targets remote origins — the stricter rule can never
+/// admit a cookie a real browser would have refused.
+fn is_secure_channel(url: &Url) -> bool {
+    matches!(url.scheme(), "https" | "wss")
+}
+
+/// Decide whether a `Set-Cookie` received from an **origin server** may enter
+/// the jar.
+///
+/// Returns `true` when the cookie may be stored, and `false` when a conforming
+/// user agent must **ignore the cookie entirely**.  Two RFC 6265bis rules are
+/// enforced here; both reduce to the same question — *was this set over a
+/// secure channel?* — which is why they share one code path and one set of
+/// call sites:
+///
+/// * §5.6 (storage model, step 15) — a cookie whose `secure-only-flag` is set
+///   but which did not arrive over a secure channel is ignored, **whatever its
+///   name**.  `cookie_store` 0.22 does not implement this, so it happens here.
+/// * §4.1.3 cookie name prefixes:
+///   * `__Secure-` (§4.1.3.1) — the cookie must carry the `Secure` attribute
+///     and must have been set over a secure channel.
+///   * `__Host-` (§4.1.3.2) — everything `__Secure-` requires, and in addition
+///     it must **not** carry a `Domain` attribute, and its `Path` must be
+///     exactly `/`.
+///   * Any other name is unaffected by the prefix rules.
+///
+/// Prefix matching is ASCII case-insensitive, matching browser behaviour.
+///
+/// This is the origin-server path only.  The programmatic APIs
+/// ([`Session::set_cookie`], [`Session::set_cookie_with_attrs`] and
+/// [`Session::remove_cookie`]) deliberately bypass it: they seed or clear jar
+/// state rather than consuming a header, and a removal must never be blocked.
+fn origin_cookie_allows_storage(cookie: &cookie_store::RawCookie<'_>, url: &Url) -> bool {
+    let secure_attr = cookie.secure().unwrap_or(false);
+    let secure_channel = is_secure_channel(url);
+
+    // §5.6 step 15: `Secure` set over a non-secure channel is ignored outright,
+    // regardless of the cookie's name.
+    if secure_attr && !secure_channel {
+        return false;
+    }
+
+    let name = cookie.name();
+    let host_prefixed = starts_with_ascii_ci(name, HOST_COOKIE_PREFIX);
+    let secure_prefixed = starts_with_ascii_ci(name, SECURE_COOKIE_PREFIX);
+    if !host_prefixed && !secure_prefixed {
+        return true;
+    }
+
+    // §4.1.3: both prefixes require `Secure` *plus* a secure channel.  The
+    // check above already rejected `Secure`-over-`http`, so what is left to
+    // catch here is a prefixed cookie that omits `Secure` altogether, and a
+    // prefixed non-`Secure` cookie offered over an insecure channel.
+    if !secure_attr || !secure_channel {
+        return false;
+    }
+
+    // `__Host-` additionally locks the cookie to the exact host and to "/".
+    if host_prefixed {
+        return cookie.domain().is_none() && cookie.path() == Some("/");
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// DNS HTTPS (SVCB) record hand-off
+// ---------------------------------------------------------------------------
+
+/// What a caller already knows about the target's DNS HTTPS (SVCB) record.
+///
+/// Passed to [`Session::build_tls_connector`] so the TLS handshake reuses the
+/// record protocol discovery already fetched for this request instead of
+/// issuing a second, possibly divergent, HTTPS-RR query.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum DiscoveredHttpsRr<'a> {
+    /// Nobody has queried yet — the connector may run its own (gated) lookup.
+    #[default]
+    Unqueried,
+    /// A caller already ran the query: `Some` is the record it returned, `None`
+    /// means the query came back empty. Either way, do **not** query again.
+    Queried(Option<&'a HttpsRecord>),
+}
+
+/// How long a parked HTTPS-RR stays claimable.
+///
+/// The hand-off is published by `pipeline::discover_quic_support` and claimed at
+/// the top of [`Session::establish_connection`], microseconds later on the same
+/// request. The window only has to survive that gap; it is deliberately far too
+/// short to act as a DNS cache.
+const HTTPS_RR_HANDOFF_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on parked entries, so a session that discovers many origins
+/// without ever reaching a TLS handshake (e.g. an all-H3 workload) cannot grow
+/// the map without limit.
+const HTTPS_RR_HANDOFF_MAX_ENTRIES: usize = 32;
+
+/// A DNS HTTPS (SVCB) record that protocol discovery fetched for an in-flight
+/// request, parked for the TLS handshake of that same request.
+///
+/// `establish_connection` is shared by the buffered, streaming, preconnect and
+/// WebSocket paths and does not receive the `QuicDiscovery` value, so discovery
+/// parks the record here and the connector claims it. Entries are **single-use**
+/// (claiming removes them) and expire after [`HTTPS_RR_HANDOFF_TTL`]: this is a
+/// hand-off slot, not a resolver cache.
+#[derive(Default)]
+pub(crate) struct HttpsRrHandoff {
+    entries: std::collections::HashMap<String, HttpsRrHandoffEntry>,
+}
+
+struct HttpsRrHandoffEntry {
+    published_at: std::time::Instant,
+    /// The lookup result — `None` means "queried, no record", which is just as
+    /// worth handing off as a hit: it spares the second query too.
+    record: Option<HttpsRecord>,
+}
+
+impl HttpsRrHandoff {
+    fn publish(&mut self, host: &str, record: Option<HttpsRecord>, now: std::time::Instant) {
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.published_at) < HTTPS_RR_HANDOFF_TTL);
+        if self.entries.len() >= HTTPS_RR_HANDOFF_MAX_ENTRIES && !self.entries.contains_key(host) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.published_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            host.to_string(),
+            HttpsRrHandoffEntry {
+                published_at: now,
+                record,
+            },
+        );
+    }
+
+    fn claim(&mut self, host: &str, now: std::time::Instant) -> Option<Option<HttpsRecord>> {
+        let entry = self.entries.remove(host)?;
+        if now.duration_since(entry.published_at) >= HTTPS_RR_HANDOFF_TTL {
+            return None;
+        }
+        Some(entry.record)
+    }
+
+    /// Like [`claim`](Self::claim), but leaves the entry in place for the
+    /// caller that consumes it (see [`Session::peek_discovered_https_rr`]).
+    #[cfg(feature = "quic-h3")]
+    fn peek(&self, host: &str, now: std::time::Instant) -> Option<Option<HttpsRecord>> {
+        let entry = self.entries.get(host)?;
+        if now.duration_since(entry.published_at) >= HTTPS_RR_HANDOFF_TTL {
+            return None;
+        }
+        Some(entry.record.clone())
+    }
+}
+
 /// A session representing a single virtual browser user.
 ///
 /// # Example
@@ -500,7 +679,7 @@ pub(crate) struct SessionInner {
     pub hsts_policy: Arc<dyn crate::hsts::HstsPolicy>,
 
     /// TLS session ticket store for session resumption (shared across connections).
-    pub session_store: Arc<InMemorySessionStore>,
+    pub session_store: Arc<dyn SessionStore>,
 
     /// Optional retry policy for failed requests.
     pub retry_policy: Option<Arc<dyn RetryPolicy>>,
@@ -541,6 +720,10 @@ pub(crate) struct SessionInner {
 
     /// Cooldown tracker for origins whose QUIC path is currently considered broken.
     pub broken_quic_tracker: BrokenQuicTracker,
+
+    /// DNS HTTPS (SVCB) records fetched by protocol discovery, parked for the
+    /// TLS handshake of the same request. See [`HttpsRrHandoff`].
+    pub https_rr_handoff: Mutex<HttpsRrHandoff>,
 
     /// QUIC handshakes currently in-flight, keyed by connection key.
     ///
@@ -713,6 +896,11 @@ impl Session {
     /// The cookie is associated with `url` and will be sent on subsequent
     /// requests to matching domains/paths according to standard cookie rules.
     ///
+    /// The RFC 6265bis §4.1.3 `__Secure-` / `__Host-` name prefixes are **not**
+    /// enforced here — this seeds the jar from application state rather than
+    /// from an origin server.  Use [`Session::set_cookie_raw`] if you want the
+    /// browser rules applied.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -728,6 +916,14 @@ impl Session {
     pub fn set_cookie(&self, url: &str, name: &str, value: &str) {
         match Url::parse(url) {
             Ok(parsed) => {
+                // Deliberately NOT gated on the RFC 6265bis §4.1.3 name prefixes.
+                // That rule governs cookies a user agent *receives* from an
+                // origin server; this is the application seeding its own jar
+                // (e.g. replaying a cookie a real browser already earned), which
+                // is the local-trust equivalent of importing a browser cookie
+                // store.  This API cannot express `Secure`, so gating it would
+                // silently drop every `__Secure-`/`__Host-` cookie handed to it.
+                // Use `set_cookie_raw` if you want the browser rules applied.
                 let raw = cookie_store::RawCookie::new(name.to_string(), value.to_string());
                 self.inner.cookie_jar.rcu(move |old| {
                     let mut jar = (**old).clone();
@@ -746,6 +942,9 @@ impl Session {
     /// This allows setting cookies that are scoped to specific paths, which
     /// enables multiple cookies with the **same name** but different paths —
     /// a common pattern with real browsers.
+    ///
+    /// As with [`Session::set_cookie`], the RFC 6265bis §4.1.3 `__Secure-` /
+    /// `__Host-` name prefixes are **not** enforced for caller-supplied cookies.
     ///
     /// # Example
     ///
@@ -804,6 +1003,12 @@ impl Session {
             builder = builder.http_only(true);
         }
         let built = builder.build();
+        // Deliberately NOT gated on the RFC 6265bis §4.1.3 name prefixes — same
+        // reasoning as `set_cookie`: this is caller-supplied jar state, not a
+        // server-sent `Set-Cookie`.  Imported jars (Netscape `cookies.txt`,
+        // browser exports) routinely carry a `domain` column even for host-only
+        // cookies, so gating here would silently drop valid `__Host-` cookies
+        // during a replay.
         self.inner.cookie_jar.rcu(move |old| {
             let mut jar = (**old).clone();
             let _ = jar.insert_raw(&built, &parsed);
@@ -815,6 +1020,16 @@ impl Session {
     ///
     /// This is the most flexible way to set cookies, supporting all cookie
     /// attributes (path, domain, expires, max-age, secure, httponly, samesite).
+    ///
+    /// Because it takes verbatim `Set-Cookie` syntax it is treated as an
+    /// origin-server cookie, so the RFC 6265bis storage rules **are** enforced
+    /// and a violating cookie is ignored exactly as a browser would ignore it:
+    ///
+    /// * §5.6 step 15 — any cookie carrying `Secure` whose URL is not `https`
+    ///   / `wss`.
+    /// * §4.1.3 — a `__Secure-` cookie without `Secure` (or not set over
+    ///   `https`), or a `__Host-` cookie carrying a `Domain` attribute or a
+    ///   `Path` other than `/`.
     ///
     /// # Example
     ///
@@ -841,6 +1056,17 @@ impl Session {
         };
         match cookie_store::RawCookie::parse(set_cookie_header.to_string()) {
             Ok(raw) => {
+                // This API takes verbatim `Set-Cookie` header syntax, so it is
+                // the origin-server path: the RFC 6265bis storage rules apply
+                // and a browser would ignore a cookie that violates them.
+                if !origin_cookie_allows_storage(&raw, &parsed) {
+                    tracing::debug!(
+                        url = %parsed,
+                        cookie = %raw.name(),
+                        "session.set_cookie_raw: cookie rejected by the RFC 6265bis storage rules"
+                    );
+                    return;
+                }
                 self.inner.cookie_jar.rcu(move |old| {
                     let mut jar = (**old).clone();
                     let _ = jar.insert_raw(&raw, &parsed);
@@ -975,6 +1201,11 @@ impl Session {
         let name = name.to_string();
         self.inner.cookie_jar.rcu(move |old| {
             let mut jar = (**old).clone();
+            // Deliberately NOT gated on the RFC 6265bis §4.1.3 name prefixes.
+            // This synthesises an already-expired cookie purely to evict an
+            // existing entry; it carries no `Secure` attribute, so gating it
+            // would make `__Secure-`/`__Host-` cookies permanently unremovable.
+            // A removal must never be blocked by the prefix rules.
             let removal =
                 cookie_store::RawCookie::build(cookie_store::RawCookie::new(name.clone(), ""))
                     .max_age(cookie::time::Duration::ZERO)
@@ -1073,6 +1304,53 @@ impl Session {
     }
 
     // -------------------------------------------------------------------
+    // DNS HTTPS (SVCB) record hand-off
+    // -------------------------------------------------------------------
+
+    /// Park the HTTPS-RR lookup result for `host` so the TLS handshake of this
+    /// request can reuse it instead of querying again.
+    ///
+    /// Only ever called from the local-DNS branch of
+    /// `pipeline::discover_quic_support` — nothing is parked on remote-DNS
+    /// routes, because nothing is looked up there.
+    pub(crate) fn publish_discovered_https_rr(&self, host: &str, record: Option<HttpsRecord>) {
+        self.inner
+            .https_rr_handoff
+            .lock()
+            .publish(host, record, std::time::Instant::now());
+    }
+
+    /// Claim the HTTPS RR parked for `host` by protocol discovery.
+    ///
+    /// Returns `None` when nothing fresh is parked (so the caller must do its
+    /// own lookup), `Some(None)` when discovery queried and found no record,
+    /// and `Some(Some(record))` for a hit. The entry is consumed.
+    pub(crate) fn take_discovered_https_rr(&self, host: &str) -> Option<Option<HttpsRecord>> {
+        self.inner
+            .https_rr_handoff
+            .lock()
+            .claim(host, std::time::Instant::now())
+    }
+
+    /// Read the HTTPS RR parked for `host` **without** consuming it.
+    ///
+    /// The H3 handshake reads the hand-off this way because it is not the last
+    /// user of the record on its request: when the QUIC attempt fails, the same
+    /// request falls back to TCP and `establish_connection` still has to find
+    /// the record there. Consuming it here would leave that fallback to issue a
+    /// second query for the host this request already resolved.
+    ///
+    /// Freshness is unchanged — an entry past [`HTTPS_RR_HANDOFF_TTL`] is not
+    /// returned, and it is still the *claim* that removes it.
+    #[cfg(feature = "quic-h3")]
+    pub(crate) fn peek_discovered_https_rr(&self, host: &str) -> Option<Option<HttpsRecord>> {
+        self.inner
+            .https_rr_handoff
+            .lock()
+            .peek(host, std::time::Instant::now())
+    }
+
+    // -------------------------------------------------------------------
     // TLS connector construction
     // -------------------------------------------------------------------
 
@@ -1081,17 +1359,23 @@ impl Session {
     /// Applies verify, custom CA, keylog, and ECH (session > client > DNS auto)
     /// configurations. Each call site only needs to provide the TLS profile
     /// and ALPS payload (which vary depending on protocol context).
+    ///
+    /// `dns_https` carries an HTTPS RR the caller already fetched for this
+    /// request. Only when it is [`DiscoveredHttpsRr::Unqueried`] does this
+    /// method run its own lookup — otherwise every HTTPS request would pay a
+    /// second HTTPS-RR round trip, and the ECH config used could disagree with
+    /// the record the H3 decision was based on.
     pub(crate) async fn build_tls_connector(
         &self,
         tls_profile: lktls::profile::types::TlsProfile,
         alps_payload: Option<Vec<u8>>,
         host: &str,
         is_remote_dns: bool,
+        dns_https: DiscoveredHttpsRr<'_>,
     ) -> crate::tls::TlsConnector {
         let client = &self.inner.client;
         let mut connector = crate::tls::TlsConnector::new(tls_profile)
-            .session_store(self.inner.session_store.clone()
-                as std::sync::Arc<dyn lktls::session_store::SessionStore>);
+            .session_store(self.inner.session_store.clone());
         // `None` => don't advertise ALPS; `Some(bytes)` => advertise + Client EE
         // payload `bytes` (empty for Chrome). Leaving the connector's default
         // (`None`) untouched keeps ALPS off.
@@ -1110,6 +1394,7 @@ impl Session {
         } else {
             connector = connector.insecure_skip_verify(true);
         }
+        connector = connector.require_close_notify(client.require_close_notify());
         if let Some(anchors) = client.custom_ca_anchors() {
             connector = connector.custom_ca_anchors(std::sync::Arc::clone(anchors));
         }
@@ -1117,28 +1402,134 @@ impl Session {
             connector = connector.keylog(cb.clone());
         }
 
-        if let Some(ref ech_config) = self.inner.ech_config {
-            connector = connector.ech_config(ech_config.clone());
-        } else if let Some(ech_config) = client.ech_config() {
-            connector = connector.ech_config(ech_config.to_vec());
-        } else if !is_remote_dns {
-            // DNS-based ECH discovery only on routes where we resolve locally.
-            // On remote-DNS routes (socks5h / HTTP CONNECT) the proxy resolves
-            // the target, so a local HTTPS-RR query here would leak the target
-            // hostname out-of-band from the proxy.
-            if let Ok(Some(https_rr)) = client.resolver().lookup_https(host).await {
-                if let Some(ech_bytes) = https_rr.ech_config_list {
-                    tracing::debug!(
-                        host = %host,
-                        ech_len = ech_bytes.len(),
-                        "ech.auto_configured_from_dns",
-                    );
-                    connector = connector.ech_config(ech_bytes);
-                }
-            }
+        if let Some(ech_config) = self
+            .resolve_ech_config(host, is_remote_dns, dns_https)
+            .await
+        {
+            connector = connector.ech_config(ech_config);
         }
 
         connector
+    }
+
+    /// Resolve the ECHConfigList to offer for `host`: session override, then
+    /// client-level, then the DNS HTTPS (SVCB) record.
+    ///
+    /// Shared by the TCP handshake ([`Self::build_tls_connector`]) and the
+    /// QUIC/H3 handshake ([`Self::establish_h3_connection_with_0rtt`]) so the
+    /// two transports cannot drift apart on which ECH config a session actually
+    /// gets — they did, and a session-level override was silently ignored on
+    /// H3 while DNS-discovered ECH never reached it at all.
+    ///
+    /// `is_remote_dns` gates the DNS level only. On remote-DNS routes (socks5h
+    /// / HTTP CONNECT) the proxy resolves the target, so a local HTTPS-RR query
+    /// here would leak the target hostname out-of-band from the proxy; the
+    /// explicit overrides still apply there.
+    ///
+    /// `dns_https` says whether this request already ran that query, so the
+    /// lookup below happens at most once per request.
+    pub(crate) async fn resolve_ech_config(
+        &self,
+        host: &str,
+        is_remote_dns: bool,
+        dns_https: DiscoveredHttpsRr<'_>,
+    ) -> Option<Vec<u8>> {
+        if let Some(ref ech_config) = self.inner.ech_config {
+            return Some(ech_config.clone());
+        }
+        if let Some(ech_config) = self.inner.client.ech_config() {
+            return Some(ech_config.to_vec());
+        }
+        if is_remote_dns {
+            return None;
+        }
+
+        let ech_bytes = match dns_https {
+            // Protocol discovery already queried for this request: reuse its
+            // answer (a miss included) rather than querying a second time.
+            DiscoveredHttpsRr::Queried(record) => {
+                record.and_then(|record| record.ech_config_list.clone())
+            }
+            DiscoveredHttpsRr::Unqueried => self
+                .inner
+                .client
+                .resolver()
+                .lookup_https(host)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|record| record.ech_config_list),
+        }?;
+
+        tracing::debug!(
+            host = %host,
+            ech_len = ech_bytes.len(),
+            "ech.auto_configured_from_dns",
+        );
+        Some(ech_bytes)
+    }
+
+    /// Build the QUIC crypto configuration from Client + Session settings.
+    ///
+    /// The H3 sibling of [`Self::build_tls_connector`], and deliberately shaped
+    /// like it: same inputs, same verify / custom-CA / ECH / keylog decisions,
+    /// so the two transports of one session present the same TLS configuration.
+    ///
+    /// `host` is the origin (the SNI and the name the certificate is checked
+    /// against), which is also the name any ECH config belongs to — never the
+    /// alternative endpoint's dial host. `dial_port` is where packets go.
+    #[cfg(feature = "quic-h3")]
+    pub(crate) async fn build_h3_crypto(
+        &self,
+        tls_profile: lktls::profile::types::TlsProfile,
+        alps_payload: Option<Vec<u8>>,
+        host: &str,
+        dial_port: u16,
+        is_remote_dns: bool,
+    ) -> lktls_quic::LktlsQuicClientConfig {
+        let client = &self.inner.client;
+        let mut crypto = lktls_quic::LktlsQuicClientConfig::new(tls_profile)
+            .port(dial_port)
+            .session_store(self.inner.session_store.clone());
+        if let Some(alps_payload) = alps_payload {
+            crypto = crypto.alps_payload(alps_payload);
+        }
+        if client.verify() {
+            // See the TCP path: verify=true → Strict (enforce), verify=false
+            // → Insecure (explicit opt-out).
+            crypto = crypto.verification_policy(lktls::verify::policy::VerificationPolicy::Strict);
+        } else {
+            crypto =
+                crypto.verification_policy(lktls::verify::policy::VerificationPolicy::Insecure);
+        }
+        if let Some(anchors) = client.custom_ca_anchors().cloned() {
+            crypto = crypto.custom_ca_anchors(anchors);
+        }
+        // Read the HTTPS RR this request's protocol discovery parked rather
+        // than claiming it: a failed QUIC attempt falls back to TCP on the same
+        // request, and `establish_connection` still has to find the record
+        // there. Nothing is ever parked on remote-DNS routes, and the same gate
+        // is kept here so a record parked by a direct-route request can never
+        // be applied to a proxied one.
+        let discovered_https_rr = if is_remote_dns {
+            None
+        } else {
+            self.peek_discovered_https_rr(host)
+        };
+        let dns_https = match discovered_https_rr {
+            Some(ref record) => DiscoveredHttpsRr::Queried(record.as_ref()),
+            None => DiscoveredHttpsRr::Unqueried,
+        };
+        if let Some(ech) = self
+            .resolve_ech_config(host, is_remote_dns, dns_https)
+            .await
+        {
+            crypto = crypto.ech_config(ech);
+        }
+        if let Some(cb) = client.keylog_callback().cloned() {
+            crypto = crypto.keylog(cb);
+        }
+        crypto
     }
 
     // -------------------------------------------------------------------
@@ -1160,6 +1551,27 @@ impl Session {
     ) -> crate::error::Result<crate::connect::EstablishedConnection> {
         let client = &self.inner.client;
         let timeouts = client.timeouts();
+        let is_remote_dns = crate::protocol::proxy_uses_remote_dns(proxy);
+
+        // Claim the HTTPS RR that protocol discovery already fetched for this
+        // request, so the handshake below does not repeat the query — and can
+        // not end up with an ECH config that disagrees with the record the H3
+        // decision was based on. Claimed *before* the TCP connect so the
+        // hand-off window stays as tight as possible.
+        //
+        // Nothing is ever parked on remote-DNS routes (discovery skips the
+        // lookup there), and this side keeps the same gate so a record parked
+        // by a direct-route request can never be applied to a proxied one.
+        let discovered_https_rr =
+            if matches!(config.scheme, crate::connection_pool::Scheme::Https) && !is_remote_dns {
+                self.take_discovered_https_rr(host)
+            } else {
+                None
+            };
+        let dns_https = match discovered_https_rr {
+            Some(ref record) => DiscoveredHttpsRr::Queried(record.as_ref()),
+            None => DiscoveredHttpsRr::Unqueried,
+        };
 
         // Phase 1: TCP connect (direct or through proxy, with optional fallback)
         let tcp_start = std::time::Instant::now();
@@ -1193,11 +1605,59 @@ impl Session {
                         config.tls_profile.clone(),
                         config.alps_payload.clone(),
                         host,
-                        crate::protocol::proxy_uses_remote_dns(proxy),
+                        is_remote_dns,
+                        dns_https,
                     )
                     .await;
 
-                crate::connect::wrap_tls(tcp, host, port, &tls_connector, tls_timeout).await
+                let first =
+                    crate::connect::wrap_tls(tcp, host, port, &tls_connector, tls_timeout).await;
+
+                // ECH rejected, and the server handed us fresh configs: retry
+                // once with them, the way a browser does. The alternative —
+                // surfacing the error — would turn a routine key rotation into
+                // a hard failure, and ECH is enabled automatically from DNS
+                // HTTPS records, so that would hit ordinary traffic. Retrying
+                // *without* ECH is not an option: it would leak the very name
+                // ECH exists to protect.
+                let Some(retry_configs) = ech_retry_configs(&first) else {
+                    return first;
+                };
+
+                tracing::info!(
+                    host = %host,
+                    len = retry_configs.len(),
+                    "ech.retrying_with_server_configs",
+                );
+
+                // The first connection is gone — it was aborted with
+                // `ech_required` — so dial again.
+                let tcp = crate::connect::connect_tcp(
+                    host,
+                    port,
+                    proxy,
+                    client.tcp_fingerprint(),
+                    client.resolver(),
+                    tcp_timeout,
+                    Some(self.connection_budget()),
+                    config,
+                )
+                .await?;
+
+                let retry_connector = self
+                    .build_tls_connector(
+                        config.tls_profile.clone(),
+                        config.alps_payload.clone(),
+                        host,
+                        is_remote_dns,
+                        dns_https,
+                    )
+                    .await
+                    .ech_config(retry_configs);
+
+                // Only one retry: if the server rejects the configs it just
+                // supplied, retrying again would loop.
+                crate::connect::wrap_tls(tcp, host, port, &retry_connector, tls_timeout).await
             }
             crate::connection_pool::Scheme::Http => {
                 let remote_addr = tcp.peer_addr().ok();
@@ -1252,7 +1712,14 @@ impl Session {
         })?;
         let dial_host = advertised_host.unwrap_or(host);
         let dial_port = advertised_port.unwrap_or(port);
-        let server_name = advertised_host.unwrap_or(host);
+        // The alternative endpoint says *where* to send packets, never *who* to
+        // authenticate. RFC 7838 §3.1 and RFC 9460 §2.3 both require it to prove
+        // it may serve the origin, so the origin host is the SNI and the name
+        // the certificate is checked against. Using the alternative's own name
+        // let it authenticate as itself — and broke every conforming deployment,
+        // since a CDN target presents a certificate for the origin, not for its
+        // own internal name.
+        let server_name = host;
         tracing::debug!(
             host = %host,
             port,
@@ -1304,29 +1771,9 @@ impl Session {
             None
         };
 
-        let mut crypto = lktls_quic::LktlsQuicClientConfig::new(tls_profile)
-            .port(dial_port)
-            .session_store(self.inner.session_store.clone());
-        if let Some(alps_payload) = alps_payload {
-            crypto = crypto.alps_payload(alps_payload);
-        }
-        if client.verify() {
-            // See the TCP path above: verify=true → Strict (enforce), verify=false
-            // → Insecure (explicit opt-out).
-            crypto = crypto.verification_policy(lktls::verify::policy::VerificationPolicy::Strict);
-        } else {
-            crypto =
-                crypto.verification_policy(lktls::verify::policy::VerificationPolicy::Insecure);
-        }
-        if let Some(anchors) = client.custom_ca_anchors().cloned() {
-            crypto = crypto.custom_ca_anchors(anchors);
-        }
-        if let Some(ech) = client.ech_config() {
-            crypto = crypto.ech_config(ech.to_vec());
-        }
-        if let Some(cb) = client.keylog_callback().cloned() {
-            crypto = crypto.keylog(cb);
-        }
+        let crypto = self
+            .build_h3_crypto(tls_profile, alps_payload, host, dial_port, is_remote_dns)
+            .await;
 
         let mut quinn_config = crypto.into_quinn();
         let tp = &quic_profile.transport_params;
@@ -2416,6 +2863,7 @@ pub struct SessionBuilder {
     h3_header_order: Option<Vec<http::header::HeaderName>>,
     cookie_order: Option<Vec<Box<str>>>,
     broken_quic_policy: Option<BrokenQuicPolicy>,
+    network_partition_context: Option<NetworkPartitionContext>,
 }
 
 impl SessionBuilder {
@@ -2440,6 +2888,7 @@ impl SessionBuilder {
             h3_header_order: None,
             cookie_order: None,
             broken_quic_policy: None,
+            network_partition_context: None,
         }
     }
 
@@ -2530,10 +2979,26 @@ impl SessionBuilder {
     ///   [`RequestBuilder::idempotency`](crate::session::RequestBuilder::idempotency)
     ///   to [`Idempotency::Idempotent`] on that request.
     ///
-    /// Retryable **status-code** responses (429/502/503/…) are retried
-    /// regardless of method — receiving a response means the server explicitly
-    /// signalled a retry, and this path is unchanged. See [`Idempotency`] and
-    /// [`crate::retry::retry_is_replay_safe`] for the exact rules.
+    /// Retryable **status-code** responses are gated the same way. The server
+    /// answered, so the request certainly arrived; a non-idempotent method is
+    /// therefore replayed only on a status that says the request was *not
+    /// applied*:
+    ///
+    /// - **Replayed** — `429 Too Many Requests` and `503 Service Unavailable`:
+    ///   both mean the server refused the request rather than handling it.
+    /// - **Returned to the caller** — `502`, `504` and the Cloudflare
+    ///   `520`–`530` range. A `502` means a gateway got a bad answer from the
+    ///   origin, which may already have applied the request; the `52x` range
+    ///   mixes "never reached the origin" with plain timeouts. Replaying a
+    ///   `POST` on those risks a duplicate charge or order.
+    ///
+    /// **Behaviour change:** these statuses used to be replayed regardless of
+    /// method. To restore that for a request you know is safe to duplicate, set
+    /// [`RequestBuilder::idempotency`](crate::session::RequestBuilder::idempotency)
+    /// to [`Idempotency::Idempotent`].
+    ///
+    /// See [`Idempotency`], [`crate::retry::retry_is_replay_safe`] and
+    /// [`crate::retry::status_retry_is_replay_safe`] for the exact rules.
     pub fn retry_policy(mut self, policy: impl RetryPolicy + 'static) -> Self {
         self.retry_policy = Some(Arc::new(policy));
         self
@@ -2601,6 +3066,10 @@ impl SessionBuilder {
     }
 
     /// Force this session to only use HTTP/1.1.
+    ///
+    /// HTTP/1.1 connections are exclusive and are not capped by the default
+    /// session connection budget. Use [`SessionBuilder::max_connections`]
+    /// when an explicit H1 connection limit is required.
     ///
     /// Even if the server negotiates HTTP/2 via ALPN, requests will be
     /// sent using HTTP/1.1. Useful when a target site has stricter
@@ -2802,6 +3271,15 @@ impl SessionBuilder {
         self
     }
 
+    /// Set the browsing context used to partition TLS and QUIC session tickets.
+    ///
+    /// The Client policy decides which dimensions become part of the cache key.
+    /// Build a new Session when the top-level browsing context changes.
+    pub fn network_partition_context(mut self, context: NetworkPartitionContext) -> Self {
+        self.network_partition_context = Some(context);
+        self
+    }
+
     /// Build the [`Session`].
     ///
     /// If no TLS fingerprint was set on the `Client`, Chrome 144 defaults
@@ -2827,6 +3305,7 @@ impl SessionBuilder {
             h3_header_order,
             cookie_order,
             broken_quic_policy,
+            network_partition_context,
         } = self;
 
         let preferred_http_version = preferred_http_version.unwrap_or(PreferredHttpVersion::Auto);
@@ -2845,7 +3324,7 @@ impl SessionBuilder {
             policy
         });
         let max_conn = max_connections_override
-            .unwrap_or(client.resource_limits().max_connections_per_session);
+            .unwrap_or_else(|| client.resource_limits().max_connections_per_session);
         let mut pool = ConnectionPool::with_max_total(max_conn);
         if let Some(idle_timeout) = idle_timeout {
             pool.idle_timeout = idle_timeout;
@@ -2859,6 +3338,11 @@ impl SessionBuilder {
         let (client, session_store) = materialize_session_fingerprint(client);
         #[cfg(not(feature = "synthetic-fp"))]
         let session_store = client.inner.session_store.clone();
+        let session_store = PartitionedSessionStore::wrap(
+            session_store,
+            client.inner.tls_session_cache_partition_policy,
+            network_partition_context.as_ref(),
+        );
         Session {
             inner: Arc::new(SessionInner {
                 client,
@@ -2884,6 +3368,7 @@ impl SessionBuilder {
                 broken_quic_tracker: broken_quic_policy
                     .map(|policy| BrokenQuicTracker::with_config(policy.resolve()))
                     .unwrap_or_else(BrokenQuicTracker::new),
+                https_rr_handoff: Mutex::new(HttpsRrHandoff::default()),
                 #[cfg(feature = "quic-h3")]
                 quic_in_flight: Mutex::new(std::collections::HashMap::new()),
             }),
@@ -2900,7 +3385,7 @@ impl SessionBuilder {
 /// caller, so synthetic sessions never share the client-level cache. Real-preset
 /// sessions keep sharing it (matching browser PSK-caching behavior).
 #[cfg(feature = "synthetic-fp")]
-fn materialize_session_fingerprint(client: Client) -> (Client, Arc<InMemorySessionStore>) {
+fn materialize_session_fingerprint(client: Client) -> (Client, Arc<dyn SessionStore>) {
     use crate::randomize::{Layers, RandomizeMode};
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
@@ -2939,9 +3424,583 @@ fn materialize_session_fingerprint(client: Client) -> (Client, Arc<InMemorySessi
     (client, store)
 }
 
+/// Extract the server-supplied `ECHConfigList` from an ECH-rejection error.
+///
+/// Returns `None` for every other error, and for an ECH rejection that carried
+/// no `retry_configs` — there is nothing to retry *with* in that case, and
+/// redialing would repeat the same rejection.
+fn ech_retry_configs<T>(result: &crate::error::Result<T>) -> Option<Vec<u8>> {
+    match result {
+        Err(crate::error::Error::Tls(lktls::error::TlsError::EchRejected { retry_configs })) => {
+            retry_configs.clone()
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ====================================================================
+    // ECH configuration precedence (session > client > DNS HTTPS RR)
+    // ====================================================================
+
+    /// Resolver that records every host passed to `resolve` / `lookup_https`
+    /// and answers HTTPS-RR queries with `https`. Tests use the recorded hosts
+    /// to assert both that a remote-DNS route performs **no** local lookup for
+    /// the target (DNS leak) and that one request never queries twice.
+    #[derive(Clone, Default)]
+    struct RecordingDns {
+        https: Option<HttpsRecord>,
+        resolve_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        https_calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingDns {
+        fn with_ech(ech: Vec<u8>) -> Self {
+            Self {
+                https: Some(HttpsRecord {
+                    ech_config_list: Some(ech),
+                    ..HttpsRecord::default()
+                }),
+                ..Self::default()
+            }
+        }
+
+        /// Snapshot the recorded HTTPS-RR hosts. Callers must snapshot *before*
+        /// asserting: `assert!` builds its message only on failure, and
+        /// re-locking this non-reentrant mutex there — while the condition's
+        /// guard is still alive to end-of-statement — deadlocks, so the test
+        /// would hang instead of reporting the leak it exists to catch.
+        /// Every caller is an H3 test, so this is dead code without the feature.
+        #[cfg(feature = "quic-h3")]
+        fn https_calls(&self) -> Vec<String> {
+            self.https_calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::DnsResolver for RecordingDns {
+        async fn resolve(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            self.resolve_calls.lock().unwrap().push(host.to_string());
+            Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+        }
+
+        async fn lookup_https(&self, host: &str) -> std::io::Result<Option<HttpsRecord>> {
+            self.https_calls.lock().unwrap().push(host.to_string());
+            Ok(self.https.clone())
+        }
+    }
+
+    fn ech_test_client(resolver: RecordingDns) -> Client {
+        let builder = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_144())
+            .dns_resolver(Arc::new(resolver));
+        #[cfg(feature = "quic-h3")]
+        let builder = builder.quic_profile(lkh3::chrome_quic());
+        builder.build()
+    }
+
+    const DNS_ECH: [u8; 4] = [0xFE, 0x0D, 0x00, 0xDD];
+    const CLIENT_ECH: [u8; 4] = [0xFE, 0x0D, 0x00, 0xCC];
+    const SESSION_ECH: [u8; 4] = [0xFE, 0x0D, 0x00, 0x55];
+
+    /// Both transports resolve ECH through this one helper, so its precedence
+    /// *is* the precedence the TCP and H3 handshakes get: an explicit
+    /// session-level override first, then the client-level one, then whatever
+    /// the DNS HTTPS RR advertises.
+    #[tokio::test]
+    async fn resolve_ech_config_prefers_session_then_client_then_dns() {
+        let resolver = RecordingDns::with_ech(DNS_ECH.to_vec());
+
+        let dns_only = ech_test_client(resolver.clone()).session().build();
+        assert_eq!(
+            dns_only
+                .resolve_ech_config("example.com", false, DiscoveredHttpsRr::Unqueried)
+                .await,
+            Some(DNS_ECH.to_vec()),
+            "with no override, the HTTPS RR supplies the ECH config",
+        );
+
+        let client_level = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_144())
+            .dns_resolver(Arc::new(resolver.clone()))
+            .ech_config(CLIENT_ECH.to_vec())
+            .build()
+            .session()
+            .build();
+        assert_eq!(
+            client_level
+                .resolve_ech_config("example.com", false, DiscoveredHttpsRr::Unqueried)
+                .await,
+            Some(CLIENT_ECH.to_vec()),
+            "a client-level ECH config outranks the DNS record",
+        );
+
+        let session_level = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_144())
+            .dns_resolver(Arc::new(resolver.clone()))
+            .ech_config(CLIENT_ECH.to_vec())
+            .build()
+            .session()
+            .ech_config(SESSION_ECH.to_vec())
+            .build();
+        assert_eq!(
+            session_level
+                .resolve_ech_config("example.com", false, DiscoveredHttpsRr::Unqueried)
+                .await,
+            Some(SESSION_ECH.to_vec()),
+            "a session-level override outranks the client-level one",
+        );
+
+        // The DNS level — and only that level — is gated on local resolution.
+        assert_eq!(
+            dns_only
+                .resolve_ech_config("example.com", true, DiscoveredHttpsRr::Unqueried)
+                .await,
+            None,
+            "a remote-DNS route must not pick up a DNS-discovered ECH config",
+        );
+        assert_eq!(
+            session_level
+                .resolve_ech_config("example.com", true, DiscoveredHttpsRr::Unqueried)
+                .await,
+            Some(SESSION_ECH.to_vec()),
+            "an explicit override still applies on a remote-DNS route",
+        );
+    }
+
+    /// The H3 handshake used to read `client.ech_config()` and nothing else, so
+    /// a session-level override was silently ignored and a DNS-discovered ECH
+    /// config never reached QUIC at all. It must now follow the same route as
+    /// the TCP path: park nothing, leak nothing, and actually look the record up
+    /// when this request has not already.
+    #[cfg(feature = "quic-h3")]
+    #[tokio::test]
+    async fn h3_connect_resolves_ech_the_same_way_the_tcp_path_does() {
+        // Port 0 is rejected by quinn before a packet is sent, so the connect
+        // fails immediately — after the ECH resolution under test.
+        async fn h3_connect(session: &Session, proxy: Option<&crate::proxy::ProxyConfig>) {
+            let result = session
+                .establish_h3_connection_with_0rtt("example.com", 0, None, None, proxy, false)
+                .await;
+            assert!(
+                result.is_err(),
+                "dialing port 0 cannot succeed; this test only exercises the setup before it",
+            );
+        }
+
+        // Direct route, nothing parked: the H3 path must run the (gated) lookup
+        // itself, exactly as `build_tls_connector` does.
+        let resolver = RecordingDns::with_ech(DNS_ECH.to_vec());
+        let session = ech_test_client(resolver.clone()).session().build();
+        h3_connect(&session, None).await;
+        assert_eq!(
+            resolver.https_calls(),
+            ["example.com"],
+            "the H3 path must discover ECH from DNS on a direct route",
+        );
+
+        // Remote-DNS route: the proxy resolves the target, so a local HTTPS-RR
+        // query here would leak the target hostname out-of-band from the proxy.
+        let resolver = RecordingDns::with_ech(DNS_ECH.to_vec());
+        let session = ech_test_client(resolver.clone()).session().build();
+        let socks5h = crate::proxy::ProxyConfig::parse("socks5h://proxy.example.com:1080")
+            .expect("test proxy URL parses");
+        h3_connect(&session, Some(&socks5h)).await;
+        let https_calls = resolver.https_calls();
+        assert!(
+            https_calls.is_empty(),
+            "remote-DNS routes must not perform a local HTTPS-RR lookup (DNS leak); got \
+             {https_calls:?}",
+        );
+
+        // An explicit override short-circuits the DNS level entirely.
+        let resolver = RecordingDns::with_ech(DNS_ECH.to_vec());
+        let session = ech_test_client(resolver.clone())
+            .session()
+            .ech_config(SESSION_ECH.to_vec())
+            .build();
+        h3_connect(&session, None).await;
+        let https_calls = resolver.https_calls();
+        assert!(
+            https_calls.is_empty(),
+            "a session-level ECH override needs no DNS lookup; got {https_calls:?}",
+        );
+    }
+
+    /// The precedence the QUIC crypto configuration actually ends up with.
+    /// Reading it off the built config is what pins the H3 path to the same
+    /// order as the TCP path: before this, `client.ech_config()` was the only
+    /// source it consulted, so both the session override and the DNS record
+    /// below were dropped on the floor.
+    #[cfg(feature = "quic-h3")]
+    #[tokio::test]
+    async fn h3_crypto_applies_the_session_client_dns_ech_precedence() {
+        async fn h3_ech(session: &Session, is_remote_dns: bool) -> Option<Vec<u8>> {
+            session
+                .build_h3_crypto(
+                    lktls::profile::presets::chrome_146_quic(),
+                    None,
+                    "example.com",
+                    443,
+                    is_remote_dns,
+                )
+                .await
+                .ech_config_list()
+                .map(<[u8]>::to_vec)
+        }
+
+        let resolver = RecordingDns::with_ech(DNS_ECH.to_vec());
+
+        let dns_only = ech_test_client(resolver.clone()).session().build();
+        assert_eq!(
+            h3_ech(&dns_only, false).await,
+            Some(DNS_ECH.to_vec()),
+            "the QUIC handshake must pick up a DNS-discovered ECH config",
+        );
+
+        let client_level = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_144())
+            .dns_resolver(Arc::new(resolver.clone()))
+            .quic_profile(lkh3::chrome_quic())
+            .ech_config(CLIENT_ECH.to_vec())
+            .build()
+            .session()
+            .build();
+        assert_eq!(
+            h3_ech(&client_level, false).await,
+            Some(CLIENT_ECH.to_vec()),
+            "a client-level ECH config outranks the DNS record on QUIC too",
+        );
+
+        let session_level = client_level
+            .inner
+            .client
+            .session()
+            .ech_config(SESSION_ECH.to_vec())
+            .build();
+        assert_eq!(
+            h3_ech(&session_level, false).await,
+            Some(SESSION_ECH.to_vec()),
+            "a session-level override must reach the QUIC handshake",
+        );
+        assert_eq!(
+            h3_ech(&session_level, true).await,
+            Some(SESSION_ECH.to_vec()),
+            "an explicit override still applies on a remote-DNS route",
+        );
+        assert_eq!(
+            h3_ech(&dns_only, true).await,
+            None,
+            "but DNS discovery does not run there — that would leak the target",
+        );
+    }
+
+    /// One request, one HTTPS-RR query: the H3 handshake reuses the record
+    /// protocol discovery parked for it — and leaves it parked, because a QUIC
+    /// failure falls back to TCP on the same request and `establish_connection`
+    /// still has to find it there.
+    #[cfg(feature = "quic-h3")]
+    #[tokio::test]
+    async fn h3_connect_reuses_the_parked_https_rr_without_consuming_it() {
+        let resolver = RecordingDns::with_ech(DNS_ECH.to_vec());
+        let session = ech_test_client(resolver.clone()).session().build();
+        session.publish_discovered_https_rr(
+            "example.com",
+            Some(HttpsRecord {
+                ech_config_list: Some(DNS_ECH.to_vec()),
+                ..HttpsRecord::default()
+            }),
+        );
+
+        let result = session
+            .establish_h3_connection_with_0rtt("example.com", 0, None, None, None, false)
+            .await;
+        assert!(result.is_err(), "dialing port 0 cannot succeed");
+
+        let https_calls = resolver.https_calls();
+        assert!(
+            https_calls.is_empty(),
+            "the parked record must be reused, not re-queried; got {https_calls:?}",
+        );
+        assert!(
+            session.take_discovered_https_rr("example.com").is_some(),
+            "the hand-off must survive for this request's TCP fallback to claim",
+        );
+    }
+
+    // ====================================================================
+    // DNS HTTPS (SVCB) record hand-off
+    // ====================================================================
+
+    /// The hand-off must behave like a hand-off and not like a DNS cache: a
+    /// parked record is claimable exactly once, and only briefly — otherwise a
+    /// record parked by a request that never reached a TLS handshake (an
+    /// all-H3 origin, say) could resurface much later with a stale ECH key.
+    #[test]
+    fn https_rr_handoff_is_single_use_and_expires() {
+        let mut handoff = HttpsRrHandoff::default();
+        let now = std::time::Instant::now();
+
+        handoff.publish("example.com", Some(HttpsRecord::default()), now);
+        assert!(
+            handoff.claim("example.com", now).is_some(),
+            "a freshly parked record must be claimable",
+        );
+        assert!(
+            handoff.claim("example.com", now).is_none(),
+            "claiming a parked record must consume it",
+        );
+
+        // A miss is worth parking too — it spares the second query.
+        handoff.publish("example.com", None, now);
+        assert_eq!(
+            handoff.claim("example.com", now),
+            Some(None),
+            "a parked lookup miss must be distinguishable from nothing parked",
+        );
+
+        handoff.publish("example.com", Some(HttpsRecord::default()), now);
+        assert!(
+            handoff
+                .claim("example.com", now + HTTPS_RR_HANDOFF_TTL)
+                .is_none(),
+            "an expired entry must not be claimable",
+        );
+
+        assert!(
+            handoff.claim("other.example", now).is_none(),
+            "a host nobody parked must report nothing",
+        );
+    }
+
+    /// A session that keeps discovering origins without ever claiming (all-H3
+    /// traffic) must not grow the hand-off map without bound.
+    #[test]
+    fn https_rr_handoff_is_capacity_bounded() {
+        let mut handoff = HttpsRrHandoff::default();
+        let now = std::time::Instant::now();
+
+        for i in 0..(HTTPS_RR_HANDOFF_MAX_ENTRIES * 2) {
+            handoff.publish(&format!("host{i}.example"), None, now);
+        }
+
+        assert!(
+            handoff.entries.len() <= HTTPS_RR_HANDOFF_MAX_ENTRIES,
+            "hand-off map grew past its bound: {} entries",
+            handoff.entries.len(),
+        );
+    }
+
+    // ====================================================================
+    // RFC 6265bis origin-server storage rules — §5.6 step 15 (`Secure` needs
+    // a secure channel) and §4.1.3 (`__Secure-` / `__Host-` name prefixes)
+    // ====================================================================
+
+    fn storable(set_cookie: &str, url: &str) -> bool {
+        let raw = cookie_store::RawCookie::parse(set_cookie.to_string())
+            .expect("test Set-Cookie header parses");
+        let parsed = Url::parse(url).expect("test URL parses");
+        origin_cookie_allows_storage(&raw, &parsed)
+    }
+
+    /// §5.6 step 15: a `Secure` cookie that did not arrive over a secure
+    /// channel is ignored entirely — no name prefix required.
+    #[test]
+    fn secure_attribute_over_plain_http_is_ignored() {
+        assert!(
+            !storable("sid=1; Secure", "http://example.com/"),
+            "an ordinary Secure cookie over http:// must be ignored"
+        );
+        assert!(
+            !storable(
+                "sid=1; Secure; Path=/app; Domain=example.com",
+                "http://example.com/app"
+            ),
+            "attributes do not rescue a Secure cookie set over http://"
+        );
+        assert!(
+            !storable("sid=1; secure", "http://example.com/"),
+            "the Secure attribute is matched case-insensitively"
+        );
+        assert!(
+            !storable("sid=1; Secure", "ws://example.com/"),
+            "ws:// is not a secure channel either"
+        );
+    }
+
+    /// The counter-cases: the §5.6 rule must not reject cookies a browser
+    /// would keep.
+    #[test]
+    fn secure_channel_rule_leaves_conforming_cookies_alone() {
+        assert!(
+            storable("sid=1; Secure", "https://example.com/"),
+            "a Secure cookie over https must still be stored"
+        );
+        assert!(
+            storable("sid=1; Secure", "wss://example.com/"),
+            "wss counts as a secure channel"
+        );
+        assert!(
+            storable("sid=1", "http://example.com/"),
+            "a cookie without Secure is unaffected over http"
+        );
+        assert!(
+            storable(
+                "sid=1; Path=/app; Domain=example.com; HttpOnly",
+                "http://example.com/app"
+            ),
+            "non-Secure attributes are unaffected over http"
+        );
+    }
+
+    /// §4.1.3.2: `__Host-` demands `Secure`, a secure channel, no `Domain`,
+    /// and `Path=/` exactly.
+    #[test]
+    fn host_prefix_requires_secure_no_domain_and_root_path() {
+        assert!(
+            storable("__Host-a=1; Secure; Path=/", "https://example.com/"),
+            "canonical __Host- cookie must be storable"
+        );
+        assert!(
+            !storable(
+                "__Host-a=1; Secure; Path=/; Domain=example.com",
+                "https://example.com/"
+            ),
+            "__Host- with a Domain attribute must be ignored"
+        );
+        assert!(
+            !storable("__Host-a=1; Secure; Path=/sub", "https://example.com/sub"),
+            "__Host- with a non-root Path must be ignored"
+        );
+        assert!(
+            !storable("__Host-a=1; Secure", "https://example.com/"),
+            "__Host- without an explicit Path=/ must be ignored"
+        );
+        assert!(
+            !storable("__Host-a=1; Path=/", "https://example.com/"),
+            "__Host- without Secure must be ignored"
+        );
+        assert!(
+            !storable("__Host-a=1; Secure; Path=/", "http://example.com/"),
+            "__Host- over a non-secure channel must be ignored"
+        );
+    }
+
+    /// §4.1.3.1: `__Secure-` demands `Secure` plus a secure channel, and
+    /// nothing else.
+    #[test]
+    fn secure_prefix_requires_secure_attribute_and_secure_channel() {
+        assert!(
+            storable("__Secure-a=1; Secure", "https://example.com/"),
+            "canonical __Secure- cookie must be storable"
+        );
+        assert!(
+            storable(
+                "__Secure-a=1; Secure; Domain=example.com; Path=/deep",
+                "https://example.com/deep"
+            ),
+            "__Secure- places no constraint on Domain/Path"
+        );
+        assert!(
+            !storable("__Secure-a=1", "https://example.com/"),
+            "__Secure- without the Secure attribute must be ignored"
+        );
+        assert!(
+            !storable("__Secure-a=1; Secure", "http://example.com/"),
+            "__Secure- over a non-secure channel must be ignored"
+        );
+    }
+
+    /// The prefixes are matched ASCII case-insensitively, so casing tricks
+    /// cannot smuggle a cookie past the rule.
+    #[test]
+    fn prefix_matching_is_ascii_case_insensitive() {
+        assert!(
+            !storable(
+                "__hOsT-a=1; Secure; Path=/; Domain=example.com",
+                "https://example.com/"
+            ),
+            "__Host- must be recognised regardless of case"
+        );
+        assert!(
+            !storable("__SECURE-a=1", "https://example.com/"),
+            "__Secure- must be recognised regardless of case"
+        );
+        assert!(
+            storable("__hOsT-a=1; Secure; Path=/", "https://example.com/"),
+            "a conforming __Host- cookie is still accepted in any casing"
+        );
+    }
+
+    /// Ordinary names — including ones that merely resemble a prefix, and
+    /// non-ASCII names (which must not panic on byte slicing) — are untouched.
+    #[test]
+    fn ordinary_cookie_names_are_unaffected_by_prefix_rules() {
+        assert!(storable("sid=1", "http://example.com/"));
+        assert!(storable(
+            "sid=1; Domain=example.com; Path=/x",
+            "http://example.com/x"
+        ));
+        assert!(
+            storable("__Hostile=1", "http://example.com/"),
+            "only the exact `__Host-` prefix is special"
+        );
+        assert!(
+            storable("__Secure=1", "http://example.com/"),
+            "`__Secure` without the trailing hyphen is an ordinary name"
+        );
+        assert!(
+            storable("__=1", "http://example.com/"),
+            "a name shorter than the prefix must not panic"
+        );
+        assert!(
+            storable("__Höst-a=1", "http://example.com/"),
+            "a non-ASCII name must not panic on the prefix comparison"
+        );
+    }
+
+    /// `wss://` is a secure channel too (cookies are shared with `https`).
+    #[test]
+    fn websocket_secure_scheme_counts_as_a_secure_channel() {
+        assert!(storable("__Secure-a=1; Secure", "wss://example.com/"));
+        assert!(!storable("__Secure-a=1; Secure", "ws://example.com/"));
+    }
+
+    /// Only an ECH rejection that actually carried `retry_configs` is worth
+    /// redialing for; everything else must surface unchanged.
+    #[test]
+    fn ech_retry_configs_only_fires_on_a_rejection_carrying_configs() {
+        let with_configs: crate::error::Result<()> = Err(crate::error::Error::Tls(
+            lktls::error::TlsError::EchRejected {
+                retry_configs: Some(vec![1, 2, 3]),
+            },
+        ));
+        assert_eq!(ech_retry_configs(&with_configs), Some(vec![1, 2, 3]));
+
+        // A rejection with nothing to retry with: redialing would just repeat it.
+        let without_configs: crate::error::Result<()> = Err(crate::error::Error::Tls(
+            lktls::error::TlsError::EchRejected {
+                retry_configs: None,
+            },
+        ));
+        assert_eq!(ech_retry_configs(&without_configs), None);
+
+        // Any other TLS failure is not an ECH rejection.
+        let other: crate::error::Result<()> = Err(crate::error::Error::Tls(
+            lktls::error::TlsError::HandshakeFailure("nope".into()),
+        ));
+        assert_eq!(ech_retry_configs(&other), None);
+
+        let ok: crate::error::Result<()> = Ok(());
+        assert_eq!(ech_retry_configs(&ok), None);
+    }
 
     fn test_client() -> Client {
         Client::builder()
@@ -3403,6 +4462,14 @@ mod tests {
     }
 
     #[test]
+    fn http1_only_session_has_no_default_connection_limit() {
+        let client = test_client();
+        let session = client.session().http1_only().build();
+        let lock = session.inner.pool.try_lock().unwrap();
+        assert_eq!(lock.max_total, usize::MAX);
+    }
+
+    #[test]
     fn invalid_proxy_url_is_logged_but_not_fatal() {
         let client = test_client();
         let session = client.session().proxy("not-a-valid-proxy").build();
@@ -3670,6 +4737,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn partition_context_wraps_client_ticket_cache() {
+        let client = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_144())
+            .tls_session_cache_partition_policy(crate::TlsSessionCachePartitionPolicy::Chromium)
+            .build();
+        let session = client
+            .session()
+            .network_partition_context(crate::NetworkPartitionContext::new(
+                "https://example.com",
+                "https://cdn.test",
+            ))
+            .build();
+
+        assert!(!Arc::ptr_eq(
+            &session.inner.session_store,
+            &client.inner.session_store
+        ));
+    }
     /// Per-session synthetic-fingerprint materialization (Tier 3a).
     #[cfg(feature = "synthetic-fp")]
     mod synthetic_fp {

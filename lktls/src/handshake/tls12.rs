@@ -42,8 +42,11 @@ use std::sync::Arc;
 use crate::crypto::kx::{self, EphemeralKeyPair, KxGroup};
 use crate::crypto::prf::{self, PrfAlgorithm};
 use crate::crypto::tls12_cipher::{Tls12CipherSuite, Tls12KeyExchange};
-use crate::error::{Result, TlsError};
+use crate::error::{AlertDescription, Result, TlsError};
+use crate::extensions::record_size_limit::parse_peer_record_size_limit;
 use crate::handshake::handshake_type;
+use crate::handshake::tls13::client_hello_extensions;
+use crate::profile::types::ext_type;
 use crate::verify::policy::VerificationPolicy;
 
 // ---------------------------------------------------------------------------
@@ -346,6 +349,12 @@ pub struct Tls12Handshake {
     custom_ca_anchors: Option<Arc<Vec<rustls_pki_types::TrustAnchor<'static>>>>,
     /// ALPN protocol negotiated in ServerHello extensions.
     negotiated_alpn: Option<String>,
+    /// The server's RFC 8449 `record_size_limit`, from the ServerHello.
+    ///
+    /// TLS 1.3 carries this in EncryptedExtensions; RFC 8449 §4 restricts that
+    /// placement to TLS 1.3, so under TLS 1.2 it rides in the ServerHello.
+    /// It bounds the records we send, not the ones we receive.
+    peer_record_size_limit: Option<u16>,
     /// Whether the server agreed to use extended master secret (RFC 7627).
     /// When true, master_secret is derived using the session hash (transcript)
     /// instead of client_random + server_random.
@@ -353,9 +362,54 @@ pub struct Tls12Handshake {
     /// Master secret from a previous session ticket (for abbreviated handshake).
     /// When set, we attempt session resumption.
     resumed_master_secret: Option<Vec<u8>>,
+    /// Whether the *original* session — the one the ticket in
+    /// `resumed_master_secret` came from — used `extended_master_secret`.
+    ///
+    /// RFC 7627 §5.3 compares this against the ServerHello of the abbreviated
+    /// handshake; see [`Tls12Handshake::check_abbreviated_extended_master_secret`].
+    /// `None` means the ticket carries no record of it, in which case the
+    /// comparison cannot be made.
+    resumed_session_used_ems: Option<bool>,
     /// Whether the current handshake is abbreviated (session ticket resumption).
     abbreviated: bool,
+    /// Named groups advertised in the `supported_groups` extension of the
+    /// ClientHello we sent, read back off the bytes in `feed_client_hello`.
+    ///
+    /// RFC 8422 §5.4 lets the server pick the ECDHE curve, but only from this
+    /// list. `None` means the ClientHello was not available or not parseable,
+    /// so there is nothing to check against.
+    offered_groups: Option<Vec<u16>>,
+    /// Signature algorithms advertised in the ClientHello we sent.
+    ///
+    /// RFC 5246 §7.4.1.4.1 requires the ServerKeyExchange signature to use one
+    /// of them. `None` means unknown (see `offered_groups`); an empty list means
+    /// we sent no `signature_algorithms` extension, in which case the RFC's
+    /// SHA-1 defaults apply.
+    offered_signature_algorithms: Option<Vec<u16>>,
+    /// Extension types actually emitted in the ClientHello we sent, plus the
+    /// ones we signalled under a different code point (see RFC 5746 §3.4 and
+    /// [`client_hello_offers_renegotiation_scsv`]).
+    ///
+    /// Read back off the wire bytes rather than off the profile for the same
+    /// reason as the two lists above, and used for the same kind of check the
+    /// TLS 1.3 path makes in `Tls13Handshake::check_server_hello_extensions`:
+    /// RFC 5246 §7.4.1.4 forbids the server from answering with an extension
+    /// we never offered.
+    ///
+    /// `None` means the ClientHello was not available or not parseable, in
+    /// which case there is nothing to compare against and the
+    /// unsolicited-extension check is skipped.
+    offered_extensions: Option<Vec<u16>>,
 }
+
+/// The signature algorithms a server may assume when the ClientHello carried no
+/// `signature_algorithms` extension (RFC 5246 §7.4.1.4.1): SHA-1 with each
+/// certificate type the negotiated cipher suite can use.
+const TLS12_DEFAULT_SIGNATURE_ALGORITHMS: [u16; 3] = [
+    0x0201, // rsa_pkcs1_sha1
+    0x0202, // dsa_sha1
+    0x0203, // ecdsa_sha1
+];
 
 /// Parsed ServerKeyExchange parameters for ECDHE.
 #[allow(dead_code)]
@@ -399,15 +453,28 @@ impl Tls12Handshake {
             verification_policy,
             custom_ca_anchors: None,
             negotiated_alpn: None,
+            peer_record_size_limit: None,
             use_extended_master_secret: false,
             resumed_master_secret: None,
+            resumed_session_used_ems: None,
             abbreviated: false,
+            offered_groups: None,
+            offered_signature_algorithms: None,
+            offered_extensions: None,
         }
     }
 
     /// Returns the ALPN protocol negotiated during the handshake (if any).
     pub fn negotiated_alpn(&self) -> Option<&str> {
         self.negotiated_alpn.as_deref()
+    }
+
+    /// The server's RFC 8449 `record_size_limit`, if the ServerHello carried one.
+    ///
+    /// `None` means the extension was not negotiated and records are chunked at
+    /// the protocol maximum, exactly as if RFC 8449 did not exist.
+    pub fn peer_record_size_limit(&self) -> Option<u16> {
+        self.peer_record_size_limit
     }
 
     /// Returns the master secret (if computed).
@@ -426,13 +493,50 @@ impl Tls12Handshake {
         &self.server_certificates
     }
 
+    /// Whether the server agreed to `extended_master_secret` (RFC 7627) for
+    /// the session established by this handshake.
+    ///
+    /// Whoever stores a session ticket issued on this connection must record
+    /// this alongside it: RFC 7627 §5.4 — "they need to differentiate between
+    /// sessions that use legacy and extended master secrets by adding a flag
+    /// to the session state" — and §5.3's abbreviated-handshake checks are
+    /// unrunnable without it. Feed it back in through
+    /// [`Self::set_session_ticket_resumption`] on the resuming handshake.
+    pub fn used_extended_master_secret(&self) -> bool {
+        self.use_extended_master_secret
+    }
+
     /// Set the master secret from a stored session ticket for resumption.
     ///
     /// When set, the handshake will attempt abbreviated handshake (RFC 5077).
     /// If the server rejects the ticket (sends Certificate instead of CCS),
     /// the handshake falls back to full handshake automatically.
+    ///
+    /// The ticket's `extended_master_secret` state is left unknown, which
+    /// disables the RFC 7627 §5.3 checks for this handshake. Prefer
+    /// [`Self::set_session_ticket_resumption`], which carries it.
     pub fn set_session_ticket_master_secret(&mut self, master_secret: Vec<u8>) {
+        self.set_session_ticket_resumption(master_secret, None);
+    }
+
+    /// Set up session-ticket resumption, carrying the original session's
+    /// `extended_master_secret` (RFC 7627) state along with its master secret.
+    ///
+    /// `original_used_extended_master_secret` is what
+    /// [`Self::used_extended_master_secret`] reported on the handshake that
+    /// issued the ticket. `None` means the stored ticket predates that
+    /// bookkeeping; the handshake then proceeds exactly as before, with the
+    /// §5.3 checks skipped, because assuming either answer would be wrong:
+    /// assuming `false` would abort every resumption against the (near
+    /// universal) servers that do negotiate EMS, and assuming `true` would
+    /// abort every resumption of a legacy non-EMS session.
+    pub fn set_session_ticket_resumption(
+        &mut self,
+        master_secret: Vec<u8>,
+        original_used_extended_master_secret: Option<bool>,
+    ) {
         self.resumed_master_secret = Some(master_secret);
+        self.resumed_session_used_ems = original_used_extended_master_secret;
     }
 
     /// Set custom CA trust anchors (merged with Mozilla root store).
@@ -460,9 +564,85 @@ impl Tls12Handshake {
         // We don't know the PRF algorithm yet (determined by ServerHello).
         // Start with SHA-256 as default, will reset if needed.
         self.client_hello_bytes = ch_bytes.to_vec();
+        self.record_offer(ch_bytes);
         let mut t = TranscriptHash::new(PrfAlgorithm::Sha256);
         t.update(ch_bytes);
         self.transcript = Some(t);
+    }
+
+    /// Read the extension types, `supported_groups` and `signature_algorithms`
+    /// we advertised back off the ClientHello bytes we sent.
+    ///
+    /// The offer is taken from the wire rather than from the profile so it stays
+    /// exact under GREASE and extension permutation, and so the TLS 1.2 state
+    /// machine does not need to carry a profile it otherwise has no use for.
+    fn record_offer(&mut self, ch_bytes: &[u8]) {
+        let Some(extensions) = client_hello_extensions(ch_bytes) else {
+            // Not a parseable ClientHello (unit tests feed placeholder bytes);
+            // there is nothing to compare a server's choice against.
+            self.offered_groups = None;
+            self.offered_signature_algorithms = None;
+            self.offered_extensions = None;
+            return;
+        };
+        let body = |target: u16| {
+            extensions
+                .iter()
+                .find(|(extension_type, _)| *extension_type == target)
+                .map(|(_, body)| *body)
+        };
+
+        // supported_groups: NamedGroupList<2..2^16-1> — a 2-byte length then
+        // 2-byte code points (RFC 8422 §5.1.1). Absent means the client stated
+        // no preference, so leave the check disabled rather than reject
+        // everything.
+        self.offered_groups = body(0x000a).and_then(parse_u16_list);
+
+        // signature_algorithms has the same shape. When it is absent RFC 5246
+        // §7.4.1.4.1 says the server must behave as if SHA-1 with each
+        // certificate type had been offered — so accept exactly that.
+        self.offered_signature_algorithms = Some(match body(0x000d) {
+            Some(data) => parse_u16_list(data).unwrap_or_default(),
+            None => TLS12_DEFAULT_SIGNATURE_ALGORITHMS.to_vec(),
+        });
+
+        // The extension types themselves, for RFC 5246 §7.4.1.4.
+        let mut offered_extensions: Vec<u16> = extensions
+            .iter()
+            .map(|(extension_type, _)| *extension_type)
+            .collect();
+
+        // RFC 5746 §3.4 lets a client signal secure renegotiation with the
+        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` cipher suite *instead of* the
+        // `renegotiation_info` extension, and §3.6 then requires the server to
+        // answer with the extension. That answer is solicited even though no
+        // extension of that type went out, so fold the SCSV into the offer.
+        // Every shipped profile sends the extension, so this only matters for a
+        // profile that speaks the older dialect.
+        if !offered_extensions.contains(&ext_type::RENEGOTIATION_INFO)
+            && client_hello_offers_renegotiation_scsv(ch_bytes)
+        {
+            offered_extensions.push(ext_type::RENEGOTIATION_INFO);
+        }
+        self.offered_extensions = Some(offered_extensions);
+    }
+
+    /// Reject a ServerHello extension we never offered (RFC 5246 §7.4.1.4).
+    ///
+    /// Mirrors `Tls13Handshake::check_encrypted_extension_offered`: when the
+    /// offer is unknown the check stays out of the way rather than rejecting
+    /// everything.
+    fn check_server_hello_extension_offered(&self, extension_type: u16) -> Result<()> {
+        let Some(ref offered) = self.offered_extensions else {
+            return Ok(());
+        };
+        if offered.contains(&extension_type) {
+            return Ok(());
+        }
+        Err(TlsError::local_alert(
+            AlertDescription::UnsupportedExtension,
+            format!("server sent unsolicited ServerHello extension 0x{extension_type:04x}"),
+        ))
     }
 
     /// Process an incoming handshake record.
@@ -635,6 +815,11 @@ impl Tls12Handshake {
             )));
         }
 
+        // The server has just committed to resuming (CCS with no Certificate),
+        // so this is the moment RFC 7627 §5.3 describes as "a ServerHello that
+        // accepts an abbreviated handshake". Check before any key derivation.
+        self.check_abbreviated_extended_master_secret()?;
+
         let master_secret = self.resumed_master_secret.take().ok_or_else(|| {
             TlsError::HandshakeFailure("no resumed master_secret for abbreviated handshake".into())
         })?;
@@ -672,6 +857,61 @@ impl Tls12Handshake {
             client_write_mac_key: key_block.client_write_mac_key,
             server_write_mac_key: key_block.server_write_mac_key,
         })
+    }
+
+    /// RFC 7627 §5.3 — the client's half of the triple-handshake defence, run
+    /// once the server has accepted an abbreviated (resumption) handshake.
+    ///
+    /// The RFC gives the client exactly two rules, and they point in opposite
+    /// directions; both are `MUST abort`:
+    ///
+    /// - "If the original session did not use the `extended_master_secret`
+    ///   extension but the new ServerHello contains the extension, the client
+    ///   MUST abort the handshake." A server cannot upgrade a legacy session's
+    ///   security by asserting EMS after the fact — the master secret being
+    ///   resumed was still computed the old way, so the claim is either a bug
+    ///   or an attacker splicing in a different session.
+    ///
+    /// - "If the original session used the extension but the new ServerHello
+    ///   does not contain the extension, the client MUST abort the handshake."
+    ///   This is the downgrade direction, and §5.4 closes the obvious escape
+    ///   hatch: even though continuing "MAY be safe" because the original
+    ///   session's extended master secret still protects it, "this document
+    ///   recommends that the client and server MUST abort such handshakes".
+    ///
+    /// Matching state in either direction (both EMS, or neither) continues.
+    ///
+    /// The extension is a bare flag, so "the new ServerHello contains the
+    /// extension" is [`Self::use_extended_master_secret`], set while parsing
+    /// the ServerHello.
+    ///
+    /// Not implemented here: §5.3's *first* client rule, "the client SHOULD NOT
+    /// offer an abbreviated handshake to resume a session that does not use an
+    /// extended master secret". That one changes what the ClientHello puts on
+    /// the wire, which this crate deliberately does not decide for itself.
+    fn check_abbreviated_extended_master_secret(&self) -> Result<()> {
+        let Some(original_used_ems) = self.resumed_session_used_ems else {
+            tracing::debug!(
+                "tls12.resumption_ems_state_unknown — RFC 7627 §5.3 checks skipped for this ticket"
+            );
+            return Ok(());
+        };
+
+        match (original_used_ems, self.use_extended_master_secret) {
+            (false, true) => Err(TlsError::local_alert(
+                AlertDescription::HandshakeFailure,
+                "RFC 7627 §5.3: server accepted an abbreviated handshake with \
+                 extended_master_secret, but the session being resumed was \
+                 established without it",
+            )),
+            (true, false) => Err(TlsError::local_alert(
+                AlertDescription::HandshakeFailure,
+                "RFC 7627 §5.3: server accepted an abbreviated handshake without \
+                 extended_master_secret, but the session being resumed was \
+                 established with it",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Process the server's Finished in abbreviated handshake and compute
@@ -806,6 +1046,9 @@ impl Tls12Handshake {
                     // Server rejected our session ticket → fall back to full handshake
                     tracing::debug!("tls12.abbreviated_rejected — falling back to full handshake");
                     self.resumed_master_secret = None;
+                    // The old session is out of the picture; the new one's EMS
+                    // state is whatever this full handshake negotiates.
+                    self.resumed_session_used_ems = None;
                     self.process_certificate(body, full_msg)
                 } else if msg_type == 0x04 {
                     // NewSessionTicket — server accepted ticket and is issuing a new one.
@@ -933,6 +1176,7 @@ impl Tls12Handshake {
                 u16::from_be_bytes([body[ext_start], body[ext_start + 1]]) as usize;
             let mut ext_offset = ext_start + 2;
             let ext_end = ext_offset + extensions_len;
+            let mut seen_extensions: Vec<u16> = Vec::new();
 
             while ext_offset + 4 <= ext_end && ext_offset + 4 <= body.len() {
                 let ext_type = u16::from_be_bytes([body[ext_offset], body[ext_offset + 1]]);
@@ -944,10 +1188,41 @@ impl Tls12Handshake {
                     break;
                 }
 
+                // RFC 5246 §7.4.1.4: "There MUST NOT be more than one extension
+                // of the same type." A duplicate is how a parser and a peer end
+                // up disagreeing about which copy counted, so refuse it before
+                // any copy is honoured.
+                if seen_extensions.contains(&ext_type) {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::IllegalParameter,
+                        format!("duplicate ServerHello extension 0x{ext_type:04x}"),
+                    ));
+                }
+                seen_extensions.push(ext_type);
+
+                // RFC 5246 §7.4.1.4: "the extension type MUST NOT appear in the
+                // extended server hello unless the same extension type appeared
+                // in the corresponding client hello", and a client that sees one
+                // MUST abort with `unsupported_extension`. Checked before the
+                // extension is acted on, so an unsolicited `record_size_limit`
+                // never gets to bound the records we send.
+                self.check_server_hello_extension_offered(ext_type)?;
+
                 // extended_master_secret extension (type 0x0017 = 23)
                 if ext_type == 0x0017 {
                     tracing::debug!("TLS 1.2 server agreed to extended_master_secret (RFC 7627)");
                     self.use_extended_master_secret = true;
+                }
+
+                // record_size_limit extension (type 0x001c = 28, RFC 8449).
+                // The server's receive limit bounds the records we send once
+                // the cipher is installed; below 64 is a fatal
+                // illegal_parameter, so this parse is allowed to fail.
+                if ext_type == 0x001c {
+                    let limit =
+                        parse_peer_record_size_limit(&body[ext_offset..ext_offset + ext_len])?;
+                    tracing::debug!("TLS 1.2 server record_size_limit: {limit}");
+                    self.peer_record_size_limit = Some(limit);
                 }
 
                 // ALPN extension (type 0x0010)
@@ -1094,6 +1369,24 @@ impl Tls12Handshake {
         }
 
         let named_curve = u16::from_be_bytes([body[1], body[2]]);
+
+        // RFC 8422 §5.4: the server selects the curve, but only from the
+        // client's `supported_groups`. Whether *we* implement the curve is a
+        // separate question, asked later in `build_ecdhe_key_exchange`; a curve
+        // we never advertised has to be refused even if we could do the math,
+        // because completing a handshake on it contradicts the ClientHello the
+        // server just saw.
+        if let Some(ref offered) = self.offered_groups {
+            if !offered.contains(&named_curve) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!(
+                        "server selected ECDHE curve 0x{named_curve:04x}, which the client did not offer"
+                    ),
+                ));
+            }
+        }
+
         let pubkey_len = body[3] as usize;
 
         if 4 + pubkey_len + 4 > body.len() {
@@ -1118,6 +1411,20 @@ impl Tls12Handshake {
         }
 
         let signature = body[sig_offset + 4..sig_offset + 4 + sig_len].to_vec();
+
+        // RFC 5246 §7.4.1.4.1: the server must sign with an algorithm the client
+        // advertised in `signature_algorithms` (or, if the client sent none, one
+        // of the SHA-1 defaults).
+        if let Some(ref offered) = self.offered_signature_algorithms {
+            if !offered.contains(&sig_algorithm) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!(
+                        "server signed ServerKeyExchange with algorithm                          0x{sig_algorithm:04x}, which the client did not offer"
+                    ),
+                ));
+            }
+        }
 
         tracing::debug!(
             "TLS 1.2 ServerKeyExchange: curve=0x{:04x}, pubkey_len={}, sig_algo=0x{:04x}",
@@ -1352,6 +1659,52 @@ impl Tls12Handshake {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Decode a TLS `vector<2..2^16-2>` of 2-byte code points: a 2-byte byte-count
+/// followed by that many bytes, read as big-endian `u16`s.
+///
+/// Shared by `supported_groups` (RFC 8422 §5.1.1) and `signature_algorithms`
+/// (RFC 5246 §7.4.1.4.1), which have the same shape. Returns `None` on a
+/// malformed body.
+fn parse_u16_list(data: &[u8]) -> Option<Vec<u16>> {
+    let byte_len = u16::from_be_bytes([*data.first()?, *data.get(1)?]) as usize;
+    if !byte_len.is_multiple_of(2) {
+        return None;
+    }
+    let items = data.get(2..2 + byte_len)?;
+    let (pairs, _) = items.as_chunks::<2>();
+    Some(pairs.iter().map(|pair| u16::from_be_bytes(*pair)).collect())
+}
+
+/// `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` — RFC 5746 §3.3. Not a cipher suite: a
+/// signalling value carried in the ClientHello's cipher suite list.
+const TLS_EMPTY_RENEGOTIATION_INFO_SCSV: u16 = 0x00ff;
+
+/// Whether the ClientHello we sent signalled secure renegotiation with the
+/// SCSV rather than with the `renegotiation_info` extension (RFC 5746 §3.4).
+///
+/// The server answers either signal with the `renegotiation_info` *extension*
+/// (§3.6), so a ServerHello carrying it is solicited in both cases.
+///
+/// Returns `false` for anything that is not a parseable ClientHello — the
+/// caller has already given up on the offer by that point.
+fn client_hello_offers_renegotiation_scsv(ch_bytes: &[u8]) -> bool {
+    // Handshake header (4) + legacy_version (2) + random (32) = the `body`
+    // offsets that `client_hello_extensions` uses.
+    let Some(body) = ch_bytes.get(4..) else {
+        return false;
+    };
+    let Some(&session_id_len) = body.get(34) else {
+        return false;
+    };
+    // `cipher_suites` is a 2-byte-length-prefixed list of 2-byte code points,
+    // exactly the shape `parse_u16_list` reads.
+    let Some(cipher_suites) = body.get(35 + session_id_len as usize..) else {
+        return false;
+    };
+    parse_u16_list(cipher_suites)
+        .is_some_and(|suites| suites.contains(&TLS_EMPTY_RENEGOTIATION_INFO_SCSV))
+}
+
 /// Build a TLS handshake message: type(1) + length(3) + body.
 fn build_handshake_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
     let len = body.len();
@@ -1537,6 +1890,22 @@ mod tests {
         body
     }
 
+    fn make_server_hello_body_with_record_size_limit(
+        cipher_suite: u16,
+        server_random: &[u8; 32],
+        limit: u16,
+    ) -> Vec<u8> {
+        let mut body = make_server_hello_body(cipher_suite, server_random);
+        // record_size_limit extension: type=0x001c, len=2, value
+        let ext_total_len = 4 + 2usize;
+        body.push((ext_total_len >> 8) as u8);
+        body.push(ext_total_len as u8);
+        body.extend_from_slice(&[0x00, 0x1c]); // ext_type
+        body.extend_from_slice(&[0x00, 0x02]); // ext_len = 2
+        body.extend_from_slice(&limit.to_be_bytes());
+        body
+    }
+
     fn make_certificate_body(cert_ders: &[&[u8]]) -> Vec<u8> {
         let mut certs_buf = Vec::new();
         for cert in cert_ders {
@@ -1568,6 +1937,433 @@ mod tests {
         body.push(dummy_sig.len() as u8);
         body.extend_from_slice(&dummy_sig);
         body
+    }
+
+    /// A ServerKeyExchange naming a specific curve and signature algorithm.
+    fn make_ske_body_with(curve: u16, sig_algorithm: u16, server_pub_key: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0x03); // curve_type = named_curve
+        body.extend_from_slice(&curve.to_be_bytes());
+        body.push(server_pub_key.len() as u8);
+        body.extend_from_slice(server_pub_key);
+        body.extend_from_slice(&sig_algorithm.to_be_bytes());
+        let dummy_sig = [0u8; 8];
+        body.extend_from_slice(&(dummy_sig.len() as u16).to_be_bytes());
+        body.extend_from_slice(&dummy_sig);
+        body
+    }
+
+    /// Drive a handshake to `WaitServerKeyExchange` having sent a *real*
+    /// ClientHello built from `profile`, so the recorded offer is the genuine
+    /// `supported_groups` / `signature_algorithms` that went on the wire.
+    fn handshake_awaiting_ske(profile: &crate::profile::types::TlsProfile) -> Tls12Handshake {
+        let client_hello =
+            crate::handshake::client_hello::ClientHelloBuilder::new(profile, "test.example.com")
+                .build()
+                .expect("build ClientHello")
+                .message;
+
+        let mut hs = Tls12Handshake::new(
+            [0x42u8; 32],
+            "test.example.com",
+            VerificationPolicy::Insecure,
+        );
+        hs.feed_client_hello(&client_hello);
+
+        let sh_body = make_server_hello_body(0xC02F, &[0x11u8; 32]);
+        hs.process_handshake_record(&build_handshake_message(
+            handshake_type::SERVER_HELLO,
+            &sh_body,
+        ))
+        .expect("ServerHello");
+
+        let cert_body = make_certificate_body(&[&[0xDE, 0xAD]]);
+        hs.process_handshake_record(&build_handshake_message(
+            handshake_type::CERTIFICATE,
+            &cert_body,
+        ))
+        .expect("Certificate");
+
+        assert_eq!(hs.state(), Tls12State::WaitServerKeyExchange);
+        hs
+    }
+
+    /// chrome_150 narrowed to two groups, so that P-384 — a curve the engine
+    /// fully implements — is one we did *not* offer. Only the local copy is
+    /// touched; the shipped profile is untouched and nothing about what a real
+    /// handshake advertises changes.
+    fn profile_offering_x25519_and_p256() -> crate::profile::types::TlsProfile {
+        let mut profile = crate::profile::presets::chrome_150();
+        profile.supported_groups = vec![0x001d, 0x0017];
+        profile.key_share_curves = vec![0x001d];
+        profile
+    }
+
+    // ========================================================================
+    // RFC 8422 §5.4 — the server must pick a curve we offered
+    // ========================================================================
+
+    #[test]
+    fn ske_rejects_curve_the_client_did_not_offer() {
+        let profile = profile_offering_x25519_and_p256();
+        let mut hs = handshake_awaiting_ske(&profile);
+
+        // P-384 is implemented by the engine but absent from this offer.
+        let ske = make_ske_body_with(0x0018, 0x0403, &[0x04; 97]);
+        let error = hs
+            .process_handshake_record(&build_handshake_message(0x0C, &ske))
+            .expect_err("a curve outside supported_groups must abort the handshake");
+
+        assert!(
+            error.to_string().contains("0x0018") && error.to_string().contains("did not offer"),
+            "expected a not-offered curve rejection, got: {error}"
+        );
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::IllegalParameter),
+        );
+    }
+
+    #[test]
+    fn ske_accepts_curve_the_client_offered() {
+        let profile = profile_offering_x25519_and_p256();
+        let mut hs = handshake_awaiting_ske(&profile);
+
+        let ske = make_ske_body_with(0x0017, 0x0403, &generate_p256_public_key());
+        let action = hs
+            .process_handshake_record(&build_handshake_message(0x0C, &ske))
+            .expect("an offered curve must be accepted");
+
+        assert!(matches!(action, Tls12HandshakeAction::ContinueReading));
+        assert_eq!(hs.state(), Tls12State::WaitServerHelloDone);
+    }
+
+    // ========================================================================
+    // RFC 5246 §7.4.1.4.1 — the server must sign with an algorithm we offered
+    // ========================================================================
+
+    #[test]
+    fn ske_rejects_signature_algorithm_the_client_did_not_offer() {
+        let profile = crate::profile::presets::chrome_150();
+        assert!(
+            !profile.signature_algorithms.contains(&0x0203),
+            "the fixture depends on ecdsa_sha1 being absent from the offer"
+        );
+        let mut hs = handshake_awaiting_ske(&profile);
+
+        let ske = make_ske_body_with(0x0017, 0x0203, &generate_p256_public_key());
+        let error = hs
+            .process_handshake_record(&build_handshake_message(0x0C, &ske))
+            .expect_err("a signature algorithm outside signature_algorithms must abort");
+
+        assert!(
+            error.to_string().contains("0x0203") && error.to_string().contains("did not offer"),
+            "expected a not-offered signature algorithm rejection, got: {error}"
+        );
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::IllegalParameter),
+        );
+    }
+
+    #[test]
+    fn ske_accepts_signature_algorithm_the_client_offered() {
+        let profile = crate::profile::presets::chrome_150();
+        let offered = profile.signature_algorithms[0];
+        let mut hs = handshake_awaiting_ske(&profile);
+
+        let ske = make_ske_body_with(0x0017, offered, &generate_p256_public_key());
+        let action = hs
+            .process_handshake_record(&build_handshake_message(0x0C, &ske))
+            .expect("an offered signature algorithm must be accepted");
+
+        assert!(matches!(action, Tls12HandshakeAction::ContinueReading));
+        assert_eq!(hs.state(), Tls12State::WaitServerHelloDone);
+    }
+
+    #[test]
+    fn real_client_hello_offer_is_read_back_off_the_wire_bytes() {
+        let profile = profile_offering_x25519_and_p256();
+        let hs = handshake_awaiting_ske(&profile);
+
+        let groups = hs
+            .offered_groups
+            .clone()
+            .expect("supported_groups recorded");
+        assert!(groups.contains(&0x001d) && groups.contains(&0x0017));
+        assert!(
+            !groups.contains(&0x0018),
+            "P-384 was not offered, so it must not appear in the recorded offer"
+        );
+
+        let sig_algs = hs
+            .offered_signature_algorithms
+            .clone()
+            .expect("signature_algorithms recorded");
+        assert_eq!(sig_algs, profile.signature_algorithms);
+    }
+
+    #[test]
+    fn unparseable_client_hello_leaves_the_offer_unknown() {
+        // The placeholder ClientHello the older unit tests feed is not a real
+        // one; with no offer to compare against the checks stay out of the way
+        // rather than rejecting everything.
+        let mut hs = new_test_handshake();
+        hs.feed_client_hello(b"fake-client-hello");
+        assert!(hs.offered_groups.is_none());
+        assert!(hs.offered_signature_algorithms.is_none());
+        assert!(
+            hs.offered_extensions.is_none(),
+            "with no readable offer the unsolicited-extension check must stay disabled"
+        );
+    }
+
+    // ========================================================================
+    // RFC 5246 §7.4.1.4 — the server must not answer with an extension we
+    // never offered, and must not send the same one twice
+    // ========================================================================
+
+    /// A handshake that has sent a *real* ClientHello built from `profile`, so
+    /// the recorded offer is the genuine extension set that went on the wire.
+    fn handshake_after_real_client_hello(
+        profile: &crate::profile::types::TlsProfile,
+    ) -> Tls12Handshake {
+        let client_hello =
+            crate::handshake::client_hello::ClientHelloBuilder::new(profile, "test.example.com")
+                .build()
+                .expect("build ClientHello")
+                .message;
+
+        let mut hs = Tls12Handshake::new(
+            [0x42u8; 32],
+            "test.example.com",
+            VerificationPolicy::Insecure,
+        );
+        hs.feed_client_hello(&client_hello);
+        hs
+    }
+
+    /// A ServerHello carrying an arbitrary extension block, so a test can send
+    /// one we did not offer, or the same one twice.
+    fn make_server_hello_body_with_extensions(
+        cipher_suite: u16,
+        server_random: &[u8; 32],
+        extensions: &[(u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut block = Vec::new();
+        for (extension_type, extension_body) in extensions {
+            block.extend_from_slice(&extension_type.to_be_bytes());
+            block.extend_from_slice(&(extension_body.len() as u16).to_be_bytes());
+            block.extend_from_slice(extension_body);
+        }
+        let mut body = make_server_hello_body(cipher_suite, server_random);
+        body.extend_from_slice(&(block.len() as u16).to_be_bytes());
+        body.extend_from_slice(&block);
+        body
+    }
+
+    /// An ALPN ServerHello extension body naming a single protocol.
+    fn alpn_extension_body(protocol: &str) -> Vec<u8> {
+        let mut body = vec![0x00, (1 + protocol.len()) as u8];
+        body.push(protocol.len() as u8);
+        body.extend_from_slice(protocol.as_bytes());
+        body
+    }
+
+    fn feed_server_hello(hs: &mut Tls12Handshake, body: &[u8]) -> Result<Tls12HandshakeAction> {
+        hs.process_handshake_record(&build_handshake_message(handshake_type::SERVER_HELLO, body))
+    }
+
+    #[test]
+    fn server_hello_rejects_an_extension_the_client_did_not_offer() {
+        let profile = crate::profile::presets::chrome_150();
+        assert!(
+            !profile
+                .extensions
+                .iter()
+                .any(|spec| spec.extension_type == ext_type::RECORD_SIZE_LIMIT),
+            "the fixture depends on record_size_limit being absent from the offer"
+        );
+        let mut hs = handshake_after_real_client_hello(&profile);
+
+        let sh = make_server_hello_body_with_extensions(
+            0xC02F,
+            &[0x11u8; 32],
+            &[(ext_type::RECORD_SIZE_LIMIT, 512u16.to_be_bytes().to_vec())],
+        );
+        let error =
+            feed_server_hello(&mut hs, &sh).expect_err("an unsolicited extension must abort");
+
+        assert!(
+            error.to_string().contains("0x001c") && error.to_string().contains("unsolicited"),
+            "expected an unsolicited-extension rejection, got: {error}"
+        );
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::UnsupportedExtension),
+        );
+        assert!(
+            hs.peer_record_size_limit().is_none(),
+            "an extension we never offered must not bound the records we send"
+        );
+    }
+
+    #[test]
+    fn server_hello_accepts_the_extensions_the_client_offered() {
+        let profile = crate::profile::presets::chrome_150();
+        let mut hs = handshake_after_real_client_hello(&profile);
+
+        let sh = make_server_hello_body_with_extensions(
+            0xC02F,
+            &[0x11u8; 32],
+            &[
+                (ext_type::EXTENDED_MASTER_SECRET, Vec::new()),
+                (ext_type::ALPN, alpn_extension_body("h2")),
+                (ext_type::RENEGOTIATION_INFO, vec![0x00]),
+            ],
+        );
+        feed_server_hello(&mut hs, &sh).expect("extensions we offered must still be accepted");
+
+        assert!(hs.use_extended_master_secret);
+        assert_eq!(hs.negotiated_alpn(), Some("h2"));
+        assert_eq!(hs.state(), Tls12State::WaitCertificate);
+    }
+
+    #[test]
+    fn server_hello_rejects_a_duplicate_extension() {
+        let profile = crate::profile::presets::chrome_150();
+        let mut hs = handshake_after_real_client_hello(&profile);
+
+        // Both copies name an extension we *did* offer, so only the
+        // duplicate rule can reject this ServerHello.
+        let sh = make_server_hello_body_with_extensions(
+            0xC02F,
+            &[0x11u8; 32],
+            &[
+                (ext_type::EXTENDED_MASTER_SECRET, Vec::new()),
+                (ext_type::EXTENDED_MASTER_SECRET, Vec::new()),
+            ],
+        );
+        let error = feed_server_hello(&mut hs, &sh).expect_err("a repeated extension must abort");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate ServerHello extension 0x0017"),
+            "expected a duplicate-extension rejection, got: {error}"
+        );
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::IllegalParameter),
+        );
+    }
+
+    #[test]
+    fn full_handshake_completes_after_a_real_client_hello() {
+        let profile = crate::profile::presets::chrome_150();
+        let mut hs = handshake_after_real_client_hello(&profile);
+
+        let sh = make_server_hello_body_with_extensions(
+            0xC02F,
+            &[0x11u8; 32],
+            &[
+                (ext_type::EXTENDED_MASTER_SECRET, Vec::new()),
+                (ext_type::ALPN, alpn_extension_body("h2")),
+            ],
+        );
+        feed_server_hello(&mut hs, &sh).expect("ServerHello");
+
+        let cert_body = make_certificate_body(&[&[0xDE, 0xAD]]);
+        hs.process_handshake_record(&build_handshake_message(
+            handshake_type::CERTIFICATE,
+            &cert_body,
+        ))
+        .expect("Certificate");
+
+        let ske_body = make_ske_body(&generate_p256_public_key());
+        hs.process_handshake_record(&build_handshake_message(0x0C, &ske_body))
+            .expect("ServerKeyExchange");
+
+        let action = hs
+            .process_handshake_record(&build_handshake_message(0x0E, &[]))
+            .expect("ServerHelloDone");
+
+        match action {
+            Tls12HandshakeAction::SendClientFlight(flight) => {
+                assert!(!flight.client_key_exchange.is_empty());
+            }
+            other => panic!("expected SendClientFlight, got {other:?}"),
+        }
+        assert!(hs.master_secret().is_some());
+    }
+
+    /// RFC 5746 §3.4/§3.6: `renegotiation_info` in a ServerHello answers either
+    /// the extension or the `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` cipher suite,
+    /// so the SCSV alone has to count as having offered it.
+    #[test]
+    fn renegotiation_info_is_solicited_by_the_scsv_alone() {
+        let mut profile = crate::profile::presets::chrome_150();
+        profile
+            .extensions
+            .retain(|spec| spec.extension_type != ext_type::RENEGOTIATION_INFO);
+        assert!(
+            !profile
+                .cipher_suites
+                .contains(&TLS_EMPTY_RENEGOTIATION_INFO_SCSV),
+            "the fixture depends on the preset not already sending the SCSV"
+        );
+
+        let reneg_sh = |random: &[u8; 32]| {
+            make_server_hello_body_with_extensions(
+                0xC02F,
+                random,
+                &[(ext_type::RENEGOTIATION_INFO, vec![0x00])],
+            )
+        };
+
+        // Neither signal: the answer is unsolicited.
+        let mut without_scsv = handshake_after_real_client_hello(&profile);
+        let error = feed_server_hello(&mut without_scsv, &reneg_sh(&[0x11u8; 32]))
+            .expect_err("with neither signal sent, renegotiation_info is unsolicited");
+        assert!(
+            error.to_string().contains("0xff01"),
+            "expected a renegotiation_info rejection, got: {error}"
+        );
+
+        // SCSV instead of the extension: the same answer is solicited.
+        let mut scsv_profile = profile.clone();
+        scsv_profile
+            .cipher_suites
+            .push(TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+        let mut with_scsv = handshake_after_real_client_hello(&scsv_profile);
+        feed_server_hello(&mut with_scsv, &reneg_sh(&[0x11u8; 32]))
+            .expect("the SCSV solicits renegotiation_info just as the extension does");
+        assert_eq!(with_scsv.state(), Tls12State::WaitCertificate);
+    }
+
+    #[test]
+    fn real_client_hello_records_the_extension_types_it_sent() {
+        let profile = crate::profile::presets::chrome_150();
+        let hs = handshake_after_real_client_hello(&profile);
+
+        let offered = hs
+            .offered_extensions
+            .clone()
+            .expect("extension types recorded");
+        for expected in [
+            ext_type::ALPN,
+            ext_type::EXTENDED_MASTER_SECRET,
+            ext_type::RENEGOTIATION_INFO,
+        ] {
+            assert!(
+                offered.contains(&expected),
+                "chrome_150 sends 0x{expected:04x}, so it must appear in the recorded offer"
+            );
+        }
+        assert!(
+            !offered.contains(&ext_type::RECORD_SIZE_LIMIT),
+            "record_size_limit was not offered, so it must not appear in the recorded offer"
+        );
     }
 
     fn generate_p256_public_key() -> Vec<u8> {
@@ -1742,6 +2538,54 @@ mod tests {
         let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
         hs.process_handshake_record(&record).unwrap();
         assert!(hs.use_extended_master_secret);
+    }
+
+    /// RFC 8449 §4 puts `record_size_limit` in EncryptedExtensions only for TLS
+    /// 1.3; under TLS 1.2 it rides in the ServerHello, and it bounds the
+    /// records we send.
+    #[test]
+    fn server_hello_with_record_size_limit() {
+        let mut hs = new_test_handshake();
+        hs.feed_client_hello(b"ch");
+        let body = make_server_hello_body_with_record_size_limit(0xC02F, &[0u8; 32], 512);
+        let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
+        hs.process_handshake_record(&record).unwrap();
+        assert_eq!(
+            hs.peer_record_size_limit(),
+            Some(512),
+            "the ServerHello record_size_limit must be captured"
+        );
+    }
+
+    #[test]
+    fn server_hello_without_record_size_limit_leaves_it_unset() {
+        let mut hs = new_test_handshake();
+        hs.feed_client_hello(b"ch");
+        let body = make_server_hello_body_with_ems(0xC02F, &[0u8; 32]);
+        let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
+        hs.process_handshake_record(&record).unwrap();
+        assert_eq!(hs.peer_record_size_limit(), None);
+    }
+
+    /// RFC 8449 §4: a value below 64 is a fatal `illegal_parameter`.
+    #[test]
+    fn server_hello_record_size_limit_below_64_is_illegal_parameter() {
+        for raw in [0u16, 1, 63] {
+            let mut hs = new_test_handshake();
+            hs.feed_client_hello(b"ch");
+            let body = make_server_hello_body_with_record_size_limit(0xC02F, &[0u8; 32], raw);
+            let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
+            let error = hs
+                .process_handshake_record(&record)
+                .expect_err("a record_size_limit below 64 must abort the handshake");
+            let description = error.as_alert().map(|alert| alert.description);
+            assert_eq!(
+                description,
+                Some(AlertDescription::IllegalParameter),
+                "value {raw} must abort with illegal_parameter, got {description:?}"
+            );
+            assert_eq!(hs.peer_record_size_limit(), None);
+        }
     }
 
     #[test]
@@ -2411,5 +3255,152 @@ mod tests {
             );
             assert_eq!(suite.unwrap().code_point(), *code);
         }
+    }
+
+    // ========================================================================
+    // Extended master secret on resumption (RFC 7627 §5.3)
+    // ========================================================================
+
+    /// Run an abbreviated handshake up to the server's CCS, choosing the
+    /// original session's EMS state and the resuming ServerHello's EMS
+    /// extension independently, and report what `accept_abbreviated_ccs` made
+    /// of the pair.
+    fn resume_with_ems(
+        original_used_ems: Option<bool>,
+        server_hello_has_ems: bool,
+    ) -> Result<Tls12TrafficKeys> {
+        let mut hs = new_test_handshake();
+        hs.set_session_ticket_resumption(vec![0xAA; 48], original_used_ems);
+        hs.feed_client_hello(b"fake-client-hello");
+
+        let server_random = [0x11u8; 32];
+        let sh_body = if server_hello_has_ems {
+            make_server_hello_body_with_ems(0xC02F, &server_random)
+        } else {
+            make_server_hello_body(0xC02F, &server_random)
+        };
+        hs.process_handshake_record(&build_handshake_message(
+            handshake_type::SERVER_HELLO,
+            &sh_body,
+        ))
+        .expect("ServerHello parses");
+        assert_eq!(hs.state(), Tls12State::WaitCertificateOrAbbreviated);
+        assert_eq!(hs.used_extended_master_secret(), server_hello_has_ems);
+
+        // Server goes straight to CCS: it accepted the abbreviated handshake.
+        hs.accept_abbreviated_ccs()
+    }
+
+    /// RFC 7627 §5.3: "If the original session did not use the
+    /// `extended_master_secret` extension but the new ServerHello contains the
+    /// extension, the client MUST abort the handshake."
+    #[test]
+    fn abbreviated_handshake_aborts_when_server_adds_ems_to_a_legacy_session() {
+        let error = resume_with_ems(Some(false), true)
+            .expect_err("a non-EMS session resumed with EMS asserted must abort");
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::HandshakeFailure),
+            "expected a fatal handshake_failure, got {error:?}"
+        );
+    }
+
+    /// RFC 7627 §5.3: "If the original session used the extension but the new
+    /// ServerHello does not contain the extension, the client MUST abort the
+    /// handshake." §5.4 keeps this a MUST even though continuing would still
+    /// be protected by the original session's extended master secret.
+    #[test]
+    fn abbreviated_handshake_aborts_when_server_drops_ems_from_an_ems_session() {
+        let error = resume_with_ems(Some(true), false)
+            .expect_err("an EMS session resumed without EMS must abort");
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::HandshakeFailure),
+            "expected a fatal handshake_failure, got {error:?}"
+        );
+    }
+
+    /// Consistent state in either direction resumes normally — the check is a
+    /// mismatch detector, not a requirement that every session use EMS.
+    #[test]
+    fn abbreviated_handshake_continues_when_ems_state_matches() {
+        for used_ems in [true, false] {
+            let keys =
+                resume_with_ems(Some(used_ems), used_ems).expect("matching EMS state must resume");
+            assert_eq!(
+                keys.cipher_suite,
+                Tls12CipherSuite::EcdheRsaAes128GcmSha256,
+                "original_used_ems={used_ems}"
+            );
+            assert_eq!(keys.client_write_key.len(), 16);
+        }
+    }
+
+    /// A ticket stored without any record of the original session's EMS state
+    /// cannot be checked, and must not be guessed at in either direction:
+    /// both ServerHello shapes still resume.
+    #[test]
+    fn abbreviated_handshake_without_recorded_ems_state_skips_the_check() {
+        for server_hello_has_ems in [true, false] {
+            let keys = resume_with_ems(None, server_hello_has_ems)
+                .expect("an unrecorded EMS state leaves resumption as it was");
+            assert_eq!(keys.cipher_suite, Tls12CipherSuite::EcdheRsaAes128GcmSha256);
+        }
+    }
+
+    /// The legacy setter is the "state not recorded" path.
+    #[test]
+    fn set_session_ticket_master_secret_leaves_ems_state_unknown() {
+        let mut hs = new_test_handshake();
+        hs.set_session_ticket_master_secret(vec![0xBB; 48]);
+        assert!(hs.resumed_master_secret.is_some());
+        assert_eq!(hs.resumed_session_used_ems, None);
+    }
+
+    /// The flag a ticket store needs to persist (RFC 7627 §5.4) is whatever the
+    /// ServerHello of the *original* handshake agreed to.
+    #[test]
+    fn used_extended_master_secret_reports_serverhello_agreement() {
+        for server_hello_has_ems in [true, false] {
+            let mut hs = new_test_handshake();
+            hs.feed_client_hello(b"ch");
+            let body = if server_hello_has_ems {
+                make_server_hello_body_with_ems(0xC02F, &[0u8; 32])
+            } else {
+                make_server_hello_body(0xC02F, &[0u8; 32])
+            };
+            hs.process_handshake_record(&build_handshake_message(
+                handshake_type::SERVER_HELLO,
+                &body,
+            ))
+            .expect("ServerHello parses");
+            assert_eq!(hs.used_extended_master_secret(), server_hello_has_ems);
+        }
+    }
+
+    /// A rejected ticket drops the old session's EMS state along with its
+    /// master secret — the full handshake that follows negotiates its own.
+    #[test]
+    fn abbreviated_rejection_clears_recorded_ems_state() {
+        let mut hs = new_test_handshake();
+        hs.set_session_ticket_resumption(vec![0xBB; 48], Some(true));
+        hs.feed_client_hello(b"ch");
+
+        let sh_body = make_server_hello_body(0xC02F, &[0u8; 32]);
+        hs.process_handshake_record(&build_handshake_message(
+            handshake_type::SERVER_HELLO,
+            &sh_body,
+        ))
+        .expect("ServerHello parses");
+        assert_eq!(hs.resumed_session_used_ems, Some(true));
+
+        let cert_body = make_certificate_body(&[&[0xDE, 0xAD]]);
+        hs.process_handshake_record(&build_handshake_message(
+            handshake_type::CERTIFICATE,
+            &cert_body,
+        ))
+        .expect("Certificate parses");
+        assert!(hs.resumed_master_secret.is_none());
+        assert_eq!(hs.resumed_session_used_ems, None);
     }
 }

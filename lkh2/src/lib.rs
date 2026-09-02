@@ -32,7 +32,7 @@ pub use adapter::{
 
 pub use adapter::await_first_response;
 
-// ─── h2-native engine ───────────────────────────────────────────────────────
+// ─── lkh2 engine ───────────────────────────────────────────────────────
 
 pub mod codec;
 pub mod frame;

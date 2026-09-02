@@ -22,6 +22,16 @@ available.
 | `chrome_149` | yes | yes | yes | generic Chromium QUIC/H3 |
 | `chrome_150` | yes | yes | yes | dedicated captured QUIC/H3 |
 | `chrome_151` | yes | yes | yes | public-site captured QUIC/H3 |
+| `chrome_152` | yes | yes | yes | public Cloudflare TLS/H2/QUIC capture; H3 baseline retained |
+
+Chrome's TCP `signature_algorithms` evolution is version-specific and must be
+compared as an ordered raw sequence: Chrome 149 starts with
+`ecdsa_secp256r1_sha256`, Chrome 150/151 start with ML-DSA `0x0904`, and Chrome
+152 prepends a GREASE code point before `0x0904`. The GREASE value changes per
+connection and is independent of the cipher/extension/group/version GREASE
+slots. JA3/JA3N omit this field and JA4 removes GREASE, so those hashes alone
+cannot validate the Chrome 152 behavior; use the field-level output or a
+GREASE-preserving fingerprint such as peetprint.
 
 `capture-chrome` takes any local Chrome/Chromium executable, including Chrome
 for Testing milestone builds. Headless mode can change application-layer
@@ -114,6 +124,7 @@ such as:
 
 - `cipher_suites[0]`
 - `extensions[4].extension_type`
+- `signature_algorithms[0]`
 - `h2_fingerprint.settings[2].value`
 - `h2_fingerprint.akamai_fingerprint`
 - `quic_fingerprint.transport_parameters[3].value`

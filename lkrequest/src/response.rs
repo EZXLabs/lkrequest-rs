@@ -543,58 +543,213 @@ impl Response {
 // Body decompression
 // ---------------------------------------------------------------------------
 
+/// One content coding from a `content-encoding` header that we can act on.
+///
+/// `Identity` is recognized but decodes to nothing at all — RFC 9110 §8.4.1.1
+/// defines it as the absence of any coding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ContentCoding {
+    Brotli,
+    Gzip,
+    Deflate,
+    Zstd,
+    Identity,
+}
+
+impl ContentCoding {
+    /// Map one content-coding token, or `None` if we cannot decode it.
+    fn from_token(token: &str) -> Option<Self> {
+        // Content codings are case-insensitive (RFC 9110 §8.4.1).
+        match token.to_ascii_lowercase().as_str() {
+            "br" => Some(Self::Brotli),
+            "gzip" | "x-gzip" => Some(Self::Gzip),
+            "deflate" => Some(Self::Deflate),
+            "zstd" => Some(Self::Zstd),
+            "identity" => Some(Self::Identity),
+            _ => None,
+        }
+    }
+
+    /// Canonical token, used for log fields, error messages, and to build the
+    /// matching [`StreamDecoder`].
+    fn token(self) -> &'static str {
+        match self {
+            Self::Brotli => "br",
+            Self::Gzip => "gzip",
+            Self::Deflate => "deflate",
+            Self::Zstd => "zstd",
+            Self::Identity => "identity",
+        }
+    }
+
+    /// Decode one whole layer.
+    fn decode(self, data: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Brotli => decompress_brotli(data),
+            Self::Gzip => decompress_gzip(data),
+            Self::Deflate => decompress_deflate(data),
+            Self::Zstd => decompress_zstd(data),
+            Self::Identity => Ok(data.to_vec()),
+        }
+    }
+}
+
+/// What a response's `content-encoding` header asks us to do.
+enum ContentEncodingPlan {
+    /// Nothing to decode: header absent, empty, or `identity` only.
+    Passthrough,
+    /// A lone coding we do not implement. Handing the body back untouched is
+    /// long-standing behavior, so it is preserved rather than turned into an
+    /// error.
+    UnknownSingle(String),
+    /// Codings to apply, already ordered for decoding. `content-encoding` lists
+    /// codings in the order the sender applied them, so decoding runs in
+    /// reverse (RFC 9110 §8.4).
+    Decode(Vec<ContentCoding>),
+    /// A multi-coding list holding at least one coding we do not implement.
+    /// Peeling off only the layers we understand would hand back bytes that are
+    /// still compressed, with nothing in the response for the caller to detect
+    /// that from — so this is refused instead.
+    UnknownInList { unknown: String, list: String },
+}
+
+/// Join every `content-encoding` header line into one comma-separated list.
+///
+/// A list-valued field may legally be split across multiple header lines
+/// (RFC 9110 §5.3), so reading only the first line can silently drop codings.
+fn content_encoding_list(headers: &HeaderMap) -> String {
+    let mut list = String::new();
+    for value in headers.get_all(http::header::CONTENT_ENCODING) {
+        let Ok(text) = value.to_str() else { continue };
+        if !list.is_empty() {
+            list.push(',');
+        }
+        list.push_str(text);
+    }
+    list
+}
+
+/// Turn a `content-encoding` list into a decoding plan.
+fn parse_content_encoding(list: &str) -> ContentEncodingPlan {
+    // RFC 9110 §5.6.1: recipients ignore empty list elements.
+    let tokens: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    match tokens.as_slice() {
+        [] => ContentEncodingPlan::Passthrough,
+        [only] => match ContentCoding::from_token(only) {
+            Some(ContentCoding::Identity) => ContentEncodingPlan::Passthrough,
+            Some(coding) => ContentEncodingPlan::Decode(vec![coding]),
+            None => ContentEncodingPlan::UnknownSingle((*only).to_string()),
+        },
+        many => {
+            let mut codings = Vec::with_capacity(many.len());
+            // Reverse order: the coding listed last was applied last, so it is
+            // the first one to peel off.
+            for token in many.iter().rev() {
+                match ContentCoding::from_token(token) {
+                    // `identity` contributes no layer.
+                    Some(ContentCoding::Identity) => {}
+                    Some(coding) => codings.push(coding),
+                    None => {
+                        return ContentEncodingPlan::UnknownInList {
+                            unknown: (*token).to_string(),
+                            list: list.trim().to_string(),
+                        };
+                    }
+                }
+            }
+            if codings.is_empty() {
+                ContentEncodingPlan::Passthrough
+            } else {
+                ContentEncodingPlan::Decode(codings)
+            }
+        }
+    }
+}
+
+/// Error for a multi-coding list we only partially understand. Shared so the
+/// buffered and streaming paths refuse identically.
+fn unsupported_coding_in_list(unknown: &str, list: &str) -> crate::error::Error {
+    crate::error::Error::Body(format!(
+        "unsupported content-encoding `{unknown}` in list `{list}`: \
+         refusing to return a partially decoded body"
+    ))
+}
+
 /// Decompress the response body based on the `content-encoding` header.
+///
+/// The header is a list: a sender may apply several codings, and
+/// `content-encoding: gzip, br` means gzip was applied first and brotli
+/// second, so decoding walks the list in reverse (RFC 9110 §8.4). Values split
+/// across multiple header lines are treated as one list.
 ///
 /// Returns the original body unchanged if:
 /// - No content-encoding header is present
-/// - The encoding is "identity" or unrecognized
+/// - The list is empty or names only `identity`
+/// - The list holds a *single* coding we do not implement
 ///
-/// Returns [`crate::error::Error::Body`] if the server declared a supported
-/// compressed encoding but the body cannot be decoded.
+/// Returns [`crate::error::Error::Body`] if a declared coding cannot be
+/// decoded, or if a multi-coding list names a coding we do not implement —
+/// decoding it halfway would return still-compressed bytes that the caller
+/// cannot distinguish from real content.
 fn decompress_body(headers: &HeaderMap, body: Bytes) -> crate::error::Result<Bytes> {
-    let encoding = match headers.get(http::header::CONTENT_ENCODING) {
-        Some(v) => v.to_str().unwrap_or("").to_lowercase(),
-        None => return Ok(body),
-    };
-
+    // An empty body carries nothing that could be silently mis-decoded, so it
+    // passes through whatever the header says (HEAD and 204 responses keep
+    // their origin's `content-encoding`).
     if body.is_empty() {
         return Ok(body);
     }
 
-    let result = match encoding.as_str() {
-        "br" => decompress_brotli(&body),
-        "gzip" | "x-gzip" => decompress_gzip(&body),
-        "deflate" => decompress_deflate(&body),
-        "zstd" => decompress_zstd(&body),
-        "identity" | "" => return Ok(body),
-        other => {
-            tracing::warn!(encoding = %other, "http.unknown_content_encoding");
+    let list = content_encoding_list(headers);
+    let codings = match parse_content_encoding(&list) {
+        ContentEncodingPlan::Passthrough => return Ok(body),
+        ContentEncodingPlan::UnknownSingle(token) => {
+            tracing::warn!(encoding = %token, "http.unknown_content_encoding");
             return Ok(body);
         }
+        ContentEncodingPlan::UnknownInList { unknown, list } => {
+            tracing::warn!(
+                encoding = %unknown,
+                content_encoding = %list,
+                "http.unknown_content_encoding_in_list",
+            );
+            return Err(unsupported_coding_in_list(&unknown, &list));
+        }
+        ContentEncodingPlan::Decode(codings) => codings,
     };
 
-    match result {
-        Ok(decompressed) => {
-            tracing::trace!(
-                encoding = %encoding,
-                raw_bytes = body.len(),
-                decoded_bytes = decompressed.len(),
-                "http.body_decompressed",
-            );
-            Ok(Bytes::from(decompressed))
-        }
-        Err(e) => {
-            tracing::warn!(
-                encoding = %encoding,
-                raw_bytes = body.len(),
-                error = %e,
-                "http.decompress_failed",
-            );
-            Err(crate::error::Error::Body(format!(
-                "decompression failed for content-encoding `{encoding}`: {e}"
-            )))
+    let raw_bytes = body.len();
+    let mut current = body;
+    for coding in codings {
+        match coding.decode(&current) {
+            Ok(decompressed) => current = Bytes::from(decompressed),
+            Err(e) => {
+                tracing::warn!(
+                    encoding = %coding.token(),
+                    content_encoding = %list,
+                    raw_bytes,
+                    error = %e,
+                    "http.decompress_failed",
+                );
+                return Err(crate::error::Error::Body(format!(
+                    "decompression failed for content-encoding `{}`: {e}",
+                    coding.token()
+                )));
+            }
         }
     }
+
+    tracing::trace!(
+        content_encoding = %list,
+        raw_bytes,
+        decoded_bytes = current.len(),
+        "http.body_decompressed",
+    );
+    Ok(current)
 }
 
 /// Hard cap on decompressed body size to prevent decompression bombs.
@@ -628,9 +783,35 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
     size_limited_read(&mut decoder, "gzip")
 }
 
+/// Whether `data` starts with an RFC 1950 zlib header.
+///
+/// CM (low nibble of CMF) must be 8 (deflate), CINFO (high nibble) at most 7
+/// (32 KiB window), and the two header bytes read as a big-endian u16 must be a
+/// multiple of 31 — RFC 1950 §2.2. A raw RFC 1951 stream starts with block
+/// header bits instead and virtually never satisfies all three.
+fn looks_like_zlib(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    let cmf = data[0];
+    let flg = data[1];
+    (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && (u16::from(cmf) * 256 + u16::from(flg)) % 31 == 0
+}
+
+/// Decompress a `Content-Encoding: deflate` body.
+///
+/// RFC 9110 §8.4.1.2 defines `deflate` as the **zlib** format (RFC 1950)
+/// wrapping a deflate stream, but a sizable minority of servers send a bare RFC
+/// 1951 stream instead. Browsers accept both; we sniff the zlib header and pick
+/// the matching decoder, so the spec-correct form no longer fails outright.
 fn decompress_deflate(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
-    size_limited_read(&mut decoder, "deflate")
+    if looks_like_zlib(data) {
+        let mut decoder = flate2::read::ZlibDecoder::new(data);
+        size_limited_read(&mut decoder, "deflate")
+    } else {
+        let mut decoder = flate2::read::DeflateDecoder::new(data);
+        size_limited_read(&mut decoder, "deflate")
+    }
 }
 
 fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -650,18 +831,86 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
 /// after the compressed stream ends to flush any remaining buffered output.
 enum StreamDecoder {
     Gzip(flate2::write::GzDecoder<Vec<u8>>),
-    Deflate(flate2::write::DeflateDecoder<Vec<u8>>),
+    Deflate(DeflateStream),
     Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
     Zstd(zstd::stream::write::Decoder<'static, Vec<u8>>),
+}
+
+/// Streaming `deflate` decoder that picks zlib (RFC 1950) or raw (RFC 1951)
+/// from the first two bytes.
+///
+/// The one-shot path can sniff its whole input up front; a stream cannot, and
+/// it cannot retry once bytes have been consumed. So the first bytes are held
+/// back until the format is decidable, then replayed into the chosen decoder.
+enum DeflateStream {
+    /// Fewer than 2 bytes seen — the format is not yet decidable.
+    Undecided(Vec<u8>),
+    Zlib(flate2::write::ZlibDecoder<Vec<u8>>),
+    Raw(flate2::write::DeflateDecoder<Vec<u8>>),
+}
+
+impl DeflateStream {
+    fn new() -> Self {
+        Self::Undecided(Vec::new())
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Result<Bytes, String> {
+        if let Self::Undecided(pending) = self {
+            pending.extend_from_slice(data);
+            if pending.len() < 2 {
+                return Ok(Bytes::new());
+            }
+            let buffered = std::mem::take(pending);
+            *self = if looks_like_zlib(&buffered) {
+                Self::Zlib(flate2::write::ZlibDecoder::new(Vec::new()))
+            } else {
+                Self::Raw(flate2::write::DeflateDecoder::new(Vec::new()))
+            };
+            return self.write_resolved(&buffered);
+        }
+        self.write_resolved(data)
+    }
+
+    fn write_resolved(&mut self, data: &[u8]) -> Result<Bytes, String> {
+        use std::io::Write;
+        let inner = match self {
+            Self::Zlib(d) => {
+                d.write_all(data)
+                    .map_err(|e| format!("deflate (zlib) stream decode: {e}"))?;
+                d.get_mut()
+            }
+            Self::Raw(d) => {
+                d.write_all(data)
+                    .map_err(|e| format!("deflate (raw) stream decode: {e}"))?;
+                d.get_mut()
+            }
+            // Unreachable: `feed` resolves the format before calling this.
+            Self::Undecided(_) => return Ok(Bytes::new()),
+        };
+        Ok(Bytes::from(std::mem::take(inner)))
+    }
+
+    fn finish(self) -> Result<Bytes, String> {
+        match self {
+            // A body of fewer than 2 bytes carries no decodable stream.
+            Self::Undecided(_) => Ok(Bytes::new()),
+            Self::Zlib(d) => d
+                .finish()
+                .map(Bytes::from)
+                .map_err(|e| format!("deflate (zlib) stream finish: {e}")),
+            Self::Raw(d) => d
+                .finish()
+                .map(Bytes::from)
+                .map_err(|e| format!("deflate (raw) stream finish: {e}")),
+        }
+    }
 }
 
 impl StreamDecoder {
     fn new(encoding: &str) -> Result<Self, String> {
         match encoding {
             "gzip" | "x-gzip" => Ok(Self::Gzip(flate2::write::GzDecoder::new(Vec::new()))),
-            "deflate" => Ok(Self::Deflate(
-                flate2::write::DeflateDecoder::new(Vec::new()),
-            )),
+            "deflate" => Ok(Self::Deflate(DeflateStream::new())),
             "br" => Ok(Self::Brotli(Box::new(brotli::DecompressorWriter::new(
                 Vec::new(),
                 4096,
@@ -686,11 +935,9 @@ impl StreamDecoder {
                     .map_err(|e| format!("gzip stream decode: {e}"))?;
                 d.get_mut()
             }
-            Self::Deflate(d) => {
-                d.write_all(data)
-                    .map_err(|e| format!("deflate stream decode: {e}"))?;
-                d.get_mut()
-            }
+            // The deflate stream owns its own zlib/raw resolution and returns
+            // decoded output directly rather than exposing an inner buffer.
+            Self::Deflate(d) => return d.feed(data),
             Self::Brotli(d) => {
                 d.write_all(data)
                     .map_err(|e| format!("brotli stream decode: {e}"))?;
@@ -712,10 +959,7 @@ impl StreamDecoder {
                 .finish()
                 .map(Bytes::from)
                 .map_err(|e| format!("gzip stream finish: {e}")),
-            Self::Deflate(d) => d
-                .finish()
-                .map(Bytes::from)
-                .map_err(|e| format!("deflate stream finish: {e}")),
+            Self::Deflate(d) => d.finish(),
             Self::Brotli(mut d) => {
                 d.close()
                     .map_err(|e| format!("brotli stream finish: {e}"))?;
@@ -730,6 +974,65 @@ impl StreamDecoder {
     }
 }
 
+/// A stack of [`StreamDecoder`]s applied in sequence, for bodies whose
+/// `content-encoding` names more than one coding.
+///
+/// `layers[0]` receives the raw body bytes and each later layer consumes the
+/// previous layer's output, so the vector is ordered last-applied-first — the
+/// reverse of the header's own order (RFC 9110 §8.4). A single-coding response
+/// is just the one-layer case.
+struct LayeredStreamDecoder {
+    layers: Vec<StreamDecoder>,
+}
+
+impl LayeredStreamDecoder {
+    /// Build one decoder per coding. `codings` must already be in decode order,
+    /// as produced by [`parse_content_encoding`].
+    fn new(codings: &[ContentCoding]) -> Result<Self, String> {
+        let mut layers = Vec::with_capacity(codings.len());
+        for coding in codings {
+            // `identity` adds no layer; the parser drops it, this is belt-and-braces.
+            if *coding == ContentCoding::Identity {
+                continue;
+            }
+            layers.push(StreamDecoder::new(coding.token())?);
+        }
+        Ok(Self { layers })
+    }
+
+    /// Feed a raw chunk through every layer and return whatever fully decoded
+    /// output is available. May be empty while any layer is still buffering.
+    fn decode_chunk(&mut self, data: &[u8]) -> Result<Bytes, String> {
+        let Some((first, rest)) = self.layers.split_first_mut() else {
+            return Ok(Bytes::copy_from_slice(data));
+        };
+        let mut current = first.decode_chunk(data)?;
+        for layer in rest {
+            if current.is_empty() {
+                // Nothing to hand down; deeper layers stay as they are.
+                return Ok(Bytes::new());
+            }
+            current = layer.decode_chunk(&current)?;
+        }
+        Ok(current)
+    }
+
+    /// Finalize every layer, flushing each one's residual output into the next
+    /// before finalizing that one in turn.
+    fn finish(self) -> Result<Bytes, String> {
+        let mut carried = Bytes::new();
+        for mut layer in self.layers {
+            let mut flushed = bytes::BytesMut::new();
+            if !carried.is_empty() {
+                flushed.extend_from_slice(&layer.decode_chunk(&carried)?);
+            }
+            flushed.extend_from_slice(&layer.finish()?);
+            carried = flushed.freeze();
+        }
+        Ok(carried)
+    }
+}
+
 /// State machine for the streaming decoder in [`StreamingResponse`].
 enum DecoderState {
     /// Not yet initialized — will inspect `content-encoding` on first use.
@@ -737,7 +1040,7 @@ enum DecoderState {
     /// No decoding needed (identity / unknown / no content-encoding).
     Passthrough,
     /// Actively decoding compressed chunks.
-    Active(Box<StreamDecoder>),
+    Active(LayeredStreamDecoder),
     /// The compressed stream has been fully consumed and finalized.
     Finished,
 }
@@ -964,32 +1267,34 @@ impl StreamingResponse {
             return self.chunk().await;
         }
 
-        // Lazy-initialize the decoder on first call.
+        // Lazy-initialize the decoder on first call. The header may name several
+        // codings, in which case one decoder per coding is stacked in decode
+        // order (RFC 9110 §8.4) — see [`LayeredStreamDecoder`].
         if matches!(self.decoder, DecoderState::Uninit) {
-            let encoding = self
-                .headers
-                .get(http::header::CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_lowercase();
-
-            let needs_decode = matches!(
-                encoding.as_str(),
-                "br" | "gzip" | "x-gzip" | "deflate" | "zstd"
-            );
-
-            if needs_decode {
-                match StreamDecoder::new(&encoding) {
-                    Ok(dec) => self.decoder = DecoderState::Active(Box::new(dec)),
+            let list = content_encoding_list(&self.headers);
+            self.decoder = match parse_content_encoding(&list) {
+                ContentEncodingPlan::Passthrough => DecoderState::Passthrough,
+                ContentEncodingPlan::UnknownSingle(token) => {
+                    tracing::warn!(encoding = %token, "http.unknown_content_encoding");
+                    DecoderState::Passthrough
+                }
+                ContentEncodingPlan::UnknownInList { unknown, list } => {
+                    tracing::warn!(
+                        encoding = %unknown,
+                        content_encoding = %list,
+                        "http.unknown_content_encoding_in_list",
+                    );
+                    return Err(unsupported_coding_in_list(&unknown, &list));
+                }
+                ContentEncodingPlan::Decode(codings) => match LayeredStreamDecoder::new(&codings) {
+                    Ok(dec) => DecoderState::Active(dec),
                     Err(e) => {
                         return Err(crate::error::Error::Body(format!(
                             "failed to init stream decoder: {e}"
                         )));
                     }
-                }
-            } else {
-                self.decoder = DecoderState::Passthrough;
-            }
+                },
+            };
         }
 
         if matches!(self.decoder, DecoderState::Passthrough) {
@@ -1176,6 +1481,104 @@ mod tests {
     }
 
     // -- Decompression: deflate -------------------------------------------
+
+    /// Regression: RFC 9110 §8.4.1.2 defines `deflate` as the zlib format
+    /// (RFC 1950). The one-shot path used a bare `DeflateDecoder`, so every
+    /// spec-correct server failed with `decompression failed`.
+    #[test]
+    fn deflate_zlib_wrapped_body_is_decoded() {
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let original = b"zlib-wrapped deflate, the format the RFC actually specifies";
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(
+            looks_like_zlib(&compressed),
+            "ZlibEncoder output must carry an RFC 1950 header"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, "deflate".parse().unwrap());
+        let resp = Response::new(StatusCode::OK, headers, Bytes::from(compressed)).unwrap();
+
+        assert_eq!(resp.bytes(), &original[..]);
+    }
+
+    /// The non-conforming raw form (RFC 1951, classically IIS) must keep
+    /// working — browsers accept both and so do we.
+    #[test]
+    fn deflate_raw_body_is_still_decoded() {
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let original = b"raw deflate, what a sizable minority of servers actually send";
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, "deflate".parse().unwrap());
+        let resp = Response::new(StatusCode::OK, headers, Bytes::from(compressed)).unwrap();
+
+        assert_eq!(resp.bytes(), &original[..]);
+    }
+
+    #[test]
+    fn looks_like_zlib_discriminates_the_two_formats() {
+        use flate2::write::{DeflateEncoder, ZlibEncoder};
+        use std::io::Write;
+
+        let payload = vec![b'x'; 512];
+
+        let mut z = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&payload).unwrap();
+        assert!(looks_like_zlib(&z.finish().unwrap()));
+
+        let mut d = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        d.write_all(&payload).unwrap();
+        assert!(!looks_like_zlib(&d.finish().unwrap()));
+
+        // Too short to decide.
+        assert!(!looks_like_zlib(&[]));
+        assert!(!looks_like_zlib(&[0x78]));
+        // 0x78 0x9C is the canonical zlib header; flipping FLG breaks the
+        // mod-31 check.
+        assert!(looks_like_zlib(&[0x78, 0x9C]));
+        assert!(!looks_like_zlib(&[0x78, 0x9D]));
+    }
+
+    /// The streaming decoder resolves the format from the first bytes, for both
+    /// formats and even when the 2-byte header is split across chunks.
+    #[test]
+    fn streaming_deflate_handles_both_formats() {
+        use flate2::write::{DeflateEncoder, ZlibEncoder};
+        use std::io::Write;
+
+        let original = b"streamed deflate payload that is long enough to matter";
+
+        let mut z = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(original).unwrap();
+        let zlib_bytes = z.finish().unwrap();
+
+        let mut d = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        d.write_all(original).unwrap();
+        let raw_bytes = d.finish().unwrap();
+
+        for compressed in [zlib_bytes, raw_bytes] {
+            // Feed one byte at a time so the header itself spans chunks — the
+            // decoder must hold back until the format is decidable.
+            let mut dec = StreamDecoder::new("deflate").unwrap();
+            let mut out = bytes::BytesMut::new();
+            for byte in &compressed {
+                out.extend_from_slice(&dec.decode_chunk(&[*byte]).unwrap());
+            }
+            out.extend_from_slice(&dec.finish().unwrap());
+            assert_eq!(out.as_ref(), original);
+        }
+    }
 
     #[test]
     fn decompress_deflate_roundtrip() {
@@ -1499,5 +1902,251 @@ mod tests {
         let dec = StreamDecoder::new("deflate").unwrap();
         let remaining = dec.finish().unwrap();
         assert!(remaining.is_empty());
+    }
+
+    // -- Multi-coding content-encoding (RFC 9110 §8.4) -------------------------
+
+    /// Build a header map with one `content-encoding` line per value, so tests
+    /// can cover both `"gzip, br"` on one line and `"gzip"` + `"br"` on two.
+    fn encodings(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(http::header::CONTENT_ENCODING, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn content_encoding_list_joins_split_header_lines() {
+        assert_eq!(
+            content_encoding_list(&encodings(&["gzip", "br"])),
+            "gzip,br"
+        );
+        assert_eq!(content_encoding_list(&encodings(&["gzip, br"])), "gzip, br");
+        assert_eq!(content_encoding_list(&HeaderMap::new()), "");
+    }
+
+    #[test]
+    fn parse_content_encoding_classifies_lists() {
+        assert!(matches!(
+            parse_content_encoding(""),
+            ContentEncodingPlan::Passthrough
+        ));
+        assert!(matches!(
+            parse_content_encoding("identity"),
+            ContentEncodingPlan::Passthrough
+        ));
+        assert!(matches!(
+            parse_content_encoding(" identity , identity "),
+            ContentEncodingPlan::Passthrough
+        ));
+        assert!(matches!(
+            parse_content_encoding("lz4"),
+            ContentEncodingPlan::UnknownSingle(token) if token == "lz4"
+        ));
+        assert!(matches!(
+            parse_content_encoding("gzip, lz4"),
+            ContentEncodingPlan::UnknownInList { unknown, list } if unknown == "lz4" && list == "gzip, lz4"
+        ));
+    }
+
+    #[test]
+    fn parse_content_encoding_orders_codings_for_decoding() {
+        // Codings are listed in the order applied, so they decode in reverse —
+        // and the tokens are case-insensitive.
+        let cases: &[(&str, &[ContentCoding])] = &[
+            ("GZip , Br", &[ContentCoding::Brotli, ContentCoding::Gzip]),
+            // `identity` contributes no layer; empty list elements are ignored.
+            ("identity, gzip", &[ContentCoding::Gzip]),
+            ("gzip,,br", &[ContentCoding::Brotli, ContentCoding::Gzip]),
+            (
+                "deflate, x-gzip, zstd",
+                &[
+                    ContentCoding::Zstd,
+                    ContentCoding::Gzip,
+                    ContentCoding::Deflate,
+                ],
+            ),
+        ];
+
+        for (list, expected) in cases {
+            match parse_content_encoding(list) {
+                ContentEncodingPlan::Decode(codings) => {
+                    assert_eq!(codings, expected.to_vec(), "list={list}");
+                }
+                _ => panic!("expected a decode plan for `{list}`"),
+            }
+        }
+    }
+
+    /// Regression: `content-encoding: gzip, br` was matched as a single opaque
+    /// token, so the caller silently received still-compressed bytes.
+    #[test]
+    fn decompress_body_decodes_multi_coding_in_reverse_order() {
+        let original = b"gzip was applied first, brotli second";
+        let compressed = compress_brotli(&compress_gzip(original));
+
+        let result = decompress_body(&encodings(&["gzip, br"]), Bytes::from(compressed.clone()))
+            .expect("gzip, br must decode");
+
+        assert_eq!(&result[..], &original[..]);
+        assert_ne!(
+            &result[..],
+            &compressed[..],
+            "must not hand back compressed bytes"
+        );
+    }
+
+    #[test]
+    fn decompress_body_decodes_three_codings() {
+        let original = b"deflate, then gzip, then brotli";
+        let compressed = compress_brotli(&compress_gzip(&compress_deflate(original)));
+
+        let result = decompress_body(&encodings(&["deflate, gzip, br"]), Bytes::from(compressed))
+            .expect("three codings must decode");
+
+        assert_eq!(&result[..], &original[..]);
+    }
+
+    /// A list-valued field may be split across header lines (RFC 9110 §5.3);
+    /// reading only the first line loses codings.
+    #[test]
+    fn decompress_body_joins_split_content_encoding_headers() {
+        let original = b"one list, two header lines";
+        let compressed = compress_brotli(&compress_gzip(original));
+
+        let result = decompress_body(&encodings(&["gzip", "br"]), Bytes::from(compressed))
+            .expect("split header lines must decode");
+
+        assert_eq!(&result[..], &original[..]);
+    }
+
+    #[test]
+    fn decompress_body_skips_identity_inside_a_list() {
+        let original = b"identity is not a layer";
+        let compressed = compress_gzip(original);
+
+        let result = decompress_body(&encodings(&["identity, gzip"]), Bytes::from(compressed))
+            .expect("identity must be a no-op layer");
+
+        assert_eq!(&result[..], &original[..]);
+    }
+
+    /// Peeling off only the codings we implement would return bytes that are
+    /// still compressed with no way for the caller to notice, so the whole
+    /// response is refused instead.
+    #[test]
+    fn decompress_body_rejects_unknown_coding_inside_a_list() {
+        let compressed = compress_gzip(b"never fully decodable");
+        let err = decompress_body(&encodings(&["gzip, lz4"]), Bytes::from(compressed)).unwrap_err();
+
+        assert!(matches!(err, crate::error::Error::Body(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("lz4"), "error should name the coding: {msg}");
+        assert!(
+            msg.contains("gzip, lz4"),
+            "error should quote the list: {msg}"
+        );
+    }
+
+    /// A *single* unrecognized coding keeps its long-standing pass-through
+    /// behavior — only partially-understood lists are an error.
+    #[test]
+    fn decompress_body_single_unknown_coding_still_passes_through() {
+        let body = Bytes::from_static(b"opaque payload");
+        let result = decompress_body(&encodings(&["lz4"]), body.clone()).unwrap();
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn decompress_body_multi_coding_empty_body_passes_through() {
+        let result = decompress_body(&encodings(&["gzip, lz4"]), Bytes::new()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // -- LayeredStreamDecoder -------------------------------------------------
+
+    /// Feed a layered decoder `chunk_size` bytes at a time and collect
+    /// everything it produces, finish included.
+    fn layered_decode_in_chunks(
+        codings: &[ContentCoding],
+        compressed: &[u8],
+        chunk_size: usize,
+    ) -> Vec<u8> {
+        let mut dec = LayeredStreamDecoder::new(codings).unwrap();
+        let mut out = Vec::new();
+        for piece in compressed.chunks(chunk_size) {
+            out.extend_from_slice(&dec.decode_chunk(piece).unwrap());
+        }
+        out.extend_from_slice(&dec.finish().unwrap());
+        out
+    }
+
+    #[test]
+    fn layered_stream_decoder_gzip_then_brotli_in_small_chunks() {
+        let original = "streamed through two codings ".repeat(40);
+        let compressed = compress_brotli(&compress_gzip(original.as_bytes()));
+
+        for chunk_size in [1, 3, 64, compressed.len()] {
+            let out = layered_decode_in_chunks(
+                &[ContentCoding::Brotli, ContentCoding::Gzip],
+                &compressed,
+                chunk_size,
+            );
+            assert_eq!(out, original.as_bytes(), "chunk_size={chunk_size}");
+        }
+    }
+
+    #[test]
+    fn layered_stream_decoder_three_codings_in_small_chunks() {
+        let original = "three codings streamed ".repeat(30);
+        let compressed = compress_brotli(&compress_gzip(&compress_deflate(original.as_bytes())));
+
+        let out = layered_decode_in_chunks(
+            &[
+                ContentCoding::Brotli,
+                ContentCoding::Gzip,
+                ContentCoding::Deflate,
+            ],
+            &compressed,
+            2,
+        );
+
+        assert_eq!(out, original.as_bytes());
+    }
+
+    #[test]
+    fn layered_stream_decoder_single_coding_still_works() {
+        let original = "a single coding is just the one-layer case ".repeat(20);
+        let cases = [
+            (ContentCoding::Gzip, compress_gzip(original.as_bytes())),
+            (ContentCoding::Brotli, compress_brotli(original.as_bytes())),
+            (
+                ContentCoding::Deflate,
+                compress_deflate(original.as_bytes()),
+            ),
+            (ContentCoding::Zstd, compress_zstd(original.as_bytes())),
+        ];
+
+        for (coding, compressed) in cases {
+            let out = layered_decode_in_chunks(&[coding], &compressed, 5);
+            assert_eq!(out, original.as_bytes(), "coding={}", coding.token());
+        }
+    }
+
+    #[test]
+    fn layered_stream_decoder_matches_the_buffered_path() {
+        let original = "both paths must agree ".repeat(50);
+        let compressed = compress_brotli(&compress_gzip(original.as_bytes()));
+
+        let streamed = layered_decode_in_chunks(
+            &[ContentCoding::Brotli, ContentCoding::Gzip],
+            &compressed,
+            7,
+        );
+        let buffered = decompress_body(&encodings(&["gzip, br"]), Bytes::from(compressed)).unwrap();
+
+        assert_eq!(streamed, buffered.to_vec());
+        assert_eq!(streamed, original.as_bytes());
     }
 }

@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-4c1.svg">
+  <img alt="Version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -34,15 +34,15 @@
 - **TLS ClientHello 控制** — 扩展顺序、GREASE、cipher suites、签名算法、key share、ECH、ALPS、证书压缩和握手行为。
 - **原生 HTTP/2 指纹** — SETTINGS 顺序、WINDOW_UPDATE、PRIORITY、伪头顺序、HPACK 行为和请求优先级。
 - **HTTP/3 与 QUIC** — 可选 H3 协议栈，支持 QUIC Transport Parameters、QPACK、PRIORITY_UPDATE、Alt-Svc、会话恢复和 SOCKS5 UDP。
-- **真实抓包驱动的预设** — Chrome 131、144–151，Firefox 133/147，Safari 18/26。
-- **浏览器式 Session** — 独立 Cookie、受物理连接上限约束的连接池、H2 stream 背压、重定向、重试、解压、流式响应、WebSocket、系统 DNS singleflight 与可选正向缓存，以及 HSTS 策略。
+- **真实抓包驱动的预设** — Chrome 131、144–152，Firefox 133/147，Safari 18/26。
+- **浏览器式 Session** — 独立 Cookie、可配置的物理连接上限、H2 stream 背压、重定向、重试、解压、流式响应、WebSocket、系统 DNS singleflight 与可选正向缓存，以及 HSTS 策略。
 - **代理编排** — HTTP CONNECT、SOCKS5、多跳代理链、解析地址回退、`ProxyPool` 和 `SessionPool`。
 - **稳定 C ABI** — `lkrequest-ffi` 将 Rust Client/Session/Request 模型暴露给其他语言。
 - **离线回归门禁** — 实际序列化的 TLS/H2/QUIC 指纹会与仓库内 golden fixture 对比。
 
 ## 项目状态
 
-- 当前工作区发布版本：**0.2.1**。
+- 当前工作区发布版本：**0.2.2**。
 - API 已可使用，但在 1.0 前仍可能演进。
 - 当前以**源码方式**集成；下面示例使用本地 checkout。
 - HTTP/3、合成指纹、遥测和公网测试均为显式 opt-in。
@@ -155,7 +155,7 @@ cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 
 | 浏览器家族 | 预设 |
 |---|---|
-| Chrome | `chrome_131`、`chrome_144`–`chrome_151` |
+| Chrome | `chrome_131`、`chrome_144`–`chrome_152` |
 | Firefox | `firefox_133`、`firefox_147` |
 | Safari | `safari_18`、`safari_26` |
 
@@ -163,23 +163,66 @@ cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 
 ```rust
 let client = lkrequest::Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_152())
     .build();
 ```
 
-Chrome 151 已通过 Windows 真实抓包验证。其 TCP TLS/H2 稳定字段与 Chrome 150 一致；多个公网 H3 站点的真实 QUIC 抓包使用经典 QUIC 签名算法列表并追加 `rsa_pkcs1_sha1`，不包含 TCP 中的三个 ML-DSA 项。
+Chrome 152 已在 Windows 上通过 Cloudflare 公网目标和 `example.com` 真实抓包验证。TCP TLS 会在 ML-DSA 条目（`0x0904`–`0x0906`）之前向 `signature_algorithms` 插入一个独立随机的 GREASE code point，并在保留 Chrome 151 其他稳定字段的同时新增顺序随机化的 Chromium `0xCA34` 信任锚标识集合；H2 未变化，QUIC 不再发送 `google_initial_rtt`（`0x3127`）。本次公网 QUIC 流程未完成到可独立重抓 H3 SETTINGS 的阶段，因此预设继续使用最近一次已验证的 Chrome H3 基线。
+
+校验 Chrome 152 时，需要比较原始有序 `signature_algorithms` 序列，或使用 peetprint 这类保留 GREASE 的指纹。JA3/JA3N 不包含该字段，JA4 又会剥离 GREASE，因此这些哈希无法发现 sigalgs 首槽缺失。回归 fixture 会原位归一化随机 GREASE 值，但仍严格要求它位于 index 0。
+
+## 浏览器网络状态策略
+
+浏览器预设不仅控制握手字节，也会建模网络行为。Chrome 预设会把 HTTP/2 DATA payload 限制为 `16375` 字节，使 9 字节帧头与 payload 能放入一次 16 KiB socket write。用户可以保留浏览器默认值、取消额外限制或显式覆盖：
+
+```rust
+use lkrequest::{Client, H2DataFramePolicy};
+
+let client = Client::builder()
+    .preset(lkrequest::preset::chrome_151())
+    .h2_data_frame_policy(H2DataFramePolicy::BrowserDefault)
+    .build();
+```
+
+TLS 1.3 PSK 会话恢复与 TLS 指纹分开控制。服务端必须先发送 `NewSessionTicket`，客户端策略再决定是否缓存 ticket，以及后续符合条件的连接是否携带 PSK：
+
+```rust
+use lkrequest::{
+    Client, NetworkPartitionContext, TlsSessionCachePartitionPolicy,
+    TlsSessionResumptionPolicy,
+};
+
+let client = Client::builder()
+    .preset(lkrequest::preset::chrome_151())
+    .tls_session_resumption_policy(TlsSessionResumptionPolicy::Enabled {
+        max_tickets_per_server: 2,
+    })
+    .tls_session_cache_partition_policy(TlsSessionCachePartitionPolicy::Chromium)
+    .build();
+
+let session = client
+    .session()
+    .network_partition_context(NetworkPartitionContext::new(
+        "https://top-level.example",
+        "https://third-party.example",
+    ))
+    .build();
+```
+
+网络分区并不等于所有 iframe 都禁止恢复：同一分区内对同一服务器的后续连接仍可恢复，但 ticket 不会跨不兼容的顶层浏览上下文复用。`TlsSessionResumptionPolicy::Disabled` 可强制完整握手；`H2DataFramePolicy::{PeerMaxFrameSize, FixedPayload, SocketWriteAligned}` 可用于显式研究覆盖。
 
 ## 能力矩阵
 
 | 能力 | 默认启用 | Feature / crate |
 |---|---:|---|
 | HTTP/1.1 | 是 | `lkrequest` |
-| 可控指纹的原生 HTTP/2 | 是 | `h2-native` |
+| 可控指纹 HTTP/2 | 是 | 内置（`lkh2`） |
 | HTTP/3 + QUIC | 否 | `quic-h3` |
-| 公网 E2E 辅助测试 | 否 | `network-e2e` |
 | 合成指纹 | 否 | `synthetic-fp` |
 | 运行指标遥测 | 否 | `telemetry` |
 | C ABI | 独立 crate | `lkrequest-ffi` |
+
+公网 E2E 测试仅用于测试，默认通过 `#[ignore]` 跳过；需要显式使用 `--include-ignored` 执行。
 
 合成模式会刻意生成不对应任何真实浏览器的指纹。它不是浏览器预设的替代品，也不应在需要 allowlist 身份的场景中使用。
 
@@ -213,7 +256,7 @@ let client = Client::builder()
     .build();
 ```
 
-缓存属于当前 resolver 实例，只保存成功且非空的地址列表，不缓存错误。TTL 或容量设为零会关闭已完成结果缓存，但仍保留并发查询合并。Resolver 配置方法互相替换，因此 `.dns()`、`.dns_resolver()` 和 `.system_dns_cache()` 中最后一次调用生效。需要自定义 DNS 服务器、DoH/DoT、HTTPS/SVCB 记录或 ECH 发现时，应继续使用 `DnsConfig` 或自定义 `DnsResolver`。
+缓存属于当前 resolver 实例，只保存成功且非空的地址列表，不缓存错误。TTL 或容量设为零会关闭已完成结果缓存，但仍保留并发查询合并。Resolver 配置方法互相替换，因此 `.dns()`、`.dns_resolver()` 和 `.system_dns_cache()` 中最后一次调用生效。需要自定义 DNS 服务器、DoT、HTTPS/SVCB 记录或 ECH 发现时，应继续使用 `DnsConfig` 或自定义 `DnsResolver`；DNS over HTTPS 还需要显式启用可选的 `doh` feature。
 
 常见选择：
 

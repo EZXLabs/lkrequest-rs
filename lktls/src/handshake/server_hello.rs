@@ -32,6 +32,14 @@ pub struct ServerHello {
     pub compression_method: u8,
     /// Parsed extensions.
     pub extensions: ServerHelloExtensions,
+    /// Every extension type present, in wire order.
+    ///
+    /// Kept verbatim (including types this parser does not otherwise care
+    /// about) so the caller can enforce RFC 8446 §4.2: a server MUST NOT send
+    /// an extension the client did not offer, and a client that receives one
+    /// MUST abort with `unsupported_extension`. The parser cannot make that
+    /// call itself — it does not know what was offered.
+    pub extension_types: Vec<u16>,
     /// Whether this is a HelloRetryRequest (detected from the special random).
     pub is_hello_retry_request: bool,
 }
@@ -137,7 +145,7 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
 
     // Extensions
     let mut extensions = ServerHelloExtensions::default();
-    let mut seen_hrr_extensions = Vec::new();
+    let mut extension_types: Vec<u16> = Vec::new();
     if pos + 2 <= data.len() {
         let ext_total = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
@@ -174,15 +182,22 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
             let ext_data = &data[pos..pos + ext_len];
             pos += ext_len;
 
-            if is_hello_retry_request {
-                if seen_hrr_extensions.contains(&ext_type) {
-                    return Err(TlsError::local_alert(
-                        AlertDescription::IllegalParameter,
-                        format!("duplicate HelloRetryRequest extension 0x{ext_type:04x}"),
-                    ));
-                }
-                seen_hrr_extensions.push(ext_type);
+            // RFC 8446 §4.2: "There MUST NOT be more than one extension of the
+            // same type in a given extension block."  This applies to every
+            // ServerHello, not just a HelloRetryRequest — a duplicate is how a
+            // parser and a peer end up disagreeing about which copy counted.
+            if extension_types.contains(&ext_type) {
+                let message = if is_hello_retry_request {
+                    format!("duplicate HelloRetryRequest extension 0x{ext_type:04x}")
+                } else {
+                    format!("duplicate ServerHello extension 0x{ext_type:04x}")
+                };
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    message,
+                ));
             }
+            extension_types.push(ext_type);
 
             match ext_type {
                 // supported_versions (0x002b)
@@ -300,8 +315,32 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
         cipher_suite,
         compression_method,
         extensions,
+        extension_types,
         is_hello_retry_request,
     })
+}
+
+/// Extension types RFC 8446 §4.1.3 permits in an ordinary (non-HRR) ServerHello.
+///
+/// The ServerHello carries only what is needed to establish the cryptographic
+/// context and pin the protocol version — everything else the server wants to
+/// say belongs in EncryptedExtensions, where it is encrypted. A
+/// HelloRetryRequest additionally allows `cookie` and the ECH
+/// accept-confirmation; [`parse_server_hello`] already gates those on the HRR
+/// path, so they are deliberately absent here.
+pub const SERVER_HELLO_PERMITTED_EXTENSIONS: [u16; 3] = [
+    0x002b, // supported_versions
+    0x0033, // key_share
+    0x0029, // pre_shared_key
+];
+
+/// Whether `ext_type` may appear in an ordinary (non-HRR) TLS 1.3 ServerHello.
+///
+/// This answers only "is this legal *here*" — it says nothing about whether the
+/// client offered it. RFC 8446 §4.2 requires both, and the second half needs the
+/// ClientHello, which this module does not have.
+pub fn server_hello_permits_extension(ext_type: u16) -> bool {
+    SERVER_HELLO_PERMITTED_EXTENSIONS.contains(&ext_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +609,77 @@ mod tests {
         ];
         let error = parse_server_hello(&build_test_hrr(&extensions)).unwrap_err();
         assert!(error.to_string().contains("exactly 8 bytes"));
+    }
+
+    /// Build a non-HRR ServerHello carrying a caller-supplied extension block.
+    fn build_test_server_hello_with_extensions(extensions: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x03, 0x03]);
+        data.extend_from_slice(&[0xAA; 32]);
+        data.push(0);
+        data.extend_from_slice(&0x1301u16.to_be_bytes());
+        data.push(0);
+        data.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        data.extend_from_slice(extensions);
+        data
+    }
+
+    #[test]
+    fn test_server_hello_rejects_duplicate_extension() {
+        // Two supported_versions extensions in an ordinary ServerHello.
+        let extensions = [
+            0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04,
+        ];
+        let error =
+            parse_server_hello(&build_test_server_hello_with_extensions(&extensions)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate ServerHello extension"),
+            "expected duplicate-extension rejection, got: {error}"
+        );
+        assert_eq!(
+            error.as_alert().map(|alert| alert.description),
+            Some(AlertDescription::IllegalParameter),
+        );
+    }
+
+    #[test]
+    fn test_server_hello_rejects_duplicate_key_share() {
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        for _ in 0..2 {
+            extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x02]);
+            extensions.extend_from_slice(&[0xAB, 0xCD]);
+        }
+        let error =
+            parse_server_hello(&build_test_server_hello_with_extensions(&extensions)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate ServerHello extension"),
+            "expected duplicate-extension rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_server_hello_records_extension_types_in_wire_order() {
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        // An extension the parser does not otherwise model must still be recorded.
+        extensions.extend_from_slice(&[0x00, 0x10, 0x00, 0x00]);
+        let sh = parse_server_hello(&build_test_server_hello_with_extensions(&extensions))
+            .expect("should parse");
+        assert_eq!(sh.extension_types, vec![0x002b, 0x0010]);
+    }
+
+    #[test]
+    fn test_server_hello_permits_only_cryptographic_context_extensions() {
+        for permitted in SERVER_HELLO_PERMITTED_EXTENSIONS {
+            assert!(server_hello_permits_extension(permitted));
+        }
+        // ALPN, cookie and ECH belong to EncryptedExtensions / HRR, not here.
+        assert!(!server_hello_permits_extension(0x0010));
+        assert!(!server_hello_permits_extension(0x002c));
+        assert!(!server_hello_permits_extension(0xFE0D));
     }
 
     #[test]

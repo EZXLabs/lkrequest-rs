@@ -272,6 +272,7 @@ fn synthetic_h3_ticket() -> lktls::session_store::SessionTicketData {
         ticket: vec![1, 2, 3, 4],
         resumption_psk: vec![0xAB; 32],
         tls_version: lktls::session_store::TicketTlsVersion::Tls13,
+        used_extended_master_secret: None,
         cipher_suite: 0x1301,
         lifetime_secs: 3600,
         age_add: 0,
@@ -280,7 +281,7 @@ fn synthetic_h3_ticket() -> lktls::session_store::SessionTicketData {
         hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
         aead_algorithm: lktls::crypto::aead::AeadAlgorithm::Aes128Gcm,
         master_secret: Vec::new(),
-        max_early_data_size: 16_384, // > 0 → early_data extension is added
+        max_early_data_size: 0xffff_ffff, // RFC 9001 §4.6.1: QUIC allows only this value
         peer_transport_parameters: Some(vec![0x01, 0x00]),
     }
 }
@@ -402,6 +403,14 @@ tls_gate! {
     chrome_146 => lktls::profile::presets::chrome_146(),
     chrome_147 => lktls::profile::presets::chrome_147(),
     chrome_148 => lktls::profile::presets::chrome_148(),
+    chrome_149 => lktls::profile::presets::chrome_149(),
+    chrome_150 => lktls::profile::presets::chrome_150(),
+    chrome_151 => lktls::profile::presets::chrome_151(),
+    chrome_152 => lktls::profile::presets::chrome_152(),
+    firefox_133 => lktls::profile::presets::firefox_133(),
+    firefox_147 => lktls::profile::presets::firefox_147(),
+    safari_18 => lktls::profile::presets::safari_18(),
+    safari_26 => lktls::profile::presets::safari_26(),
 }
 
 h2_gate! {
@@ -411,6 +420,14 @@ h2_gate! {
     chrome_146_h2 => "chrome_146" => lkh2::profile::chrome_146_h2(),
     chrome_147_h2 => "chrome_147" => lkh2::profile::chrome_147_h2(),
     chrome_148_h2 => "chrome_148" => lkh2::profile::chrome_148_h2(),
+    chrome_149_h2 => "chrome_149" => lkh2::profile::chrome_149_h2(),
+    chrome_150_h2 => "chrome_150" => lkh2::profile::chrome_150_h2(),
+    chrome_151_h2 => "chrome_151" => lkh2::profile::chrome_151_h2(),
+    chrome_152_h2 => "chrome_152" => lkh2::profile::chrome_152_h2(),
+    firefox_133_h2 => "firefox_133" => lkh2::profile::firefox_133_h2(),
+    firefox_147_h2 => "firefox_147" => lkh2::profile::firefox_147_h2(),
+    safari_18_h2 => "safari_18" => lkh2::profile::safari_18_h2(),
+    safari_26_h2 => "safari_26" => lkh2::profile::safari_26_h2(),
 }
 
 #[cfg(feature = "quic-h3")]
@@ -418,5 +435,6 @@ quic_gate! {
     chrome_146_quic => "chrome_146_quic" => lkh3::chrome_146_quic(),
     chrome_150_quic => "chrome_150_quic" => lkh3::chrome_150_quic(),
     chrome_151_quic => "chrome_151_quic" => lkh3::chrome_151_quic(),
+    chrome_152_quic => "chrome_152_quic" => lkh3::chrome_152_quic(),
     chrome_generic_quic => "chrome_generic_quic" => lkh3::chrome_quic(),
 }

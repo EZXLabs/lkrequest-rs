@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Implement this trait to provide custom DNS resolution behavior.
 /// The default implementation ([`SystemDns`]) delegates to the OS resolver.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DnsResolver: Send + Sync + 'static {
     /// Exposes the concrete resolver implementation name for diagnostics/tests.
@@ -68,28 +69,47 @@ pub trait DnsResolver: Send + Sync + 'static {
 
 /// Parsed data from a DNS HTTPS resource record (type 65, RFC 9460).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+// `default` keeps previously-serialized records (e.g. the JSON returned by an
+// FFI custom-resolver callback) deserializable as fields are added.
+#[serde(default)]
 pub struct HttpsRecord {
     /// ECHConfigList binary data (from the `ech` SvcParam).
     /// Ready to pass directly to `lktls::ech::config::parse_ech_config_list()`.
     pub ech_config_list: Option<Vec<u8>>,
     /// ALPN protocol identifiers (from the `alpn` SvcParam).
     pub alpn: Vec<String>,
+    /// The `no-default-alpn` SvcParam was present (RFC 9460 §7.1.1).
+    ///
+    /// When `true` the protocol implied by the URI scheme (`http/1.1` for
+    /// `https://`) is **not** usable at this endpoint — only the identifiers
+    /// listed in [`alpn`](Self::alpn) are. An RR carrying `no-default-alpn`
+    /// without an `alpn` is not self-consistent and is discarded while parsing,
+    /// so this flag is only ever `true` alongside a non-empty `alpn`.
+    pub no_default_alpn: bool,
     /// Target name (from the SVCB TargetName field), if not `.` (alias mode).
     pub target: Option<String>,
     /// Alternative port from the `port` SvcParam.
     pub port: Option<u16>,
     /// IPv4 hints from the `ipv4hint` SvcParam.
+    ///
+    /// **Parsed and exposed, but not used anywhere inside lkrequest.**
+    /// Connection setup always resolves [`target`](Self::target) (or the request
+    /// host) through the configured [`DnsResolver`] and never dials a hinted
+    /// address. RFC 9460 §7.3 treats the hints as a latency optimisation
+    /// rather than a requirement, so ignoring them is conforming; callers that
+    /// want hint-seeded dialing must apply them themselves.
     pub ipv4_hints: Vec<Ipv4Addr>,
     /// IPv6 hints from the `ipv6hint` SvcParam.
+    ///
+    /// **Parsed and exposed, but not used anywhere inside lkrequest** — see
+    /// [`ipv4_hints`](Self::ipv4_hints).
     pub ipv6_hints: Vec<Ipv6Addr>,
 }
 
 impl HttpsRecord {
     /// Returns `true` if the HTTPS RR advertises HTTP/3 support.
     pub fn supports_h3(&self) -> bool {
-        self.alpn
-            .iter()
-            .any(|proto| proto == "h3" || proto.starts_with("h3-"))
+        self.alpn.iter().any(|proto| proto == "h3")
     }
 }
 
@@ -108,7 +128,7 @@ impl HttpsRecord {
 /// use lkrequest::{Client, DnsConfig};
 ///
 /// let client = Client::builder()
-///     .dns(DnsConfig::CloudflareHttps)
+///     .dns(DnsConfig::System)
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -117,14 +137,17 @@ pub enum DnsConfig {
     System,
     /// Google Public DNS (8.8.8.8 / 8.8.4.4, UDP).
     Google,
+    #[cfg(feature = "doh")]
     /// Google Public DNS over HTTPS.
     GoogleHttps,
     /// Cloudflare DNS (1.1.1.1 / 1.0.0.1, UDP).
     Cloudflare,
+    #[cfg(feature = "doh")]
     /// Cloudflare DNS over HTTPS.
     CloudflareHttps,
     /// Quad9 DNS (9.9.9.9, UDP, DNSSEC-validating).
     Quad9,
+    #[cfg(feature = "doh")]
     /// Quad9 DNS over HTTPS.
     Quad9Https,
     /// Custom DNS server (plain UDP/TCP).
@@ -541,7 +564,7 @@ impl SystemDnsFlightGroup {
 
         let mut receiver = entry.result.clone();
         loop {
-            if let Some(result) = { receiver.borrow().clone() } {
+            if let Some(result) = receiver.borrow().clone() {
                 return result
                     .map(|addresses| addresses.as_ref().to_vec())
                     .map_err(|error| error.to_io_error());
@@ -613,13 +636,14 @@ use hickory_resolver::config::{
     NameServerConfig, ResolverConfig, ResolverOpts, CLOUDFLARE, GOOGLE, QUAD9,
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::proto::rr::rdata::svcb::SvcParamValue;
+use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
 use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::TokioResolver;
 
 /// Panic message used by the infallible constructors when resolver
 /// initialization fails. The fallible `try_*` variants surface the real error.
-const RESOLVER_INIT_PANIC_MSG: &str = "hickory resolver init failed (platform certificate store?)";
+const RESOLVER_INIT_PANIC_MSG: &str =
+    "hickory resolver init failed (is the required DNS transport feature enabled?)";
 
 /// DNS resolver backed by [`hickory-resolver`](https://docs.rs/hickory-resolver).
 ///
@@ -660,10 +684,13 @@ impl HickoryDns {
                 ResolverConfig::default()
             }
             DnsConfig::Google => ResolverConfig::udp_and_tcp(&GOOGLE),
+            #[cfg(feature = "doh")]
             DnsConfig::GoogleHttps => ResolverConfig::https(&GOOGLE),
             DnsConfig::Cloudflare => ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+            #[cfg(feature = "doh")]
             DnsConfig::CloudflareHttps => ResolverConfig::https(&CLOUDFLARE),
             DnsConfig::Quad9 => ResolverConfig::udp_and_tcp(&QUAD9),
+            #[cfg(feature = "doh")]
             DnsConfig::Quad9Https => ResolverConfig::https(&QUAD9),
             DnsConfig::Custom(addr) => {
                 let mut udp = ConnectionConfig::udp();
@@ -747,14 +774,33 @@ impl DnsResolver for HickoryDns {
     }
 
     async fn lookup_https(&self, host: &str) -> io::Result<Option<HttpsRecord>> {
+        let selected = follow_https_alias_chain(host, |name| self.lookup_https_rrset(name)).await?;
+        tracing::debug!(
+            host = %host,
+            has_record = selected.is_some(),
+            alpn = ?selected.as_ref().map(|record| &record.alpn),
+            target = ?selected.as_ref().and_then(|record| record.target.as_deref()),
+            port = ?selected.as_ref().and_then(|record| record.port),
+            "dns.https_lookup_complete"
+        );
+        Ok(selected)
+    }
+}
+
+impl HickoryDns {
+    /// Issue one HTTPS (type 65) query and interpret the RRSet it returns.
+    ///
+    /// This is a single step of the AliasMode chain that
+    /// [`follow_https_alias_chain`] drives.
+    async fn lookup_https_rrset(&self, host: String) -> io::Result<HttpsRrSet> {
         tracing::debug!(host = %host, resolver = "hickory", "dns.https_lookup_start");
-        let response = match self.resolver.lookup(host, RecordType::HTTPS).await {
+        let response = match self.resolver.lookup(&host, RecordType::HTTPS).await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::debug!(host = %host, error = %e, "dns.https_lookup_failed");
                 let e_dbg = format!("{e:?}");
                 if e_dbg.contains("NoRecordsFound") || e.to_string().contains("no record found") {
-                    return Ok(None);
+                    return Ok(HttpsRrSet::Empty);
                 }
                 return Err(io::Error::other(e.to_string()));
             }
@@ -768,40 +814,129 @@ impl DnsResolver for HickoryDns {
             };
 
             let svcb = &https.0;
-            let mut result = HttpsRecord::default();
+            let Some(mut result) = parse_https_svc_params(svcb.svc_priority, &svcb.svc_params)
+            else {
+                // RFC 9460 requires this RR to be ignored in its entirety.
+                tracing::debug!(
+                    host = %host,
+                    priority = svcb.svc_priority,
+                    "dns.https_record_ignored"
+                );
+                continue;
+            };
 
             let target = svcb.target_name.to_string();
             if let Some(target) = normalize_https_target(&target) {
                 result.target = Some(target);
             }
 
-            for (_, value) in svcb.svc_params.iter() {
-                apply_https_svc_param(&mut result, value);
-            }
-
             candidates.push((svcb.svc_priority, result));
         }
 
-        let selected = select_https_record(candidates);
-        tracing::debug!(
-            host = %host,
-            has_record = selected.is_some(),
-            alpn = ?selected.as_ref().map(|record| &record.alpn),
-            target = ?selected.as_ref().and_then(|record| record.target.as_deref()),
-            port = ?selected.as_ref().and_then(|record| record.port),
-            "dns.https_lookup_complete"
-        );
-        Ok(selected)
+        Ok(classify_https_rrset(candidates))
     }
 }
 
-fn apply_https_svc_param(result: &mut HttpsRecord, value: &SvcParamValue) {
+/// RFC 9460 §2.4.1: `SvcPriority == 0` puts the RR in AliasMode;
+/// anything else is ServiceMode.
+const ALIAS_MODE_PRIORITY: u16 = 0;
+
+/// Maximum number of AliasMode redirections followed during one HTTPS RR
+/// discovery.
+///
+/// RFC 9460 §3 requires clients to bound the alias chain; 8 is the
+/// customary limit. Exceeding it — or revisiting a name already queried —
+/// ends discovery with `Ok(None)`, because a broken alias chain is a discovery
+/// failure (no HTTPS RR found) rather than a request failure.
+const MAX_HTTPS_ALIAS_HOPS: usize = 8;
+
+/// The meaning of one HTTPS/SVCB RRSet, per RFC 9460 §2.4.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HttpsRrSet {
+    /// AliasMode: the HTTPS records for this owner name live at another name,
+    /// which must be queried in turn.
+    Alias(String),
+    /// ServiceMode: the single alternative endpoint selected from the set.
+    Service(HttpsRecord),
+    /// No usable HTTPS record (empty answer, or every RR had to be discarded).
+    Empty,
+}
+
+/// Resolve HTTPS records for `host`, following AliasMode redirections.
+///
+/// `query` performs one HTTPS query for one name. It is a parameter rather than
+/// a direct call so the chain logic can be exercised without a live resolver —
+/// the same seam [`SystemDnsFlightGroup::resolve_with`] uses.
+async fn follow_https_alias_chain<F, Fut>(host: &str, query: F) -> io::Result<Option<HttpsRecord>>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = io::Result<HttpsRrSet>>,
+{
+    let mut visited = vec![alias_chain_key(host)];
+    let mut name = host.to_string();
+    let mut hops = 0usize;
+    let mut followed_alias = false;
+
+    loop {
+        match query(name.clone()).await? {
+            HttpsRrSet::Service(record) => return Ok(Some(record)),
+            HttpsRrSet::Empty => {
+                if followed_alias {
+                    return Ok(Some(HttpsRecord {
+                        target: Some(name),
+                        ..HttpsRecord::default()
+                    }));
+                }
+                return Ok(None);
+            }
+            HttpsRrSet::Alias(target) => {
+                hops += 1;
+                if hops > MAX_HTTPS_ALIAS_HOPS {
+                    tracing::debug!(
+                        host = %host,
+                        limit = MAX_HTTPS_ALIAS_HOPS,
+                        "dns.https_alias_chain_too_long"
+                    );
+                    return Ok(None);
+                }
+
+                let key = alias_chain_key(&target);
+                if visited.contains(&key) {
+                    tracing::debug!(host = %host, target = %target, "dns.https_alias_chain_loop");
+                    return Ok(None);
+                }
+                visited.push(key);
+                name = target;
+                followed_alias = true;
+            }
+        }
+    }
+}
+
+/// Canonical form of a name for alias-loop detection: case- and
+/// trailing-dot-insensitive, matching DNS name comparison.
+fn alias_chain_key(name: &str) -> String {
+    normalize_https_target(name).unwrap_or_default()
+}
+
+/// Apply one SvcParam to `result`, reporting whether it was understood.
+///
+/// The return value is the single source of truth for the `mandatory`
+/// (RFC 9460 §8) support check in [`parse_https_svc_params`]: a key
+/// counts as supported only because this function acted on its value, so the
+/// "keys we support" set cannot drift from what is actually implemented. The
+/// match is deliberately exhaustive, so a new `SvcParamValue` variant fails to
+/// compile here instead of being silently reported as unsupported.
+fn apply_https_svc_param(result: &mut HttpsRecord, value: &SvcParamValue) -> bool {
     match value {
         SvcParamValue::EchConfigList(ech) => {
             result.ech_config_list = Some(ech.0.clone());
         }
         SvcParamValue::Alpn(alpn) => {
             result.alpn = alpn.0.iter().map(|s| s.to_string()).collect();
+        }
+        SvcParamValue::NoDefaultAlpn => {
+            result.no_default_alpn = true;
         }
         SvcParamValue::Port(port) => {
             result.port = Some(*port);
@@ -812,8 +947,62 @@ fn apply_https_svc_param(result: &mut HttpsRecord, value: &SvcParamValue) {
         SvcParamValue::Ipv6Hint(hints) => {
             result.ipv6_hints = hints.0.iter().copied().map(Into::into).collect();
         }
-        _ => {}
+        // `mandatory` carries no endpoint data of its own — it constrains the
+        // *other* params, and `parse_https_svc_params` enforces it. It still
+        // counts as understood, so that an RR naming `mandatory` in its own
+        // mandatory list (which RFC 9460 §8 permits) stays usable.
+        SvcParamValue::Mandatory(_) => {}
+        SvcParamValue::Unknown(_) => return false,
     }
+    true
+}
+
+/// Interpret the SvcParams of one HTTPS/SVCB RR.
+///
+/// Returns `None` when RFC 9460 requires the entire RR to be ignored:
+///
+/// * §8 — the `mandatory` list names a key this client does not
+///   understand, or names a key the RR does not itself contain (which makes the
+///   RR non-self-consistent); either way the RR must not be used.
+/// * §7.1 — `no-default-alpn` without a companion `alpn`, which is
+///   likewise not self-consistent.
+fn parse_https_svc_params(
+    svc_priority: u16,
+    params: &[(SvcParamKey, SvcParamValue)],
+) -> Option<HttpsRecord> {
+    let mut record = HttpsRecord::default();
+
+    if svc_priority == ALIAS_MODE_PRIORITY {
+        // RFC 9460 §2.4.2: in AliasMode the SvcParams are not used, and
+        // any that are present must be ignored. Only the TargetName matters.
+        return Some(record);
+    }
+
+    let mut understood: Vec<SvcParamKey> = Vec::with_capacity(params.len());
+    let mut mandatory: Option<&[SvcParamKey]> = None;
+
+    for (key, value) in params {
+        if let SvcParamValue::Mandatory(keys) = value {
+            mandatory = Some(keys.0.as_slice());
+        }
+        if apply_https_svc_param(&mut record, value) {
+            understood.push(*key);
+        }
+    }
+
+    if let Some(keys) = mandatory {
+        if let Some(unsupported) = keys.iter().copied().find(|key| !understood.contains(key)) {
+            tracing::debug!(key = ?unsupported, "dns.https_record_unsupported_mandatory_key");
+            return None;
+        }
+    }
+
+    if record.no_default_alpn && record.alpn.is_empty() {
+        tracing::debug!("dns.https_record_no_default_alpn_without_alpn");
+        return None;
+    }
+
+    Some(record)
 }
 
 fn normalize_https_target(target: &str) -> Option<String> {
@@ -825,51 +1014,59 @@ fn normalize_https_target(target: &str) -> Option<String> {
     }
 }
 
-fn select_https_record(mut candidates: Vec<(u16, HttpsRecord)>) -> Option<HttpsRecord> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    candidates.sort_by_key(|(priority, _)| *priority);
-    let best_priority = candidates[0].0;
-    let mut merged = HttpsRecord::default();
-
-    for (_, record) in candidates
-        .into_iter()
-        .take_while(|(priority, _)| *priority == best_priority)
+/// Decide what a complete HTTPS RRSet means.
+///
+/// **Mixed sets.** RFC 9460 §2.4.1 says that if an RRSet contains a
+/// record in AliasMode, the recipient must ignore any ServiceMode records in
+/// the set. This takes that literally: one AliasMode RR discards every
+/// ServiceMode RR beside it and the alias is followed instead. We do not fall
+/// back to the ServiceMode records, because such a zone is malformed and the
+/// alias is the authoritative statement about where the service lives.
+///
+/// If several AliasMode RRs are present (which §2.4.2 says should not
+/// happen) the first in DNS response order is followed, for the same
+/// determinism reason as [`select_https_record`].
+fn classify_https_rrset(candidates: Vec<(u16, HttpsRecord)>) -> HttpsRrSet {
+    if let Some((_, alias)) = candidates
+        .iter()
+        .find(|(priority, _)| *priority == ALIAS_MODE_PRIORITY)
     {
-        merge_https_record(&mut merged, record);
+        return match alias.target.as_deref() {
+            Some(target) => HttpsRrSet::Alias(target.to_string()),
+            // RFC 9460 §2.5.1: an AliasMode TargetName of "." says the
+            // service is not available. Stop the chain with no record.
+            None => HttpsRrSet::Empty,
+        };
     }
 
-    Some(merged)
+    match select_https_record(candidates) {
+        Some(record) => HttpsRrSet::Service(record),
+        None => HttpsRrSet::Empty,
+    }
 }
 
-fn merge_https_record(target: &mut HttpsRecord, candidate: HttpsRecord) {
-    if target.ech_config_list.is_none() {
-        target.ech_config_list = candidate.ech_config_list;
-    }
-    if target.target.is_none() {
-        target.target = candidate.target;
-    }
-    if target.port.is_none() {
-        target.port = candidate.port;
-    }
-
-    for alpn in candidate.alpn {
-        if !target.alpn.contains(&alpn) {
-            target.alpn.push(alpn);
-        }
-    }
-    for hint in candidate.ipv4_hints {
-        if !target.ipv4_hints.contains(&hint) {
-            target.ipv4_hints.push(hint);
-        }
-    }
-    for hint in candidate.ipv6_hints {
-        if !target.ipv6_hints.contains(&hint) {
-            target.ipv6_hints.push(hint);
-        }
-    }
+/// Pick the single ServiceMode endpoint to use out of an HTTPS RRSet.
+///
+/// RFC 9460 §2.4.2 makes the whole ServiceMode RR the unit of selection:
+/// each record describes one complete alternative endpoint. Fields from
+/// different records must therefore never be combined — pairing one record's
+/// `target` with another record's `port` invents an endpoint the zone owner
+/// never published, and can connect somewhere nobody advertised.
+///
+/// §2.4.1 also says clients should randomly shuffle records that share a
+/// priority, to spread load. We deliberately do **not** randomize: this crate
+/// values reproducible behaviour, so the same RRSet must always yield the same
+/// endpoint. The first record at the lowest priority, in DNS response order,
+/// wins (`min_by_key` returns the first of several equal minima).
+///
+/// AliasMode records are never endpoints and are skipped here;
+/// [`classify_https_rrset`] deals with them.
+fn select_https_record(candidates: Vec<(u16, HttpsRecord)>) -> Option<HttpsRecord> {
+    candidates
+        .into_iter()
+        .filter(|(priority, _)| *priority != ALIAS_MODE_PRIORITY)
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, record)| record)
 }
 
 // ---------------------------------------------------------------------------
@@ -879,7 +1076,10 @@ fn merge_https_record(target: &mut HttpsRecord, candidate: HttpsRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_resolver::proto::rr::rdata::{svcb::IpHint, A, AAAA};
+    use hickory_resolver::proto::rr::rdata::{
+        svcb::{Alpn, IpHint, Mandatory},
+        A, AAAA,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1296,6 +1496,7 @@ mod tests {
         assert!(resolver.resolver_impl_name().ends_with("HickoryDns"));
     }
 
+    #[cfg(feature = "doh")]
     #[test]
     fn try_from_config_initializes_doh_preset() {
         // The fallible path must succeed for a known-good DoH preset; this also
@@ -1313,21 +1514,25 @@ mod tests {
         let mut record = HttpsRecord {
             ech_config_list: None,
             alpn: Vec::new(),
+            no_default_alpn: false,
             target: None,
             port: None,
             ipv4_hints: Vec::new(),
             ipv6_hints: Vec::new(),
         };
 
-        apply_https_svc_param(&mut record, &SvcParamValue::Port(8443));
-        apply_https_svc_param(
+        assert!(apply_https_svc_param(
+            &mut record,
+            &SvcParamValue::Port(8443)
+        ));
+        assert!(apply_https_svc_param(
             &mut record,
             &SvcParamValue::Ipv4Hint(IpHint(vec![A::from(Ipv4Addr::new(192, 0, 2, 10))])),
-        );
-        apply_https_svc_param(
+        ));
+        assert!(apply_https_svc_param(
             &mut record,
             &SvcParamValue::Ipv6Hint(IpHint(vec![AAAA::from(Ipv6Addr::LOCALHOST)])),
-        );
+        ));
 
         assert_eq!(record.port, Some(8443));
         assert_eq!(record.ipv4_hints, vec![Ipv4Addr::new(192, 0, 2, 10)]);
@@ -1335,10 +1540,11 @@ mod tests {
     }
 
     #[test]
-    fn https_record_supports_h3_variants() {
+    fn https_record_supports_only_final_h3() {
         let record = HttpsRecord {
             ech_config_list: None,
             alpn: vec!["h2".into(), "h3-29".into(), "h3".into()],
+            no_default_alpn: false,
             target: None,
             port: Some(443),
             ipv4_hints: vec![],
@@ -1346,39 +1552,101 @@ mod tests {
         };
 
         assert!(record.supports_h3());
+
+        let draft_only = HttpsRecord {
+            alpn: vec!["h2".into(), "h3-29".into()],
+            ..record
+        };
+        assert!(!draft_only.supports_h3());
     }
 
     #[test]
-    fn select_https_record_merges_same_priority_records() {
-        let selected = select_https_record(vec![
-            (
-                1,
-                HttpsRecord {
-                    alpn: vec!["h2".into()],
-                    target: Some("svc.example".into()),
-                    ..HttpsRecord::default()
-                },
-            ),
-            (
-                1,
-                HttpsRecord {
-                    alpn: vec!["h3".into()],
-                    port: Some(8443),
-                    ipv4_hints: vec![Ipv4Addr::new(192, 0, 2, 1)],
-                    ..HttpsRecord::default()
-                },
-            ),
-        ])
-        .unwrap();
+    fn https_record_accepts_only_the_final_h3_alpn_token() {
+        for alpn in ["h3-29", "h3-32", "h3-draft", "h3-experimental"] {
+            let record = HttpsRecord {
+                alpn: vec![alpn.into()],
+                ..HttpsRecord::default()
+            };
+            assert!(
+                !record.supports_h3(),
+                "unsupported draft or unknown ALPN {alpn:?} must not trigger H3"
+            );
+        }
 
+        let final_h3 = HttpsRecord {
+            alpn: vec!["h2".into(), "h3".into()],
+            ..HttpsRecord::default()
+        };
+        assert!(final_h3.supports_h3());
+    }
+    /// RFC 9460 §2.4.2: the ServiceMode RR is the unit of selection.
+    /// Records that share a priority are separate alternative endpoints, so the
+    /// selected record must be exactly one of them — never a field-by-field
+    /// blend that pairs one record's target with another record's port.
+    #[test]
+    fn select_https_record_takes_one_whole_record_at_lowest_priority() {
+        let first = HttpsRecord {
+            alpn: vec!["h2".into()],
+            target: Some("svc.example".into()),
+            ..HttpsRecord::default()
+        };
+        let second = HttpsRecord {
+            alpn: vec!["h3".into()],
+            target: Some("other.example".into()),
+            port: Some(8443),
+            ipv4_hints: vec![Ipv4Addr::new(192, 0, 2, 1)],
+            ..HttpsRecord::default()
+        };
+
+        let selected = select_https_record(vec![(1, first.clone()), (1, second)]).unwrap();
+
+        // Whole-record selection: byte-for-byte the first candidate.
+        assert_eq!(selected, first);
+        // And specifically nothing leaked across from the sibling record.
         assert_eq!(selected.target.as_deref(), Some("svc.example"));
-        assert_eq!(selected.port, Some(8443));
-        assert_eq!(selected.alpn, vec!["h2", "h3"]);
-        assert_eq!(selected.ipv4_hints, vec![Ipv4Addr::new(192, 0, 2, 1)]);
+        assert_eq!(selected.alpn, vec!["h2"]);
+        assert_eq!(selected.port, None);
+        assert!(selected.ipv4_hints.is_empty());
     }
 
+    /// Selection is deterministic rather than shuffled (see the doc comment on
+    /// `select_https_record`): the same RRSet always yields the same endpoint.
     #[test]
-    fn select_https_record_preserves_alias_mode_target() {
+    fn select_https_record_is_deterministic_within_a_priority() {
+        let candidates = vec![
+            (
+                2,
+                HttpsRecord {
+                    target: Some("low-priority.example".into()),
+                    ..HttpsRecord::default()
+                },
+            ),
+            (
+                1,
+                HttpsRecord {
+                    target: Some("first.example".into()),
+                    ..HttpsRecord::default()
+                },
+            ),
+            (
+                1,
+                HttpsRecord {
+                    target: Some("second.example".into()),
+                    ..HttpsRecord::default()
+                },
+            ),
+        ];
+
+        for _ in 0..16 {
+            let selected = select_https_record(candidates.clone()).unwrap();
+            assert_eq!(selected.target.as_deref(), Some("first.example"));
+        }
+    }
+
+    /// An AliasMode RR names another owner to resolve; it is not an endpoint, so
+    /// it must never be returned as the selected ServiceMode record.
+    #[test]
+    fn select_https_record_never_returns_an_alias_mode_record() {
         let selected = select_https_record(vec![
             (
                 0,
@@ -1391,13 +1659,317 @@ mod tests {
                 1,
                 HttpsRecord {
                     alpn: vec!["h3".into()],
+                    target: Some("svc.example".into()),
                     ..HttpsRecord::default()
                 },
             ),
         ])
         .unwrap();
 
-        assert_eq!(selected.target.as_deref(), Some("alias.example"));
-        assert!(selected.alpn.is_empty());
+        assert_eq!(selected.target.as_deref(), Some("svc.example"));
+        assert_eq!(selected.alpn, vec!["h3"]);
+
+        let alias_only = select_https_record(vec![(
+            0,
+            HttpsRecord {
+                target: Some("alias.example".into()),
+                ..HttpsRecord::default()
+            },
+        )]);
+        assert_eq!(alias_only, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // AliasMode (RFC 9460 sections 2.4.2 / 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_https_rrset_reports_alias_mode() {
+        let outcome = classify_https_rrset(vec![(
+            0,
+            HttpsRecord {
+                target: Some("alias.example".into()),
+                ..HttpsRecord::default()
+            },
+        )]);
+
+        assert_eq!(outcome, HttpsRrSet::Alias("alias.example".into()));
+    }
+
+    /// §2.4.1: an RRSet containing an AliasMode record means the
+    /// ServiceMode records in that set must be ignored.
+    #[test]
+    fn classify_https_rrset_lets_alias_mode_discard_service_mode_siblings() {
+        let outcome = classify_https_rrset(vec![
+            (
+                1,
+                HttpsRecord {
+                    alpn: vec!["h3".into()],
+                    target: Some("svc.example".into()),
+                    ..HttpsRecord::default()
+                },
+            ),
+            (
+                0,
+                HttpsRecord {
+                    target: Some("alias.example".into()),
+                    ..HttpsRecord::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(outcome, HttpsRrSet::Alias("alias.example".into()));
+    }
+
+    /// §2.5.1: an AliasMode TargetName of "." means the service does not
+    /// exist, so discovery stops with nothing.
+    #[test]
+    fn classify_https_rrset_stops_on_alias_to_root() {
+        let outcome = classify_https_rrset(vec![(0, HttpsRecord::default())]);
+        assert_eq!(outcome, HttpsRrSet::Empty);
+    }
+
+    /// Build an in-memory HTTPS "zone" for the alias-chain tests, mirroring the
+    /// closure-driven fakes used by the `SystemDnsFlightGroup` tests above.
+    fn https_zone(entries: &[(&str, HttpsRrSet)]) -> HashMap<String, HttpsRrSet> {
+        entries
+            .iter()
+            .map(|(name, outcome)| ((*name).to_string(), outcome.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn https_alias_chain_is_followed_to_the_service_record() {
+        let service = HttpsRecord {
+            alpn: vec!["h3".into()],
+            target: Some("svc.test".into()),
+            ..HttpsRecord::default()
+        };
+        let zone = https_zone(&[
+            ("alias.test", HttpsRrSet::Alias("hop1.test".into())),
+            ("hop1.test", HttpsRrSet::Alias("hop2.test".into())),
+            ("hop2.test", HttpsRrSet::Service(service.clone())),
+        ]);
+        let queried: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let selected = follow_https_alias_chain("alias.test", |name| {
+            let zone = &zone;
+            let queried = &queried;
+            async move {
+                queried.lock().unwrap().push(name.clone());
+                Ok(zone.get(&name).cloned().unwrap_or(HttpsRrSet::Empty))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(selected, Some(service));
+        assert_eq!(
+            *queried.lock().unwrap(),
+            vec![
+                "alias.test".to_string(),
+                "hop1.test".to_string(),
+                "hop2.test".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn https_alias_chain_uses_final_target_when_rrset_is_empty() {
+        let queried: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let selected = follow_https_alias_chain("alias.test", |name| {
+            let queried = &queried;
+            async move {
+                queried.lock().unwrap().push(name.clone());
+                if name == "alias.test" {
+                    Ok(HttpsRrSet::Alias("final.test".into()))
+                } else {
+                    Ok(HttpsRrSet::Empty)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            selected.and_then(|record| record.target),
+            Some("final.test".into())
+        );
+        assert_eq!(
+            *queried.lock().unwrap(),
+            vec!["alias.test".to_string(), "final.test".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn https_alias_chain_stops_on_a_loop() {
+        let zone = https_zone(&[
+            ("loop-a.test", HttpsRrSet::Alias("loop-b.test".into())),
+            // Trailing dot + upper case: loop detection is DNS-name-comparison
+            // insensitive, so this still resolves to the already-visited name.
+            ("loop-b.test", HttpsRrSet::Alias("LOOP-A.test.".into())),
+        ]);
+        let queried: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let selected = follow_https_alias_chain("loop-a.test", |name| {
+            let zone = &zone;
+            let queried = &queried;
+            async move {
+                queried.lock().unwrap().push(name.clone());
+                Ok(zone.get(&name).cloned().unwrap_or(HttpsRrSet::Empty))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(selected, None);
+        assert_eq!(
+            *queried.lock().unwrap(),
+            vec!["loop-a.test".to_string(), "loop-b.test".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn https_alias_chain_is_bounded() {
+        // A non-looping chain that is longer than the hop limit.
+        let names: Vec<String> = (0..64).map(|i| format!("hop{i}.test")).collect();
+        let entries: Vec<(&str, HttpsRrSet)> = names
+            .windows(2)
+            .map(|pair| (pair[0].as_str(), HttpsRrSet::Alias(pair[1].clone())))
+            .collect();
+        let zone = https_zone(&entries);
+        let queried: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let selected = follow_https_alias_chain("hop0.test", |name| {
+            let zone = &zone;
+            let queried = &queried;
+            async move {
+                queried.lock().unwrap().push(name.clone());
+                Ok(zone.get(&name).cloned().unwrap_or(HttpsRrSet::Empty))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(selected, None);
+        // The initial query plus exactly MAX_HTTPS_ALIAS_HOPS redirections.
+        assert_eq!(queried.lock().unwrap().len(), MAX_HTTPS_ALIAS_HOPS + 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // mandatory / no-default-alpn (RFC 9460 sections 8 and 7.1)
+    // -----------------------------------------------------------------------
+
+    /// §8: an RR whose `mandatory` list names a key the client does not
+    /// understand must be ignored in its entirety.
+    #[test]
+    fn mandatory_unsupported_key_discards_the_record() {
+        let params = vec![
+            (
+                SvcParamKey::Mandatory,
+                SvcParamValue::Mandatory(Mandatory(vec![SvcParamKey::Key(65280)])),
+            ),
+            (
+                SvcParamKey::Key(65280),
+                SvcParamValue::Unknown(hickory_resolver::proto::rr::rdata::svcb::Unknown(vec![
+                    0x01,
+                ])),
+            ),
+            (
+                SvcParamKey::Alpn,
+                SvcParamValue::Alpn(Alpn(vec!["h3".to_string()])),
+            ),
+        ];
+
+        assert_eq!(parse_https_svc_params(1, &params), None);
+    }
+
+    /// §8: a `mandatory` list of keys we do implement leaves the record
+    /// usable.
+    #[test]
+    fn mandatory_supported_keys_keep_the_record() {
+        let params = vec![
+            (
+                SvcParamKey::Mandatory,
+                SvcParamValue::Mandatory(Mandatory(vec![SvcParamKey::Alpn, SvcParamKey::Port])),
+            ),
+            (
+                SvcParamKey::Alpn,
+                SvcParamValue::Alpn(Alpn(vec!["h3".to_string()])),
+            ),
+            (SvcParamKey::Port, SvcParamValue::Port(8443)),
+        ];
+
+        let record = parse_https_svc_params(1, &params).expect("record should be usable");
+        assert_eq!(record.alpn, vec!["h3"]);
+        assert_eq!(record.port, Some(8443));
+    }
+
+    /// §8: `mandatory` may only list keys that are present in the same
+    /// RR; one that is missing makes the RR non-self-consistent.
+    #[test]
+    fn mandatory_key_absent_from_the_record_discards_it() {
+        let params = vec![(
+            SvcParamKey::Mandatory,
+            SvcParamValue::Mandatory(Mandatory(vec![SvcParamKey::Port])),
+        )];
+
+        assert_eq!(parse_https_svc_params(1, &params), None);
+    }
+
+    /// §2.4.2: SvcParams present on an AliasMode RR are ignored, so a
+    /// `mandatory` list there cannot invalidate the alias.
+    #[test]
+    fn alias_mode_ignores_svc_params() {
+        let params = vec![
+            (
+                SvcParamKey::Mandatory,
+                SvcParamValue::Mandatory(Mandatory(vec![SvcParamKey::Key(65280)])),
+            ),
+            (
+                SvcParamKey::Alpn,
+                SvcParamValue::Alpn(Alpn(vec!["h3".to_string()])),
+            ),
+        ];
+
+        let record = parse_https_svc_params(0, &params).expect("alias RR stays usable");
+        assert_eq!(record, HttpsRecord::default());
+    }
+
+    /// §7.1.1: `no-default-alpn` must be surfaced, because it says the
+    /// scheme's implied protocol (`http/1.1`) is not served here.
+    #[test]
+    fn no_default_alpn_is_recorded() {
+        let params = vec![
+            (
+                SvcParamKey::Alpn,
+                SvcParamValue::Alpn(Alpn(vec!["h2".to_string(), "h3".to_string()])),
+            ),
+            (SvcParamKey::NoDefaultAlpn, SvcParamValue::NoDefaultAlpn),
+        ];
+
+        let record = parse_https_svc_params(1, &params).expect("record should be usable");
+        assert!(record.no_default_alpn);
+        assert_eq!(record.alpn, vec!["h2", "h3"]);
+
+        // Absent by default.
+        let plain = parse_https_svc_params(
+            1,
+            &[(
+                SvcParamKey::Alpn,
+                SvcParamValue::Alpn(Alpn(vec!["h2".to_string()])),
+            )],
+        )
+        .expect("record should be usable");
+        assert!(!plain.no_default_alpn);
+    }
+
+    /// §7.1: `no-default-alpn` without `alpn` is not self-consistent —
+    /// it would leave no usable protocol at all — so the RR is discarded.
+    #[test]
+    fn no_default_alpn_without_alpn_discards_the_record() {
+        let params = vec![(SvcParamKey::NoDefaultAlpn, SvcParamValue::NoDefaultAlpn)];
+        assert_eq!(parse_https_svc_params(1, &params), None);
     }
 }

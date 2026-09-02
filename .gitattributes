@@ -1,0 +1,28 @@
+# Line endings.
+#
+# This checkout runs with `core.autocrlf=true`, and the committed blobs were a
+# mix of CRLF and LF — `lkh2/src/adapter.rs` was mixed *within a single file*
+# (89 of 352 lines LF). `rustfmt` rewrites a whole file to LF the moment it
+# touches one line, so a three-line change would arrive as a thousand-line diff.
+# That cost real review time repeatedly, and more than once a genuine change was
+# nearly lost inside the churn.
+#
+# `text=auto` lets git keep detecting binary content on its own; `eol=lf` pins
+# both the committed blob and the working tree to LF, so `core.autocrlf` no
+# longer has anything to disagree with. Rust, cargo and rustfmt are all
+# indifferent to line endings on Windows.
+* text=auto eol=lf
+
+# Belt and braces: never let the rule above touch a format where a stray byte
+# would corrupt the file. `text=auto` should already detect these, but these are
+# exactly the files where being wrong is expensive.
+*.pcapng binary
+*.pcap   binary
+*.der    binary
+*.p12    binary
+*.pfx    binary
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.woff   binary
+*.woff2  binary

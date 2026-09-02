@@ -202,17 +202,43 @@ pub fn verify_certificate_chain(
         TlsError::CertificateError(format!("certificate chain verification failed: {e}"))
     })?;
 
-    // Verify hostname
-    let server_name = ServerName::try_from(hostname)
+    verify_hostname(&ee, hostname)
+}
+
+/// Check that the end-entity certificate's identity covers `hostname`.
+///
+/// Split out of [`verify_certificate_chain`] so the name-normalization rules can
+/// be exercised without standing up a full chain and trust anchor set.
+///
+/// An IPv6 host arrives in its RFC 3986 authority form (`"[::1]"` — what
+/// `url::Url::host_str()` yields). `ServerName::try_from` accepts a DNS name or
+/// a *bare* IP address and rejects the bracketed form, which failed every HTTPS
+/// request to an IPv6 literal with `invalid hostname` before the certificate was
+/// ever consulted. Normalizing first also means the address is matched against
+/// the certificate's `iPAddress` SAN, which is the correct identity for an IP
+/// host (RFC 6125 §6.4 / RFC 2818).
+fn verify_hostname(ee: &webpki::EndEntityCert<'_>, hostname: &str) -> Result<()> {
+    let bare_host = crate::handshake::strip_ipv6_brackets(hostname);
+    let server_name = ServerName::try_from(bare_host)
         .map_err(|_| TlsError::CertificateError(format!("invalid hostname: {hostname}")))?;
     ee.verify_is_valid_for_subject_name(&server_name)
         .map_err(|e| {
             TlsError::CertificateError(format!(
                 "hostname verification failed for '{hostname}': {e}"
             ))
-        })?;
+        })
+}
 
-    Ok(())
+/// Check a DER-encoded end-entity certificate against `hostname`.
+///
+/// Convenience wrapper over the same identity check
+/// [`verify_certificate_chain`] performs, without chain or expiry validation.
+pub fn verify_hostname_der(cert_der: &[u8], hostname: &str) -> Result<()> {
+    let cert = CertificateDer::from(cert_der);
+    let ee = webpki::EndEntityCert::try_from(&cert).map_err(|e| {
+        TlsError::CertificateError(format!("failed to parse end-entity certificate: {e}"))
+    })?;
+    verify_hostname(&ee, hostname)
 }
 
 /// Parse a DER-encoded X.509 certificate into a `TrustAnchor`.
@@ -503,6 +529,79 @@ pub fn verify_server_key_exchange_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // Hostname identity — IPv6 authority form
+    // ========================================================================
+
+    /// Build a self-signed certificate carrying the given SANs. `rcgen` turns an
+    /// entry that parses as an IP address into an `iPAddress` SAN and everything
+    /// else into a `dNSName` SAN.
+    fn self_signed_der(sans: &[&str]) -> Vec<u8> {
+        let sans: Vec<String> = sans.iter().map(|s| (*s).to_string()).collect();
+        rcgen::generate_simple_self_signed(sans)
+            .expect("rcgen self-signed")
+            .cert
+            .der()
+            .to_vec()
+    }
+
+    /// Regression: an IPv6 host reaches the TLS layer in its RFC 3986 authority
+    /// form (`"[::1]"`, straight from `url::Url::host_str()`).
+    /// `ServerName::try_from` rejects the bracketed form, so every HTTPS request
+    /// to an IPv6 literal failed with `invalid hostname` before the certificate
+    /// was even consulted.
+    #[test]
+    fn bracketed_ipv6_authority_matches_ip_san() {
+        let der = self_signed_der(&["::1"]);
+
+        assert!(
+            verify_hostname_der(&der, "[::1]").is_ok(),
+            "bracketed IPv6 authority form must match the iPAddress SAN"
+        );
+        assert!(
+            verify_hostname_der(&der, "::1").is_ok(),
+            "the bare IPv6 address must keep matching"
+        );
+    }
+
+    #[test]
+    fn bracketed_ipv6_still_rejects_a_different_address() {
+        let der = self_signed_der(&["::1"]);
+        assert!(
+            verify_hostname_der(&der, "[2001:db8::1]").is_err(),
+            "a certificate for ::1 must not satisfy 2001:db8::1"
+        );
+    }
+
+    /// Stripping brackets must not weaken DNS-name checking.
+    #[test]
+    fn dns_names_are_unaffected_by_bracket_normalization() {
+        let der = self_signed_der(&["example.com"]);
+
+        assert!(
+            verify_hostname_der(&der, "example.com").is_ok(),
+            "the exact DNS name must match"
+        );
+        assert!(
+            verify_hostname_der(&der, "other.example.com").is_err(),
+            "a different DNS name must not match"
+        );
+        // A bracketed non-address is not an address; it stays a (bogus) name.
+        assert!(
+            verify_hostname_der(&der, "[example.com]").is_err(),
+            "brackets around a DNS name must not be silently accepted"
+        );
+    }
+
+    #[test]
+    fn ipv4_literals_keep_matching_their_ip_san() {
+        let der = self_signed_der(&["127.0.0.1"]);
+        assert!(
+            verify_hostname_der(&der, "127.0.0.1").is_ok(),
+            "IPv4 literal must match its iPAddress SAN"
+        );
+    }
 
     // ========================================================================
     // parse_der_tl

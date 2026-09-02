@@ -15,7 +15,7 @@
 //! 5. Repeat 2–4.
 
 use crate::codec::{DecodeResult, H2Codec};
-use crate::conn_state::{ConnState, H2ErrorCode};
+use crate::conn_state::{ConnState, ConnectionError, H2ErrorCode};
 use crate::frame::*;
 use crate::policy::{FlowControlPolicy, HpackEncodePolicy, ImmediateFlowControl};
 use crate::profile::H2Profile;
@@ -80,6 +80,21 @@ impl ContinuationAssembler {
     /// the only valid next frame types are CONTINUATION on the same stream.
     pub fn is_active(&self) -> bool {
         self.active_stream.is_some()
+    }
+
+    /// The stream whose field block is currently being reassembled, if any.
+    pub fn active_stream(&self) -> Option<u32> {
+        self.active_stream
+    }
+
+    /// Discard every partially assembled field block.
+    ///
+    /// Used when the connection is torn down by a connection error: the
+    /// half-built header block can never be completed, and the buffered bytes
+    /// must not outlive the connection.
+    pub fn abort(&mut self) {
+        self.bufs.clear();
+        self.active_stream = None;
     }
 
     /// Push the header block from a HEADERS frame.
@@ -245,8 +260,18 @@ pub struct H2Engine {
     flow_control: Box<dyn FlowControlPolicy>,
     /// HPACK encoding policy (controls per-header encoding choices).
     hpack_policy: Option<Box<dyn HpackEncodePolicy>>,
+    /// Browser-specific DATA payload cap, further constrained by the peer's
+    /// advertised SETTINGS_MAX_FRAME_SIZE.
+    max_data_frame_payload: Option<usize>,
     /// Highest peer stream ID we have successfully processed.
     last_peer_stream_id: u32,
+    /// Highest stream ID *we* have opened. Stream IDs above this one are still
+    /// "idle" (RFC 9113 §5.1) and the peer must never send us frames on them.
+    highest_local_stream_id: u32,
+    /// Error code of a connection error *we* detected and answered with a
+    /// GOAWAY. Set once; the connection is terminated from that point on
+    /// (RFC 9113 §5.4.1).
+    local_goaway: Option<H2ErrorCode>,
     /// Connection-level initial receive window (65535 + window_update from profile).
     conn_initial_recv_window: u32,
     /// Reusable buffer for events (cleared each `process()` call).
@@ -266,6 +291,27 @@ struct PendingBodyData {
     end_stream: bool,
 }
 
+/// Why a frame the peer sent for a stream cannot be accepted (RFC 9113 §5.1).
+///
+/// Receive side only: every variant describes something the *peer* did wrong,
+/// and each maps to the answer §5.1 prescribes. Shared by the HEADERS and DATA
+/// paths so both classify an unusable stream the same way.
+#[derive(Debug, Clone, Copy)]
+enum RecvStreamRefusal {
+    /// The stream exists but is no longer receiving — closed, or half-closed
+    /// (remote) after the peer's END_STREAM. Stream error: STREAM_CLOSED.
+    NotReceiving(crate::stream::StreamState),
+    /// A stream of ours that completed and was already reaped by
+    /// `cleanup_closed_streams`. Same answer as an explicitly closed stream
+    /// rather than a connection error.
+    Reaped,
+    /// A stream this client never opened: "idle" in §5.1 terms, so a frame on
+    /// it is a connection error of type PROTOCOL_ERROR. This client only ever
+    /// opens odd-numbered streams and never accepts push, so an even-numbered
+    /// stream always lands here too.
+    NeverOpened,
+}
+
 impl H2Engine {
     /// Create a client-side engine from an `H2Profile`.
     ///
@@ -275,7 +321,13 @@ impl H2Engine {
     ///
     /// Uses default policies. Use `client_with_policies` to customise.
     pub fn client(profile: &H2Profile) -> (Self, Vec<H2Frame>) {
-        Self::client_with_policies(profile, Box::new(ImmediateFlowControl), None)
+        let behavior = profile.behavior();
+        Self::client_with_policies(
+            profile,
+            Box::new(ImmediateFlowControl),
+            None,
+            behavior.write_policy.max_data_frame_payload(),
+        )
     }
 
     /// Create a client-side engine with custom flow-control and HPACK policies.
@@ -287,6 +339,7 @@ impl H2Engine {
         profile: &H2Profile,
         flow_control: Box<dyn FlowControlPolicy>,
         hpack_policy: Option<Box<dyn HpackEncodePolicy>>,
+        max_data_frame_payload: Option<usize>,
     ) -> (Self, Vec<H2Frame>) {
         let preface_frames = profile.to_preface_frames();
         let headers_priority = profile.to_headers_priority_spec();
@@ -333,7 +386,10 @@ impl H2Engine {
             last_client_stream_id: None,
             flow_control,
             hpack_policy,
+            max_data_frame_payload,
             last_peer_stream_id: 0,
+            highest_local_stream_id: 0,
+            local_goaway: None,
             conn_initial_recv_window: 65535u32.saturating_add(profile.window_update),
             event_buf: Vec::new(),
             outbound_buf: Vec::new(),
@@ -356,10 +412,20 @@ impl H2Engine {
         events.clear();
         outbound.clear();
 
+        // RFC 9113 §5.4.1: a connection error means sending GOAWAY *and*
+        // terminating the connection. Once we have done that, nothing further
+        // arriving on this connection is processed.
+        if self.local_goaway.is_some() {
+            return (events, outbound);
+        }
+
         loop {
             match self.codec.decode(input) {
                 DecodeResult::Frame(frame) => {
                     self.handle_frame(frame, &mut events, &mut outbound);
+                    if self.local_goaway.is_some() {
+                        break;
+                    }
                 }
                 DecodeResult::NeedMoreData { .. } => break,
                 DecodeResult::Error(e) => {
@@ -397,7 +463,9 @@ impl H2Engine {
 
     /// Allocate a new stream ID and return it.
     pub fn open_stream(&mut self) -> u32 {
-        self.state.open_stream()
+        let stream_id = self.state.open_stream();
+        self.highest_local_stream_id = self.highest_local_stream_id.max(stream_id);
+        stream_id
     }
 
     /// Encode a HEADERS frame for a request.
@@ -554,6 +622,10 @@ impl H2Engine {
     /// has actually been sent.
     pub fn build_data(&mut self, stream_id: u32, data: Bytes, end_stream: bool) -> Vec<H2Frame> {
         let max_frame_size = self.state.remote_settings().max_frame_size as usize;
+        let max_data_frame_payload = self
+            .max_data_frame_payload
+            .filter(|cap| *cap > 0)
+            .map_or(max_frame_size, |cap| cap.min(max_frame_size));
         let mut frames = Vec::new();
         let mut remaining = data;
 
@@ -580,7 +652,7 @@ impl H2Engine {
                 return frames;
             }
 
-            let chunk_size = remaining.len().min(max_frame_size).min(window);
+            let chunk_size = remaining.len().min(max_data_frame_payload).min(window);
             let chunk = remaining.slice(..chunk_size);
             remaining = remaining.slice(chunk_size..);
 
@@ -710,17 +782,52 @@ impl H2Engine {
         outbound.push(Self::make_settings_ack());
     }
 
-    fn emit_goaway(&self, error_code: H2ErrorCode, outbound: &mut Vec<H2Frame>) {
+    /// Queue a GOAWAY for a connection error *we* detected and mark the
+    /// connection terminated.
+    ///
+    /// RFC 9113 §5.4.1: "An endpoint that encounters a connection error ...
+    /// MUST first send a GOAWAY frame ... After sending the GOAWAY frame for an
+    /// error condition, the endpoint MUST close the TCP connection." Queuing the
+    /// frame is only half of that; the engine must also stop treating the
+    /// connection as usable, or the driver keeps dispatching queued requests
+    /// onto a connection we have already declared dead.
+    fn emit_goaway(&mut self, error_code: H2ErrorCode, outbound: &mut Vec<H2Frame>) {
         outbound.push(self.make_goaway(error_code));
+        if self.local_goaway.is_none() {
+            self.local_goaway = Some(error_code);
+        }
+        // A field block that was mid-reassembly can never be completed now.
+        self.continuation.abort();
     }
 
     fn emit_ping_ack(data: [u8; 8], outbound: &mut Vec<H2Frame>) {
         outbound.push(Self::make_ping_ack(data));
     }
 
-    /// Check if the connection has received a GOAWAY.
+    /// Whether the connection is draining and must not take new streams.
+    ///
+    /// True once *any* GOAWAY has been received. This deliberately does not key
+    /// off `has_error()`: a graceful shutdown — which Google and Cloudflare send
+    /// routinely for connection turnover — carries `NO_ERROR`, sets no error,
+    /// and would otherwise leave the driver opening streams the peer has
+    /// already promised to refuse (RFC 9113 §6.8).
+    ///
+    /// It is also true once *we* have sent a GOAWAY for a connection error we
+    /// detected (RFC 9113 §5.4.1) — see [`Self::local_connection_error`]. Both
+    /// conditions mean the same thing to a caller asking "may I still put a
+    /// request on this connection?", which is why they share one predicate.
     pub fn is_goaway(&self) -> bool {
-        self.state.has_error()
+        self.state.goaway_received() || self.local_goaway.is_some()
+    }
+
+    /// The error code of a connection error *this endpoint* detected and
+    /// answered with a GOAWAY, if any.
+    ///
+    /// Distinct from a GOAWAY we *received* ([`ConnState::goaway_received`]):
+    /// this one means we terminated the connection, so no further inbound
+    /// frames are processed by [`Self::process`].
+    pub fn local_connection_error(&self) -> Option<H2ErrorCode> {
+        self.local_goaway
     }
 
     /// Get the connection-level send window size.
@@ -736,6 +843,34 @@ impl H2Engine {
         events: &mut Vec<H2Event>,
         outbound: &mut Vec<H2Frame>,
     ) {
+        // RFC 9113 §4.3 / §6.10: a field block must arrive as a contiguous
+        // sequence of HEADERS + CONTINUATION frames "with no interleaved frames
+        // of any other type or from any other stream". While the assembler is
+        // mid-sequence the *only* acceptable frame is a CONTINUATION (the
+        // assembler itself rejects one on the wrong stream); anything else —
+        // including frame types we would otherwise ignore, such as PRIORITY or
+        // an extension frame — is a connection error of type PROTOCOL_ERROR.
+        if self.continuation.is_active() && !matches!(frame, H2Frame::Continuation(_)) {
+            let expected = self.continuation.active_stream().unwrap_or(0);
+            let described = match &frame {
+                H2Frame::Unknown(f) => format!("unknown frame type 0x{:02x}", f.frame_type),
+                other => other.frame_type().to_string(),
+            };
+            let stream_id = frame.stream_id();
+            tracing::warn!(
+                expected_stream = expected,
+                stream_id,
+                frame = %described,
+                "h2.frame_interleaved_with_continuation"
+            );
+            self.emit_goaway(H2ErrorCode::ProtocolError, outbound);
+            events.push(H2Event::Error(format!(
+                "{described} frame on stream {stream_id} interleaved with the \
+                 CONTINUATION sequence for stream {expected}"
+            )));
+            return;
+        }
+
         match frame {
             H2Frame::Settings(f) => self.handle_settings(f, events, outbound),
             H2Frame::Headers(f) => self.handle_headers(f, events, outbound),
@@ -771,7 +906,8 @@ impl H2Engine {
         let old_header_table_size = self.state.remote_settings().header_table_size;
 
         if let Err(e) = self.state.apply_remote_settings(&frame) {
-            self.emit_goaway(H2ErrorCode::ProtocolError, outbound);
+            let code = Self::settings_error_code(&frame, &e);
+            self.emit_goaway(code, outbound);
             events.push(H2Event::Error(e.to_string()));
             return;
         }
@@ -799,6 +935,37 @@ impl H2Engine {
             max_frame_size = self.state.remote_settings().max_frame_size,
             "h2.remote_settings_applied"
         );
+    }
+
+    /// Pick the connection error code for a rejected remote SETTINGS frame.
+    ///
+    /// RFC 9113 §6.5.2: "Values above the maximum flow-control window size of
+    /// 2^31-1 MUST be treated as a connection error of type
+    /// FLOW_CONTROL_ERROR" — not the PROTOCOL_ERROR that every other malformed
+    /// SETTINGS parameter earns (§6.5.3).
+    ///
+    /// `ConnectionError::FlowControlError` is already unambiguous: it comes
+    /// from applying the new initial window size to an existing stream and
+    /// overflowing it (§6.9.2), which is a FLOW_CONTROL_ERROR as well.
+    /// `ConnectionError::SettingsError`, on the other hand, flattens the
+    /// offending parameter into a message string, so the frame is re-inspected
+    /// here rather than parsing that text — the detection itself lives in
+    /// `conn_state::H2Settings::apply`.
+    fn settings_error_code(frame: &SettingsFrame, err: &ConnectionError) -> H2ErrorCode {
+        if matches!(err, ConnectionError::FlowControlError(_)) {
+            return H2ErrorCode::FlowControlError;
+        }
+
+        let window_too_large = frame.settings.iter().any(|param| {
+            SettingsId::from_u16(param.id) == Some(SettingsId::InitialWindowSize)
+                && param.value > 0x7FFF_FFFF
+        });
+
+        if window_too_large {
+            H2ErrorCode::FlowControlError
+        } else {
+            H2ErrorCode::ProtocolError
+        }
     }
 
     fn handle_headers(
@@ -850,6 +1017,66 @@ impl H2Engine {
         }
     }
 
+    /// Decide whether a stream the peer sent a frame for can still receive it
+    /// (RFC 9113 §5.1).
+    ///
+    /// `Ok(())` means the stream is in the map and receiving — the normal case,
+    /// and the one trailers and body DATA land in. Otherwise the returned
+    /// [`RecvStreamRefusal`] says which §5.1 case applies; feed it to
+    /// [`Self::refuse_frame_for_stream`] to emit the prescribed answer.
+    ///
+    /// `highest_local_stream_id` is what distinguishes a stream of ours that
+    /// completed and was reaped (a stream error) from one that was never opened
+    /// (a connection error): only stream IDs we have actually handed out can be
+    /// the former.
+    fn classify_recv_stream(&self, stream_id: u32) -> Result<(), RecvStreamRefusal> {
+        match self.state.get_stream(stream_id).map(|s| s.state()) {
+            Some(state) if state.can_receive() => Ok(()),
+            Some(state) => Err(RecvStreamRefusal::NotReceiving(state)),
+            None if stream_id % 2 == 1 && stream_id <= self.highest_local_stream_id => {
+                Err(RecvStreamRefusal::Reaped)
+            }
+            None => Err(RecvStreamRefusal::NeverOpened),
+        }
+    }
+
+    /// Answer a frame that [`Self::classify_recv_stream`] refused, per the
+    /// error class RFC 9113 §5.1 assigns to it.
+    ///
+    /// `frame_kind` is the frame type name for diagnostics only ("HEADERS",
+    /// "DATA"); it does not change what goes on the wire.
+    fn refuse_frame_for_stream(
+        &mut self,
+        stream_id: u32,
+        frame_kind: &'static str,
+        refusal: RecvStreamRefusal,
+        events: &mut Vec<H2Event>,
+        outbound: &mut Vec<H2Frame>,
+    ) {
+        match refusal {
+            RecvStreamRefusal::NotReceiving(state) => {
+                tracing::warn!(
+                    stream_id,
+                    frame = frame_kind,
+                    state = %state,
+                    "h2.frame_on_stream_that_cannot_receive"
+                );
+                self.emit_rst_stream(stream_id, H2ErrorCode::StreamClosed.as_u32(), outbound);
+            }
+            RecvStreamRefusal::Reaped => {
+                tracing::warn!(stream_id, frame = frame_kind, "h2.frame_on_closed_stream");
+                self.emit_rst_stream(stream_id, H2ErrorCode::StreamClosed.as_u32(), outbound);
+            }
+            RecvStreamRefusal::NeverOpened => {
+                tracing::warn!(stream_id, frame = frame_kind, "h2.frame_on_idle_stream");
+                self.emit_goaway(H2ErrorCode::ProtocolError, outbound);
+                events.push(H2Event::Error(format!(
+                    "received {frame_kind} on stream {stream_id}, which this client never opened"
+                )));
+            }
+        }
+    }
+
     fn complete_headers(
         &mut self,
         stream_id: u32,
@@ -869,20 +1096,22 @@ impl H2Engine {
             }
         };
 
-        // For client-side, incoming HEADERS = response headers
-        let stream = match self.state.get_stream_mut(stream_id) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(stream_id, "h2.headers_for_unknown_stream");
-                events.push(H2Event::Error(format!(
-                    "received HEADERS for unknown stream {stream_id}"
-                )));
-                return;
-            }
-        };
+        // For client-side, incoming HEADERS = response headers.
+        //
+        // RFC 9113 §5.1. The header block was decoded first regardless of what
+        // follows: HPACK state is connection-wide, so skipping the decode would
+        // desynchronise the dynamic table. The stream state decides what we do
+        // with the result — see [`Self::classify_recv_stream`], which the DATA
+        // path shares so both frame types treat an unusable stream alike.
+        if let Err(refusal) = self.classify_recv_stream(stream_id) {
+            self.refuse_frame_for_stream(stream_id, "HEADERS", refusal, events, outbound);
+            return;
+        }
 
         if end_stream {
-            let _ = stream.recv_end_stream();
+            if let Some(stream) = self.state.get_stream_mut(stream_id) {
+                let _ = stream.recv_end_stream();
+            }
         }
 
         events.push(H2Event::ResponseHeaders {
@@ -910,22 +1139,49 @@ impl H2Engine {
             return;
         }
 
+        // Connection-level flow control is settled *before* any per-stream
+        // decision, because RFC 9113 §6.9.1 charges these bytes to the
+        // connection window the moment the peer sends them — whether or not we
+        // end up keeping the frame. Replenishing only on the paths where we
+        // accept the DATA would shrink the connection window a little on every
+        // refused frame until the connection stalls for every other stream on
+        // it. This is a move, not an addition: on the path where the frame is
+        // accepted nothing else is queued between here and where this used to
+        // run, so the frames a normal response produces are byte-identical and
+        // in the same order.
+        if flow_len > 0 {
+            if let Some(increment) = self.flow_control.on_data_received(
+                0,
+                flow_len,
+                self.state.recv_window(),
+                self.conn_initial_recv_window,
+            ) {
+                Self::emit_window_update(0, increment, outbound);
+                let _ = self.state.update_recv_window(increment);
+            }
+        }
+
+        // RFC 9113 §5.1: DATA is only acceptable on a stream that can still
+        // receive. A stream missing from the map is *not* a licence to deliver
+        // the payload anyway — it is either one of ours that already completed
+        // and was reaped (stream error) or one we never opened (connection
+        // error). Shared with the HEADERS path so both classify it identically.
+        if let Err(refusal) = self.classify_recv_stream(frame.stream_id) {
+            self.refuse_frame_for_stream(frame.stream_id, "DATA", refusal, events, outbound);
+            return;
+        }
+
         let stream_recv_window;
         let stream_initial_window;
-        if let Some(stream) = self.state.get_stream_mut(frame.stream_id) {
-            if !stream.state().can_receive() {
-                tracing::warn!(
-                    stream_id = frame.stream_id,
-                    state = %stream.state(),
-                    "h2.data_after_end_stream"
-                );
-                self.emit_rst_stream(
-                    frame.stream_id,
-                    H2ErrorCode::StreamClosed.as_u32(),
-                    outbound,
-                );
+        {
+            let Some(stream) = self.state.get_stream_mut(frame.stream_id) else {
+                // Unreachable: `classify_recv_stream` returns `Ok` only for a
+                // stream that is present in the map. Dropping the frame is the
+                // conservative answer if that ever stops holding — never the
+                // old fall-through that delivered `ResponseData` for a stream
+                // the engine knows nothing about.
                 return;
-            }
+            };
 
             if let Err(_e) = stream.consume_recv_window(flow_len) {
                 self.emit_rst_stream(
@@ -946,22 +1202,9 @@ impl H2Engine {
             if frame.end_stream {
                 let _ = stream.recv_end_stream();
             }
-        } else {
-            stream_recv_window = 0;
-            stream_initial_window = 65535;
         }
 
         if flow_len > 0 {
-            if let Some(increment) = self.flow_control.on_data_received(
-                0,
-                flow_len,
-                self.state.recv_window(),
-                self.conn_initial_recv_window,
-            ) {
-                Self::emit_window_update(0, increment, outbound);
-                let _ = self.state.update_recv_window(increment);
-            }
-
             if let Some(increment) = self.flow_control.on_data_received(
                 frame.stream_id,
                 flow_len,
@@ -1401,6 +1644,78 @@ mod tests {
         );
     }
 
+    /// Regression: a graceful GOAWAY carries NO_ERROR (0) and therefore sets no
+    /// connection `error`. `is_goaway()` used to report `has_error()`, so a
+    /// routine server-side connection turnover (Google, Cloudflare) left the
+    /// driver happily opening new streams the peer had already promised to
+    /// refuse — RFC 9113 §6.8.
+    #[test]
+    fn goaway_with_no_error_marks_connection_draining() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        assert!(!engine.is_goaway(), "fresh connection is not draining");
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::GoAway(GoAwayFrame {
+                last_stream_id: 5,
+                error_code: 0, // NO_ERROR — graceful shutdown
+                debug_data: Bytes::new(),
+            }),
+            &mut server_buf,
+        );
+        let _ = engine.process(&mut server_buf);
+
+        assert!(
+            engine.is_goaway(),
+            "GOAWAY(NO_ERROR) must put the connection in the draining state"
+        );
+    }
+
+    /// A GOAWAY carrying a real error code must also mark the connection
+    /// draining (this half already worked, and must keep working).
+    #[test]
+    fn goaway_with_error_code_marks_connection_draining() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::GoAway(GoAwayFrame {
+                last_stream_id: 1,
+                error_code: 0x1, // PROTOCOL_ERROR
+                debug_data: Bytes::new(),
+            }),
+            &mut server_buf,
+        );
+        let _ = engine.process(&mut server_buf);
+
+        assert!(engine.is_goaway());
+        assert!(engine.state.has_error(), "a non-zero code still sets error");
+    }
+
+    /// `last_stream_id` is retained so callers can tell which streams the peer
+    /// never processed (RFC 9113 §6.8) and may safely retry elsewhere.
+    #[test]
+    fn goaway_retains_last_stream_id() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        assert_eq!(engine.state.goaway_last_stream_id(), None);
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::GoAway(GoAwayFrame {
+                last_stream_id: 7,
+                error_code: 0,
+                debug_data: Bytes::new(),
+            }),
+            &mut server_buf,
+        );
+        let _ = engine.process(&mut server_buf);
+
+        assert_eq!(engine.state.goaway_last_stream_id(), Some(7));
+    }
+
     #[test]
     fn test_handle_ping() {
         let (mut engine, _) = H2Engine::client(&chrome_144_h2());
@@ -1541,7 +1856,7 @@ mod tests {
 
     #[test]
     fn test_build_data_splits_by_max_frame_size() {
-        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let (mut engine, _) = H2Engine::client(&firefox_147_h2());
         let sid = engine.open_stream();
 
         // Increase the send window so flow control doesn't block
@@ -1582,6 +1897,46 @@ mod tests {
         }
         assert_eq!(total, body_size);
         assert!(engine.pending_data.is_empty());
+    }
+
+    #[test]
+    fn chrome_data_frames_fit_one_16k_socket_write_after_large_server_setting() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Settings(SettingsFrame {
+                ack: false,
+                settings: vec![SettingsParameter {
+                    id: 0x05,
+                    value: 65_535,
+                }],
+            }),
+            &mut server_buf,
+        );
+        let _ = engine.process(&mut server_buf);
+
+        let sid = engine.open_stream();
+        engine.state.update_send_window(1_000_000).unwrap();
+        engine
+            .state
+            .get_stream_mut(sid)
+            .unwrap()
+            .update_send_window(1_000_000)
+            .unwrap();
+
+        let frames = engine.build_data(sid, Bytes::from(vec![0xCC; 65_535]), true);
+        let payload_lengths: Vec<usize> = frames
+            .iter()
+            .map(|frame| match frame {
+                H2Frame::Data(data) => data.data.len(),
+                _ => panic!("expected DATA frame"),
+            })
+            .collect();
+
+        assert_eq!(payload_lengths, vec![16_375, 16_375, 16_375, 16_375, 35]);
+        assert!(payload_lengths.iter().all(|length| length + 9 <= 16_384));
     }
 
     #[test]
@@ -2108,6 +2463,918 @@ mod tests {
         } else {
             panic!("expected Headers frame");
         }
+    }
+
+    /// A CONTINUATION for a different stream cannot complete the outstanding
+    /// field block and is a connection-level protocol error.
+    #[test]
+    fn continuation_on_a_different_stream_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let block = server_response_block(&mut encoder);
+        let split = block.len() / 2;
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::copy_from_slice(&block[..split]),
+                end_stream: false,
+                end_headers: false,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        codec.encode(
+            &H2Frame::Continuation(ContinuationFrame {
+                stream_id: sid + 2,
+                header_block: Bytes::copy_from_slice(&block[split..]),
+                end_headers: true,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "a CONTINUATION on another stream must be a connection error"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, H2Event::ResponseHeaders { .. })),
+            "the incomplete field block must not be delivered"
+        );
+    }
+    // ── RFC 9113 receive-side state machine ───────────────────────────
+    //
+    // All of these drive the engine from the *server's* side of the wire and
+    // assert on what the engine does with malformed input. None of them change
+    // anything the client emits during normal traffic.
+
+    /// The error code of the first GOAWAY the engine queued, if any.
+    fn goaway_error_code(outbound: &[H2Frame]) -> Option<u32> {
+        outbound.iter().find_map(|f| match f {
+            H2Frame::GoAway(g) => Some(g.error_code),
+            _ => None,
+        })
+    }
+
+    /// Error codes of every RST_STREAM queued for `stream_id`.
+    fn rst_stream_codes(outbound: &[H2Frame], stream_id: u32) -> Vec<u32> {
+        outbound
+            .iter()
+            .filter_map(|f| match f {
+                H2Frame::RstStream(r) if r.stream_id == stream_id => Some(r.error_code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn response_header_events(events: &[H2Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, H2Event::ResponseHeaders { .. }))
+            .count()
+    }
+
+    /// A response header block long enough to be worth splitting in half.
+    fn server_response_block(encoder: &mut crate::hpack::HeaderEncoder) -> Vec<u8> {
+        encoder.encode(vec![
+            (":status", "200"),
+            ("content-type", "text/plain"),
+            ("server", "test-origin"),
+        ])
+    }
+
+    /// H-05. RFC 9113 §4.3: a field block "MUST be transmitted as a contiguous
+    /// sequence of frames, with no interleaved frames of any other type or from
+    /// any other stream"; §6.10 makes the violation a connection error of type
+    /// PROTOCOL_ERROR. A DATA frame arriving mid-CONTINUATION must therefore be
+    /// refused, not processed as though no sequence were in progress.
+    #[test]
+    fn data_interleaved_with_continuation_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let block = server_response_block(&mut encoder);
+        let split = block.len() / 2;
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::copy_from_slice(&block[..split]),
+                end_stream: false,
+                end_headers: false, // CONTINUATION expected next
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        codec.encode(
+            &H2Frame::Data(DataFrame {
+                stream_id: sid,
+                data: Bytes::from_static(b"body before the headers finished"),
+                end_stream: false,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "DATA inside a CONTINUATION sequence must be a connection error"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, H2Event::ResponseData { .. })),
+            "the interleaved DATA frame must not be delivered to the caller"
+        );
+    }
+
+    /// H-05. Connection-level frames are no more welcome mid-sequence than
+    /// stream-level ones: a PING must not be answered while a field block is
+    /// still being reassembled.
+    #[test]
+    fn ping_interleaved_with_continuation_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let block = server_response_block(&mut encoder);
+        let split = block.len() / 2;
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::copy_from_slice(&block[..split]),
+                end_stream: false,
+                end_headers: false,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        codec.encode(
+            &H2Frame::Ping(PingFrame {
+                ack: false,
+                data: [9; 8],
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "PING inside a CONTINUATION sequence must be a connection error"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, H2Event::PingAck)),
+            "the interleaved PING must not be acknowledged"
+        );
+        assert!(
+            !outbound.iter().any(|f| matches!(f, H2Frame::Ping(_))),
+            "no PONG may be emitted for a PING that violated §6.10"
+        );
+    }
+
+    /// H-05 counter-case: a well-formed HEADERS + CONTINUATION run on one
+    /// stream must still reassemble and deliver the response.
+    #[test]
+    fn continuation_on_the_same_stream_still_completes_the_field_block() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let block = server_response_block(&mut encoder);
+        let split = block.len() / 2;
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::copy_from_slice(&block[..split]),
+                end_stream: false,
+                end_headers: false,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        codec.encode(
+            &H2Frame::Continuation(ContinuationFrame {
+                stream_id: sid,
+                header_block: Bytes::copy_from_slice(&block[split..]),
+                end_headers: true,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(goaway_error_code(&outbound), None, "no violation here");
+        let delivered = events.iter().any(|e| {
+            matches!(e, H2Event::ResponseHeaders { stream_id, headers, .. }
+                if *stream_id == sid && headers.iter().any(|(n, v)| n == ":status" && v == "200"))
+        });
+        assert!(
+            delivered,
+            "a split field block must still produce ResponseHeaders"
+        );
+    }
+
+    /// H-07. RFC 9113 §5.1: a stream this client never opened is "idle", and
+    /// receiving HEADERS on an idle stream is a connection error of type
+    /// PROTOCOL_ERROR. Reporting an event and carrying on is not enough.
+    #[test]
+    fn headers_on_a_stream_we_never_opened_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let opened = engine.open_stream();
+        assert_eq!(opened, 1, "client streams start at 1");
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let block = server_response_block(&mut encoder);
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: 5, // never opened — still idle
+                header_block: Bytes::from(block),
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "HEADERS on an idle stream must be answered with GOAWAY(PROTOCOL_ERROR)"
+        );
+        assert_eq!(
+            response_header_events(&events),
+            0,
+            "nothing may be delivered for a stream we never opened"
+        );
+    }
+
+    /// H-07. This client opens only odd-numbered streams and never accepts
+    /// push, so a HEADERS frame on an even-numbered stream is always a peer
+    /// violation — even when the ID is below the highest stream we opened.
+    #[test]
+    fn headers_on_an_even_numbered_stream_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        engine.open_stream(); // 1
+        engine.open_stream(); // 3
+        let highest = engine.open_stream(); // 5
+        assert_eq!(highest, 5, "three client streams: 1, 3, 5");
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let block = server_response_block(&mut encoder);
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: 2, // server-initiated: only possible via push
+                header_block: Bytes::from(block),
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "HEADERS on an even stream must be answered with GOAWAY(PROTOCOL_ERROR)"
+        );
+        assert_eq!(
+            response_header_events(&events),
+            0,
+            "a pushed response must never be surfaced"
+        );
+    }
+
+    /// H-07. Once the peer has ended its side of the stream, further HEADERS
+    /// are a stream error: RST_STREAM(STREAM_CLOSED), exactly what the DATA
+    /// path already answers with (§5.1).
+    #[test]
+    fn headers_after_the_peer_ended_the_stream_get_rst_stream() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        // One encoder for the whole test: the engine's HPACK decoder is
+        // connection-wide, so both blocks must come from the same table.
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let codec = H2Codec::new();
+
+        let mut first = BytesMut::new();
+        let block = server_response_block(&mut encoder);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(block),
+                end_stream: true, // peer is done → half-closed (remote)
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut first,
+        );
+        let (events, outbound) = engine.process(&mut first);
+        assert_eq!(response_header_events(&events), 1, "first response arrives");
+        assert!(
+            rst_stream_codes(&outbound, sid).is_empty(),
+            "the legitimate response must not be reset"
+        );
+
+        let mut second = BytesMut::new();
+        let trailing = encoder.encode(vec![(":status", "200")]);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(trailing),
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut second,
+        );
+        let (events, outbound) = engine.process(&mut second);
+
+        assert_eq!(
+            rst_stream_codes(&outbound, sid),
+            vec![H2ErrorCode::StreamClosed.as_u32()],
+            "HEADERS after END_STREAM must be answered with RST_STREAM(STREAM_CLOSED)"
+        );
+        assert_eq!(
+            response_header_events(&events),
+            0,
+            "no second response may be delivered on a stream that is done"
+        );
+    }
+
+    /// H-07 counter-case: trailers. A HEADERS frame that follows DATA which did
+    /// *not* carry END_STREAM is legitimate (RFC 9113 §8.1) and must still be
+    /// delivered — the stream is open, so it can still receive.
+    #[test]
+    fn trailers_after_data_are_still_accepted() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+
+        let block = server_response_block(&mut encoder);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(block),
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        codec.encode(
+            &H2Frame::Data(DataFrame {
+                stream_id: sid,
+                data: Bytes::from_static(b"chunked body"),
+                end_stream: false, // stream stays open for the trailers
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        let trailers = encoder.encode(vec![("x-checksum", "deadbeef")]);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(trailers),
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(goaway_error_code(&outbound), None, "trailers are legal");
+        assert!(
+            rst_stream_codes(&outbound, sid).is_empty(),
+            "trailers must not be reset"
+        );
+        let trailer_delivered = events.iter().any(|e| {
+            matches!(e, H2Event::ResponseHeaders { stream_id, headers, end_stream }
+                if *stream_id == sid
+                    && *end_stream
+                    && headers.iter().any(|(n, _)| n == "x-checksum"))
+        });
+        assert!(
+            trailer_delivered,
+            "the trailing field block must be delivered"
+        );
+    }
+
+    // ── N-04: DATA is held to the same stream-state standard as HEADERS ──
+    //
+    // RFC 9113 §5.1 does not care which frame type arrived: a stream we never
+    // opened is idle (connection error), and one of ours that is finished can
+    // only answer with RST_STREAM(STREAM_CLOSED). The connection-level flow
+    // control window is settled either way, because the peer charged those
+    // bytes to it the moment it sent them (§6.9.1).
+
+    /// Increments of every WINDOW_UPDATE queued for `stream_id`.
+    fn window_update_increments(outbound: &[H2Frame], stream_id: u32) -> Vec<u32> {
+        outbound
+            .iter()
+            .filter_map(|f| match f {
+                H2Frame::WindowUpdate(w) if w.stream_id == stream_id => Some(w.increment),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn response_data_events(events: &[H2Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, H2Event::ResponseData { .. }))
+            .count()
+    }
+
+    fn encoded_data(stream_id: u32, body: &'static [u8], end_stream: bool) -> BytesMut {
+        let codec = H2Codec::new();
+        let mut buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Data(DataFrame {
+                stream_id,
+                data: Bytes::from_static(body),
+                end_stream,
+                padding: None,
+            }),
+            &mut buf,
+        );
+        buf
+    }
+
+    /// Drive a complete request/response exchange on a fresh stream and leave
+    /// it closed *and reaped* — the state `cleanup_closed_streams` produces
+    /// once both sides have sent END_STREAM.
+    fn engine_with_a_reaped_stream() -> (H2Engine, u32) {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+        // Our request ends here → half-closed (local).
+        let _ = engine.build_headers(sid, &[(":method", "GET"), (":path", "/")], true, None);
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        let block = server_response_block(&mut encoder);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(block),
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        codec.encode(
+            &H2Frame::Data(DataFrame {
+                stream_id: sid,
+                data: Bytes::from_static(b"the whole body"),
+                end_stream: true, // peer ends too → closed → reaped
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        let (events, _) = engine.process(&mut server_buf);
+        assert_eq!(
+            response_data_events(&events),
+            1,
+            "the legitimate body must be delivered before the stream is reaped"
+        );
+        (engine, sid)
+    }
+
+    /// N-04. DATA on a stream this client never opened is a connection error of
+    /// type PROTOCOL_ERROR — the same answer the HEADERS path already gives.
+    /// The old code fell through with a zero stream window and delivered the
+    /// payload as if it belonged to a request we had made.
+    #[test]
+    fn data_on_a_stream_we_never_opened_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let opened = engine.open_stream();
+        assert_eq!(opened, 1, "client streams start at 1");
+
+        let mut server_buf = encoded_data(5, b"body for a stream we never opened", true);
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "DATA on an idle stream must be answered with GOAWAY(PROTOCOL_ERROR)"
+        );
+        assert_eq!(
+            response_data_events(&events),
+            0,
+            "nothing may be delivered for a stream we never opened"
+        );
+    }
+
+    /// N-04. This client opens only odd-numbered streams and never accepts
+    /// push, so DATA on an even-numbered stream is always a peer violation,
+    /// even below the highest stream we opened.
+    #[test]
+    fn data_on_an_even_numbered_stream_is_a_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        engine.open_stream(); // 1
+        engine.open_stream(); // 3
+        let highest = engine.open_stream(); // 5
+        assert_eq!(highest, 5, "three client streams: 1, 3, 5");
+
+        let mut server_buf = encoded_data(2, b"pushed body", true);
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "DATA on an even stream must be answered with GOAWAY(PROTOCOL_ERROR)"
+        );
+        assert_eq!(
+            response_data_events(&events),
+            0,
+            "a pushed body must never be surfaced"
+        );
+    }
+
+    /// N-04. DATA for a stream of ours that already completed and was reaped is
+    /// a *stream* error: RST_STREAM(STREAM_CLOSED), never a delivered body.
+    #[test]
+    fn data_on_a_reaped_stream_is_reset_not_delivered() {
+        let (mut engine, sid) = engine_with_a_reaped_stream();
+        assert!(
+            engine.state.get_stream(sid).is_none(),
+            "the finished stream must be gone from the map for this test to mean anything"
+        );
+
+        let mut server_buf = encoded_data(sid, b"body after the response finished", false);
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            rst_stream_codes(&outbound, sid),
+            vec![H2ErrorCode::StreamClosed.as_u32()],
+            "DATA on a reaped stream must be answered with RST_STREAM(STREAM_CLOSED)"
+        );
+        assert_eq!(
+            goaway_error_code(&outbound),
+            None,
+            "a reaped stream of ours is a stream error, not a connection error"
+        );
+        assert_eq!(
+            response_data_events(&events),
+            0,
+            "no body may be delivered for a stream that is already finished"
+        );
+    }
+
+    /// N-04, flow control. RFC 9113 §6.9.1: the peer charged these bytes to the
+    /// *connection* window when it sent them, so refusing the frame must not
+    /// leave that window short — otherwise every refused DATA frame shrinks the
+    /// connection a little until the other streams on it stall.
+    #[test]
+    fn refused_data_still_settles_the_connection_flow_control_window() {
+        let (mut engine, sid) = engine_with_a_reaped_stream();
+        let window_before = engine.state.recv_window();
+        let body: &'static [u8] = b"body after the response finished";
+
+        let mut server_buf = encoded_data(sid, body, false);
+        let (_events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            window_update_increments(&outbound, 0),
+            vec![body.len() as u32],
+            "the connection window must be replenished for DATA we refuse"
+        );
+        assert_eq!(
+            engine.state.recv_window(),
+            window_before,
+            "the connection receive window must end where it started"
+        );
+        assert!(
+            window_update_increments(&outbound, sid).is_empty(),
+            "no stream-level WINDOW_UPDATE may be sent for a stream we just reset"
+        );
+    }
+
+    /// N-04, flow control. Same rule on the path that was already refusing
+    /// DATA: a stream still in the map that can no longer receive (half-closed
+    /// (remote) after the peer's END_STREAM) answered with RST_STREAM and
+    /// returned *before* replenishing the connection window, so every such
+    /// frame permanently shrank the window shared by all other streams.
+    #[test]
+    fn refused_data_on_a_half_closed_stream_still_settles_the_connection_window() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        let block = server_response_block(&mut encoder);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(block),
+                end_stream: true, // peer is done → half-closed (remote)
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        let (events, _) = engine.process(&mut server_buf);
+        assert_eq!(
+            response_header_events(&events),
+            1,
+            "the response itself must arrive before the stray DATA"
+        );
+
+        let window_before = engine.state.recv_window();
+        let body: &'static [u8] = b"data the peer had no business sending";
+        let mut stray = encoded_data(sid, body, false);
+        let (_events, outbound) = engine.process(&mut stray);
+
+        assert_eq!(
+            rst_stream_codes(&outbound, sid),
+            vec![H2ErrorCode::StreamClosed.as_u32()],
+            "DATA after the peer's END_STREAM is still RST_STREAM(STREAM_CLOSED)"
+        );
+        assert_eq!(
+            window_update_increments(&outbound, 0),
+            vec![body.len() as u32],
+            "the connection window must be replenished for the refused DATA"
+        );
+        assert_eq!(
+            engine.state.recv_window(),
+            window_before,
+            "the connection receive window must end where it started"
+        );
+    }
+
+    /// N-04 counter-case. A body on a healthy stream is untouched: it is
+    /// delivered, and the two WINDOW_UPDATEs it produces are exactly the frames
+    /// — and the order — this client sent before the fix.
+    #[test]
+    fn well_formed_data_is_delivered_with_unchanged_window_updates() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        let sid = engine.open_stream();
+
+        let mut encoder = crate::hpack::HeaderEncoder::with_default_size();
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        let block = server_response_block(&mut encoder);
+        codec.encode(
+            &H2Frame::Headers(HeadersFrame {
+                stream_id: sid,
+                header_block: Bytes::from(block),
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        let body: &'static [u8] = b"a perfectly ordinary response body";
+        codec.encode(
+            &H2Frame::Data(DataFrame {
+                stream_id: sid,
+                data: Bytes::from_static(body),
+                end_stream: true,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            response_data_events(&events),
+            1,
+            "an ordinary body must still be delivered"
+        );
+        assert!(
+            rst_stream_codes(&outbound, sid).is_empty() && goaway_error_code(&outbound).is_none(),
+            "an ordinary response must not be refused: {outbound:?}"
+        );
+        let updates: Vec<(u32, u32)> = outbound
+            .iter()
+            .filter_map(|f| match f {
+                H2Frame::WindowUpdate(w) => Some((w.stream_id, w.increment)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            updates,
+            vec![(0, body.len() as u32), (sid, body.len() as u32)],
+            "the connection update still precedes the stream update, unchanged"
+        );
+    }
+
+    /// H-08. RFC 9113 §6.5.2: a SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1 is a
+    /// connection error of type FLOW_CONTROL_ERROR, not PROTOCOL_ERROR. The
+    /// code we put on the wire is what the peer uses to diagnose the failure.
+    #[test]
+    fn oversized_initial_window_size_is_a_flow_control_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Settings(SettingsFrame {
+                ack: false,
+                settings: vec![SettingsParameter {
+                    id: 0x04,           // SETTINGS_INITIAL_WINDOW_SIZE
+                    value: 0x8000_0000, // 2^31 — one above the maximum
+                }],
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::FlowControlError.as_u32()),
+            "§6.5.2 requires FLOW_CONTROL_ERROR for an oversized initial window"
+        );
+        assert!(
+            !outbound.iter().any(|f| matches!(f, H2Frame::Settings(_))),
+            "a rejected SETTINGS frame must not be ACKed"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, H2Event::Error(_))),
+            "the rejection must be reported to the driver"
+        );
+    }
+
+    /// H-08 counter-case: every other malformed SETTINGS parameter keeps the
+    /// PROTOCOL_ERROR code — the fix distinguishes the flow-control case, it
+    /// does not blanket-relabel settings failures.
+    #[test]
+    fn malformed_max_frame_size_setting_is_still_a_protocol_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Settings(SettingsFrame {
+                ack: false,
+                settings: vec![SettingsParameter {
+                    id: 0x05,  // SETTINGS_MAX_FRAME_SIZE
+                    value: 42, // below the 16384 floor
+                }],
+            }),
+            &mut server_buf,
+        );
+
+        let (_events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "an out-of-range MAX_FRAME_SIZE stays a PROTOCOL_ERROR (§6.5.3)"
+        );
+    }
+
+    /// H-09. RFC 9113 §5.4.1: a connection error means sending GOAWAY *and*
+    /// terminating the connection. Queuing the frame while leaving the engine
+    /// reporting a healthy connection lets the driver keep dispatching queued
+    /// requests onto a connection we just declared dead.
+    #[test]
+    fn a_local_connection_error_marks_the_connection_dead() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+        assert!(!engine.is_goaway(), "fresh connection is usable");
+
+        // A DATA frame header claiming 20000 bytes: larger than the 16384 we
+        // advertise as SETTINGS_MAX_FRAME_SIZE, so the codec rejects it.
+        let mut server_buf = BytesMut::new();
+        server_buf.extend_from_slice(&[0x00, 0x4E, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "an undecodable frame is a connection error"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, H2Event::Error(_))),
+            "the driver is told about the failure"
+        );
+        assert!(
+            engine.is_goaway(),
+            "after sending GOAWAY the connection must not take new streams"
+        );
+        assert_eq!(
+            engine.local_connection_error(),
+            Some(H2ErrorCode::ProtocolError),
+            "the terminating condition is recorded as locally generated"
+        );
+    }
+
+    /// H-09. Termination is not just a flag: nothing that arrives after the
+    /// GOAWAY — in the same buffer or a later one — may still be acted on.
+    #[test]
+    fn no_frames_are_processed_after_a_local_connection_error() {
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        // PUSH_PROMISE: we never enable push, so this is a connection error.
+        codec.encode(
+            &H2Frame::PushPromise(PushPromiseFrame {
+                stream_id: 1,
+                promised_stream_id: 2,
+                header_block: Bytes::new(),
+                end_headers: true,
+                padding: None,
+            }),
+            &mut server_buf,
+        );
+        // Queued behind it, in the same read: a PING we must not answer.
+        codec.encode(
+            &H2Frame::Ping(PingFrame {
+                ack: false,
+                data: [7; 8],
+            }),
+            &mut server_buf,
+        );
+
+        let (events, outbound) = engine.process(&mut server_buf);
+
+        assert_eq!(
+            goaway_error_code(&outbound),
+            Some(H2ErrorCode::ProtocolError.as_u32()),
+            "PUSH_PROMISE is a connection error for this client"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, H2Event::PingAck)),
+            "frames queued behind the connection error must not be processed"
+        );
+        assert!(
+            !outbound.iter().any(|f| matches!(f, H2Frame::Ping(_))),
+            "no PONG may go out on a terminated connection"
+        );
+
+        // A later read on the same dead connection is inert too.
+        let mut later = BytesMut::new();
+        codec.encode(
+            &H2Frame::Ping(PingFrame {
+                ack: false,
+                data: [8; 8],
+            }),
+            &mut later,
+        );
+        let (events, outbound) = engine.process(&mut later);
+        assert!(events.is_empty(), "a terminated connection emits no events");
+        assert!(
+            outbound.is_empty(),
+            "a terminated connection emits no frames"
+        );
     }
 
     #[test]

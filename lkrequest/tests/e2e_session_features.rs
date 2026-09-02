@@ -708,3 +708,313 @@ async fn test_custom_dns_resolver() {
 
     assert_eq!(resp.status().as_u16(), 200);
 }
+
+// =========================================================================
+// RFC 6265bis §4.1.3 — `__Secure-` / `__Host-` cookie name prefixes
+//
+// `Session::set_cookie_raw` takes verbatim `Set-Cookie` syntax, so it is the
+// origin-server path and must ignore prefixed cookies that violate the rule,
+// exactly as a browser would.  No server is needed: the jar is inspected
+// directly (Tier 0, no network).
+// =========================================================================
+
+fn prefix_session() -> Session {
+    mk_session(&chrome_144_client())
+}
+
+/// `__Host-` must be host-locked: a `Domain` attribute disqualifies it.
+#[test]
+fn host_prefixed_cookie_with_domain_attribute_is_rejected() {
+    let session = prefix_session();
+    session.set_cookie_raw(
+        "https://example.com/",
+        "__Host-sid=nope; Secure; Path=/; Domain=example.com",
+    );
+    assert!(
+        session
+            .get_cookie("https://example.com/", "__Host-sid")
+            .is_none(),
+        "__Host- cookie carrying Domain must not be stored: {:?}",
+        session.get_cookies("https://example.com/")
+    );
+}
+
+/// `__Host-` requires `Path=/` exactly.
+#[test]
+fn host_prefixed_cookie_with_non_root_path_is_rejected() {
+    let session = prefix_session();
+    session.set_cookie_raw(
+        "https://example.com/sub",
+        "__Host-sid=nope; Secure; Path=/sub",
+    );
+    assert!(
+        session
+            .get_cookie("https://example.com/sub", "__Host-sid")
+            .is_none(),
+        "__Host- cookie with Path=/sub must not be stored: {:?}",
+        session.get_cookies("https://example.com/sub")
+    );
+}
+
+/// A conforming `__Host-` cookie is stored and served normally.
+#[test]
+fn host_prefixed_cookie_in_correct_form_is_accepted() {
+    let session = prefix_session();
+    session.set_cookie_raw("https://example.com/", "__Host-sid=yes; Secure; Path=/");
+    assert_eq!(
+        session.get_cookie("https://example.com/", "__Host-sid"),
+        Some("yes".to_string()),
+        "conforming __Host- cookie must be stored"
+    );
+}
+
+/// `__Secure-` requires the `Secure` attribute.
+#[test]
+fn secure_prefixed_cookie_without_secure_attribute_is_rejected() {
+    let session = prefix_session();
+    session.set_cookie_raw("https://example.com/", "__Secure-sid=nope; Path=/");
+    assert!(
+        session
+            .get_cookie("https://example.com/", "__Secure-sid")
+            .is_none(),
+        "__Secure- cookie without the Secure attribute must not be stored: {:?}",
+        session.get_cookies("https://example.com/")
+    );
+}
+
+/// `__Secure-` also requires a secure channel, even when `Secure` is present.
+///
+/// The jar is probed over `https` on purpose: `get_cookies` already declines to
+/// *send* a `Secure` cookie to an `http` URL, so probing over `http` would look
+/// green even when the cookie was wrongly stored.
+#[test]
+fn secure_prefixed_cookie_over_plain_http_is_rejected() {
+    let session = prefix_session();
+    session.set_cookie_raw(
+        "http://example.com/",
+        "__Secure-viahttp=nope; Secure; Path=/",
+    );
+    assert!(
+        session
+            .get_cookie("https://example.com/", "__Secure-viahttp")
+            .is_none(),
+        "__Secure- cookie set over http:// must not be stored: {:?}",
+        session.get_cookies("https://example.com/")
+    );
+
+    // ...and the same header over https is fine, proving the channel is what
+    // made the difference.
+    session.set_cookie_raw(
+        "https://example.com/",
+        "__Secure-viahttps=yes; Secure; Path=/",
+    );
+    assert_eq!(
+        session.get_cookie("https://example.com/", "__Secure-viahttps"),
+        Some("yes".to_string()),
+        "the same cookie over https must be stored"
+    );
+}
+
+/// A `__Host-` cookie set over plain `http` must be ignored as well.  Probed
+/// over `https` for the same reason as above.
+#[test]
+fn host_prefixed_cookie_over_plain_http_is_rejected() {
+    let session = prefix_session();
+    session.set_cookie_raw("http://example.com/", "__Host-viahttp=nope; Secure; Path=/");
+    assert!(
+        session
+            .get_cookie("https://example.com/", "__Host-viahttp")
+            .is_none(),
+        "__Host- cookie set over http:// must not be stored: {:?}",
+        session.get_cookies("https://example.com/")
+    );
+}
+
+/// An ordinary cookie name keeps its pre-existing behaviour: attributes that
+/// would disqualify a prefixed cookie are irrelevant here.
+#[test]
+fn ordinary_cookie_name_is_unaffected_by_prefix_rules() {
+    let session = prefix_session();
+    session.set_cookie_raw(
+        "http://example.com/sub",
+        "sid=plain; Path=/sub; Domain=example.com",
+    );
+    assert_eq!(
+        session.get_cookie("http://example.com/sub", "sid"),
+        Some("plain".to_string()),
+        "unprefixed cookie must be unaffected"
+    );
+}
+
+/// Removal must never be blocked by the prefix rules: a stored `__Host-`
+/// cookie has to stay removable even though the synthesised expiry cookie
+/// carries no `Secure` attribute.
+#[test]
+fn prefixed_cookie_can_still_be_removed() {
+    let session = prefix_session();
+    session.set_cookie_raw("https://example.com/", "__Host-sid=yes; Secure; Path=/");
+    assert_eq!(
+        session.get_cookie("https://example.com/", "__Host-sid"),
+        Some("yes".to_string()),
+        "precondition: the cookie is stored"
+    );
+
+    session.remove_cookie("https://example.com/", "__Host-sid");
+    assert!(
+        session
+            .get_cookie("https://example.com/", "__Host-sid")
+            .is_none(),
+        "__Host- cookie must remain removable: {:?}",
+        session.get_cookies("https://example.com/")
+    );
+}
+
+/// The caller-facing programmatic APIs deliberately bypass the prefix rules
+/// (they seed jar state rather than consuming an origin-server header).
+#[test]
+fn programmatic_set_cookie_apis_bypass_prefix_rules() {
+    let session = prefix_session();
+    session.set_cookie("https://example.com/", "__Host-imported", "v");
+    assert_eq!(
+        session.get_cookie("https://example.com/", "__Host-imported"),
+        Some("v".to_string()),
+        "set_cookie must not apply the origin-server prefix rules"
+    );
+
+    session.set_cookie_with_attrs(
+        "https://example.com/",
+        "__Secure-imported",
+        "v",
+        Some("/"),
+        Some("example.com"),
+        false,
+        false,
+    );
+    assert_eq!(
+        session.get_cookie("https://example.com/", "__Secure-imported"),
+        Some("v".to_string()),
+        "set_cookie_with_attrs must not apply the origin-server prefix rules"
+    );
+}
+
+// =========================================================================
+// RFC 6265bis §5.6 (storage model, step 15) — a cookie whose `secure-only-flag`
+// is set must be ignored entirely unless it arrived over a secure channel.
+//
+// Unlike §4.1.3 this applies to *every* cookie name, not just the `__Secure-`
+// / `__Host-` prefixes, and `cookie_store` 0.22 does not implement it.
+//
+// Every jar probe below is made over `https` on purpose: `get_cookies` already
+// declines to *send* a `Secure` cookie to an `http` URL, so probing over
+// `http` would look green even when the cookie was wrongly stored.
+// =========================================================================
+
+/// An ordinary (unprefixed) cookie name carrying `Secure`, delivered over
+/// plain `http`, must not enter the jar.
+#[test]
+fn secure_cookie_over_plain_http_is_not_stored() {
+    let session = prefix_session();
+    session.set_cookie_raw("http://example.com/", "sid=hijacked; Secure; Path=/");
+    assert!(
+        session.get_cookie("https://example.com/", "sid").is_none(),
+        "a Secure cookie set over http:// must be ignored entirely: {:?}",
+        session.get_cookies("https://example.com/")
+    );
+}
+
+/// Counter-case: the same header over `https` is stored, proving it is the
+/// channel and not the `Secure` attribute that made the difference.
+#[test]
+fn secure_cookie_over_https_is_still_stored() {
+    let session = prefix_session();
+    session.set_cookie_raw("https://example.com/", "sid=kept; Secure; Path=/");
+    assert_eq!(
+        session.get_cookie("https://example.com/", "sid"),
+        Some("kept".to_string()),
+        "a Secure cookie over https must still be stored"
+    );
+}
+
+/// Counter-case: a cookie *without* `Secure` over plain `http` is untouched
+/// by the rule and must still be stored and served.
+#[test]
+fn non_secure_cookie_over_plain_http_is_still_stored() {
+    let session = prefix_session();
+    session.set_cookie_raw("http://example.com/", "sid=kept; Path=/; HttpOnly");
+    assert_eq!(
+        session.get_cookie("http://example.com/", "sid"),
+        Some("kept".to_string()),
+        "an ordinary non-Secure cookie over http must still be stored"
+    );
+}
+
+/// The response path (`pipeline::store_cookies`) is the one that matters in
+/// practice, so exercise it against a real cleartext origin: a server reached
+/// over `http://` cannot set a `Secure` cookie, but its ordinary cookies are
+/// stored as before.
+#[tokio::test]
+async fn secure_cookie_from_cleartext_response_is_not_stored() {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cleartext test server");
+    let addr = listener.local_addr().expect("local addr");
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    if let Ok((tcp, _)) = accepted {
+                        tokio::spawn(async move {
+                            let svc = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+                                Ok::<_, hyper::Error>(
+                                    hyper::Response::builder()
+                                        .status(200)
+                                        .header("set-cookie", "sid=hijacked; Path=/; Secure")
+                                        .header("set-cookie", "plain=kept; Path=/")
+                                        .body(Full::new(Bytes::from("ok")))
+                                        .expect("build response"),
+                                )
+                            });
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(TokioIo::new(tcp), svc)
+                                .await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let session = chrome_144_client().session().http1_only().build();
+    let resp = session
+        .get(&format!("http://{addr}/set"))
+        .send()
+        .await
+        .expect("cleartext GET");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Probe over https so `get_cookies` does not hide a wrongly-stored
+    // Secure cookie by simply declining to send it.
+    let secure_probe = format!("https://{addr}/");
+    assert!(
+        session.get_cookie(&secure_probe, "sid").is_none(),
+        "a cleartext origin must not be able to set a Secure cookie: {:?}",
+        session.get_cookies(&secure_probe)
+    );
+
+    // Counter-case: its ordinary cookie is unaffected.
+    assert_eq!(
+        session.get_cookie(&format!("http://{addr}/"), "plain"),
+        Some("kept".to_string()),
+        "a non-Secure cookie from the same response must still be stored"
+    );
+
+    drop(shutdown_tx);
+}

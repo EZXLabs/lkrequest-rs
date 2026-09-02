@@ -271,6 +271,25 @@ impl ConnState {
         self.error.is_some()
     }
 
+    /// Whether a GOAWAY has been received, regardless of its error code.
+    ///
+    /// A graceful shutdown carries `NO_ERROR` (0) and therefore sets no
+    /// `error`, but RFC 9113 §6.8 forbids opening new streams after *any*
+    /// GOAWAY — "the peer... MUST NOT open additional streams on the
+    /// connection". Callers deciding whether the connection may still take new
+    /// streams must consult this, not [`Self::has_error`].
+    pub fn goaway_received(&self) -> bool {
+        self.goaway_received
+    }
+
+    /// Last stream ID the peer reports as processed, from the received GOAWAY.
+    ///
+    /// Streams above this ID were *not* processed and may be safely retried on
+    /// a fresh connection (RFC 9113 §6.8).
+    pub fn goaway_last_stream_id(&self) -> Option<u32> {
+        self.goaway_last_stream_id
+    }
+
     pub fn error(&self) -> Option<H2ErrorCode> {
         self.error
     }

@@ -10,6 +10,418 @@ No unreleased changes yet.
 
 
 
+## lkrequest 0.2.2
+
+This patch release adds the Chrome 152 preset and hardens protocol correctness, browser-session behavior, and compatibility after **v0.2.1**.
+
+### Features
+
+- **Chrome 152 TLS / H2 / QUIC preset** — Captured from Chrome
+  152.0.7977.65 on Windows against public Cloudflare endpoints on August 28,
+  2026. TCP TLS prepends an independently randomized GREASE code point to
+  `signature_algorithms`, ahead of the ML-DSA algorithms, and adds
+  Chromium/BoringSSL's `0xca34` trust-anchor identifier vector with
+  per-ClientHello order randomization. H2 retains Chrome 151's SETTINGS,
+  connection window, pseudo-header order, and priority shape. QUIC retains the
+  Chrome 151 signature and transport baseline but removes the no-longer-sent
+  `google_initial_rtt` parameter (`0x3127`). The capture established the QUIC
+  ClientHello and client transport parameters but not a complete H3 SETTINGS
+  exchange, so H3 intentionally retains the latest verified Chrome baseline.
+
+### Fixes
+
+- **Chrome 152 signature-algorithm GREASE parity** — The initial preset omitted
+  the leading GREASE slot that real Chrome 152 sends before `0x0904`, `0x0905`,
+  and `0x0906`, causing `peetprint_hash` to diverge even though JA3/JA3N, JA4,
+  and the HTTP/2 Akamai fingerprint still matched. `lktls` now models a distinct
+  per-connection signature-algorithm GREASE seed rather than reusing the cipher
+  GREASE value, and `fpverify` tokenizes that random value in place so regression
+  goldens preserve the required list position.
+- **ECH rejection now aborts instead of returning an unprotected connection** —
+  when a server did not accept Encrypted ClientHello, `lktls` logged the fact and
+  carried on: it installed application traffic keys and handed the caller a
+  connection whose true server name had never been protected, so the request ECH
+  existed to hide went out in the clear. RFC 9849 §6.1.6 allows the outer
+  handshake only to authenticate the config's `public_name` and collect
+  `retry_configs`. Both the TCP and QUIC paths now abort there, before any
+  traffic keys or session-ticket context exist, and TCP sends an `ech_required`
+  alert (121, newly modelled) after its client Finished. Certificate
+  verification on the rejection path targets the `public_name` — the identity
+  the server actually presents — instead of failing against a name it never
+  claimed. GREASE ECH is unaffected: it is not an ECH offer, so a server
+  ignoring it rejects nothing.
+- **ECH rejection is retried once with the server's `retry_configs`** — ECH is
+  enabled automatically from DNS HTTPS records, so aborting alone would turn a
+  routine ECH key rotation into a hard failure for ordinary traffic. The session
+  now redials once using the configs the server supplied, as a browser does.
+  Retrying *without* ECH is deliberately not a fallback: it would leak the very
+  name ECH protects.
+
+- **Alternative services no longer supply the TLS identity** — an Alt-Svc entry
+  or HTTPS RR names *where* to send packets, but the endpoint must still prove it
+  may serve the origin (RFC 7838 §3.1, RFC 9460 §2.3). The advertised host was
+  used as the SNI and certificate name, so the alternative authenticated as
+  itself — and conforming deployments failed outright, since an HTTPS RR
+  `TargetName` is typically a CDN's internal name serving the origin's
+  certificate. The dial target still follows the advertisement.
+- **Status-code retries are gated on replay safety** — the error-retry path
+  checked `retry_is_replay_safe`, the status path checked nothing, so a `POST`
+  answered with `502` was sent twice. Since the server answered, the request
+  certainly arrived; a non-idempotent method is now replayed only on a status
+  that says it was *not applied* — `429` and `503`. `502`, `504` and the
+  Cloudflare `520`–`530` range are ambiguous about whether the origin already
+  processed the request and are returned to the caller instead. Safe methods and
+  an explicit `Idempotency::Idempotent` are unaffected; see
+  `Session::retry_policy` for how to restore the old behaviour per request.
+- **WebSocket handshake responses are validated** — only the `101` status was
+  checked; a wrong or missing `Sec-WebSocket-Accept` merely logged a warning.
+  RFC 6455 §4.1 requires failing the connection on that, on a missing or wrong
+  `Upgrade`/`Connection`, and on any extension or subprotocol the client did not
+  offer. All are enforced now. This also uncovered that `Sec-WebSocket-Accept`
+  was computed with a GUID that is not the one RFC 6455 §1.3 specifies, so the
+  token never matched a conforming server — invisible while the check only
+  warned, and while the local test server had independently invented a third
+  value. Both now use the specified GUID, pinned by the §1.3 test vector.
+- **TLS post-handshake message framing** — post-handshake messages follow the
+  same framing as the handshake itself (RFC 8446 §5.1): several may be coalesced
+  into one record and one may span several records. Each record was treated as
+  exactly one message, so a `KeyUpdate` sharing a record with a
+  `NewSessionTicket` was silently dropped — the read keys were never rotated and
+  every subsequent record failed to decrypt — and coalesced tickets past the
+  first were lost. Decrypted handshake bytes are now buffered and only complete
+  messages dispatched, mirroring the handshake-time reassembly.
+- **HTTP/2 GOAWAY with `NO_ERROR`** — a graceful shutdown (which Google and
+  Cloudflare send routinely for connection turnover) carries `NO_ERROR` and so
+  set no connection error, while the draining check keyed off "has error". The
+  driver kept opening streams the peer had already promised to refuse (RFC 9113
+  §6.8). Draining is now keyed off GOAWAY receipt itself, so queued requests
+  fail over to a fresh connection; the GOAWAY `last_stream_id` is exposed for
+  callers that need to tell processed from unprocessed streams.
+- **`304 Not Modified` no longer treated as a redirect** — every 3xx was
+  classified as a redirect, so a conditional request answered with `304` (and
+  likewise `300`/`305`/`306`) reached the `Location` lookup and failed with
+  `redirect response missing Location header`. Only `301`/`302`/`303`/`307`/`308`
+  are followed now; the rest are returned to the caller as-is (RFC 9110 §15.4).
+- **`Content-Encoding: deflate` accepts the zlib form** — RFC 9110 §8.4.1.2
+  defines `deflate` as the zlib format (RFC 1950), but only a bare RFC 1951
+  stream was decodable, so spec-conforming servers failed outright. Both the
+  one-shot and streaming paths now sniff the zlib header and select the matching
+  decoder; the streaming path holds back the first bytes until the format is
+  decidable.
+- **`multipart/form-data` no longer announces the library** — the boundary was
+  built as `----lkrequest{hex}`, so the crate name went out in the
+  `Content-Type` of every upload and a single server-side regex identified it,
+  whatever the TLS and HTTP/2 fingerprints said. It now matches what a real
+  Chrome 151 emits, captured rather than guessed
+  (`tests/b_layer_chrome_multipart.rs` drives a real browser at a local
+  plaintext server): `----WebKitFormBoundary` followed by exactly 16
+  alphanumerics. The random part is drawn by rejection sampling so the
+  character distribution is uniform — `byte % 62` would over-weight the first
+  eight letters, and a skewed distribution is itself a tell. **This changes the
+  bytes on the wire.**
+- **multipart field names and filenames are escaped the way Chrome escapes
+  them** — they were interpolated into `Content-Disposition` verbatim, so a
+  caller-supplied name containing CR or LF could terminate the header line
+  (RFC 5322 §2.2) and append part headers, start an extra part, or forge the
+  boundary. From the same capture: `"` becomes `%22`, CR and LF become `%0D`
+  and `%0A`, and everything else — backslash, `;`, non-ASCII — goes out
+  verbatim as UTF-8. One asymmetry no amount of reading the RFC would predict:
+  a *field name* has its newlines normalised to CRLF first, so a lone CR and a
+  lone LF both come out `%0D%0A`, while a *filename* is not normalised and a
+  lone LF stays `%0A`. `Content-Type` has no quoted form to escape into, so a
+  CR or LF there is rejected instead (Chrome discards the type entirely and
+  sends `application/octet-stream`; an error is easier to debug than a silent
+  substitution, and neither puts the bytes on the wire).
+- **A TLS 1.2 `HelloRequest` is refused with a fatal alert instead of being
+  ignored** — it was dropped silently, which no browser does, leaving a
+  behavioural probe for any server willing to send one. BoringSSL's client
+  default is `ssl_renegotiate_never`, which sends a **fatal**
+  `no_renegotiation` and aborts; Chrome reaches the same state after the
+  handshake unless the negotiated ALPN is in `renego_allowed_for_protos`, empty
+  by default and never containing h2 (RFC 9113 §9.2.1 forbids renegotiation
+  outright). Note the alert is fatal even though RFC 5246 §7.2.2 calls
+  `no_renegotiation` a warning — that deviation is BoringSSL's, and matching
+  the browser is the point. **Behaviour change:** such a connection now ends
+  with `ConnectionAborted` where it previously carried on.
+- **The handshake fails when the server picks something the client never
+  offered** — a TLS 1.2 `named_curve`, a `ServerKeyExchange` signature
+  algorithm, or a TLS 1.3 `CertificateVerify` scheme was only checked against
+  what the implementation supports, never against what the ClientHello
+  advertised. Completing a handshake on an unadvertised algorithm is a
+  contradiction the server can see. Duplicate-extension detection also ran only
+  on the HelloRetryRequest branch, and `rsa_pkcs1_*` is now rejected in
+  `CertificateVerify` per RFC 8446 §4.4.3.
+- **The peer's `record_size_limit` is honoured when sending (RFC 8449)** — the
+  extension was advertised but never applied; records were always sliced at
+  16384 bytes, so a peer that asked for smaller records got oversized ones.
+- **TLS record layer hardened and session-ticket trust bounded** — plaintext
+  handshake and alert records were still accepted after handshake keys were
+  installed; an unknown record `content_type` was silently skipped where
+  RFC 8446 §5.1 requires `unexpected_message`; TLS 1.2 resumption neither
+  recorded nor checked the Extended Master Secret state (RFC 7627); and ticket
+  lifetimes were unbounded, now capped at seven days. Post-handshake reader
+  arming also uses the `record_size_limit` we advertised.
+- **Unsolicited TLS 1.2 extensions are refused, and port-0 alternative services
+  dropped** — the TLS 1.2 parser had no "did we offer this?" check, unlike the
+  TLS 1.3 path. Separately, `h3=":0"` produced an alt-authority pointing at a
+  port RFC 6335 §6 reserves and nothing listens on.
+- **A connection that ends without `close_notify` is distinguishable from a
+  clean shutdown** — both produced an identical EOF, so on a body delimited by
+  connection close (RFC 9112 §6.3) a truncation was indistinguishable from a
+  complete response. `TlsStream::received_close_notify()` now reports which
+  happened, and `ClientBuilder::require_close_notify(true)` turns the ambiguous
+  case into `UnexpectedEof`. **Off by default** — many production servers just
+  drop the connection and browsers accept that. One part is unconditional: the
+  read loop stops at `close_notify` instead of polling on, because RFC 8446
+  §6.1 means anything arriving after it did not come from the peer, and those
+  bytes were being appended to the response body.
+- **HTTP/2 responses are validated rather than quietly repaired** — a
+  `content-length` that disagreed with the DATA actually delivered was accepted
+  (a response-length desync), headers that failed to parse were dropped, and a
+  missing or malformed `:status` became `500`. Connection-specific fields
+  (`Connection`, `Transfer-Encoding`, `Keep-Alive`, `Proxy-Connection`) are now
+  rejected per RFC 9113 §8.2.2, pseudo-header rules are enforced, DATA is held
+  to the same standard as HEADERS, and `101` is no longer treated as an interim
+  status (HTTP/2 does not use it).
+- **A malformed HTTP/2 response now resets the stream** — RFC 9113 §8.1.1 makes
+  it a stream error of type PROTOCOL_ERROR, but nothing was written to the
+  wire. Chromium's netlog runs `HTTP2_SESSION_RECV_INVALID_HEADER` →
+  `HTTP2_SESSION_SEND_RST_STREAM`, so silence was the divergence, not the
+  fidelity — and it let the server keep sending DATA on a stream already torn
+  down, with that stream's flow-control window never returned.
+- **The HTTP/2 connection state machine is tighter on peer protocol errors** —
+  frames could be interleaved into a CONTINUATION sequence, stream-state checks
+  on the HEADERS path were weaker than on DATA, every `SETTINGS` error mapped
+  to PROTOCOL_ERROR where an `INITIAL_WINDOW_SIZE` overflow must be
+  FLOW_CONTROL_ERROR, and a local connection error did not move the connection
+  to a terminal state. Fixing the DATA path also closed a pre-existing
+  connection-window leak: a frame arriving on a stream that could not receive
+  consumed connection window that was never replenished.
+- **DNS HTTPS/SVCB records are read as records, not merged field by field** —
+  fields from same-priority records were mixed together, producing endpoint
+  descriptions no server ever published; `AliasMode` was not followed;
+  `mandatory` (key 0) and `no-default-alpn` (key 2) were silently dropped, so a
+  client could connect with a protocol the endpoint had declared it does not
+  speak. Alias chains are followed with loop detection and a hop cap.
+- **Alternative services keep the bracketed IPv6 form and honour `persist`** —
+  brackets were stripped at parse time while `Url::host_str()` keeps them, so a
+  bare `2001:db8::1` reached the dialer and could not be used.
+- **HTTPS-RR discovery issues one query per request instead of two** — protocol
+  discovery and the TLS handshake's automatic ECH configuration each ran their
+  own lookup. Beyond the extra round trip, the two answers could disagree: a
+  rotated ECH key or a load-balanced resolver left the ECH config out of step
+  with the endpoint the H3 decision was made against.
+- **Draft HTTP/3 advertisements are ignored** — `select_h3` fell back to any
+  `h3-*` token including `h3-29`, while Chrome 140+ accepts only `h3`.
+- **QUIC early-data tickets, HTTP/3 SETTINGS and HTTP/3 ECH are validated** — a
+  QUIC ticket's `max_early_data_size` was accepted whenever non-zero, where
+  RFC 9001 §4.6.1 requires exactly `0xffffffff`; custom H3 profiles could emit
+  reserved settings identifiers; and the H3 path was missing two of the three
+  ECH configuration fallbacks the TCP path already had.
+- **Redirects rewrite the method only where the spec says to** — `301`, `302`
+  and `303` unconditionally became `GET`, so a `HEAD` request came back as a
+  `GET`, which Chrome does not do. `303` still rewrites everything except
+  `HEAD` (RFC 9110 §15.4.4).
+- **Multi-layer `Content-Encoding` is decoded** — only the outermost coding was
+  handled, so `gzip, br` was returned still compressed with a header claiming
+  otherwise. Codings are now applied in reverse order, in both the one-shot and
+  streaming paths.
+- **Cookie name prefixes are enforced, and `Secure` cookies from plain HTTP are
+  ignored** — `__Secure-` and `__Host-` carry security meaning only if the
+  requirements are checked (RFC 6265bis §5.6), and a `Secure` cookie received
+  over plain HTTP was stored regardless of its name.
+- **HSTS is learned only from a secure transport, and never for IP literals** —
+  a plaintext HTTP response could inject a `Strict-Transport-Security` policy
+  into a session using `DynamicHsts` (RFC 6797 §8.1).
+- **SOCKS5 sub-negotiation replies are validated, and any 2xx completes a
+  CONNECT tunnel** — the username/password reply's version byte was never
+  checked (RFC 1929), and only an exact `200` was accepted where RFC 9110
+  §9.3.6 makes every 2xx a success.
+- **Sessions are no longer capped at 64 physical connections by default** —
+  the implicit ceiling caused unrelated high-concurrency workloads to fail
+  with `session connection limit reached`. The default is now unbounded;
+  callers that need a hard budget can still set `max_connections_per_session`
+  or `SessionBuilder::max_connections` explicitly.
+- **Legacy feature names remain accepted** — `h2-native` is retained as a
+  compatibility alias even though `lkh2` is now the only HTTP/2 engine, and
+  `network-e2e` continues to gate public-network QUIC integration tests. This
+  prevents existing Cargo invocations from failing during a patch upgrade.
+- **WebSocket close codes and reasons are validated before they go on the
+  wire** — `1005`, `1006` and `1015` may never be sent (RFC 6455 §7.4.1), and
+  a reason longer than 123 bytes cannot fit a control frame.
+
+### 修复（中文）
+
+- **ECH 被拒绝后中止，而不是把外层连接交给应用** — 服务端未接受 Encrypted
+  ClientHello 时，`lktls` 只打一行日志就继续：安装应用流量密钥，把一条真实服务器
+  名从未被保护过的连接交给调用方，于是 ECH 本要隐藏的那个请求明文发了出去。
+  RFC 9849 §6.1.6 规定外层握手只能用于认证 config 的 `public_name` 和取回
+  `retry_configs`。现在 TCP 与 QUIC 两条路径都在那里中止 —— 早于任何流量密钥和
+  session-ticket 上下文的产生 —— TCP 还会在 client Finished 之后发出
+  `ech_required` alert（121，新建模）。拒绝路径上的证书验证改为针对
+  `public_name`（服务端实际出示的身份），而不是拿一个它从未声称的名字去验证。
+  GREASE ECH 不受影响：它不是 ECH offer，服务端忽略它并没有拒绝任何东西。
+- **ECH 被拒绝后用服务端给的 `retry_configs` 重试一次** — ECH 会由 DNS HTTPS
+  记录自动启用，所以只中止不重试会把一次例行的 ECH 密钥轮换变成普通流量的硬失败。
+  现在 Session 会用服务端提供的 config 重拨一次，与浏览器做法一致。**不**回退到
+  「不带 ECH 重试」：那会泄漏 ECH 正要保护的那个名字。
+- **TLS 后握手消息分帧** — 后握手消息与握手本身遵循同样的分帧规则（RFC 8446
+  §5.1）：多条可以合并进一个 record，一条也可以跨多个 record。此前每个 record 被
+  当作恰好一条消息，因此与 `NewSessionTicket` 合并在同一 record 的 `KeyUpdate`
+  会被静默丢弃 —— 读密钥永不轮换，之后所有 record 解密失败；合并发送的第二张
+  ticket 同样丢失。现在解密后的握手字节先进缓冲，只有完整消息才被分发，与握手期
+  的重组逻辑一致。
+- **HTTP/2 `NO_ERROR` GOAWAY** — 优雅关闭（Google、Cloudflare 常规的连接轮换）
+  携带 `NO_ERROR`，因此不置连接错误，而 draining 判断却读取「是否有错误」。
+  driver 会继续在对端已承诺拒绝的连接上开新流（RFC 9113 §6.8）。现在 draining
+  直接以「是否收到 GOAWAY」为准，排队请求会转到新连接；同时暴露 GOAWAY 的
+  `last_stream_id`，供调用方区分已处理与未处理的流。
+- **`304 Not Modified` 不再被当作重定向** — 此前所有 3xx 都被归类为重定向，条件
+  请求得到的 `304`（以及 `300`/`305`/`306`）会走到 `Location` 提取并以
+  `redirect response missing Location header` 失败。现在只跟随
+  `301`/`302`/`303`/`307`/`308`，其余原样返回调用方（RFC 9110 §15.4）。
+- **`Content-Encoding: deflate` 支持 zlib 形式** — RFC 9110 §8.4.1.2 定义的
+  `deflate` 是 zlib 格式（RFC 1950），但此前只能解裸 RFC 1951 流，符合规范的服务
+  端一律失败。一次性与流式路径现在都会嗅探 zlib 头并选择对应解码器；流式路径会先
+  暂存开头字节，直到能判定格式为止。
+- **备用服务不再提供 TLS 身份** — Alt-Svc 条目或 HTTPS RR 说的是「往哪里发包」，
+  但该端点仍须证明自己有权服务该 origin（RFC 7838 §3.1、RFC 9460 §2.3）。此前广告
+  出来的主机被同时用作 SNI 与证书校验名，于是备用端点是以「它自己」的身份通过认证
+  的；而且符合规范的部署会直接失败——HTTPS RR 的 `TargetName` 通常是 CDN 的内部
+  名，用的却是 origin 的证书。拨号目标仍然跟随广告。
+- **状态码重试也要过幂等闸门** — 错误重试路径检查 `retry_is_replay_safe`，状态码
+  路径却什么都不查，于是一个收到 `502` 的 `POST` 会被发第二次。既然服务端已经作
+  答，请求必然已被处理。
+- **WebSocket 握手响应会被校验** — 此前只看 `101` 状态码，`Upgrade`、`Connection`、
+  `Sec-WebSocket-Accept` 以及服务端回选的扩展与子协议一概不验。现在五项全部失败即
+  拒绝（RFC 6455 §4.1）：服务端若回选一个我们从未提供的扩展或子协议，连接不再建立。
+- **`multipart/form-data` 不再自报家门** — boundary 此前构造成
+  `----lkrequest{hex}`，等于每个上传请求的 `Content-Type` 里都写着库名，服务端一条
+  正则就能识别，TLS 与 HTTP/2 指纹做得再像也无济于事。现在与真实 Chrome 151 一致，
+  且是**实测所得而非推测**（`tests/b_layer_chrome_multipart.rs` 驱动真实浏览器打本地
+  明文服务器）：`----WebKitFormBoundary` 加恰好 16 位字母数字。随机部分用拒绝采样，
+  以保证字符分布均匀——`byte % 62` 会让前 8 个字母偏多，而分布倾斜本身就是破绽。
+  **本条改变线上字节。**
+- **multipart 字段名与文件名按 Chrome 的规则转义** — 此前原样插入
+  `Content-Disposition`，于是调用方给的名字里若含 CR 或 LF，就能终止该头行
+  （RFC 5322 §2.2）并追加 part 头、开出额外的 part、甚至伪造 boundary。据同一份实测：
+  `"` 编码为 `%22`，CR / LF 编码为 `%0D` / `%0A`，其余一切——反斜杠、`;`、非 ASCII
+  ——原样作为 UTF-8 送出。有一处光读 RFC 绝对推不出来的不对称：**字段名**会先把换行
+  归一化成 CRLF，所以单独的 CR 和单独的 LF 都变成 `%0D%0A`；而**文件名不归一化**，
+  单独的 LF 就是 `%0A`。`Content-Type` 不是带引号的参数，套不上这套编码，因此其中的
+  CR / LF 直接拒绝（Chrome 的做法是整个丢弃、改送 `application/octet-stream`；报错比
+  静默替换好排查，而两者都不会把异常字节送上线）。
+- **TLS 1.2 的 `HelloRequest` 以 fatal alert 拒绝，不再静默忽略** — 此前直接丢弃，
+  而没有任何浏览器会这么做，等于给任何愿意发一个 `HelloRequest` 的服务端留了个行为
+  探针。BoringSSL 客户端默认 `ssl_renegotiate_never`，该模式下发 **fatal** 的
+  `no_renegotiation` 并中止；Chrome 握手后也会落到同一状态，除非协商出的 ALPN 在
+  `renego_allowed_for_protos` 里——该表默认为空，且永远不可能含 h2（RFC 9113 §9.2.1
+  直接禁止重协商）。注意这个 alert 是 fatal，尽管 RFC 5246 §7.2.2 把
+  `no_renegotiation` 归为 warning——这处偏离是 BoringSSL 的，而我们要跟的是浏览器。
+  **行为变更：**此类连接现在以 `ConnectionAborted` 结束，此前会照常继续。
+- **服务端选了我们从未提供的算法时，握手会失败** — TLS 1.2 的 `named_curve`、
+  `ServerKeyExchange` 的签名算法、TLS 1.3 `CertificateVerify` 的签名方案，此前都只
+  对照「实现是否支持」，从不对照「ClientHello 是否广告过」。在未广告的算法上完成握
+  手，是服务端可见的矛盾。重复扩展检测此前也只在 HelloRetryRequest 分支运行；
+  `CertificateVerify` 现在按 RFC 8446 §4.4.3 拒绝 `rsa_pkcs1_*`。
+- **发送时遵守对端的 `record_size_limit`（RFC 8449）** — 该扩展只广告不执行，记录恒
+  按 16384 字节切分，于是要求更小记录的对端仍会收到超限记录。
+- **TLS 记录层收紧，会话票据的信任被限时** — 装了握手密钥之后仍接受明文的
+  handshake 与 alert 记录；未知的记录 `content_type` 被静默跳过，而 RFC 8446 §5.1
+  要求回 `unexpected_message`；TLS 1.2 恢复既不记录也不校验 Extended Master Secret
+  状态（RFC 7627）；票据生命期无上限，现在封顶七天。后握手阶段读取器的装配也改用我
+  方广告的 `record_size_limit`。
+- **拒绝未经请求的 TLS 1.2 扩展，丢弃端口为 0 的备用服务** — TLS 1.2 解析器缺少
+  「我们是否 offer 过」的检查，不像 TLS 1.3 那条路径。另外 `h3=":0"` 会产生一个指向
+  RFC 6335 §6 保留端口的备用权威，那里不可能有监听者。
+- **连接在没有 `close_notify` 的情况下结束，现在可与正常收尾区分** — 两者此前产生
+  完全相同的 EOF，于是对靠连接关闭定界的响应体（RFC 9112 §6.3），截断与完整响应无
+  法区分。`TlsStream::received_close_notify()` 现在报告实际发生的是哪一种，
+  `ClientBuilder::require_close_notify(true)` 可把有歧义的那种变成 `UnexpectedEof`。
+  **默认关闭**——大量生产服务端就是直接断连接，浏览器也接受。其中有一半是无条件的：
+  读循环收到 `close_notify` 即停止，不再继续轮询，因为按 RFC 8446 §6.1，其后到达的
+  任何字节都不可能来自对端，而那些字节此前会被追加进响应体。
+- **HTTP/2 响应改为校验，而不是悄悄修补** — `content-length` 与实际收到的 DATA 不
+  符会被接受（响应长度 desync）；解析失败的头被丢弃；缺失或非法的 `:status` 变成
+  `500`。现在按 RFC 9113 §8.2.2 拒绝 connection-specific 字段（`Connection`、
+  `Transfer-Encoding`、`Keep-Alive`、`Proxy-Connection`），强制伪头规则，DATA 与
+  HEADERS 同等对待，且 `101` 不再被当作 interim 状态（HTTP/2 不使用它）。
+- **畸形的 HTTP/2 响应现在会重置该流** — RFC 9113 §8.1.1 规定这是 PROTOCOL_ERROR
+  类型的**流**错误，但此前什么都不往线上写。Chromium 的 netlog 事件链是
+  `HTTP2_SESSION_RECV_INVALID_HEADER` → `HTTP2_SESSION_SEND_RST_STREAM`，所以沉默
+  才是偏离、不是保真；而且沉默会让服务端继续在一条已被拆掉的流上发 DATA，该流的流
+  控窗口永不归还。
+- **HTTP/2 连接状态机对协议错误更严格** — 帧可以插进 CONTINUATION 序列中间；
+  HEADERS 路径的流状态检查弱于 DATA 路径；所有 `SETTINGS` 错误一律映射成
+  PROTOCOL_ERROR，而 `INITIAL_WINDOW_SIZE` 溢出必须是 FLOW_CONTROL_ERROR；本地连接
+  错误后不进入终止态。修 DATA 路径时顺带堵上一个既有的连接级流控泄漏：到达一条无法
+  接收的流上的帧会消耗连接窗口，却从不补回。
+- **DNS HTTPS/SVCB 记录按「整条记录」读取，不再逐字段拼接** — 同优先级记录的字段被
+  混在一起，拼出没有任何服务端发布过的端点描述；`AliasMode` 不被跟随；`mandatory`
+  （key 0）与 `no-default-alpn`（key 2）被静默吞掉，于是可能用该端点明确声明不支持的
+  协议去连接。别名链现在会跟随，并带环路检测与跳数上限。
+- **备用服务保留 IPv6 的方括号形式，并解析 `persist`** — 解析时剥掉了方括号，而
+  `Url::host_str()` 保留，于是裸的 `2001:db8::1` 会进到拨号器且无法使用。
+- **HTTPS-RR 发现每请求只查一次，而非两次** — 协议发现与 TLS 握手的 ECH 自动配置各
+  查各的。除了多一次往返，两次答案还可能不一致：ECH 密钥轮换或解析器做了负载均衡，
+  都会让 ECH 配置与当初做出 H3 决策的那个端点对不上。
+- **忽略 draft 版 HTTP/3 广告** — `select_h3` 会回退到任意 `h3-*`（含 `h3-29`），而
+  Chrome 140+ 只认 `h3`。
+- **校验 QUIC early-data 票据、HTTP/3 SETTINGS 与 HTTP/3 ECH** — QUIC 票据的
+  `max_early_data_size` 只要非零就被接受，而 RFC 9001 §4.6.1 要求精确等于
+  `0xffffffff`；自定义 H3 profile 可以发出保留的设置标识符；H3 路径还缺了 TCP 路径
+  早已具备的三级 ECH 配置回退中的两级。
+- **重定向只在规范要求的地方改写方法** — `301`、`302`、`303` 无条件变成 `GET`，于是
+  一个 `HEAD` 请求会以 `GET` 返回，而 Chrome 不会这么做。`303` 仍然改写除 `HEAD` 以
+  外的一切（RFC 9110 §15.4.4）。
+- **解码多层 `Content-Encoding`** — 此前只处理最外层，于是 `gzip, br` 被原样返回，
+  头里却声称已解码。现在按逆序逐层应用，一次性与流式路径都是如此。
+- **强制 cookie 名前缀，忽略明文 HTTP 上收到的 `Secure` cookie** — `__Secure-` 与
+  `__Host-` 只有在其要求被检查时才具有安全含义（RFC 6265bis §5.6）；而在明文 HTTP
+  上收到的 `Secure` cookie，无论叫什么名字此前都会被存下。
+- **HSTS 只从安全传输上学习，且绝不对 IP 字面量生效** — 一个明文 HTTP 响应可以往使
+  用 `DynamicHsts` 的会话里注入 `Strict-Transport-Security` 策略（RFC 6797 §8.1）。
+- **校验 SOCKS5 子协商回复，CONNECT 隧道接受任意 2xx** — 用户名/密码回复的版本字节
+  从不校验（RFC 1929）；而 CONNECT 只接受精确的 `200`，RFC 9110 §9.3.6 规定任何 2xx
+  都表示成功。
+- **Session 默认不再限制为 64 条物理连接** — 隐式上限会让无关的高并发负载报
+  `session connection limit reached`。默认值现为不设上限；需要硬预算的调用方仍可显式
+  设置 `max_connections_per_session` 或 `SessionBuilder::max_connections`。
+- **保留旧 feature 名称兼容性** — `h2-native` 继续作为兼容别名存在，尽管 `lkh2`
+  已是唯一 HTTP/2 引擎；`network-e2e` 继续控制公网 QUIC 集成测试。补丁升级时，现有
+  Cargo 命令不会因为 feature 消失而解析失败。
+- **WebSocket 的 close code 与 reason 在上线前被校验** — `1005`、`1006`、`1015` 永远
+  不得发送（RFC 6455 §7.4.1），且 reason 超过 123 字节放不进控制帧。
+
+### Internal
+
+- **The offline fingerprint gate covers every preset, not six of them** — it
+  gated chrome_131/144/145/146/147/148, so chrome_149/150/151, firefox_133/147
+  and safari_18/26 shipped with no byte-level regression gate. There was an
+  inversion too: chrome_150_quic and chrome_151_quic had QUIC goldens while
+  chrome_150 and chrome_151 had no TLS golden, leaving the newer builds better
+  protected on QUIC than on the transport they actually use. 14 new goldens; the
+  gate goes from 12 tests to 26. These lock in the bytes we emit today, so they
+  catch drift from here on — they are not evidence that today matches the real
+  browser, which is what the `#[ignore]`d Tier-2 tests are for.
+- **Line endings are pinned to LF via `.gitattributes`** — committed blobs were
+  a CRLF/LF mix, and `lkh2/src/adapter.rs` was mixed within one file, so rustfmt
+  turned a three-line edit into a thousand-line diff. 162 files renormalised
+  with no content change.
+
+### 内部（中文）
+
+- **离线指纹门覆盖全部 preset，而非其中六个** — 此前只守 chrome_131/144/145/146/
+  147/148，于是 chrome_149/150/151、firefox_133/147、safari_18/26 全都没有字节级
+  回归门。还有一处倒挂：chrome_150_quic 与 chrome_151_quic 有 QUIC 黄金文件，而
+  chrome_150、chrome_151 没有 TLS 黄金文件，新版本在 QUIC 上反而比在它们实际主用的
+  传输上守得更严。新增 14 个黄金文件，门从 12 个测试增至 26 个。它们锁的是**今天**
+  发出的字节，能挡住此后的漂移；但不构成「今天等于真实浏览器」的证据——后者由标了
+  `#[ignore]` 的 Tier-2 测试负责。
+- **用 `.gitattributes` 把行尾固定为 LF** — 提交的 blob 此前 CRLF/LF 混杂，
+  `lkh2/src/adapter.rs` 甚至单文件内部就混，于是 rustfmt 会把三行改动变成上千行
+  diff。归一化 162 个文件，内容无变化。
+
 ## lkrequest 0.2.1
 
 This patch release contains reliability, compatibility, and release-artifact fixes developed after **v0.2.0**.
@@ -140,6 +552,3 @@ This release includes the changes developed since the initial **v0.1.0** release
 - **Blocking API** — Synchronous wrapper for non-async contexts
 - **Multipart/Form-Data** — File uploads with streaming support
 - **TCP Fingerprint** — JA4T-style TCP SYN fingerprinting
-
-
-

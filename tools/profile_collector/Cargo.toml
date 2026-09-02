@@ -28,7 +28,7 @@ aes = { workspace = true }
 # TLS server (for capture with H2 fingerprinting)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rcgen = "0.14"
-rustls-pemfile = "2"
+
 
 # Hashing (Akamai fingerprint)
 sha2 = "0.10"

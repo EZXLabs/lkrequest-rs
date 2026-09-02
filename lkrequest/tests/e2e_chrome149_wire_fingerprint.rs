@@ -12,8 +12,6 @@
 //!
 //! `TEST_PROXY` is optional; without it the request goes direct.
 
-#![cfg(feature = "h2-native")]
-
 use lkrequest::{preset, Client, HttpVersion};
 
 /// chrome_149 H2 fingerprint is identical to 144/146/147/148 (same `chrome_144_h2()`).

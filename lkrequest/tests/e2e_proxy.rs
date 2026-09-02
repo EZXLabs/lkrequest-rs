@@ -5,6 +5,8 @@
 
 mod support;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use lkrequest::h2::profile::chrome_144_h2;
 use lkrequest::Client;
 use lktls::profile::presets;
@@ -111,6 +113,77 @@ async fn test_proxy_connection_reuse() {
             .unwrap_or_else(|e| panic!("request {i}: {e}"));
         assert_eq!(resp.status().as_u16(), 200);
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9110 §9.3.6 — any 2xx CONNECT response establishes the tunnel
+// ---------------------------------------------------------------------------
+
+/// Start a CONNECT proxy that confirms the tunnel with `status_line` (e.g.
+/// `"201 Created"`) instead of the conventional `200 Connection Established`,
+/// then relays bytes like any other proxy. Runs until the test runtime stops.
+async fn start_status_line_proxy(status_line: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind status-line proxy");
+    let url = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("local_addr").port()
+    );
+
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    if client.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let Some(target) = head.lines().next().and_then(|l| l.split(' ').nth(1)) else {
+                    return;
+                };
+                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+
+                let response = format!("HTTP/1.1 {status_line}\r\n\r\n");
+                if client.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+
+    tokio::task::yield_now().await;
+    url
+}
+
+/// A proxy is free to confirm CONNECT with any 2xx, not just `200`.
+#[tokio::test]
+async fn test_proxy_connect_201_established_tunnels() {
+    let srv = start_local_https_server().await;
+    let proxy_url = start_status_line_proxy("201 Created").await;
+    let client = chrome_client();
+    let session = client.session().proxy(&proxy_url).build();
+
+    let resp = session
+        .get(&url_join(&srv.base_url, "/get"))
+        .send()
+        .await
+        .expect("a 201 CONNECT response must establish the tunnel");
+
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().expect("utf-8");
+    assert!(body.contains("127.0.0.1"), "body={body}");
 }
 
 // ---------------------------------------------------------------------------

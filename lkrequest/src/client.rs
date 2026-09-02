@@ -19,12 +19,13 @@ use lkquic::{
     ChromeConnectionIdGenerator, QuicEndpointManager, QuicEndpointStrategy, QuinnBackend,
 };
 use lktls::profile::types::TlsProfile;
-use lktls::session_store::InMemorySessionStore;
+use lktls::session_store::SessionStore;
 use lktls::KeyLogCallback;
 use rustls_pki_types::TrustAnchor;
 
 use crate::dns::{DnsConfig, DnsResolver, SystemDns, SystemDnsCacheConfig};
 use crate::h2::H2Profile;
+use crate::network_partition::{TlsSessionCachePartitionPolicy, TlsSessionResumptionPolicy};
 use crate::protocol::ProtocolPolicy;
 use crate::session::SessionBuilder;
 use crate::tcp_fingerprint::TcpFingerprint;
@@ -227,7 +228,10 @@ pub struct ResourceLimits {
     pub max_header_size: usize,
     /// Maximum total size of all headers combined (in bytes).
     pub max_headers_total_size: usize,
-    /// Maximum number of connections per session (hard upper limit).
+    /// Maximum number of connections per session.
+    ///
+    /// The default is unbounded. Set this explicitly to impose a hard
+    /// physical-connection limit for a session.
     pub max_connections_per_session: usize,
     /// Minimum transfer rate in bytes/second.
     /// If the transfer rate falls below this for the duration of
@@ -244,7 +248,7 @@ impl Default for ResourceLimits {
             max_header_count: 256,
             max_header_size: 16 * 1024,          // 16 KB
             max_headers_total_size: 1024 * 1024, // 1 MB
-            max_connections_per_session: 64,
+            max_connections_per_session: usize::MAX,
             min_transfer_rate: None,
             transfer_rate_window: Duration::from_secs(10),
         }
@@ -520,6 +524,10 @@ pub(crate) struct ClientInner {
     /// Set to `false` to skip certificate verification (insecure, for dev/testing only).
     pub verify: bool,
 
+    /// Whether a TLS connection that ends without `close_notify` is an error.
+    /// Default: `false`. See [`ClientBuilder::require_close_notify`].
+    pub require_close_notify: bool,
+
     /// DNS resolver used for all connections from this client.
     pub resolver: Arc<dyn DnsResolver>,
 
@@ -531,7 +539,13 @@ pub(crate) struct ClientInner {
     /// client. Browsers cache QUIC PSKs at the profile/client level, not per
     /// request session, so H3 resumption and 0-RTT need to cross Session
     /// boundaries.
-    pub session_store: Arc<InMemorySessionStore>,
+    pub session_store: Arc<dyn SessionStore>,
+
+    /// Policy used to construct the shared TLS/QUIC ticket store.
+    pub tls_session_resumption_policy: TlsSessionResumptionPolicy,
+
+    /// Browser policy used to partition TLS and QUIC session tickets.
+    pub tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy,
 
     /// Fingerprint randomization policy. Read at session build to decide
     /// whether each session materializes its own synthetic identity.
@@ -565,6 +579,11 @@ impl Client {
     /// Returns a reference to the H2 profile.
     pub fn h2_profile(&self) -> &H2Profile {
         &self.fingerprint.h2_profile
+    }
+
+    /// Return the configured TLS session-resumption policy.
+    pub fn tls_session_resumption_policy(&self) -> TlsSessionResumptionPolicy {
+        self.inner.tls_session_resumption_policy
     }
 
     /// Returns a reference to the QUIC fingerprint profile.
@@ -719,6 +738,12 @@ impl Client {
         self.inner.verify
     }
 
+    /// Returns whether a TLS connection closed without `close_notify` is
+    /// treated as an error. See [`ClientBuilder::require_close_notify`].
+    pub fn require_close_notify(&self) -> bool {
+        self.inner.require_close_notify
+    }
+
     /// Returns a reference to the DNS resolver.
     pub fn resolver(&self) -> &dyn DnsResolver {
         &*self.inner.resolver
@@ -789,6 +814,40 @@ impl Client {
 // Builder
 // ---------------------------------------------------------------------------
 
+/// Controls how outbound HTTP/2 DATA payloads are capped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum H2DataFramePolicy {
+    /// Keep the browser preset's native behavior.
+    #[default]
+    BrowserDefault,
+    /// Follow only the peer's SETTINGS_MAX_FRAME_SIZE.
+    PeerMaxFrameSize,
+    /// Cap each DATA payload to an explicit positive byte count.
+    FixedPayload(usize),
+    /// Reserve the 9-byte HTTP/2 frame header inside a target socket write.
+    SocketWriteAligned { max_write_size: usize },
+}
+
+impl H2DataFramePolicy {
+    fn payload_override(self) -> Option<Option<usize>> {
+        match self {
+            Self::BrowserDefault => None,
+            Self::PeerMaxFrameSize => Some(None),
+            Self::FixedPayload(max_payload) => {
+                assert!(max_payload > 0, "max DATA frame payload must be positive");
+                Some(Some(max_payload))
+            }
+            Self::SocketWriteAligned { max_write_size } => {
+                assert!(
+                    max_write_size > 9,
+                    "socket write size must exceed the 9-byte HTTP/2 frame header"
+                );
+                Some(Some(max_write_size - 9))
+            }
+        }
+    }
+}
+
 /// Builder for constructing a [`Client`].
 pub struct ClientBuilder {
     tls_profile: Option<TlsProfile>,
@@ -810,7 +869,11 @@ pub struct ClientBuilder {
     max_pending_h2_requests: Option<usize>,
     keylog_callback: Option<KeyLogCallback>,
     verify: bool,
+    require_close_notify: bool,
     resolver: Option<Arc<dyn DnsResolver>>,
+    h2_data_frame_policy: H2DataFramePolicy,
+    tls_session_resumption_policy: TlsSessionResumptionPolicy,
+    tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy,
     randomize: crate::randomize::Randomize,
 }
 
@@ -836,7 +899,11 @@ impl ClientBuilder {
             max_pending_h2_requests: None,
             keylog_callback: None,
             verify: true,
+            require_close_notify: false,
             resolver: None,
+            h2_data_frame_policy: H2DataFramePolicy::BrowserDefault,
+            tls_session_resumption_policy: TlsSessionResumptionPolicy::BrowserDefault,
+            tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Unpartitioned,
             randomize: crate::randomize::Randomize::off(),
         }
     }
@@ -859,6 +926,34 @@ impl ClientBuilder {
     /// ```
     pub fn randomize(mut self, policy: crate::randomize::Randomize) -> Self {
         self.randomize = policy;
+        self
+    }
+
+    /// Set the TLS session-cache partition policy.
+    ///
+    /// The policy is applied when a Session supplies a
+    /// [`NetworkPartitionContext`](crate::NetworkPartitionContext). Without a
+    /// context, the legacy unpartitioned cache is preserved.
+    pub fn tls_session_cache_partition_policy(
+        mut self,
+        policy: TlsSessionCachePartitionPolicy,
+    ) -> Self {
+        self.tls_session_cache_partition_policy = policy;
+        self
+    }
+
+    /// Configure whether TLS session tickets are cached and offered as PSKs.
+    pub fn tls_session_resumption_policy(mut self, policy: TlsSessionResumptionPolicy) -> Self {
+        if let TlsSessionResumptionPolicy::Enabled {
+            max_tickets_per_server,
+        } = policy
+        {
+            assert!(
+                max_tickets_per_server > 0,
+                "max_tickets_per_server must be greater than zero"
+            );
+        }
+        self.tls_session_resumption_policy = policy;
         self
     }
 
@@ -898,6 +993,13 @@ impl ClientBuilder {
     /// If not set, defaults to Chrome 144 H2 profile.
     pub fn h2_profile(mut self, profile: H2Profile) -> Self {
         self.h2_profile = Some(profile);
+        self
+    }
+
+    /// Override the preset's outbound HTTP/2 DATA framing policy.
+    pub fn h2_data_frame_policy(mut self, policy: H2DataFramePolicy) -> Self {
+        let _ = policy.payload_override();
+        self.h2_data_frame_policy = policy;
         self
     }
 
@@ -1446,6 +1548,31 @@ impl ClientBuilder {
         self
     }
 
+    /// Treat a TLS connection that ends without a `close_notify` alert as an
+    /// error instead of a clean end of stream.
+    ///
+    /// **Default: `false`** -- the behaviour of every released version so far.
+    ///
+    /// RFC 8446 section 6.1 requires each side to send `close_notify` before
+    /// closing, but many production servers just drop the TCP connection, and
+    /// browsers accept that. Enforcing the alert by default would therefore fail
+    /// requests that Chrome completes, which is why this is opt-in.
+    ///
+    /// Turning it on matters for one case: a response body delimited by
+    /// connection close (RFC 9112 section 6.3 -- neither `Content-Length` nor
+    /// `Transfer-Encoding: chunked`). There an attacker who can reset the
+    /// connection may truncate the body, and the caller cannot tell, because a
+    /// truncated stream ends exactly the way a complete one does. Bodies with a
+    /// declared length or chunked framing are already protected: a short read is
+    /// reported as an incomplete message either way.
+    ///
+    /// Enabling this may cause `UnexpectedEof` errors against servers that are
+    /// merely sloppy rather than hostile.
+    pub fn require_close_notify(mut self, require: bool) -> Self {
+        self.require_close_notify = require;
+        self
+    }
+
     /// Load the operating system's native CA certificates and add them
     /// as trusted roots, in addition to the built-in Mozilla root store.
     pub fn use_native_certs(mut self) -> Self {
@@ -1471,7 +1598,7 @@ impl ClientBuilder {
     /// use lkrequest::{Client, DnsConfig};
     ///
     /// let client = Client::builder()
-    ///     .dns(DnsConfig::CloudflareHttps)
+    ///     .dns(DnsConfig::System)
     ///     .build();
     /// ```
     pub fn dns(mut self, config: DnsConfig) -> Self {
@@ -1566,9 +1693,15 @@ impl ClientBuilder {
         let quic_tls_profile = self.quic_tls_profile.unwrap_or(None);
 
         // Default to Chrome 144 H2 profile if not explicitly set
-        let h2_profile = self
+        let mut h2_profile = self
             .h2_profile
             .unwrap_or_else(crate::h2::profile::chrome_144_h2);
+        if let Some(max_payload) = self.h2_data_frame_policy.payload_override() {
+            let behavior = h2_profile
+                .behavior()
+                .with_max_data_frame_payload(max_payload);
+            h2_profile = h2_profile.with_behavior(behavior);
+        }
         let quic_profile = self.quic_profile.unwrap_or_default();
 
         let header_order = self.header_order;
@@ -1645,10 +1778,13 @@ impl ClientBuilder {
                 max_pending_h2_requests: self.max_pending_h2_requests,
                 keylog_callback: self.keylog_callback,
                 verify: self.verify,
+                require_close_notify: self.require_close_notify,
                 resolver,
                 #[cfg(feature = "quic-h3")]
                 quic_endpoint_manager: tokio::sync::Mutex::new(endpoint_manager),
-                session_store: Arc::new(InMemorySessionStore::new()),
+                session_store: self.tls_session_resumption_policy.create_store(),
+                tls_session_resumption_policy: self.tls_session_resumption_policy,
+                tls_session_cache_partition_policy: self.tls_session_cache_partition_policy,
                 #[cfg(feature = "synthetic-fp")]
                 randomize: self.randomize,
             }),
@@ -1682,6 +1818,59 @@ mod tests {
     #[should_panic(expected = "max_pending_h2_requests must be greater than zero")]
     fn zero_pending_h2_request_limit_is_rejected() {
         let _ = Client::builder().max_pending_h2_requests(0);
+    }
+
+    #[test]
+    fn chrome_h2_data_policy_defaults_to_browser_cap() {
+        let client = Client::builder().build();
+        assert_eq!(
+            client
+                .h2_profile()
+                .behavior()
+                .write_policy
+                .max_data_frame_payload(),
+            Some(lkh2::policy::CHROMIUM_MAX_DATA_FRAME_PAYLOAD)
+        );
+    }
+
+    #[test]
+    fn h2_data_policy_can_follow_peer_or_use_custom_write_alignment() {
+        let peer_max = Client::builder()
+            .h2_data_frame_policy(H2DataFramePolicy::PeerMaxFrameSize)
+            .build();
+        assert_eq!(
+            peer_max
+                .h2_profile()
+                .behavior()
+                .write_policy
+                .max_data_frame_payload(),
+            None
+        );
+
+        let aligned = Client::builder()
+            .h2_data_frame_policy(H2DataFramePolicy::SocketWriteAligned {
+                max_write_size: 8_192,
+            })
+            .build();
+        assert_eq!(
+            aligned
+                .h2_profile()
+                .behavior()
+                .write_policy
+                .max_data_frame_payload(),
+            Some(8_183)
+        );
+    }
+
+    #[test]
+    fn tls_session_resumption_policy_is_configurable() {
+        let client = Client::builder()
+            .tls_session_resumption_policy(TlsSessionResumptionPolicy::Disabled)
+            .build();
+        assert_eq!(
+            client.tls_session_resumption_policy(),
+            TlsSessionResumptionPolicy::Disabled
+        );
     }
 
     // -- TimeoutConfig -----------------------------------------------------
@@ -1753,7 +1942,7 @@ mod tests {
         let rl = ResourceLimits::default();
         assert_eq!(rl.max_response_body_size, 100 * 1024 * 1024);
         assert_eq!(rl.max_header_count, 256);
-        assert_eq!(rl.max_connections_per_session, 64);
+        assert_eq!(rl.max_connections_per_session, usize::MAX);
     }
 
     #[test]

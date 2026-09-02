@@ -6,8 +6,6 @@
 //! Requires network access and a local HTTP proxy (default 127.0.0.1:7897).
 //! Override via `TEST_PROXY` env var.
 
-#![cfg(feature = "h2-native")]
-
 use lkh2::profile::*;
 use lkrequest::TlsConnector;
 use lktls::profile::presets;

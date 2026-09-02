@@ -235,22 +235,22 @@ impl ProxyConfig {
                 let target = format!("{host}:{port}");
                 let (status_code, response_bytes) =
                     send_connect_request(stream, &target, self.auth.as_ref()).await?;
-                match status_code {
-                    200 => Ok(()),
-                    407 => Err(Error::proxy(
+                if connect_tunnel_established(status_code) {
+                    Ok(())
+                } else if status_code == 407 {
+                    Err(Error::proxy(
                         ProxyErrorKind::AuthenticationRequired,
                         format!("proxy chain hop {self} requires authentication (407)"),
                         None,
-                    )),
-                    other => {
-                        let line = String::from_utf8_lossy(&response_bytes);
-                        let line = line.lines().next().unwrap_or("");
-                        Err(Error::proxy(
-                            ProxyErrorKind::TunnelRefused { status_code: other },
-                            format!("proxy chain hop {self} CONNECT failed: {line}"),
-                            None,
-                        ))
-                    }
+                    ))
+                } else {
+                    let line = String::from_utf8_lossy(&response_bytes);
+                    let line = line.lines().next().unwrap_or("");
+                    Err(Error::proxy(
+                        ProxyErrorKind::TunnelRefused { status_code },
+                        format!("proxy chain hop {self} CONNECT failed: {line}"),
+                        None,
+                    ))
                 }
             }
             ProxyScheme::Socks5 { remote_dns, .. } => {
@@ -266,7 +266,9 @@ impl ProxyConfig {
     ///
     /// 1. TCP connect to proxy
     /// 2. Send `CONNECT target:port HTTP/1.1` (+ optional Proxy-Authorization)
-    /// 3. Read `HTTP/1.1 200 Connection Established` (byte-by-byte to avoid over-reading)
+    /// 3. Read the status line (byte-by-byte to avoid over-reading); any 2xx
+    ///    establishes the tunnel per RFC 9110 §9.3.6, `200 Connection
+    ///    Established` being the conventional one
     /// 4. Return the TCP stream (now tunneled)
     ///
     /// **Important**: The HTTP response is read one byte at a time until `\r\n\r\n`
@@ -312,8 +314,8 @@ impl ProxyConfig {
             let (status_code, response_bytes) =
                 send_connect_request(&mut stream, &target, self.auth.as_ref()).await?;
 
-            if status_code == 200 {
-                tracing::debug!("proxy.tunnel_established");
+            if connect_tunnel_established(status_code) {
+                tracing::debug!(status = status_code, "proxy.tunnel_established");
                 return Ok(stream);
             }
 
@@ -351,8 +353,11 @@ impl ProxyConfig {
                     let (retry_code, _) =
                         send_connect_request(&mut stream2, &target, self.auth.as_ref()).await?;
 
-                    if retry_code == 200 {
-                        tracing::debug!("proxy.tunnel_established_after_407_retry");
+                    if connect_tunnel_established(retry_code) {
+                        tracing::debug!(
+                            status = retry_code,
+                            "proxy.tunnel_established_after_407_retry"
+                        );
                         return Ok(stream2);
                     }
 
@@ -737,11 +742,19 @@ async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&ProxyAuth>) -> R
                 )
             })?;
 
-            if auth.username.len() > 255 || auth.password.len() > 255 {
+            // RFC 1929 §2 fixes both UNAME and PASSWD at 1–255 bytes: each is
+            // length-prefixed by a single octet, so 0 is as unrepresentable as
+            // 256. An empty credential would go on the wire as a zero-length
+            // field whose meaning is server-defined — reject it here instead of
+            // letting the peer decide what it means.
+            if !(1..=255).contains(&auth.username.len())
+                || !(1..=255).contains(&auth.password.len())
+            {
                 return Err(Error::proxy(
                     ProxyErrorKind::ProtocolError,
                     format!(
-                        "SOCKS5 auth credentials too long (username: {} bytes, password: {} bytes, max: 255)",
+                        "SOCKS5 auth credentials must be 1-255 bytes each (RFC 1929) \
+                         (username: {} bytes, password: {} bytes)",
                         auth.username.len(),
                         auth.password.len(),
                     ),
@@ -772,6 +785,21 @@ async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&ProxyAuth>) -> R
                     Some(Box::new(e)),
                 )
             })?;
+
+            // RFC 1929 §2: the subnegotiation reply is `VER STATUS` with VER
+            // fixed at 0x01. A peer answering another version is not speaking
+            // this subnegotiation, so its STATUS octet means nothing — treating
+            // it as success would authenticate against an unknown dialect.
+            if auth_resp[0] != 0x01 {
+                return Err(Error::proxy(
+                    ProxyErrorKind::ProtocolError,
+                    format!(
+                        "SOCKS5 auth subnegotiation protocol error: expected version 1 (RFC 1929), got {}",
+                        auth_resp[0]
+                    ),
+                    None,
+                ));
+            }
 
             if auth_resp[1] != 0x00 {
                 return Err(Error::proxy(
@@ -1109,6 +1137,16 @@ async fn connect_tcp_to_proxy_with_budget(
         )
     })
 }
+/// Whether a CONNECT response status establishes the tunnel.
+///
+/// RFC 9110 §9.3.6: "Any 2xx (Successful) response indicates that the sender
+/// (and all inbound proxies) will switch to tunnel mode". Only `200` is
+/// conventional, but a conformant proxy may answer with any 2xx and the tunnel
+/// is live either way, so accepting only `200` would drop a working tunnel.
+fn connect_tunnel_established(status_code: u16) -> bool {
+    (200..300).contains(&status_code)
+}
+
 /// Send an HTTP CONNECT request and read the response headers byte-by-byte.
 ///
 /// Returns `(status_code, raw_response_bytes)`. The byte-by-byte read ensures
@@ -1486,5 +1524,347 @@ mod tests {
         drop(stream);
         first_server.await.unwrap();
         final_server.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 1929 — SOCKS5 username/password subnegotiation
+    // -----------------------------------------------------------------------
+
+    fn user_pass_auth(username: &str, password: &str) -> ProxyAuth {
+        ProxyAuth {
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    /// Fake SOCKS5 peer that selects the username/password method (0x02) and
+    /// answers the subnegotiation with a scripted `[VER, STATUS]` pair.
+    ///
+    /// Returns the raw auth request the client sent — empty when the client
+    /// refused to send credentials at all.
+    async fn serve_socks_auth(listener: &tokio::net::TcpListener, reply: [u8; 2]) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut greeting = [0u8; 4];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+        stream.write_all(&[0x05, 0x02]).await.unwrap();
+
+        let mut request = vec![0u8; 2];
+        if stream.read_exact(&mut request).await.is_err() {
+            return Vec::new();
+        }
+        let mut username = vec![0u8; request[1] as usize];
+        stream.read_exact(&mut username).await.unwrap();
+        request.append(&mut username);
+        let mut password_len = [0u8; 1];
+        stream.read_exact(&mut password_len).await.unwrap();
+        let mut password = vec![0u8; password_len[0] as usize];
+        stream.read_exact(&mut password).await.unwrap();
+        request.push(password_len[0]);
+        request.append(&mut password);
+
+        stream.write_all(&reply).await.unwrap();
+        request
+    }
+
+    /// Run a username/password handshake against `serve_socks_auth`.
+    /// Returns the handshake result and the credentials that reached the wire.
+    async fn socks5_auth_handshake(reply: [u8; 2], auth: &ProxyAuth) -> (Result<()>, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { serve_socks_auth(&listener, reply).await });
+
+        let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let result = socks5_handshake(&mut stream, Some(auth)).await;
+        drop(stream);
+
+        (result, server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_reply_requires_subnegotiation_version_one() {
+        for version in [0x00u8, 0x05] {
+            let (result, request) =
+                socks5_auth_handshake([version, 0x00], &user_pass_auth("user", "pass")).await;
+
+            let error = result
+                .expect_err("a non-RFC1929 subnegotiation version must not count as authenticated");
+            assert!(
+                error.to_string().contains("expected version 1"),
+                "VER={version:#04x} should be refused, got: {error}"
+            );
+            assert_eq!(
+                request[0], 0x01,
+                "client must send subnegotiation version 1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_reply_version_one_success_is_accepted() {
+        let (result, request) =
+            socks5_auth_handshake([0x01, 0x00], &user_pass_auth("user", "pass")).await;
+
+        assert!(
+            result.is_ok(),
+            "VER=1 STATUS=0 must authenticate: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            request,
+            vec![0x01, 4, b'u', b's', b'e', b'r', 4, b'p', b'a', b's', b's']
+        );
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_reply_version_one_failure_status_is_rejected() {
+        let (result, _) =
+            socks5_auth_handshake([0x01, 0x01], &user_pass_auth("user", "pass")).await;
+
+        let error = result.expect_err("a non-zero STATUS must fail authentication");
+        assert!(
+            error.to_string().contains("SOCKS5 authentication failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn socks5_empty_credentials_are_rejected_before_transmission() {
+        for auth in [user_pass_auth("", "pass"), user_pass_auth("user", "")] {
+            let (result, request) = socks5_auth_handshake([0x01, 0x00], &auth).await;
+
+            let error = result.expect_err("RFC 1929 UNAME/PASSWD must be 1-255 bytes");
+            assert!(
+                error.to_string().contains("must be 1-255 bytes"),
+                "{auth:?} should be refused, got: {error}"
+            );
+            assert!(
+                request.is_empty(),
+                "an unencodable credential must never reach the wire: {request:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 9110 §9.3.6 — any 2xx CONNECT response establishes the tunnel
+    // -----------------------------------------------------------------------
+
+    /// Read one CONNECT request head, answer it with `response`, and return the
+    /// request head the client sent.
+    async fn serve_connect_exchange(stream: &mut TcpStream, response: &str) -> String {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8(head).unwrap()
+    }
+
+    /// Drive a single-hop HTTP CONNECT against a proxy answering `response`.
+    async fn http_proxy_connect(response: &str) -> (Result<TcpStream>, String) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = response.to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            serve_connect_exchange(&mut stream, &response).await
+        });
+
+        let proxy = ProxyConfig::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+        let result = proxy.connect("target.test", 443, None, &resolver).await;
+
+        (result, server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn http_connect_accepts_any_2xx_status() {
+        for (status, reason) in [
+            (200, "Connection Established"),
+            (201, "Created"),
+            (204, "No Content"),
+        ] {
+            let (result, request) =
+                http_proxy_connect(&format!("HTTP/1.1 {status} {reason}\r\n\r\n")).await;
+
+            let stream = result
+                .unwrap_or_else(|error| panic!("{status} must establish the tunnel: {error}"));
+            drop(stream);
+            assert!(
+                request.starts_with("CONNECT target.test:443 HTTP/1.1\r\n"),
+                "{request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_non_2xx_status() {
+        for status in [302u16, 403, 502] {
+            let (result, _) = http_proxy_connect(&format!("HTTP/1.1 {status} Nope\r\n\r\n")).await;
+
+            let error = result.expect_err("a non-2xx status must not be treated as a tunnel");
+            assert!(
+                error.to_string().contains("proxy CONNECT failed"),
+                "{error}"
+            );
+            assert!(
+                matches!(
+                    error.as_proxy_error().map(|proxy| &proxy.kind),
+                    Some(ProxyErrorKind::TunnelRefused { status_code }) if *status_code == status
+                ),
+                "{status} should surface as TunnelRefused, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_connect_407_without_credentials_still_requires_auth() {
+        let (result, _) = http_proxy_connect(
+            "HTTP/1.1 407 Proxy Authentication Required\r\n\
+             Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+        )
+        .await;
+
+        let error = result.expect_err("407 without credentials must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("proxy requires authentication (407)"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_connect_407_retry_with_credentials_still_tunnels() {
+        for retry_status in ["200 Connection Established", "201 Created"] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                let first_request = serve_connect_exchange(
+                    &mut first,
+                    "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                     Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n",
+                )
+                .await;
+                drop(first);
+
+                let (mut second, _) = listener.accept().await.unwrap();
+                let second_request = serve_connect_exchange(
+                    &mut second,
+                    &format!("HTTP/1.1 {retry_status}\r\n\r\n"),
+                )
+                .await;
+                (first_request, second_request)
+            });
+
+            let proxy = ProxyConfig::parse(&format!("http://user:pass@127.0.0.1:{port}")).unwrap();
+            let resolver = StaticResolver {
+                addresses: Vec::new(),
+            };
+
+            let stream = proxy
+                .connect("target.test", 443, None, &resolver)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("407 retry answered {retry_status} must tunnel: {error}")
+                });
+            drop(stream);
+
+            let (first_request, second_request) = server.await.unwrap();
+            assert!(
+                first_request.starts_with("CONNECT target.test:443 HTTP/1.1\r\n"),
+                "{first_request}"
+            );
+            assert!(
+                second_request
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic"),
+                "the 407 retry must carry credentials: {second_request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_chain_hop_accepts_any_2xx_status() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // One socket plays both hops: the chain tunnels hop 2's CONNECT through
+        // hop 1's stream, so both requests arrive on the same connection.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hop = serve_connect_exchange(&mut stream, "HTTP/1.1 201 Created\r\n\r\n").await;
+            let target = serve_connect_exchange(&mut stream, "HTTP/1.1 202 Accepted\r\n\r\n").await;
+            (hop, target)
+        });
+
+        let proxy = ProxyConfig::parse_chain(&[
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:9".to_string(),
+        ])
+        .unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+
+        let stream = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .unwrap_or_else(|error| panic!("2xx hop responses must build the chain: {error}"));
+        drop(stream);
+
+        let (hop, target) = server.await.unwrap();
+        assert!(hop.starts_with("CONNECT 127.0.0.1:9 HTTP/1.1\r\n"), "{hop}");
+        assert!(
+            target.starts_with("CONNECT target.test:443 HTTP/1.1\r\n"),
+            "{target}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_chain_hop_rejects_non_2xx_status() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            serve_connect_exchange(&mut stream, "HTTP/1.1 502 Bad Gateway\r\n\r\n").await
+        });
+
+        let proxy = ProxyConfig::parse_chain(&[
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:9".to_string(),
+        ])
+        .unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+
+        let error = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect_err("a non-2xx hop response must fail the chain");
+        assert!(error.to_string().contains("proxy chain hop"), "{error}");
+
+        let hop = server.await.unwrap();
+        assert!(hop.starts_with("CONNECT 127.0.0.1:9 HTTP/1.1\r\n"), "{hop}");
     }
 }

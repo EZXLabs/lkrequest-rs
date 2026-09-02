@@ -32,6 +32,19 @@ pub enum Tls12RecordCipher {
 /// Maximum TLS record payload size (2^14 = 16384 bytes).
 pub const MAX_RECORD_PAYLOAD: usize = 16384;
 
+/// Largest `TLSInnerPlaintext` a TLS 1.3 record may carry: 2^14 + 1 octets.
+///
+/// RFC 8446 §5.2 caps `TLSInnerPlaintext.content` at 2^14 octets and appends one
+/// octet of inner content type; RFC 8449 §4 states the same total the other way
+/// round — "TLS 1.3 uses a limit of 2^14+1 octets" for a value that "includes
+/// the content type and padding added in TLS 1.3 (that is, the complete length
+/// of TLSInnerPlaintext)".
+pub const MAX_TLS13_INNER_PLAINTEXT: usize = MAX_RECORD_PAYLOAD + 1;
+
+/// Largest expansion RFC 8446 §5.2 allows a `TLSCiphertext` to add over the
+/// plaintext it protects: 256 octets, hence a wire record of at most 2^14 + 256.
+pub const MAX_CIPHERTEXT_EXPANSION: usize = 256;
+
 /// TLS record header size: ContentType (1) + Version (2) + Length (2).
 pub const RECORD_HEADER_SIZE: usize = 5;
 

@@ -1,15 +1,14 @@
-#![cfg(feature = "network-e2e")]
-
 use lkrequest::{Client, HttpVersion};
 
-// Tier-2 (public network): off by default per docs/TESTING.md, so `--all-features`
-// CI runs (which enable `network-e2e`) don't fail without internet. Run with
+// Tier-2 (public network): off by default per docs/TESTING.md, so normal
+// CI runs don't fail without internet. Run with
 // `--include-ignored` when validating against the real network.
 #[tokio::test]
 #[ignore = "Tier-2: hits cloudflare-quic.com; run with --include-ignored"]
 async fn cloudflare_quic_homepage_uses_h3() {
     let client = Client::builder()
         .fingerprint(lktls::profile::presets::chrome_144())
+        .quic_profile(lkh3::chrome_quic())
         .build();
 
     let session = client.session().http3_only().build();

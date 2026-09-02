@@ -12,7 +12,9 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use lkrequest::h2::profile::chrome_144_h2;
-use lkrequest::{Client, DnsConfig, DnsResolver};
+#[cfg(feature = "doh")]
+use lkrequest::DnsResolver;
+use lkrequest::{Client, DnsConfig};
 use lktls::profile::presets;
 use support::local_https::{start_local_https_server, url_join};
 
@@ -60,6 +62,7 @@ fn dns_config_cloudflare() {
 }
 
 #[test]
+#[cfg(feature = "doh")]
 fn dns_config_google_https() {
     let client = chrome_client_with_dns(DnsConfig::GoogleHttps);
     let session = client.session().build();
@@ -243,6 +246,7 @@ async fn hickory_dns_resolve_and_request() {
 }
 
 #[tokio::test]
+#[cfg(feature = "doh")]
 #[ignore = "Tier-2: public DNS HTTPS record lookup"]
 async fn hickory_dns_https_record_lookup() {
     use lkrequest::dns::HickoryDns;

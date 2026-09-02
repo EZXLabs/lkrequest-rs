@@ -26,6 +26,7 @@ pub enum PresetKind {
     Chrome149,
     Chrome150,
     Chrome151,
+    Chrome152,
     Firefox133,
     Firefox147,
     Safari18,

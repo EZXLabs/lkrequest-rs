@@ -148,8 +148,12 @@ impl<'a> ClientHelloBuilder<'a> {
     /// Per RFC 6066 Section 3, literal IP addresses MUST NOT be sent in the
     /// SNI extension. When this returns `true`, the SNI extension is omitted
     /// from the ClientHello.
+    ///
+    /// Accepts the bracketed IPv6 authority form (`"[::1]"`) that
+    /// `url::Url::host_str()` produces — a bare `parse::<IpAddr>()` rejects it,
+    /// which used to put a literal `[::1]` on the wire as an SNI hostname.
     fn hostname_is_ip(&self) -> bool {
-        self.hostname.parse::<std::net::IpAddr>().is_ok()
+        super::hostname_is_ip_literal(&self.hostname)
     }
 
     /// Override the 32-byte random value (useful for deterministic testing).
@@ -463,12 +467,6 @@ impl<'a> ClientHelloBuilder<'a> {
             return Err(TlsError::InvalidProfile(
                 "chromium_boringssl requires grease.supported_groups when grease.key_share is enabled"
                     .to_string(),
-            ));
-        }
-
-        if chromium_boringssl && self.profile.grease.signature_algorithms {
-            return Err(TlsError::InvalidProfile(
-                "chromium_boringssl does not support grease.signature_algorithms".to_string(),
             ));
         }
 
@@ -1000,6 +998,9 @@ impl<'a> ClientHelloBuilder<'a> {
                 ExtensionSource::RawBytes { data } => {
                     let payload = decode_hex(data)?;
                     GenericExtension::new(ext_spec.extension_type, payload).encode(&mut buf);
+                }
+                ExtensionSource::TrustAnchorIds { ids, shuffle } => {
+                    self.encode_trust_anchor_ids(ext_spec.extension_type, ids, *shuffle, &mut buf)?;
                 }
             }
         }
@@ -1586,6 +1587,9 @@ impl<'a> ClientHelloBuilder<'a> {
                 let payload = decode_hex(data)?;
                 GenericExtension::new(spec.extension_type, payload).encode(buf);
             }
+            ExtensionSource::TrustAnchorIds { ids, shuffle } => {
+                self.encode_trust_anchor_ids(spec.extension_type, ids, *shuffle, buf)?;
+            }
             ExtensionSource::Grease => {
                 if self.profile.grease.extensions && !chromium_boringssl {
                     let (ext_grease, payload_len) = match grease_ext_idx {
@@ -1597,6 +1601,57 @@ impl<'a> ClientHelloBuilder<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn encode_trust_anchor_ids(
+        &self,
+        extension_type: u16,
+        ids: &[String],
+        shuffle: bool,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        let mut decoded = ids
+            .iter()
+            .map(|id| {
+                let bytes = decode_hex(id)?;
+                if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+                    return Err(TlsError::InvalidProfile(format!(
+                        "trust anchor id must contain 1..=255 bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                Ok(bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if shuffle && decoded.len() > 1 {
+            let mut slot = self.shuffle_rng.borrow_mut();
+            let rng: &mut dyn rand_core::RngCore = match slot.as_deref_mut() {
+                Some(rng) => rng,
+                None => &mut OsRng,
+            };
+            for index in (1..decoded.len()).rev() {
+                decoded.swap(index, below(rng, index + 1));
+            }
+        }
+
+        let list_len = decoded.iter().try_fold(0usize, |total, id| {
+            total
+                .checked_add(1 + id.len())
+                .ok_or_else(|| TlsError::InvalidProfile("trust anchor id list is too large".into()))
+        })?;
+        let list_len = u16::try_from(list_len).map_err(|_| {
+            TlsError::InvalidProfile("trust anchor id list exceeds 65535 bytes".into())
+        })?;
+
+        let mut payload = Vec::with_capacity(2 + list_len as usize);
+        payload.extend_from_slice(&list_len.to_be_bytes());
+        for id in decoded {
+            payload.push(id.len() as u8);
+            payload.extend_from_slice(&id);
+        }
+        GenericExtension::new(extension_type, payload).encode(buf);
         Ok(())
     }
 
@@ -1685,7 +1740,7 @@ impl<'a> ClientHelloBuilder<'a> {
             ext_type::SIGNATURE_ALGORITHMS => {
                 let mut algos = Vec::with_capacity(self.profile.signature_algorithms.len() + 1);
                 if self.profile.grease.signature_algorithms {
-                    algos.push(grease.get(grease::GreaseIndex::Cipher));
+                    algos.push(grease.get(grease::GreaseIndex::SignatureAlgorithm));
                 }
                 algos.extend_from_slice(&self.profile.signature_algorithms);
                 SignatureAlgorithms { algorithms: algos }.encode(buf);
@@ -2337,21 +2392,35 @@ mod tests {
     }
 
     #[test]
-    fn test_chromium_boringssl_rejects_signature_algorithms_grease() {
-        let mut profile = presets::chrome_144();
-        profile.grease.signature_algorithms = true;
-
-        let err = ClientHelloBuilder::new(&profile, "example.com")
+    fn test_chrome_152_prepends_signature_algorithms_grease() {
+        let profile = presets::chrome_152();
+        let output = ClientHelloBuilder::new(&profile, "example.com")
             .build()
-            .expect_err("Chromium/BoringSSL should reject sigalg GREASE");
-        assert!(
-            matches!(
-                err,
-                TlsError::InvalidProfile(ref msg)
-                    if msg.contains("does not support grease.signature_algorithms")
-            ),
-            "unexpected error: {err}"
+            .expect("Chrome 152 sigalg GREASE should be supported");
+        let payload = extract_extension_payload_from_body(
+            &output.message[4..],
+            ext_type::SIGNATURE_ALGORITHMS,
+        )
+        .expect("signature_algorithms extension");
+        let declared_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        assert_eq!(declared_len, payload.len() - 2);
+        let (algorithm_bytes, remainder) = payload[2..].as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let algorithms: Vec<u16> = algorithm_bytes
+            .iter()
+            .map(|bytes| u16::from_be_bytes(*bytes))
+            .collect();
+
+        assert_eq!(
+            algorithms.first(),
+            Some(
+                &output
+                    .grease_values
+                    .get(grease::GreaseIndex::SignatureAlgorithm)
+            )
         );
+        assert!(is_grease_value(algorithms[0]));
+        assert_eq!(&algorithms[1..], profile.signature_algorithms);
     }
 
     #[test]
@@ -3525,6 +3594,13 @@ mod tests {
             "2001:db8::1",
             "0.0.0.0",
             "255.255.255.255",
+            // Bracketed IPv6 authority form — what `url::Url::host_str()`
+            // returns for `https://[::1]/`. A bare `parse::<IpAddr>()` rejects
+            // these, which used to put a literal `[::1]` on the wire as an SNI
+            // hostname (RFC 6066 §3 forbids IP literals in SNI entirely).
+            "[::1]",
+            "[2001:db8::1]",
+            "[::ffff:127.0.0.1]",
         ];
         for ip in &cases_ip {
             let builder = ClientHelloBuilder::new(&profile, *ip);
@@ -3537,6 +3613,11 @@ mod tests {
             "my-server",
             "a.b.c.d.example.com",
             "192.168.0.10.nip.io",
+            // Brackets are only stripped as a matched pair around a real
+            // address; these stay DNS names (and stay in SNI).
+            "[not-an-ip]",
+            "[::1",
+            "::1]",
         ];
         for name in &cases_dns {
             let builder = ClientHelloBuilder::new(&profile, *name);
@@ -3674,6 +3755,71 @@ mod tests {
         assert!(
             distinct.len() > 1,
             "different seeds should yield different extension orders"
+        );
+    }
+
+    #[test]
+    fn trust_anchor_ids_encode_vector_and_shuffle_reproducibly() {
+        use rand_core::SeedableRng;
+
+        let profile = presets::chrome_152();
+        let payload_for = |seed: [u8; 32]| {
+            let output = ClientHelloBuilder::new(&profile, "example.com")
+                .with_rng(rand_chacha::ChaCha20Rng::from_seed(seed))
+                .build()
+                .expect("Chrome 152 ClientHello should build");
+            extract_extension_body(&output.message, ext_type::TRUST_ANCHOR_IDS)
+                .expect("Chrome 152 should encode trust-anchor identifiers")
+        };
+
+        let parse_ids = |payload: &[u8]| {
+            assert!(payload.len() >= 2);
+            let declared = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+            assert_eq!(declared, payload.len() - 2);
+
+            let mut ids = Vec::new();
+            let mut offset = 2;
+            while offset < payload.len() {
+                let len = payload[offset] as usize;
+                offset += 1;
+                assert!(len > 0);
+                assert!(offset + len <= payload.len());
+                ids.push(payload[offset..offset + len].to_vec());
+                offset += len;
+            }
+            ids
+        };
+
+        let first = payload_for([1; 32]);
+        assert_eq!(first, payload_for([1; 32]));
+        let ids = parse_ids(&first);
+        assert_eq!(ids.len(), 32);
+        assert_eq!(first.len(), 206);
+
+        let expected = match profile
+            .extensions
+            .iter()
+            .find(|extension| extension.extension_type == ext_type::TRUST_ANCHOR_IDS)
+            .map(|extension| &extension.source)
+            .expect("trust-anchor extension source")
+        {
+            ExtensionSource::TrustAnchorIds { ids, .. } => ids
+                .iter()
+                .map(|id| decode_hex(id).unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            source => panic!("unexpected source: {source:?}"),
+        };
+        assert_eq!(
+            ids.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+
+        let distinct = (1u8..=8)
+            .map(|seed| payload_for([seed; 32]))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            distinct.len() > 1,
+            "different seeds should vary anchor order"
         );
     }
 }

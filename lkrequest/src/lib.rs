@@ -101,6 +101,8 @@
 //! | [`tcp_fingerprint`] | TCP-level fingerprint (JA4T) — window size, TCP options, MSS, window scale, TTL |
 //! | [`connection_pool`] | Per-session connection pool with H2 multiplexing |
 
+#![allow(clippy::double_must_use)]
+
 pub mod alt_svc;
 pub mod blocking;
 pub mod client;
@@ -113,6 +115,7 @@ pub mod h2;
 pub mod hsts;
 pub mod middleware;
 pub mod multipart;
+pub mod network_partition;
 pub mod preset;
 pub mod protocol;
 pub mod proxy;
@@ -133,7 +136,7 @@ pub use alt_svc::{
     should_skip_quic, AltSvcCache, AltSvcEntry, BrokenQuicConfig, BrokenQuicPolicy,
     BrokenQuicTracker, BrokenReason, Origin, Scheme as AltSvcScheme,
 };
-pub use client::{Client, FallbackConfig, ResourceLimits, TimeoutConfig};
+pub use client::{Client, FallbackConfig, H2DataFramePolicy, ResourceLimits, TimeoutConfig};
 pub use connect::{EstablishedConnection, TransportStream};
 pub use connection_pool::PoolStats;
 pub use dns::{CachedSystemDns, DnsConfig, DnsResolver, HttpsRecord, SystemDnsCacheConfig};
@@ -143,6 +146,9 @@ pub use error::{
 };
 pub use hsts::{DynamicHsts, HstsPolicy, NoHsts, StaticHsts};
 pub use middleware::Middleware;
+pub use network_partition::{
+    NetworkPartitionContext, TlsSessionCachePartitionPolicy, TlsSessionResumptionPolicy,
+};
 pub use preset::ClientPreset;
 pub use protocol::{
     AcquisitionPolicy, DnsResolutionMode, FallbackPolicy, HttpIntent, ProtocolPolicy,

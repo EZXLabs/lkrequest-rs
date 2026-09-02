@@ -26,6 +26,8 @@ pub struct LocalHttpsServer {
     shutdown: Option<oneshot::Sender<()>>,
     /// Shared request counter for retry/counting tests.
     pub request_counter: Arc<AtomicU32>,
+    /// Shared TCP accept counter for connection-reuse tests.
+    pub tcp_accept_counter: Arc<AtomicU32>,
 }
 
 /// DER-encoded CA certificate for the local server (for `add_ca_cert_der`).
@@ -281,6 +283,19 @@ async fn handle_request(
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap());
+    }
+
+    if path == "/alt-svc" && method == Method::GET {
+        let port = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("port="))
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(443);
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("alt-svc", format!("h3=\":{port}\"; ma=60"))
+            .body(Full::new(Bytes::from("ok")))
             .unwrap());
     }
 
@@ -550,6 +565,7 @@ pub async fn start_local_https_server() -> LocalHttpsServer {
     let certified = build_certified_key();
     let acceptor = tls_acceptor(&certified);
     let request_counter = Arc::new(AtomicU32::new(0));
+    let tcp_accept_counter = Arc::new(AtomicU32::new(0));
 
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -559,6 +575,7 @@ pub async fn start_local_https_server() -> LocalHttpsServer {
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let counter = request_counter.clone();
+    let accept_counter = tcp_accept_counter.clone();
 
     tokio::spawn(async move {
         loop {
@@ -567,6 +584,7 @@ pub async fn start_local_https_server() -> LocalHttpsServer {
                 _ = &mut shutdown_rx => break,
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
+                    accept_counter.fetch_add(1, Ordering::Relaxed);
                     let acc = acceptor.clone();
                     let cnt = counter.clone();
                     tokio::spawn(async move {
@@ -594,6 +612,7 @@ pub async fn start_local_https_server() -> LocalHttpsServer {
         base_url,
         shutdown: Some(shutdown_tx),
         request_counter,
+        tcp_accept_counter,
     }
 }
 

@@ -72,8 +72,7 @@ QUIC tests live behind `required-features = ["quic-h3"]`:
 cargo test -p lkrequest --features quic-h3
 ```
 
-The `network-e2e` feature additionally compiles public-network integration
-helpers (e.g. `quic_network_e2e.rs`).
+Public-network integration helpers (e.g. `quic_network_e2e.rs`) are compiled with the QUIC test target and remain `#[ignore]`d by default; use `--include-ignored` to run them.
 
 ### FFI (`lkrequest-ffi`)
 

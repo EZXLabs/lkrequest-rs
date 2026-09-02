@@ -18,9 +18,7 @@
 //!
 //! Run:
 //!   ECH_CONFIG_LIST_HEX=<hex> TEST_PROXY=http://127.0.0.1:7897 \
-//!     cargo test -p lkrequest --features h2-native --test ech_alps_diagnostic -- --include-ignored --nocapture
-
-#![cfg(feature = "h2-native")]
+//!     cargo test -p lkrequest --test ech_alps_diagnostic -- --include-ignored --nocapture
 
 use lkrequest::TlsConnector;
 use lktls::profile::presets;
@@ -105,7 +103,13 @@ async fn ech_compression_narrowing() {
         .with_env_filter("lktls=debug")
         .try_init();
 
-    let hex = std::env::var("ECH_CONFIG_LIST_HEX").expect("set ECH_CONFIG_LIST_HEX");
+    let hex = match std::env::var("ECH_CONFIG_LIST_HEX") {
+        Ok(hex) => hex,
+        Err(_) => {
+            eprintln!("skipping: set ECH_CONFIG_LIST_HEX to run the real ECH diagnostic");
+            return;
+        }
+    };
     let ech = hex_decode(&hex).expect("valid hex");
     let host = std::env::var("ECH_TARGET_HOST").unwrap_or_else(|_| "cloudflare-ech.com".into());
     println!("ECH host = {host}, ECHConfigList = {} bytes\n", ech.len());

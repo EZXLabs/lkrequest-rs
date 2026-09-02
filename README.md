@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-4c1.svg">
+  <img alt="Version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -35,15 +35,15 @@ The core invariant is simple: **a browser preset should match the target browser
 - **TLS ClientHello control** — extension ordering, GREASE, cipher suites, signature algorithms, key shares, ECH, ALPS, certificate compression, and handshake behavior.
 - **Native HTTP/2 fingerprinting** — SETTINGS order, WINDOW_UPDATE, PRIORITY, pseudo-header order, HPACK behavior, and request priority.
 - **HTTP/3 and QUIC** — optional H3 stack with QUIC Transport Parameters, QPACK settings, PRIORITY_UPDATE, Alt-Svc discovery, session resumption, and SOCKS5 UDP support.
-- **Capture-backed browser presets** — Chrome 131 and 144–151, Firefox 133/147, and Safari 18/26.
-- **Browser-like sessions** — isolated cookie jars, physically bounded connection pools, H2 stream backpressure, redirects, retries, decompression, streaming, WebSocket, system-DNS singleflight with optional positive caching, and HSTS policies.
+- **Capture-backed browser presets** — Chrome 131 and 144–152, Firefox 133/147, and Safari 18/26.
+- **Browser-like sessions** — isolated cookie jars, configurable physical connection limits, H2 stream backpressure, redirects, retries, decompression, streaming, WebSocket, system-DNS singleflight with optional positive caching, and HSTS policies.
 - **Proxy orchestration** — HTTP CONNECT, SOCKS5, multi-hop proxy chains, resolved-address fallback, `ProxyPool`, and `SessionPool`.
 - **Stable C ABI** — `lkrequest-ffi` mirrors the Rust Client/Session/Request model for other languages.
 - **Offline regression gates** — serialized TLS/H2/QUIC fingerprints are checked against committed golden fixtures.
 
 ## Project Status
 
-- Current workspace release: **0.2.1**.
+- Current workspace release: **0.2.2**.
 - The public API is usable but still evolving before 1.0.
 - The repository is currently consumed **from source**; examples below use a local checkout.
 - HTTP/3, synthetic fingerprints, telemetry, and public-network tests are opt-in features.
@@ -156,7 +156,7 @@ The high-level presets bundle TLS, H2, optional QUIC/H3, protocol policy, and he
 
 | Family | Presets |
 |---|---|
-| Chrome | `chrome_131`, `chrome_144`–`chrome_151` |
+| Chrome | `chrome_131`, `chrome_144`–`chrome_152` |
 | Firefox | `firefox_133`, `firefox_147` |
 | Safari | `safari_18`, `safari_26` |
 
@@ -164,23 +164,66 @@ Use explicit versions for reproducible behavior:
 
 ```rust
 let client = lkrequest::Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_152())
     .build();
 ```
 
-Chrome 151 is capture-verified on Windows. Its TCP TLS/H2 stable fields match Chrome 150, while real public-site QUIC captures use the classic QUIC signature-algorithm list plus `rsa_pkcs1_sha1` without the three TCP ML-DSA entries.
+Chrome 152 is capture-verified on Windows against public Cloudflare endpoints and `example.com`. TCP TLS prepends an independently randomized GREASE code point to `signature_algorithms` before the ML-DSA entries (`0x0904`–`0x0906`) and adds Chromium's shuffled `0xCA34` trust-anchor identifier set while retaining Chrome 151's other stable fields; H2 is unchanged, and QUIC no longer sends `google_initial_rtt` (`0x3127`). The public QUIC flow did not complete far enough to independently recapture H3 SETTINGS, so the preset retains the latest verified Chrome H3 baseline.
+
+When validating Chrome 152, compare the raw ordered `signature_algorithms` sequence or a GREASE-preserving fingerprint such as peetprint. JA3/JA3N do not include this field, while JA4 removes GREASE, so those hashes cannot detect a missing sigalgs GREASE slot. The regression fixture therefore normalizes the random GREASE value in place but still requires it at index 0.
+
+## Browser Network-State Policies
+
+Browser presets model network behavior in addition to handshake bytes. Chrome presets cap HTTP/2 DATA payloads at `16375` bytes so the 9-byte frame header and payload fit in a 16 KiB socket write. The cap can be preserved, disabled, or replaced explicitly:
+
+```rust
+use lkrequest::{Client, H2DataFramePolicy};
+
+let client = Client::builder()
+    .preset(lkrequest::preset::chrome_151())
+    .h2_data_frame_policy(H2DataFramePolicy::BrowserDefault)
+    .build();
+```
+
+TLS 1.3 PSK resumption is controlled separately from the TLS fingerprint. A server must first issue a `NewSessionTicket`; the client policy then controls whether that ticket is cached and offered on a later eligible connection:
+
+```rust
+use lkrequest::{
+    Client, NetworkPartitionContext, TlsSessionCachePartitionPolicy,
+    TlsSessionResumptionPolicy,
+};
+
+let client = Client::builder()
+    .preset(lkrequest::preset::chrome_151())
+    .tls_session_resumption_policy(TlsSessionResumptionPolicy::Enabled {
+        max_tickets_per_server: 2,
+    })
+    .tls_session_cache_partition_policy(TlsSessionCachePartitionPolicy::Chromium)
+    .build();
+
+let session = client
+    .session()
+    .network_partition_context(NetworkPartitionContext::new(
+        "https://top-level.example",
+        "https://third-party.example",
+    ))
+    .build();
+```
+
+Partitioning does not disable resumption for every iframe. Repeated connections to the same server can resume inside the same partition, while tickets are not reused across incompatible top-level browsing contexts. `TlsSessionResumptionPolicy::Disabled` forces full handshakes, and `H2DataFramePolicy::{PeerMaxFrameSize, FixedPayload, SocketWriteAligned}` provide explicit research overrides.
 
 ## Capability Matrix
 
 | Capability | Default | Feature / crate |
 |---|---:|---|
 | HTTP/1.1 | Yes | `lkrequest` |
-| Native fingerprintable HTTP/2 | Yes | `h2-native` |
+| Fingerprintable HTTP/2 | Yes | built in (`lkh2`) |
 | HTTP/3 + QUIC | No | `quic-h3` |
-| Public-network E2E helpers | No | `network-e2e` |
 | Synthetic fingerprint generation | No | `synthetic-fp` |
 | Operational telemetry | No | `telemetry` |
 | C ABI | Separate crate | `lkrequest-ffi` |
+
+Public-network E2E tests are test-only and remain ignored by default; run them explicitly with `--include-ignored`.
 
 Synthetic modes intentionally produce fingerprints that do not correspond to a captured browser. They are not substitutes for browser presets and should not be used where allowlist identity is expected.
 
@@ -214,7 +257,7 @@ let client = Client::builder()
     .build();
 ```
 
-The cache belongs to that resolver instance, stores only successful non-empty address lists, and never caches errors. A zero TTL or zero capacity disables completed-result caching while retaining in-flight coalescing. Resolver configuration methods replace each other, so the last call to `.dns()`, `.dns_resolver()`, or `.system_dns_cache()` wins. Use `DnsConfig` or a custom `DnsResolver` instead when custom name servers, DoH/DoT, HTTPS/SVCB records, or ECH discovery are required.
+The cache belongs to that resolver instance, stores only successful non-empty address lists, and never caches errors. A zero TTL or zero capacity disables completed-result caching while retaining in-flight coalescing. Resolver configuration methods replace each other, so the last call to `.dns()`, `.dns_resolver()`, or `.system_dns_cache()` wins. Use `DnsConfig` or a custom `DnsResolver` instead when custom name servers, DoH/DoT, HTTPS/SVCB records, or ECH discovery are required. DNS over HTTPS additionally requires the optional `doh` feature.
 
 Typical choices:
 

@@ -656,3 +656,126 @@ async fn lkrequest_http3_emits_chrome_control_stream_frames() {
     server_task.await.unwrap();
     server.wait_idle().await;
 }
+
+/// Resolver that advertises H3 at a **different** hostname than the origin, the
+/// way an HTTPS RR with an explicit `TargetName` does. Every name still resolves
+/// to the local server, so only the TLS identity distinguishes the two.
+#[derive(Clone)]
+struct AlternativeTargetDns;
+
+#[async_trait]
+impl lkrequest::DnsResolver for AlternativeTargetDns {
+    async fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![localhost_addr(port)])
+    }
+
+    async fn lookup_https(
+        &self,
+        _host: &str,
+    ) -> std::io::Result<Option<lkrequest::dns::HttpsRecord>> {
+        Ok(Some(lkrequest::dns::HttpsRecord {
+            target: Some("alt.invalid".to_string()),
+            alpn: vec!["h3".to_string()],
+            ..Default::default()
+        }))
+    }
+}
+
+/// An alternative service selects the dial target, never the TLS identity.
+///
+/// RFC 7838 §3.1 and RFC 9460 §2.3 both require the alternative endpoint to
+/// prove it may serve the *origin*; the client authenticates the origin name.
+/// Sending the alternative's own name as SNI let it authenticate as itself, and
+/// broke conforming deployments, where a CDN target holds a certificate for the
+/// origin rather than for its internal name.
+///
+/// The server here holds a certificate for `localhost` only, and reports the SNI
+/// it actually received.
+#[tokio::test]
+async fn alt_service_target_does_not_become_the_tls_identity() {
+    ensure_rustls_provider();
+    let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+
+    let mut server_tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .unwrap();
+    server_tls.alpn_protocols = vec![b"h3".to_vec()];
+    let server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls).unwrap()));
+
+    let server = Endpoint::server(server_config, localhost_addr(0)).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let (sni_tx, sni_rx) = oneshot::channel::<Option<String>>();
+
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+
+            // What the client actually put in the ClientHello.
+            let sni = conn
+                .handshake_data()
+                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|data| data.server_name.clone());
+            let _ = sni_tx.send(sni);
+
+            let mut h3_conn =
+                server::Connection::<_, bytes::Bytes>::new(h3_quinn::Connection::new(conn))
+                    .await
+                    .unwrap();
+            if let Some(resolver) = h3_conn.accept().await.unwrap() {
+                let (_request, mut stream) = resolver.resolve_request().await.unwrap();
+                stream
+                    .send_response(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                stream
+                    .send_data(bytes::Bytes::from_static(b"origin-identity"))
+                    .await
+                    .unwrap();
+                stream.finish().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    });
+
+    let client = lkrequest::Client::builder()
+        .fingerprint(lktls::profile::presets::chrome_144())
+        .quic_profile(lkh3::chrome_quic())
+        // Verification stays on: the certificate names `localhost`, so an SNI of
+        // `alt.invalid` also fails the identity check, not just this assertion.
+        .add_ca_cert_der(cert_der.as_ref())
+        .dns_resolver(Arc::new(AlternativeTargetDns))
+        .build();
+
+    let session = client.session().http3_only().build();
+    let url = format!("https://localhost:{}/alt", server_addr.port());
+    let response = session
+        .get(&url)
+        .send()
+        .await
+        .expect("the origin identity must be used, so the localhost certificate matches");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().unwrap(), "origin-identity");
+
+    let sni = sni_rx.await.expect("server reports the SNI it received");
+    assert_eq!(
+        sni.as_deref(),
+        Some("localhost"),
+        "SNI must name the origin, not the alternative service target"
+    );
+
+    server_task.await.unwrap();
+    server.wait_idle().await;
+}

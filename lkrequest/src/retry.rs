@@ -15,8 +15,14 @@
 //! (connection-establishment failures, HTTP/2 `REFUSED_STREAM`), or when the
 //! request is explicitly marked [`Idempotency::Idempotent`](crate::Idempotency).
 //! This prevents a timeout/reset *after* a `POST` was sent from silently
-//! duplicating a side effect. Retryable status-code responses (429/502/503/…)
-//! are retried regardless of method.
+//! duplicating a side effect.
+//!
+//! Status-code retries are gated the same way, by
+//! [`status_retry_is_replay_safe`]. Because the server answered, a
+//! non-idempotent method is never replayed by default: a status code cannot
+//! prove that the request was not applied. Safe methods and callers that
+//! explicitly opt into replay with [`Idempotency::Idempotent`](crate::Idempotency)
+//! remain eligible for status-code retries.
 //!
 //! # Built-in Strategies
 //!
@@ -116,6 +122,22 @@ pub fn retry_is_replay_safe(
     error: &Error,
 ) -> bool {
     error.is_safe_to_replay() || crate::session::can_send_early_data(method, idempotency)
+}
+
+/// Whether a *status-code* retry is safe to auto-replay.
+///
+/// The server answered, so the request reached the HTTP peer. Even statuses
+/// such as `429 Too Many Requests` and `503 Service Unavailable` do not prove
+/// that an unsafe request was not observed or applied by an upstream gateway
+/// or application. Consequently, only safe methods or an explicit
+/// [`Idempotency::Idempotent`](crate::Idempotency) opt-in may be replayed.
+pub fn status_retry_is_replay_safe(
+    method: &http::Method,
+    idempotency: crate::session::Idempotency,
+    status: http::StatusCode,
+) -> bool {
+    let _ = status;
+    crate::session::can_send_early_data(method, idempotency)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +396,54 @@ mod tests {
         assert_eq!(d2, Duration::from_millis(500));
 
         assert!(policy.should_retry(3, Some(&timeout_error), None).is_none());
+    }
+
+    /// Regression: the status-code retry path had no replay-safety gate at all,
+    /// so a `POST` answered with `502` — where the origin may already have
+    /// applied it — was silently sent again.
+    #[test]
+    fn status_retry_gate_blocks_ambiguous_statuses_for_non_idempotent_methods() {
+        use crate::session::Idempotency;
+        use http::{Method, StatusCode};
+
+        let ambiguous = [502u16, 504, 520, 522, 524, 530];
+        for code in ambiguous {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(
+                !status_retry_is_replay_safe(&Method::POST, Idempotency::Default, status),
+                "POST must not be auto-replayed on {code}: the origin may have applied it"
+            );
+        }
+
+        for code in [429u16, 503] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(
+                !status_retry_is_replay_safe(&Method::POST, Idempotency::Default, status),
+                "POST must not be auto-replayed on {code}: the status does not prove non-application"
+            );
+        }
+    }
+
+    /// Safe methods and an explicit idempotency opt-in are replayable on every
+    /// retryable status — the gate only constrains non-idempotent methods.
+    #[test]
+    fn status_retry_gate_allows_safe_methods_and_explicit_idempotency() {
+        use crate::session::Idempotency;
+        use http::{Method, StatusCode};
+
+        let bad_gateway = StatusCode::from_u16(502).unwrap();
+
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS, Method::TRACE] {
+            assert!(
+                status_retry_is_replay_safe(&method, Idempotency::Default, bad_gateway),
+                "{method} is safe and carries no side effect to duplicate"
+            );
+        }
+
+        assert!(
+            status_retry_is_replay_safe(&Method::POST, Idempotency::Idempotent, bad_gateway),
+            "an explicit Idempotency-Key opts a POST back into replay"
+        );
     }
 
     #[test]

@@ -124,6 +124,12 @@ pub enum AlertDescription {
     CertificateRequired,
     /// `no_application_protocol` (120).
     NoApplicationProtocol,
+    /// `ech_required` (121).
+    ///
+    /// Sent by a client that offered Encrypted ClientHello and the server did
+    /// not accept it: the outer handshake exists only to authenticate the
+    /// `public_name` and collect `retry_configs`, and must then be aborted.
+    EchRequired,
     /// Unknown alert description code.
     Unknown(u8),
 }
@@ -166,6 +172,7 @@ impl AlertDescription {
             115 => AlertDescription::UnknownPskIdentity,
             116 => AlertDescription::CertificateRequired,
             120 => AlertDescription::NoApplicationProtocol,
+            121 => AlertDescription::EchRequired,
             other => AlertDescription::Unknown(other),
         }
     }
@@ -207,6 +214,7 @@ impl AlertDescription {
             AlertDescription::UnknownPskIdentity => 115,
             AlertDescription::CertificateRequired => 116,
             AlertDescription::NoApplicationProtocol => 120,
+            AlertDescription::EchRequired => 121,
             AlertDescription::Unknown(b) => *b,
         }
     }
@@ -248,6 +256,7 @@ impl AlertDescription {
             AlertDescription::UnknownPskIdentity => "unknown_psk_identity",
             AlertDescription::CertificateRequired => "certificate_required",
             AlertDescription::NoApplicationProtocol => "no_application_protocol",
+            AlertDescription::EchRequired => "ech_required",
             AlertDescription::Unknown(_) => "unknown",
         }
     }
@@ -336,6 +345,22 @@ pub enum TlsError {
     /// A required feature is not yet implemented.
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    /// Encrypted ClientHello was offered but the server did not accept it.
+    ///
+    /// The outer handshake runs to completion so the `public_name` can be
+    /// authenticated and any `retry_configs` collected, and is then aborted with
+    /// an `ech_required` alert — the connection must not carry application data,
+    /// because the true server name was never protected.
+    ///
+    /// `retry_configs` carries the fresh `ECHConfigList` the server offered, if
+    /// any. A caller that wants to preserve ECH should retry the connection once
+    /// with it; retrying without ECH would leak the very name ECH was protecting.
+    #[error("ECH rejected by server (retry_configs: {} bytes)", retry_configs.as_ref().map_or(0, |c| c.len()))]
+    EchRejected {
+        /// Fresh `ECHConfigList` from the server's EncryptedExtensions, if sent.
+        retry_configs: Option<Vec<u8>>,
+    },
 }
 
 impl TlsError {
@@ -416,6 +441,7 @@ mod tests {
             (70, AlertDescription::ProtocolVersion),
             (80, AlertDescription::InternalError),
             (120, AlertDescription::NoApplicationProtocol),
+            (121, AlertDescription::EchRequired),
         ];
         for &(byte, ref expected) in cases {
             assert_eq!(AlertDescription::from_byte(byte), *expected);

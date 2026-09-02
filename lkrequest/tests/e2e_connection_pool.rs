@@ -5,9 +5,23 @@
 mod support;
 
 use lkrequest::h2::profile::chrome_144_h2;
+#[cfg(feature = "quic-h3")]
+use lkrequest::TimeoutConfig;
 use lkrequest::{Client, HttpVersion, PreferredHttpVersion};
 use lktls::profile::presets;
 use support::local_https::{start_local_https_server, url_join};
+
+#[cfg(feature = "quic-h3")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "quic-h3")]
+use std::sync::Arc;
+#[cfg(feature = "quic-h3")]
+use std::time::Duration;
+
+#[cfg(feature = "quic-h3")]
+use quinn::crypto::rustls::QuicServerConfig;
+#[cfg(feature = "quic-h3")]
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn chrome_client() -> Client {
     Client::builder()
@@ -112,6 +126,65 @@ async fn test_pool_connection_reuse_h1() {
         stats.total >= 1,
         "H1 pool should have connections, stats={stats:?}"
     );
+}
+
+#[cfg(feature = "quic-h3")]
+#[tokio::test]
+async fn test_h3_fallback_reuses_pooled_h2_after_quic_is_marked_broken() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let srv = start_local_https_server().await;
+    let quic_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let quic_cert_der = CertificateDer::from(quic_cert.cert.der().to_vec());
+    let quic_key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
+        quic_cert.signing_key.serialize_der(),
+    ));
+    let mut quic_tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![quic_cert_der], quic_key_der)
+        .unwrap();
+    quic_tls.alpn_protocols = vec![b"not-h3".to_vec()];
+    let quic_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(quic_tls).unwrap()));
+    let quic_server = quinn::Endpoint::server(quic_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let quic_port = quic_server.local_addr().unwrap().port();
+    let quic_task = tokio::spawn({
+        let quic_server = quic_server.clone();
+        async move {
+            if let Some(incoming) = quic_server.accept().await {
+                let _ = incoming.await;
+            }
+        }
+    });
+    let client = Client::builder()
+        .fingerprint(presets::chrome_144())
+        .h2_profile(chrome_144_h2())
+        .quic_profile(lkh3::chrome_quic())
+        .verify(false)
+        .timeout_config(
+            TimeoutConfig::default().with_quic_connect_timeout(Duration::from_millis(200)),
+        )
+        .build();
+    let session = client.session().http3_with_fallback().build();
+    let url = url_join(&srv.base_url, &format!("/alt-svc?port={quic_port}"));
+
+    for request_index in 0..3 {
+        let response = session
+            .get(&url)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("request {request_index}: {error}"));
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.version(), HttpVersion::H2);
+    }
+
+    assert_eq!(
+        srv.tcp_accept_counter.load(Ordering::Relaxed),
+        2,
+        "the initial H2 connection and QUIC-fallback H2 connection are expected; later requests must reuse the pooled fallback connection"
+    );
+
+    quic_server.close(0u32.into(), b"done");
+    let _ = quic_task.await;
 }
 
 // ---------------------------------------------------------------------------

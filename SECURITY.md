@@ -7,7 +7,7 @@ If you discover a security vulnerability in `lkrequest`, please report it
 discussion for security-sensitive matters, as that may expose other users to
 risk before a fix is available.
 
-- **Contact:** email `art_liberoxr@mail.com` with the subject line prefixed
+- **Contact:** email `admin@ez-xlabs.com` with the subject line prefixed
   `[lkrequest security]`.
 - **Include (where possible):** affected crate(s) and version/commit, a
   description of the issue and its impact, reproduction steps or a
@@ -31,8 +31,8 @@ are not backed by a contractual SLA.
 
 | Version | Supported                          |
 | ------- | ---------------------------------- |
-| 0.1.x   | Pre-release / best-effort only     |
-| < 0.1   | Not supported                      |
+| 0.2.x   | Pre-release / best-effort only     |
+| < 0.2   | Not supported                      |
 
 `lkrequest` has not yet reached a stable 1.0 release. The `0.1.x` line is
 pre-release software; security fixes are provided on a best-effort basis and

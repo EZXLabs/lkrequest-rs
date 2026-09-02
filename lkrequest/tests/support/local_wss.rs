@@ -55,7 +55,10 @@ fn tls_acceptor(cert: &CertifiedKey<KeyPair>) -> TlsAcceptor {
 fn ws_accept_key(client_key: &str) -> String {
     use aws_lc_rs::digest;
     let mut input = client_key.trim().to_string();
-    input.push_str("258EAFA5-E914-47DA-95CA-5AB5DC175B18");
+    // RFC 6455 §1.3. The previous value here was not the GUID the RFC
+    // specifies, which stayed invisible while the client only warned on a
+    // mismatched Sec-WebSocket-Accept.
+    input.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, input.as_bytes());
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_ref())
 }

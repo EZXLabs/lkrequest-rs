@@ -32,6 +32,7 @@ pub(crate) fn parse_preset_name(name: &str) -> Result<PresetKind, FfiError> {
         "chrome_149" => Ok(PresetKind::Chrome149),
         "chrome_150" => Ok(PresetKind::Chrome150),
         "chrome_151" => Ok(PresetKind::Chrome151),
+        "chrome_152" => Ok(PresetKind::Chrome152),
         "firefox_133" => Ok(PresetKind::Firefox133),
         "firefox_147" => Ok(PresetKind::Firefox147),
         "safari_18" => Ok(PresetKind::Safari18),
@@ -51,6 +52,7 @@ pub(crate) fn preset_bundle(preset: PresetKind) -> lkrequest::preset::ClientPres
         PresetKind::Chrome149 => lkrequest::preset::chrome_149(),
         PresetKind::Chrome150 => lkrequest::preset::chrome_150(),
         PresetKind::Chrome151 => lkrequest::preset::chrome_151(),
+        PresetKind::Chrome152 => lkrequest::preset::chrome_152(),
         PresetKind::Firefox133 => lkrequest::preset::firefox_133(),
         PresetKind::Firefox147 => lkrequest::preset::firefox_147(),
         PresetKind::Safari18 => lkrequest::preset::safari_18(),
@@ -393,10 +395,13 @@ fn map_dns_config(config: lk_dns_config_t) -> lkrequest::DnsConfig {
     match config {
         lk_dns_config_t::LK_DNS_SYSTEM => lkrequest::DnsConfig::System,
         lk_dns_config_t::LK_DNS_GOOGLE => lkrequest::DnsConfig::Google,
+        #[cfg(feature = "doh")]
         lk_dns_config_t::LK_DNS_GOOGLE_HTTPS => lkrequest::DnsConfig::GoogleHttps,
         lk_dns_config_t::LK_DNS_CLOUDFLARE => lkrequest::DnsConfig::Cloudflare,
+        #[cfg(feature = "doh")]
         lk_dns_config_t::LK_DNS_CLOUDFLARE_HTTPS => lkrequest::DnsConfig::CloudflareHttps,
         lk_dns_config_t::LK_DNS_QUAD9 => lkrequest::DnsConfig::Quad9,
+        #[cfg(feature = "doh")]
         lk_dns_config_t::LK_DNS_QUAD9_HTTPS => lkrequest::DnsConfig::Quad9Https,
     }
 }

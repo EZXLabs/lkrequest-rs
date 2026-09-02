@@ -1,0 +1,25 @@
+{
+  "headers_priority": {
+    "exclusive": true,
+    "stream_dependency": 0,
+    "weight": 255
+  },
+  "priority_frames": [],
+  "pseudo_header_order": [
+    "method",
+    "scheme",
+    "path",
+    "authority"
+  ],
+  "settings": [
+    {
+      "id": "initial_window_size",
+      "value": 4194304
+    },
+    {
+      "id": "max_concurrent_streams",
+      "value": 100
+    }
+  ],
+  "window_update": 10485760
+}

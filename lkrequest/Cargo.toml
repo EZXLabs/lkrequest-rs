@@ -1,14 +1,18 @@
 [package]
 name = "lkrequest"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "HTTP client with fine-grained TLS fingerprint control"
 
 [features]
 default = ["h2-native"]
+
+doh = ["hickory-resolver/https-aws-lc-rs"]
+# Backward-compatible alias. HTTP/2 always uses lkh2 and no longer has an
+# alternate backend.
 h2-native = ["lkh2/h2-native"]
 quic-h3 = ["dep:lktls-quic", "dep:lkh3", "dep:lkquic", "dep:quinn"]
-# Tier-2 integration tests that hit the public internet (not enabled in default CI).
+# Tier-2 integration tests that hit the public internet (not enabled in CI).
 network-e2e = []
 # Operational telemetry (bandwidth / connection / request counters). Off by
 # default so non-observed deployments carry zero transport instrumentation.
@@ -65,7 +69,6 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 urlencoding = "2"
 tracing-subscriber = { version = "0.3", features = ["registry", "fmt", "env-filter"] }
-h2 = { workspace = true }
 hyper-util = { workspace = true, features = ["server-auto", "http1", "http2"] }
 rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26"
@@ -82,6 +85,14 @@ harness = false
 [[bench]]
 name = "offline_bench"
 harness = false
+
+[[bench]]
+name = "multipart_bench"
+harness = false
+
+[[example]]
+name = "dns_proxy_probe"
+required-features = ["doh"]
 
 [[example]]
 name = "telemetry_metrics"

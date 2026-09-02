@@ -77,7 +77,7 @@ thiserror = "2"
 fastwebsockets = { version = "0.10", features = ["upgrade"] }
 
 # HTTP
-hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = [
     "client",
     "client-legacy",
@@ -106,9 +106,9 @@ base64 = "0.22"
 bitflags = "2"
 
 # DNS
-hickory-resolver = { version = "0.26", features = [
+hickory-resolver = { version = "0.26", default-features = false, features = [
     "tokio",
-    "https-aws-lc-rs",
+    "tls-aws-lc-rs",
     "rustls-platform-verifier",
 ] }
 async-trait = "0.1"

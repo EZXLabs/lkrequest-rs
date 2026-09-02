@@ -71,6 +71,33 @@ pub enum CanonicalExtSource {
     /// fingerprint). A struct variant (not a tuple) so it serializes cleanly
     /// under the internally-tagged representation.
     Raw { data: String },
+    /// Chromium/BoringSSL trust-anchor identifiers. The wire order is shuffled,
+    /// so canonicalization stores the sorted identifier set.
+    TrustAnchorIds { ids: Vec<String> },
+}
+
+fn canonical_trust_anchor_ids(data: &[u8]) -> Option<Vec<String>> {
+    if data.len() < 2 {
+        return None;
+    }
+    let declared = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if declared != data.len() - 2 {
+        return None;
+    }
+
+    let mut ids = Vec::new();
+    let mut offset = 2;
+    while offset < data.len() {
+        let len = data[offset] as usize;
+        offset += 1;
+        if len == 0 || offset + len > data.len() {
+            return None;
+        }
+        ids.push(hex::encode(&data[offset..offset + len]));
+        offset += len;
+    }
+    ids.sort();
+    Some(ids)
 }
 
 /// A single canonical extension: its (possibly tokenized) type plus source.
@@ -94,7 +121,7 @@ pub struct CanonicalTlsFingerprint {
     pub extensions: Vec<CanonicalExtension>,
     /// `supported_groups` (0x000a) in order; GREASE tokenized.
     pub supported_groups: Vec<u16>,
-    /// `signature_algorithms` (0x000d) in order.
+    /// `signature_algorithms` (0x000d) in order; GREASE tokenized.
     pub signature_algorithms: Vec<u16>,
     /// `ec_point_formats` (0x000b).
     pub ec_point_formats: Vec<u8>,
@@ -143,7 +170,9 @@ impl CanonicalTlsFingerprint {
             match ext.extension_type {
                 0x000a => supported_groups = tokenize_vec(extract_supported_groups(&ext.data)),
                 0x000b => ec_point_formats = extract_ec_point_formats(&ext.data),
-                0x000d => signature_algorithms = extract_signature_algorithms(&ext.data),
+                0x000d => {
+                    signature_algorithms = tokenize_vec(extract_signature_algorithms(&ext.data))
+                }
                 0x0010 => alpn_protocols = extract_alpn_protocols(&ext.data),
                 0x0015 => has_padding = true,
                 0x001b => {
@@ -166,6 +195,15 @@ impl CanonicalTlsFingerprint {
                     CanonicalExtension {
                         extension_type: GREASE_TOKEN,
                         source: CanonicalExtSource::Grease,
+                    }
+                } else if e.extension_type == 0xca34 {
+                    CanonicalExtension {
+                        extension_type: e.extension_type,
+                        source: canonical_trust_anchor_ids(&e.data)
+                            .map(|ids| CanonicalExtSource::TrustAnchorIds { ids })
+                            .unwrap_or_else(|| CanonicalExtSource::Raw {
+                                data: hex::encode(&e.data),
+                            }),
                     }
                 } else if WELL_KNOWN_EXTENSIONS.contains(&e.extension_type) || e.data.is_empty() {
                     CanonicalExtension {
@@ -231,6 +269,8 @@ mod tests {
                 // supported_groups with a GREASE group first
                 ext(0x000a, encode_u16_list(&[0xcaca, 0x001d, 0x0017])),
                 ext(0xdead, vec![9, 9]), // unknown extension with data
+                // signature_algorithms with a GREASE algorithm first
+                ext(0x000d, encode_u16_list(&[0xdada, 0x0804, 0x0403])),
             ],
         }
     }
@@ -279,6 +319,12 @@ mod tests {
     }
 
     #[test]
+    fn grease_in_signature_algorithms_is_tokenized_in_place() {
+        let fp = CanonicalTlsFingerprint::from_parsed(&ch_with_grease());
+        assert_eq!(fp.signature_algorithms, vec![GREASE_TOKEN, 0x0804, 0x0403]);
+    }
+
+    #[test]
     fn two_captures_with_different_grease_values_are_equal_after_canonicalization() {
         let mut a = ch_with_grease();
         let mut b = ch_with_grease();
@@ -291,6 +337,31 @@ mod tests {
             CanonicalTlsFingerprint::from_parsed(&a),
             CanonicalTlsFingerprint::from_parsed(&b),
             "canonical fingerprints must match once GREASE is tokenized"
+        );
+    }
+
+    #[test]
+    fn trust_anchor_identifier_order_is_canonicalized() {
+        let payload = |ids: &[&[u8]]| {
+            let mut data = Vec::new();
+            let list_len = ids.iter().map(|id| 1 + id.len()).sum::<usize>() as u16;
+            data.extend_from_slice(&list_len.to_be_bytes());
+            for id in ids {
+                data.push(id.len() as u8);
+                data.extend_from_slice(id);
+            }
+            data
+        };
+        let mut a = ch_with_grease();
+        let mut b = ch_with_grease();
+        a.extensions
+            .push(ext(0xca34, payload(&[b"first", b"second"])));
+        b.extensions
+            .push(ext(0xca34, payload(&[b"second", b"first"])));
+
+        assert_eq!(
+            CanonicalTlsFingerprint::from_parsed(&a),
+            CanonicalTlsFingerprint::from_parsed(&b)
         );
     }
 

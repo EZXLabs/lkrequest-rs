@@ -31,11 +31,11 @@ fn rand_u8() -> u8 {
 /// Per-connection GREASE seeds, mirroring BoringSSL's `ssl_grease_index_t`.
 ///
 /// Each GREASE position (cipher, group, extension1, extension2, version,
-/// ticket_extension, ech_config_id) gets its own independent random value,
+/// ticket_extension, ech_config_id, signature_algorithm) gets its own independent random value,
 /// generated once per connection and reused across HelloRetryRequest retries.
 #[derive(Debug, Clone)]
 pub struct GreaseValues {
-    seeds: [u8; 7],
+    seeds: [u8; 8],
 }
 
 #[repr(usize)]
@@ -48,6 +48,7 @@ pub enum GreaseIndex {
     Version = 4,
     TicketExtension = 5,
     EchConfigId = 6,
+    SignatureAlgorithm = 7,
 }
 
 impl Default for GreaseValues {
@@ -61,7 +62,7 @@ impl GreaseValues {
     pub fn new() -> Self {
         use aws_lc_rs::rand::{SecureRandom, SystemRandom};
         let rng = SystemRandom::new();
-        let mut seeds = [0u8; 7];
+        let mut seeds = [0u8; 8];
         rng.fill(&mut seeds).expect("system RNG failed");
         Self { seeds }
     }
@@ -186,10 +187,20 @@ mod tests {
     #[test]
     fn extension2_grease_is_xored_when_it_matches_extension1() {
         let grease = GreaseValues {
-            seeds: [0, 0, 0x20, 0x2f, 0, 0, 0],
+            seeds: [0, 0, 0x20, 0x2f, 0, 0, 0, 0],
         };
         assert_eq!(grease.get(GreaseIndex::Extension1), 0x2a2a);
         assert_eq!(grease.get(GreaseIndex::Extension2), 0x3a3a);
+    }
+
+    #[test]
+    fn signature_algorithm_grease_uses_an_independent_seed() {
+        let grease = GreaseValues {
+            seeds: [0x80, 0, 0, 0, 0, 0, 0, 0x10],
+        };
+
+        assert_eq!(grease.get(GreaseIndex::Cipher), 0x8a8a);
+        assert_eq!(grease.get(GreaseIndex::SignatureAlgorithm), 0x1a1a);
     }
 
     #[test]

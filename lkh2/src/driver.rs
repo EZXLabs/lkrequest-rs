@@ -295,6 +295,44 @@ struct PendingStream {
     headers_tx: Option<oneshot::Sender<Result<NativeResponseHeaders, DriverError>>>,
     /// Streams body data chunks to the consumer.
     body_tx: mpsc::UnboundedSender<Result<Bytes, DriverError>>,
+    /// Method of the request this stream carries. Decides whether the response
+    /// is defined to have content (RFC 9110 §6.4.1), which in turn decides
+    /// whether the RFC 9113 §8.1.1 content-length check applies.
+    method: http::Method,
+    /// `content-length` bookkeeping, populated once the final response headers
+    /// declare one for a response that is defined to have content.
+    content_length: Option<ContentLengthCheck>,
+}
+
+impl PendingStream {
+    fn new(
+        method: http::Method,
+        headers_tx: oneshot::Sender<Result<NativeResponseHeaders, DriverError>>,
+        body_tx: mpsc::UnboundedSender<Result<Bytes, DriverError>>,
+    ) -> Self {
+        Self {
+            headers_tx: Some(headers_tx),
+            body_tx,
+            method,
+            content_length: None,
+        }
+    }
+}
+
+/// Running comparison of a response's declared `content-length` against the
+/// sum of its DATA frame payload lengths (RFC 9113 §8.1.1).
+struct ContentLengthCheck {
+    expected: u64,
+    received: u64,
+}
+
+impl ContentLengthCheck {
+    fn mismatch_reason(&self) -> String {
+        format!(
+            "content-length {} does not match the {} DATA byte(s) received (RFC 9113 §8.1.1)",
+            self.expected, self.received
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -433,11 +471,13 @@ where
         .map(|max| Arc::new(Semaphore::new(max)));
 
     let behavior = behavior.unwrap_or_else(H2Behavior::default_behavior);
+    let max_data_frame_payload = behavior.write_policy.max_data_frame_payload();
 
     tracing::info!(
         write_policy = ?behavior.write_policy,
         flow_control = ?behavior.flow_control,
         hpack_policy = ?behavior.hpack_policy,
+        max_data_frame_payload = ?max_data_frame_payload,
         max_pending_requests = ?config.max_pending_requests,
         "h2.native.behavior_applied"
     );
@@ -446,6 +486,7 @@ where
         profile,
         behavior.flow_control.box_clone(),
         Some(behavior.hpack_policy.box_clone()),
+        max_data_frame_payload,
     );
 
     let write_policy = behavior.write_policy;
@@ -614,6 +655,12 @@ async fn driver_loop<S>(
                     }
                     Ok(_n) => {
                         let (mut events, outbound_frames) = engine.process(&mut read_buf);
+                        let connection_error = events.iter().find_map(|event| match event {
+                            H2Event::Error(message) => Some(DriverError::Protocol(format!(
+                                "connection error: {message}"
+                            ))),
+                            _ => None,
+                        });
 
                         if !outbound_frames.is_empty() {
                             if let Err(e) = encode_and_write_frames(
@@ -627,11 +674,33 @@ async fn driver_loop<S>(
                             }
                         }
 
+                        let mut resets = Vec::new();
                         for event in events.drain(..) {
-                            handle_event(event, &mut pending);
+                            handle_event_inner(event, &mut pending, &mut resets);
+                        }
+
+                        // RFC 9113 §8.1.1: a malformed response is a stream
+                        // error of type PROTOCOL_ERROR, and the RST_STREAM has
+                        // to reach the server or it may keep sending DATA on a
+                        // stream we have already torn down.
+                        if let Err(e) = write_stream_resets(&mut stream, &mut engine, &resets).await
+                        {
+                            let error = DriverError::Io(e.to_string());
+                            tracing::error!(error = %error, "h2.native.rst_stream_write_error");
+                            notify_all_error(&mut pending, error.clone());
+                            notify_waiting_error(&mut waiting, error);
+                            break;
                         }
 
                         engine.recycle_buffers(events, Vec::new());
+
+                        if let Some(error) = connection_error {
+                            tracing::error!(error = %error, "h2.native.connection_error");
+                            notify_all_error(&mut pending, error.clone());
+                            notify_waiting_error(&mut waiting, error);
+                            let _ = stream.shutdown().await;
+                            break;
+                        }
                     }
                     Err(e) => {
                         let error = DriverError::Io(e.to_string());
@@ -750,41 +819,43 @@ where
         }
 
         let stream_id = engine.open_stream();
-        let (frames, headers_tx, body_tx, pending_permit) = match request {
+        let (frames, headers_tx, body_tx, pending_permit, method) = match request {
             QueuedRequest::Request {
                 request,
                 headers_tx,
                 body_tx,
                 pending_permit,
                 ..
-            } => (
-                engine.build_request(stream_id, *request),
-                headers_tx,
-                body_tx,
-                pending_permit,
-            ),
+            } => {
+                let method = request.method().clone();
+                (
+                    engine.build_request(stream_id, *request),
+                    headers_tx,
+                    body_tx,
+                    pending_permit,
+                    method,
+                )
+            }
             QueuedRequest::NativeRequest {
                 request,
                 headers_tx,
                 body_tx,
                 pending_permit,
                 ..
-            } => (
-                engine.build_native_request(stream_id, *request),
-                headers_tx,
-                body_tx,
-                pending_permit,
-            ),
+            } => {
+                let method = request.method.clone();
+                (
+                    engine.build_native_request(stream_id, *request),
+                    headers_tx,
+                    body_tx,
+                    pending_permit,
+                    method,
+                )
+            }
         };
         drop(pending_permit);
 
-        pending.insert(
-            stream_id,
-            PendingStream {
-                headers_tx: Some(headers_tx),
-                body_tx,
-            },
-        );
+        pending.insert(stream_id, PendingStream::new(method, headers_tx, body_tx));
 
         if let Err(error) = encode_and_write_frames(stream, engine, write_policy, frames).await {
             let error = DriverError::Io(error.to_string());
@@ -804,8 +875,8 @@ where
 /// Group, encode, and flush frames via write policy.
 ///
 /// Each group returned by `FrameWritePolicy::group_frames` is encoded
-/// into a single buffer and flushed as one TLS record, giving the
-/// policy full control over the wire framing.
+/// into a single buffer and issued as one `AsyncWrite` call. The TLS layer
+/// may split that write into multiple records when it exceeds its record cap.
 async fn encode_and_write_frames<S>(
     stream: &mut S,
     engine: &H2Engine,
@@ -844,6 +915,7 @@ where
         .extensions
         .get::<crate::profile::RequestPriority>()
         .copied();
+    let method = parts.method.clone();
     let native_req = crate::adapter::NativeH2Request {
         method: parts.method,
         uri: parts.uri,
@@ -865,10 +937,7 @@ where
 
     pending.insert(
         stream_id,
-        PendingStream {
-            headers_tx: Some(first_req.headers_tx),
-            body_tx: first_req.body_tx,
-        },
+        PendingStream::new(method, first_req.headers_tx, first_req.body_tx),
     );
 
     if let Err(e) = encode_and_write_frames(stream, engine, write_policy, frames).await {
@@ -896,37 +965,249 @@ fn is_interim_status(status: u16) -> bool {
     (100..200).contains(&status)
 }
 
-fn handle_event(event: H2Event, pending: &mut HashMap<u32, PendingStream>) {
+/// Whether a response to `method` with `status` is defined to carry content
+/// (RFC 9110 §6.4.1).
+///
+/// RFC 9113 §8.1.1 exempts these responses from the content-length ↔ DATA-sum
+/// equality: a 204, a 304 or the response to a HEAD may legally declare a
+/// non-zero `content-length` while sending no DATA at all.
+fn response_has_content(method: &http::Method, status: u16) -> bool {
+    if method == http::Method::HEAD {
+        return false;
+    }
+    if method == http::Method::CONNECT && (200..300).contains(&status) {
+        return false;
+    }
+    !matches!(status, 204 | 304)
+}
+
+/// Fail one stream with a malformed-response protocol error.
+///
+/// RFC 9113 §8.1.1 makes a malformed response a **stream** error of type
+/// PROTOCOL_ERROR, so only this stream is torn down — the connection and every
+/// other stream on it keep running. The caller receives
+/// `DriverError::Protocol` (never a synthesized status), which is what lets it
+/// tell a protocol violation apart from a status the server really sent.
+///
+/// The stream id is pushed onto `resets` so the driver loop can emit the
+/// RST_STREAM §8.1.1 also calls for. This used to write nothing to the wire, on
+/// the theory that sending the frame would diverge from the fingerprint. That
+/// was backwards: Chromium's netlog runs
+/// `HTTP2_SESSION_RECV_INVALID_HEADER` → `HTTP2_SESSION_SEND_RST_STREAM` with
+/// PROTOCOL_ERROR, so staying silent is the divergence. Staying silent also
+/// leaks: the server may keep sending DATA on a stream we have already torn
+/// down, and that stream's flow-control window is never returned.
+fn fail_malformed(
+    pending: &mut HashMap<u32, PendingStream>,
+    stream_id: u32,
+    reason: String,
+    resets: &mut Vec<u32>,
+) {
+    let Some(ps) = pending.remove(&stream_id) else {
+        return;
+    };
+    resets.push(stream_id);
+    let error = DriverError::Protocol(format!("{}: {reason}", crate::adapter::MALFORMED_PREFIX));
+    tracing::debug!(stream_id, error = %error, "h2.native.malformed_response");
+    if let Some(tx) = ps.headers_tx {
+        let _ = tx.send(Err(error.clone()));
+    }
+    let _ = ps.body_tx.send(Err(error));
+}
+
+/// Encode and write one RST_STREAM(PROTOCOL_ERROR) per malformed stream.
+async fn write_stream_resets<S>(
+    stream: &mut S,
+    engine: &mut H2Engine,
+    resets: &[u32],
+) -> Result<(), std::io::Error>
+where
+    S: AsyncWrite + Unpin,
+{
+    if resets.is_empty() {
+        return Ok(());
+    }
+    let mut output = BytesMut::new();
+    for &stream_id in resets {
+        engine.send_rst_stream(
+            stream_id,
+            crate::conn_state::H2ErrorCode::ProtocolError.as_u32(),
+            &mut output,
+        );
+    }
+    if !output.is_empty() {
+        stream.write_all(&output).await?;
+        stream.flush().await?;
+    }
+    Ok(())
+}
+
+/// End-of-stream bookkeeping: enforce RFC 9113 §8.1.1's content-length ↔
+/// DATA-sum equality, then drop the stream (dropping `body_tx` signals EOF).
+fn finish_stream(pending: &mut HashMap<u32, PendingStream>, stream_id: u32, resets: &mut Vec<u32>) {
+    let mismatch = pending.get(&stream_id).and_then(|ps| {
+        ps.content_length
+            .as_ref()
+            .filter(|check| check.received != check.expected)
+            .map(ContentLengthCheck::mismatch_reason)
+    });
+    match mismatch {
+        Some(reason) => fail_malformed(pending, stream_id, reason, resets),
+        None => {
+            pending.remove(&stream_id);
+        }
+    }
+}
+
+/// Dispatch one engine event.
+///
+/// Returns the streams that need a RST_STREAM(PROTOCOL_ERROR) — normally
+/// empty. The driver loop calls [`handle_event_inner`] directly with a shared
+/// buffer; this wrapper exists so tests can dispatch a single event without
+/// threading one through.
+#[cfg(test)]
+fn handle_event(event: H2Event, pending: &mut HashMap<u32, PendingStream>) -> Vec<u32> {
+    let mut resets = Vec::new();
+    handle_event_inner(event, pending, &mut resets);
+    resets
+}
+
+fn handle_event_inner(
+    event: H2Event,
+    pending: &mut HashMap<u32, PendingStream>,
+    resets: &mut Vec<u32>,
+) {
     match event {
         H2Event::ResponseHeaders {
             stream_id,
             headers,
             end_stream,
         } => {
-            if let Some(ps) = pending.get_mut(&stream_id) {
-                let status = crate::hpack::get_status(&headers).unwrap_or(0);
+            // A field section that arrives once the response headers have
+            // already been handed to the caller is the trailer section.
+            let Some(is_trailers) = pending.get(&stream_id).map(|ps| ps.headers_tx.is_none())
+            else {
+                return;
+            };
 
-                // 1xx interim responses (e.g. 103 Early Hints, which servers
-                // like Cloudflare send ahead of the final 200) are NOT the
-                // final response. Skip the interim HEADERS block and keep
-                // `headers_tx` in place so the subsequent final (non-1xx)
-                // HEADERS is delivered to the caller instead.
-                //
-                // An interim response must not carry END_STREAM (RFC 9113
-                // §8.1), so `end_stream` is intentionally ignored here; the
-                // pending stream is left open to await the final response.
-                if is_interim_status(status) {
-                    tracing::debug!(stream_id, status, "h2.native.interim_response_skipped");
+            // RFC 9113 §8.3 (only `:status`, exactly once, ahead of every
+            // regular field) and §8.1 (no pseudo-header at all in a trailer
+            // section). Checked first: a section whose *shape* is wrong is
+            // malformed regardless of what its regular fields look like.
+            if let Err(reason) =
+                crate::adapter::validate_response_pseudo_headers(&headers, is_trailers)
+            {
+                fail_malformed(pending, stream_id, reason, resets);
+                return;
+            }
+
+            // RFC 9113 §8.2.1/§8.2.2 apply to every received field section,
+            // response and trailer sections alike.
+            if let Err(reason) = crate::adapter::validate_response_fields(&headers) {
+                fail_malformed(pending, stream_id, reason, resets);
+                return;
+            }
+
+            if is_trailers {
+                if end_stream {
+                    finish_stream(pending, stream_id, resets);
+                }
+                return;
+            }
+
+            // RFC 9113 §8.3.2: a missing or unusable `:status` is a protocol
+            // error. Reporting it as a synthesized status would be
+            // indistinguishable from a server that really sent that status.
+            let status = match crate::adapter::validate_response_status(
+                crate::hpack::get_pseudo_header(&headers, ":status"),
+            ) {
+                Ok(status) => status,
+                Err(reason) => {
+                    fail_malformed(pending, stream_id, reason, resets);
                     return;
                 }
+            };
 
-                if let Some(tx) = ps.headers_tx.take() {
-                    let _ = tx.send(Ok(NativeResponseHeaders { status, headers }));
+            // 1xx interim responses (e.g. 103 Early Hints, which servers like
+            // Cloudflare send ahead of the final 200) are NOT the final
+            // response. Skip the interim HEADERS block and keep `headers_tx`
+            // in place so the subsequent final (non-1xx) HEADERS is delivered
+            // to the caller instead.
+            if is_interim_status(status) {
+                // RFC 9113 §8.5: HTTP/2 has no upgrade mechanism, so 101 is
+                // never a valid HTTP/2 response. Parking the stream as if a
+                // final response were still coming would hang it forever.
+                if status == 101 {
+                    fail_malformed(
+                        pending,
+                        stream_id,
+                        "101 (Switching Protocols) is not used in HTTP/2 (RFC 9113 §8.5)"
+                            .to_string(),
+                        resets,
+                    );
+                    return;
                 }
+                // RFC 9113 §8.1: an interim response is never the end of the
+                // stream. If the server ends it here, no final response can
+                // ever arrive — surface the protocol error rather than leaving
+                // the request to hang until it times out.
                 if end_stream {
-                    // No body — drop body_tx to signal EOF.
-                    pending.remove(&stream_id);
+                    fail_malformed(
+                        pending,
+                        stream_id,
+                        format!(
+                            "interim {status} response carried END_STREAM, so no final response can follow (RFC 9113 §8.1)"
+                        ),
+                        resets,
+                    );
+                    return;
                 }
+                tracing::debug!(stream_id, status, "h2.native.interim_response_skipped");
+                return;
+            }
+
+            // RFC 9113 §8.1.1: `content-length`, when the response is defined
+            // to have content, must equal the sum of the DATA payload lengths.
+            let declared_length = match crate::adapter::response_content_length(&headers) {
+                Ok(length) => length,
+                Err(reason) => {
+                    fail_malformed(pending, stream_id, reason, resets);
+                    return;
+                }
+            };
+
+            let empty_body_mismatch = {
+                let Some(ps) = pending.get_mut(&stream_id) else {
+                    return;
+                };
+                if let Some(expected) = declared_length {
+                    if response_has_content(&ps.method, status) {
+                        ps.content_length = Some(ContentLengthCheck {
+                            expected,
+                            received: 0,
+                        });
+                    }
+                }
+                // END_STREAM here means the whole content is zero bytes.
+                match (&ps.content_length, end_stream) {
+                    (Some(check), true) if check.expected != 0 => Some(check.mismatch_reason()),
+                    _ => None,
+                }
+            };
+            if let Some(reason) = empty_body_mismatch {
+                fail_malformed(pending, stream_id, reason, resets);
+                return;
+            }
+
+            let Some(ps) = pending.get_mut(&stream_id) else {
+                return;
+            };
+            if let Some(tx) = ps.headers_tx.take() {
+                let _ = tx.send(Ok(NativeResponseHeaders { status, headers }));
+            }
+            if end_stream {
+                // No body — drop body_tx to signal EOF.
+                pending.remove(&stream_id);
             }
         }
         H2Event::ResponseData {
@@ -934,6 +1215,23 @@ fn handle_event(event: H2Event, pending: &mut HashMap<u32, PendingStream>) {
             data,
             end_stream,
         } => {
+            let overflow = {
+                let Some(ps) = pending.get_mut(&stream_id) else {
+                    return;
+                };
+                match ps.content_length.as_mut() {
+                    Some(check) => {
+                        check.received = check.received.saturating_add(data.len() as u64);
+                        (check.received > check.expected).then(|| check.mismatch_reason())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(reason) = overflow {
+                fail_malformed(pending, stream_id, reason, resets);
+                return;
+            }
+
             if let Some(ps) = pending.get_mut(&stream_id) {
                 if !data.is_empty() {
                     if let Err(e) = ps.body_tx.send(Ok(data)) {
@@ -941,7 +1239,7 @@ fn handle_event(event: H2Event, pending: &mut HashMap<u32, PendingStream>) {
                     }
                 }
                 if end_stream {
-                    pending.remove(&stream_id);
+                    finish_stream(pending, stream_id, resets);
                 }
             }
         }
@@ -1056,6 +1354,30 @@ mod tests {
             .uri(format!("https://example.test/{path}"))
             .body(None)
             .unwrap()
+    }
+
+    fn has_frame(wire: &[u8], frame_type: u8, stream_id: u32) -> bool {
+        let mut offset = 0;
+        while offset + 9 <= wire.len() {
+            let length =
+                u32::from_be_bytes([0, wire[offset], wire[offset + 1], wire[offset + 2]]) as usize;
+            let end = offset + 9 + length;
+            if end > wire.len() {
+                return false;
+            }
+            let current_type = wire[offset + 3];
+            let current_stream_id = u32::from_be_bytes([
+                wire[offset + 5] & 0x7f,
+                wire[offset + 6],
+                wire[offset + 7],
+                wire[offset + 8],
+            ]);
+            if current_type == frame_type && current_stream_id == stream_id {
+                return true;
+            }
+            offset = end;
+        }
+        false
     }
 
     // ====================================================================
@@ -1353,6 +1675,123 @@ mod tests {
         driver_task.abort();
     }
     // ====================================================================
+    // Local connection errors — the driver must close the transport and
+    // fail both active and queued requests after writing error GOAWAY.
+    // ====================================================================
+
+    #[tokio::test]
+    async fn local_connection_error_closes_driver_and_notifies_pending_and_waiting() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let (server_ready_tx, server_ready_rx) = oneshot::channel();
+        let (first_request_tx, first_request_rx) = oneshot::channel();
+        let (inject_error_tx, inject_error_rx) = oneshot::channel();
+
+        let server_task = tokio::spawn(async move {
+            let mut preface = [0u8; crate::CONNECTION_PREFACE.len()];
+            server_io.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, crate::CONNECTION_PREFACE);
+
+            let settings = [
+                0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+                0x01,
+            ];
+            server_io.write_all(&settings).await.unwrap();
+
+            let mut wire = BytesMut::new();
+            loop {
+                let read = server_io.read_buf(&mut wire).await.unwrap();
+                assert!(read > 0, "client closed before acknowledging SETTINGS");
+                if has_frame(&wire, 0x04, 0)
+                    && wire.windows(9).any(|window| {
+                        window == [0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00]
+                    })
+                {
+                    break;
+                }
+            }
+            let _ = server_ready_tx.send(());
+
+            loop {
+                let read = server_io.read_buf(&mut wire).await.unwrap();
+                assert!(read > 0, "client closed before sending the first request");
+                if has_frame(&wire, 0x01, 1) {
+                    let _ = first_request_tx.send(());
+                    break;
+                }
+            }
+
+            inject_error_rx.await.unwrap();
+            let malformed_data = [0x00, 0x4e, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+            server_io.write_all(&malformed_data).await.unwrap();
+
+            let mut tail = [0u8; 1024];
+            loop {
+                if server_io.read(&mut tail).await.unwrap() == 0 {
+                    break;
+                }
+            }
+            has_frame(&wire, 0x01, 3)
+        });
+
+        let profile = crate::profile::chrome_146_h2();
+        let (sender, driver_task) = spawn_driver(client_io, &profile).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server_ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let first_task = tokio::spawn({
+            let mut sender = sender.clone();
+            async move { sender.send_request(request("first")).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), first_request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !first_task.is_finished(),
+            "first request completed before the server injected an error"
+        );
+
+        let second_task = tokio::spawn({
+            let mut sender = sender.clone();
+            async move { sender.send_request(request("second")).await }
+        });
+        tokio::task::yield_now().await;
+        inject_error_tx.send(()).unwrap();
+
+        let first_result = tokio::time::timeout(Duration::from_secs(1), first_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_result = tokio::time::timeout(Duration::from_secs(1), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first_result, Err(DriverError::Protocol(ref message)) if message.contains("connection error")),
+            "pending request should receive the connection error: {first_result:?}"
+        );
+        assert!(
+            matches!(second_result, Err(DriverError::Protocol(ref message)) if message.contains("connection error")),
+            "waiting request should receive the connection error: {second_result:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), driver_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_dispatched = tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !second_dispatched,
+            "the second request must remain waiting while the peer allows one stream"
+        );
+    }
+    // ====================================================================
     // FirstRequest — channel pair creation
     // ====================================================================
 
@@ -1390,13 +1829,7 @@ mod tests {
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
 
         let mut pending = HashMap::new();
-        pending.insert(
-            1,
-            PendingStream {
-                headers_tx: Some(h_tx),
-                body_tx: b_tx,
-            },
-        );
+        pending.insert(1, PendingStream::new(http::Method::GET, h_tx, b_tx));
 
         notify_all_error(&mut pending, DriverError::Shutdown);
 
@@ -1426,16 +1859,16 @@ mod tests {
     type BodyRx = mpsc::UnboundedReceiver<Result<Bytes, DriverError>>;
 
     fn pending_with_channels() -> (HashMap<u32, PendingStream>, HeadersRx, BodyRx) {
+        pending_with_channels_for(http::Method::GET)
+    }
+
+    fn pending_with_channels_for(
+        method: http::Method,
+    ) -> (HashMap<u32, PendingStream>, HeadersRx, BodyRx) {
         let (h_tx, h_rx) = oneshot::channel();
         let (b_tx, b_rx) = mpsc::unbounded_channel();
         let mut pending = HashMap::new();
-        pending.insert(
-            1,
-            PendingStream {
-                headers_tx: Some(h_tx),
-                body_tx: b_tx,
-            },
-        );
+        pending.insert(1, PendingStream::new(method, h_tx, b_tx));
         (pending, h_rx, b_rx)
     }
 
@@ -1517,6 +1950,609 @@ mod tests {
         };
         handle_event(trailers, &mut pending);
         assert!(!pending.contains_key(&1));
+    }
+
+    // ====================================================================
+    // Malformed responses (RFC 9113 §8.1.1) — receive-side validation.
+    //
+    // Each of these must fail the *stream* with `DriverError::Protocol`
+    // (message prefixed "malformed response") so the caller can tell a
+    // protocol violation apart from a status the server really sent, and the
+    // stream must not be left pending (which used to hang the request until
+    // its timeout).
+    // ====================================================================
+
+    fn headers_event(stream_id: u32, headers: &[(&str, &str)], end_stream: bool) -> H2Event {
+        H2Event::ResponseHeaders {
+            stream_id,
+            headers: headers
+                .iter()
+                .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+                .collect(),
+            end_stream,
+        }
+    }
+
+    fn data_event(stream_id: u32, data: &[u8], end_stream: bool) -> H2Event {
+        H2Event::ResponseData {
+            stream_id,
+            data: Bytes::copy_from_slice(data),
+            end_stream,
+        }
+    }
+
+    /// Return the protocol-error text a channel result carries, or `None` when
+    /// it is not a `DriverError::Protocol`.
+    fn protocol_error_text<T>(result: Result<T, DriverError>) -> Option<String> {
+        match result {
+            Err(DriverError::Protocol(msg)) => Some(msg),
+            _ => None,
+        }
+    }
+
+    /// Drive a single response HEADERS block through `handle_event` and report
+    /// the protocol error the headers channel received, if any.
+    fn malformed_headers_reason(headers: &[(&str, &str)], end_stream: bool) -> Option<String> {
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels();
+        handle_event(headers_event(1, headers, end_stream), &mut pending);
+        let still_pending = pending.contains_key(&1);
+        let reason = h_rx.try_recv().ok().and_then(protocol_error_text);
+        if reason.is_some() && still_pending {
+            return Some(format!("{reason:?} but the stream was left pending"));
+        }
+        reason
+    }
+
+    // ── H-04: an invalid :status must not be disguised as a status code ──
+
+    #[test]
+    fn missing_status_is_a_protocol_error_not_a_500() {
+        let reason = malformed_headers_reason(&[("content-type", "text/plain")], false);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("malformed response") && r.contains(":status")),
+            "a response with no :status must fail the stream, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn non_numeric_status_is_a_protocol_error() {
+        let reason = malformed_headers_reason(&[(":status", "abc")], false);
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains(":status")),
+            "an unparsable :status must fail the stream, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_status_is_a_protocol_error() {
+        for bad in [":status-099", ":status-1000", ":status-20", ":status-0200"] {
+            let value = bad.trim_start_matches(":status-");
+            let reason = malformed_headers_reason(&[(":status", value)], false);
+            assert!(
+                reason.is_some(),
+                ":status {value:?} must fail the stream, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_status_still_reaches_the_caller() {
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels();
+        handle_event(headers_event(1, &[(":status", "500")], true), &mut pending);
+        let delivered = h_rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            delivered.status, 500,
+            "a server-sent 500 must still be delivered as an ordinary response"
+        );
+    }
+
+    // ── H-02: malformed field names/values must be rejected, not dropped ──
+
+    #[test]
+    fn uppercase_field_name_is_a_protocol_error() {
+        let reason = malformed_headers_reason(&[(":status", "200"), ("X-Trace", "abc")], false);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("X-Trace") && r.contains("§8.2.1")),
+            "an uppercase field name must fail the stream instead of being lowercased, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_field_name_and_value_bytes_are_protocol_errors() {
+        let cases: &[(&str, &str)] = &[
+            ("x bad", "v"),        // space in the name
+            ("x\u{7f}bad", "v"),   // DEL in the name
+            ("", "v"),             // empty name
+            ("x-nul", "a\u{0}b"),  // NUL in the value
+            ("x-cr", "a\rb"),      // CR in the value
+            ("x-lf", "a\nb"),      // LF in the value
+            ("x-pad", " padded"),  // leading whitespace
+            ("x-pad", "padded\t"), // trailing whitespace
+        ];
+        for (name, value) in cases {
+            let reason = malformed_headers_reason(&[(":status", "200"), (name, value)], false);
+            assert!(
+                reason.is_some(),
+                "field ({name:?}, {value:?}) must fail the stream, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_fields_are_delivered_untouched() {
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("x-trace", "abc")], true),
+            &mut pending,
+        );
+        let delivered = h_rx.try_recv().unwrap().unwrap();
+        assert!(
+            delivered
+                .headers
+                .iter()
+                .any(|(n, v)| n == "x-trace" && v == "abc"),
+            "well-formed fields must pass through: {:?}",
+            delivered.headers
+        );
+    }
+
+    // ── H-03: connection-specific fields make the response malformed ──
+
+    #[test]
+    fn connection_specific_fields_are_protocol_errors() {
+        let cases: &[(&str, &str)] = &[
+            ("connection", "keep-alive"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+        ];
+        for (name, value) in cases {
+            let reason = malformed_headers_reason(&[(":status", "200"), (name, value)], false);
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("§8.2.2")),
+                "connection-specific field {name:?} must fail the stream, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn te_is_only_allowed_with_the_value_trailers() {
+        let allowed = malformed_headers_reason(&[(":status", "200"), ("te", "trailers")], false);
+        assert!(
+            allowed.is_none(),
+            "te: trailers is explicitly permitted, got {allowed:?}"
+        );
+        let rejected = malformed_headers_reason(&[(":status", "200"), ("te", "gzip")], false);
+        assert!(
+            rejected.is_some(),
+            "any other te value must fail the stream, got {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn connection_specific_field_in_trailers_is_a_protocol_error() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(headers_event(1, &[(":status", "200")], false), &mut pending);
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+
+        handle_event(
+            headers_event(1, &[("transfer-encoding", "chunked")], true),
+            &mut pending,
+        );
+        let body_error = b_rx.try_recv().ok().and_then(protocol_error_text);
+        assert!(
+            body_error.as_deref().is_some_and(|r| r.contains("§8.2.2")),
+            "a malformed trailer section must fail the body stream, got {body_error:?}"
+        );
+    }
+
+    // ── N-03: response pseudo-header rules (RFC 9113 §8.3, §8.1) ──
+    //
+    // Only `:status` is defined for a response, it may appear exactly once, no
+    // pseudo-header may follow a regular field, and a trailer section carries
+    // none at all. Each violation makes the response malformed, which §8.1.1
+    // makes a stream error of type PROTOCOL_ERROR.
+
+    #[test]
+    fn duplicate_status_is_a_protocol_error() {
+        let reason = malformed_headers_reason(&[(":status", "200"), (":status", "404")], false);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("more than one :status")),
+            "a second :status must fail the stream instead of being ignored, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_response_schedules_rst_stream_and_removes_pending_request() {
+        let (mut pending, mut headers_rx, mut body_rx) = pending_with_channels();
+
+        let resets = handle_event(
+            headers_event(1, &[(":status", "200"), (":status", "204")], false),
+            &mut pending,
+        );
+
+        assert_eq!(
+            resets,
+            vec![1],
+            "malformed response must be reset on the wire"
+        );
+        assert!(
+            !pending.contains_key(&1),
+            "a reset stream must not remain pending"
+        );
+        assert!(
+            headers_rx
+                .try_recv()
+                .ok()
+                .and_then(protocol_error_text)
+                .is_some_and(|reason| reason.contains("malformed response")),
+            "the headers waiter must receive the protocol error"
+        );
+        assert!(
+            body_rx
+                .try_recv()
+                .ok()
+                .and_then(protocol_error_text)
+                .is_some_and(|reason| reason.contains("malformed response")),
+            "the body waiter must receive the protocol error"
+        );
+    }
+    #[test]
+    fn unknown_pseudo_header_in_a_response_is_a_protocol_error() {
+        // Request pseudo-headers and anything invented: §8.3 defines exactly
+        // one pseudo-header for responses.
+        for name in [":method", ":path", ":authority", ":scheme", ":protocol"] {
+            let reason = malformed_headers_reason(&[(":status", "200"), (name, "x")], false);
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains(name) && r.contains("§8.3")),
+                "{name} is not defined for responses and must fail the stream, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pseudo_header_after_a_regular_field_is_a_protocol_error() {
+        let reason = malformed_headers_reason(&[("x-trace", "abc"), (":status", "200")], false);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("after a regular field")),
+            "every pseudo-header must precede the regular fields, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn pseudo_header_in_a_trailer_section_is_a_protocol_error() {
+        for (name, value) in [(":status", "200"), (":method", "GET")] {
+            let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+            handle_event(headers_event(1, &[(":status", "200")], false), &mut pending);
+            assert_eq!(
+                h_rx.try_recv().unwrap().unwrap().status,
+                200,
+                "the final response must be delivered before the trailers"
+            );
+
+            handle_event(headers_event(1, &[(name, value)], true), &mut pending);
+            let body_error = b_rx.try_recv().ok().and_then(protocol_error_text);
+            assert!(
+                body_error
+                    .as_deref()
+                    .is_some_and(|r| r.contains("trailer section")),
+                "{name} in a trailer section must fail the body stream, got {body_error:?}"
+            );
+        }
+    }
+
+    // N-03 counter-cases: the rules above must not reject conforming sections.
+
+    #[test]
+    fn a_response_with_status_first_is_still_delivered() {
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(
+                1,
+                &[
+                    (":status", "200"),
+                    ("content-type", "text/plain"),
+                    ("x-trace", "abc"),
+                ],
+                true,
+            ),
+            &mut pending,
+        );
+        let delivered = h_rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            delivered.status, 200,
+            "a conforming field section must still reach the caller"
+        );
+        assert!(
+            delivered
+                .headers
+                .iter()
+                .any(|(n, v)| n == "x-trace" && v == "abc"),
+            "the regular fields after :status must survive: {:?}",
+            delivered.headers
+        );
+    }
+
+    #[test]
+    fn legitimate_trailers_after_data_are_still_accepted() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(headers_event(1, &[(":status", "200")], false), &mut pending);
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+        handle_event(data_event(1, b"chunk", false), &mut pending);
+        handle_event(
+            headers_event(1, &[("grpc-status", "0"), ("x-checksum", "deadbeef")], true),
+            &mut pending,
+        );
+
+        let mut chunks = 0usize;
+        let mut errors = 0usize;
+        while let Ok(message) = b_rx.try_recv() {
+            match message {
+                Ok(_) => chunks += 1,
+                Err(_) => errors += 1,
+            }
+        }
+        assert_eq!(
+            errors, 0,
+            "a trailer section of regular fields is legal (RFC 9113 §8.1) and must not fail"
+        );
+        assert_eq!(chunks, 1, "the body chunk must still have been delivered");
+        assert!(
+            !pending.contains_key(&1),
+            "END_STREAM on the trailers must complete the stream"
+        );
+    }
+
+    // ── H-06: the 1xx state machine ──
+
+    #[test]
+    fn status_101_is_a_protocol_error_not_an_interim_response() {
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels();
+        handle_event(headers_event(1, &[(":status", "101")], false), &mut pending);
+        let reason = h_rx.try_recv().ok().and_then(protocol_error_text);
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("101")),
+            "101 has no meaning in HTTP/2 and must fail the stream, got {reason:?}"
+        );
+        assert!(
+            !pending.contains_key(&1),
+            "a 101 response must not leave the stream waiting for a final response"
+        );
+    }
+
+    #[test]
+    fn interim_response_with_end_stream_is_a_protocol_error() {
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels();
+        handle_event(headers_event(1, &[(":status", "103")], true), &mut pending);
+        let reason = h_rx.try_recv().ok().and_then(protocol_error_text);
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("END_STREAM")),
+            "an interim response ending the stream must fail it, got {reason:?}"
+        );
+        assert!(
+            !pending.contains_key(&1),
+            "an interim END_STREAM must not leave the request hanging until its timeout"
+        );
+    }
+
+    // ── H-01: content-length must equal the DATA payload sum ──
+
+    #[test]
+    fn content_length_shorter_than_the_data_sum_is_a_protocol_error() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("content-length", "2")], false),
+            &mut pending,
+        );
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+
+        handle_event(data_event(1, b"toolong", true), &mut pending);
+        let body_error = b_rx.try_recv().ok().and_then(protocol_error_text);
+        assert!(
+            body_error
+                .as_deref()
+                .is_some_and(|r| r.contains("content-length")),
+            "more DATA than content-length declares must fail the stream, got {body_error:?}"
+        );
+    }
+
+    #[test]
+    fn content_length_longer_than_the_data_sum_is_a_protocol_error() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("content-length", "10")], false),
+            &mut pending,
+        );
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+
+        handle_event(data_event(1, b"short", true), &mut pending);
+        // The truncated chunk is delivered first, then the desync surfaces.
+        let chunk = b_rx.try_recv().unwrap().unwrap();
+        assert_eq!(&chunk[..], b"short");
+        let body_error = b_rx.try_recv().ok().and_then(protocol_error_text);
+        assert!(
+            body_error
+                .as_deref()
+                .is_some_and(|r| r.contains("content-length")),
+            "a short body must not be reported as a clean EOF, got {body_error:?}"
+        );
+    }
+
+    #[test]
+    fn non_zero_content_length_with_end_stream_on_headers_is_a_protocol_error() {
+        let reason = malformed_headers_reason(
+            &[(":status", "200"), ("content-length", "5")],
+            /* end_stream */ true,
+        );
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("content-length")),
+            "a bodiless response declaring content-length: 5 must fail the stream, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn matching_content_length_delivers_the_body_and_a_clean_eof() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("content-length", "2")], false),
+            &mut pending,
+        );
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+
+        handle_event(data_event(1, b"ok", true), &mut pending);
+        let chunk = b_rx.try_recv().unwrap().unwrap();
+        assert_eq!(&chunk[..], b"ok");
+        assert!(
+            b_rx.try_recv().is_err() && !pending.contains_key(&1),
+            "a matching content-length must end the stream cleanly"
+        );
+    }
+
+    #[test]
+    fn split_data_frames_are_summed_not_compared_individually() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("content-length", "4")], false),
+            &mut pending,
+        );
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+
+        handle_event(data_event(1, b"ab", false), &mut pending);
+        handle_event(data_event(1, b"", false), &mut pending);
+        handle_event(data_event(1, b"cd", true), &mut pending);
+        let mut body = Vec::new();
+        while let Ok(Ok(chunk)) = b_rx.try_recv() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(&body[..], b"abcd");
+    }
+
+    #[test]
+    fn content_length_is_also_checked_when_the_stream_ends_in_trailers() {
+        let (mut pending, mut h_rx, mut b_rx) = pending_with_channels();
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("content-length", "9")], false),
+            &mut pending,
+        );
+        assert_eq!(h_rx.try_recv().unwrap().unwrap().status, 200);
+
+        handle_event(data_event(1, b"ab", false), &mut pending);
+        let _ = b_rx.try_recv();
+        handle_event(
+            headers_event(1, &[("grpc-status", "0")], true),
+            &mut pending,
+        );
+        let body_error = b_rx.try_recv().ok().and_then(protocol_error_text);
+        assert!(
+            body_error
+                .as_deref()
+                .is_some_and(|r| r.contains("content-length")),
+            "the sum check must also run when the stream ends on trailers, got {body_error:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_or_unparsable_content_length_is_a_protocol_error() {
+        let conflicting = malformed_headers_reason(
+            &[
+                (":status", "200"),
+                ("content-length", "3"),
+                ("content-length", "5"),
+            ],
+            false,
+        );
+        assert!(
+            conflicting
+                .as_deref()
+                .is_some_and(|r| r.contains("content-length")),
+            "conflicting content-length values must fail the stream, got {conflicting:?}"
+        );
+        for bad in ["", "abc", "-1", "+5", "0x10", "5 "] {
+            let reason =
+                malformed_headers_reason(&[(":status", "200"), ("content-length", bad)], false);
+            assert!(
+                reason.is_some(),
+                "content-length {bad:?} must fail the stream, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_defined_to_have_no_content_skip_the_sum_check() {
+        // RFC 9113 §8.1.1 explicitly permits a non-zero content-length with no
+        // DATA on 204/304 and on the response to a HEAD request.
+        for status in ["204", "304"] {
+            let reason =
+                malformed_headers_reason(&[(":status", status), ("content-length", "42")], true);
+            assert!(
+                reason.is_none(),
+                "a {status} declaring content-length: 42 is legal, got {reason:?}"
+            );
+        }
+
+        let (mut pending, mut h_rx, _b_rx) = pending_with_channels_for(http::Method::HEAD);
+        handle_event(
+            headers_event(1, &[(":status", "200"), ("content-length", "42")], true),
+            &mut pending,
+        );
+        let delivered = h_rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            delivered.status, 200,
+            "a HEAD response may declare a content-length it does not send"
+        );
+    }
+
+    #[test]
+    fn response_has_content_follows_rfc_9110_6_4_1() {
+        assert!(response_has_content(&http::Method::GET, 200));
+        assert!(!response_has_content(&http::Method::HEAD, 200));
+        assert!(!response_has_content(&http::Method::GET, 204));
+        assert!(!response_has_content(&http::Method::GET, 304));
+        assert!(!response_has_content(&http::Method::CONNECT, 200));
+        assert!(response_has_content(&http::Method::CONNECT, 407));
+    }
+
+    #[test]
+    fn malformed_response_is_a_stream_error_not_a_connection_error() {
+        // Two concurrent streams; only the malformed one must be torn down.
+        let (h_tx1, mut h_rx1) = oneshot::channel();
+        let (b_tx1, _b_rx1) = mpsc::unbounded_channel();
+        let (h_tx2, mut h_rx2) = oneshot::channel();
+        let (b_tx2, _b_rx2) = mpsc::unbounded_channel();
+        let mut pending = HashMap::new();
+        pending.insert(1, PendingStream::new(http::Method::GET, h_tx1, b_tx1));
+        pending.insert(3, PendingStream::new(http::Method::GET, h_tx2, b_tx2));
+
+        handle_event(
+            headers_event(1, &[("x-no-status", "1")], false),
+            &mut pending,
+        );
+
+        assert!(
+            h_rx1
+                .try_recv()
+                .ok()
+                .and_then(protocol_error_text)
+                .is_some(),
+            "the malformed stream must fail"
+        );
+        assert!(
+            pending.contains_key(&3) && h_rx2.try_recv().is_err(),
+            "the sibling stream must be untouched by another stream's malformed response"
+        );
     }
 
     // ====================================================================
@@ -1683,6 +2719,247 @@ mod tests {
         assert!(body_rx.recv().await.is_none());
 
         // Shut the client driver down so the server task can finish.
+        drop(sender);
+        let _ = task.await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("server task timed out");
+    }
+
+    /// Minimal fake H2 server that answers with a response whose declared
+    /// `content-length` is larger than the DATA it actually sends — the
+    /// response-length desync of RFC 9113 §8.1.1.
+    async fn fake_server_short_body<S>(mut server: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        const HEADERS: u8 = 0x1;
+        const SETTINGS: u8 = 0x4;
+        const DATA: u8 = 0x0;
+        const END_STREAM: u8 = 0x1;
+        const END_HEADERS: u8 = 0x4;
+
+        server
+            .write_all(&h2_frame(SETTINGS, 0, 0, &[]))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut preface = [0u8; 24];
+        server.read_exact(&mut preface).await.unwrap();
+
+        let sid = loop {
+            let mut hdr = [0u8; 9];
+            server.read_exact(&mut hdr).await.unwrap();
+            let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+            let ftype = hdr[3];
+            let sid = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) & 0x7fff_ffff;
+            let mut payload = vec![0u8; len];
+            server.read_exact(&mut payload).await.unwrap();
+            if ftype == HEADERS {
+                break sid;
+            }
+        };
+
+        // 200 promising 100 bytes …
+        let mut block = hpack_indexed_name(8, "200");
+        block.extend(hpack_new_name("content-length", "100"));
+        server
+            .write_all(&h2_frame(HEADERS, END_HEADERS, sid, &block))
+            .await
+            .unwrap();
+        // … then delivering 2 and closing the stream.
+        server
+            .write_all(&h2_frame(DATA, END_STREAM, sid, b"ok"))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut scratch = [0u8; 512];
+        while let Ok(n) = server.read(&mut scratch).await {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn short_body_against_content_length_surfaces_end_to_end() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(fake_server_short_body(server_io));
+
+        let profile = crate::profile::chrome_144_h2();
+        let (mut sender, task) = spawn_driver(client_io, &profile).await.unwrap();
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(None)
+            .unwrap();
+
+        let (headers, mut body_rx) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), sender.send_request(req))
+                .await
+                .expect("send_request timed out")
+                .unwrap();
+        assert_eq!(headers.status, 200);
+
+        // The two bytes the server did send arrive normally …
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), body_rx.recv())
+            .await
+            .expect("body recv timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&chunk[..], b"ok");
+
+        // … and the truncation is then reported instead of a clean EOF.
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(10), body_rx.recv())
+            .await
+            .expect("body recv timed out");
+        let reason = tail.and_then(protocol_error_text);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("malformed response") && r.contains("content-length")),
+            "a truncated body must not be handed to the caller as a complete one, got {reason:?}"
+        );
+
+        drop(sender);
+        let _ = task.await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("server task timed out");
+    }
+
+    /// Like [`fake_server_short_body`], but it keeps reading afterwards and
+    /// reports the first RST_STREAM the client sends (stream id, error code).
+    async fn fake_server_short_body_watching_for_rst<S>(
+        mut server: S,
+        rst_tx: tokio::sync::oneshot::Sender<Option<(u32, u32)>>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        const HEADERS: u8 = 0x1;
+        const SETTINGS: u8 = 0x4;
+        const DATA: u8 = 0x0;
+        const RST_STREAM: u8 = 0x3;
+        const END_STREAM: u8 = 0x1;
+        const END_HEADERS: u8 = 0x4;
+
+        server
+            .write_all(&h2_frame(SETTINGS, 0, 0, &[]))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut preface = [0u8; 24];
+        server.read_exact(&mut preface).await.unwrap();
+
+        let sid = loop {
+            let mut hdr = [0u8; 9];
+            server.read_exact(&mut hdr).await.unwrap();
+            let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+            let ftype = hdr[3];
+            let sid = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) & 0x7fff_ffff;
+            let mut payload = vec![0u8; len];
+            server.read_exact(&mut payload).await.unwrap();
+            if ftype == HEADERS {
+                break sid;
+            }
+        };
+
+        // Promise 100 bytes, deliver 2, close the stream: RFC 9113 §8.1.1
+        // response-length desync.
+        let mut block = hpack_indexed_name(8, "200");
+        block.extend(hpack_new_name("content-length", "100"));
+        server
+            .write_all(&h2_frame(HEADERS, END_HEADERS, sid, &block))
+            .await
+            .unwrap();
+        server
+            .write_all(&h2_frame(DATA, END_STREAM, sid, b"ok"))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        // Now watch for the client's RST_STREAM.
+        let mut found = None;
+        loop {
+            let mut hdr = [0u8; 9];
+            if server.read_exact(&mut hdr).await.is_err() {
+                break;
+            }
+            let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+            let ftype = hdr[3];
+            let frame_sid = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) & 0x7fff_ffff;
+            let mut payload = vec![0u8; len];
+            if server.read_exact(&mut payload).await.is_err() {
+                break;
+            }
+            if ftype == RST_STREAM && payload.len() == 4 {
+                let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                found = Some((frame_sid, code));
+                break;
+            }
+        }
+        let _ = rst_tx.send(found);
+
+        let mut scratch = [0u8; 512];
+        while let Ok(n) = server.read(&mut scratch).await {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    /// RFC 9113 §8.1.1 makes a malformed response a stream error of type
+    /// PROTOCOL_ERROR, which means an actual RST_STREAM on the wire.
+    ///
+    /// This used to be suppressed on the theory that any extra frame would
+    /// diverge from the browser fingerprint. That was backwards — Chromium's
+    /// netlog goes `HTTP2_SESSION_RECV_INVALID_HEADER` →
+    /// `HTTP2_SESSION_SEND_RST_STREAM` with PROTOCOL_ERROR, so *not* sending it
+    /// was the divergence. Staying silent also let the server keep sending DATA
+    /// on a stream we had already torn down, with its flow-control window never
+    /// returned.
+    #[tokio::test]
+    async fn malformed_response_sends_rst_stream_protocol_error() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (rst_tx, rst_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(fake_server_short_body_watching_for_rst(server_io, rst_tx));
+
+        let profile = crate::profile::chrome_144_h2();
+        let (mut sender, task) = spawn_driver(client_io, &profile).await.unwrap();
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(None)
+            .unwrap();
+
+        let (_headers, mut body_rx) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), sender.send_request(req))
+                .await
+                .expect("send_request timed out")
+                .unwrap();
+
+        // Drain until the stream ends, which is what triggers the check.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), body_rx.recv()).await
+        {}
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), rst_rx)
+            .await
+            .expect("timed out waiting for the client's RST_STREAM")
+            .expect("server task dropped the channel");
+
+        const PROTOCOL_ERROR: u32 = 0x1;
+        assert_eq!(
+            observed,
+            Some((1, PROTOCOL_ERROR)),
+            "the malformed stream must be reset with PROTOCOL_ERROR on the wire",
+        );
+
         drop(sender);
         let _ = task.await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server)

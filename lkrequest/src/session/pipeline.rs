@@ -601,6 +601,18 @@ pub(crate) async fn establish_h2_with_first_request(
 // ---------------------------------------------------------------------------
 
 /// Build an absolute URI for HTTP/2 `:path` + `:authority` pseudo-headers.
+/// Whether a 3xx status is a redirect the client should *follow*.
+///
+/// Not every 3xx is a redirect (RFC 9110 §15.4). `304 Not Modified` is the
+/// normal answer to a conditional request, `300 Multiple Choices` offers
+/// alternatives rather than naming one, `305 Use Proxy` is deprecated, and 306
+/// is unused — none of them carry a `Location` to follow. Treating every 3xx as
+/// followable turned an ordinary cache revalidation into
+/// `redirect response missing Location header`.
+pub(crate) fn is_followable_redirect(status: http::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
 pub(crate) fn build_h2_uri(scheme: Scheme, host: &str, port: u16, path: &str) -> String {
     let scheme_str = match scheme {
         Scheme::Https => "https",
@@ -682,6 +694,20 @@ pub(crate) fn store_cookies(session: &Session, resp_headers: &HeaderMap, parsed_
             let mut new_jar = (**old).clone();
             for raw_cookie in &set_cookies {
                 if let Ok(set_cookie) = cookie_store::RawCookie::parse(raw_cookie.as_str()) {
+                    // RFC 6265bis: a `Secure` cookie that did not arrive over a
+                    // secure channel (§5.6 step 15), or a `__Secure-` /
+                    // `__Host-` cookie that does not satisfy its name prefix
+                    // (§4.1.3), is ignored by a browser, so it must not enter
+                    // the jar here either. This is the origin-server path — the
+                    // one those rules are written for.
+                    if !super::origin_cookie_allows_storage(&set_cookie, &url) {
+                        tracing::debug!(
+                            name = set_cookie.name(),
+                            url = %url,
+                            "http.cookie_rejected_by_storage_rules",
+                        );
+                        continue;
+                    }
                     let _ = new_jar.insert_raw(&set_cookie, &url);
                 }
             }
@@ -769,13 +795,34 @@ pub(crate) fn try_acquire_pooled(
     conn_key: &ConnectionKey,
     http_version: PreferredHttpVersion,
 ) -> Option<AcquiredConnection> {
+    let broken_quic = if http_version == PreferredHttpVersion::Http3WithFallback {
+        let origin = Origin::new(
+            origin_scheme_from(conn_key.scheme),
+            conn_key.host.as_ref(),
+            conn_key.port,
+        );
+        session
+            .broken_quic_tracker()
+            .is_route_broken(&conn_key.route)
+            || session
+                .broken_quic_tracker()
+                .is_broken_for_route(&conn_key.route, &origin)
+    } else {
+        false
+    };
+
     let mut pool = session.inner.pool.lock();
     match http_version {
         PreferredHttpVersion::Auto => pool.try_acquire_internal(conn_key),
         PreferredHttpVersion::Http1Only => pool.try_acquire_h1_pooled_internal(conn_key),
         PreferredHttpVersion::Http2Only => pool.try_acquire_h2_pooled_internal(conn_key),
-        PreferredHttpVersion::Http3Only | PreferredHttpVersion::Http3WithFallback => {
-            pool.try_acquire_h3_pooled_internal(conn_key)
+        PreferredHttpVersion::Http3Only => pool.try_acquire_h3_pooled_internal(conn_key),
+        PreferredHttpVersion::Http3WithFallback => {
+            if broken_quic {
+                pool.try_acquire_internal(conn_key)
+            } else {
+                pool.try_acquire_h3_pooled_internal(conn_key)
+            }
         }
     }
 }
@@ -1019,13 +1066,21 @@ pub(crate) async fn discover_quic_support(
     // so a local HTTPS-RR (SVCB) query here would leak the target hostname
     // out-of-band from the proxy — skip it.
     let dns_https = if route.dns_mode == DnsResolutionMode::Local {
-        session
+        let record = session
             .client()
             .resolver()
             .lookup_https(host)
             .await
             .ok()
-            .flatten()
+            .flatten();
+        // Hand the answer to this request's TLS handshake
+        // (`Session::build_tls_connector`, which auto-configures ECH from the
+        // same record). Without it every HTTPS request pays a second HTTPS-RR
+        // round trip, and the two answers can disagree — a rotated ECH key or a
+        // load-balanced resolver would leave the ECH config out of step with
+        // the endpoint this H3 decision was made against.
+        session.publish_discovered_https_rr(host, record.clone());
+        record
     } else {
         None
     };
@@ -1147,6 +1202,7 @@ pub(crate) fn log_quic_discovery(discovery: &QuicDiscovery) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::DiscoveredHttpsRr;
     use async_trait::async_trait;
     use std::io;
     use std::sync::Arc;
@@ -1158,8 +1214,117 @@ mod tests {
         builder
     }
 
+    /// A QUIC profile is what makes `discover_quic_support` run its HTTPS-RR
+    /// query at all, so the lookup-count tests need one in both feature
+    /// configurations. Without `quic-h3` the profile is an opaque in-crate
+    /// placeholder, which is exactly enough to get past the `MissingProfile`
+    /// early return.
+    #[cfg(feature = "quic-h3")]
+    fn test_quic_profile() -> crate::QuicProfile {
+        lkh3::chrome_quic()
+    }
+
+    #[cfg(not(feature = "quic-h3"))]
+    fn test_quic_profile() -> crate::QuicProfile {
+        crate::QuicProfile { _private: () }
+    }
+
+    /// Regression: the origin-server `Set-Cookie` path is where RFC 6265bis
+    /// §4.1.3 actually applies, and it stored prefixed cookies unconditionally.
+    #[test]
+    fn store_cookies_rejects_cookies_violating_their_name_prefix() {
+        let session = test_session();
+        let url = Url::parse("https://example.com/").expect("url");
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::SET_COOKIE,
+            // `__Host-` forbids a Domain attribute.
+            "__Host-bad=1; Secure; Path=/; Domain=example.com"
+                .parse()
+                .unwrap(),
+        );
+        headers.append(
+            http::header::SET_COOKIE,
+            // `__Host-` requires Path=/.
+            "__Host-bad2=1; Secure; Path=/sub".parse().unwrap(),
+        );
+        headers.append(
+            http::header::SET_COOKIE,
+            // `__Secure-` requires the Secure attribute.
+            "__Secure-bad=1; Path=/".parse().unwrap(),
+        );
+        headers.append(
+            http::header::SET_COOKIE,
+            // Canonical forms, and an ordinary name, must still be stored.
+            "__Host-good=1; Secure; Path=/".parse().unwrap(),
+        );
+        headers.append(
+            http::header::SET_COOKIE,
+            "__Secure-good=1; Secure; Path=/".parse().unwrap(),
+        );
+        headers.append(http::header::SET_COOKIE, "plain=1; Path=/".parse().unwrap());
+
+        store_cookies(&session, &headers, &url);
+
+        let stored: Vec<String> = session
+            .inner
+            .cookie_jar
+            .load()
+            .matches(&url)
+            .into_iter()
+            .map(|c| c.name().to_string())
+            .collect();
+
+        for rejected in ["__Host-bad", "__Host-bad2", "__Secure-bad"] {
+            assert!(
+                !stored.iter().any(|n| n == rejected),
+                "{rejected} violates its name prefix and must not be stored; jar has {stored:?}"
+            );
+        }
+        for accepted in ["__Host-good", "__Secure-good", "plain"] {
+            assert!(
+                stored.iter().any(|n| n == accepted),
+                "{accepted} is valid and must still be stored; jar has {stored:?}"
+            );
+        }
+    }
+
     fn test_session() -> Session {
         test_client_builder().build().session().build()
+    }
+
+    /// Regression: `status.is_redirection()` treats every 3xx as followable, so
+    /// a `304 Not Modified` — the normal answer to a conditional request —
+    /// reached the `Location` extraction and failed the request with
+    /// `redirect response missing Location header`.
+    #[test]
+    fn only_location_bearing_3xx_are_followable_redirects() {
+        use http::StatusCode;
+
+        for code in [301u16, 302, 303, 307, 308] {
+            assert!(
+                is_followable_redirect(StatusCode::from_u16(code).unwrap()),
+                "{code} must be followed"
+            );
+        }
+
+        for code in [300u16, 304, 305, 306] {
+            assert!(
+                !is_followable_redirect(StatusCode::from_u16(code).unwrap()),
+                "{code} carries no Location and must be returned to the caller"
+            );
+        }
+    }
+
+    /// Non-3xx statuses are never redirects.
+    #[test]
+    fn non_3xx_statuses_are_not_redirects() {
+        use http::StatusCode;
+
+        for code in [200u16, 204, 400, 404, 500, 503] {
+            assert!(!is_followable_redirect(StatusCode::from_u16(code).unwrap()));
+        }
     }
 
     fn test_policy() -> ProtocolPolicy {
@@ -1312,10 +1477,15 @@ mod tests {
             PreferredHttpVersion::Auto,
         )
         .await;
+        // Snapshot before asserting: `assert!` evaluates its message only on
+        // failure, and re-locking the same non-reentrant mutex there — while the
+        // condition's guard is still alive to end-of-statement — deadlocks. This
+        // guard test would then hang instead of reporting the leak it exists to
+        // catch.
+        let https_calls = rec.https_calls.lock().unwrap().clone();
         assert!(
-            rec.https_calls.lock().unwrap().is_empty(),
-            "remote-DNS routes must not perform a local DNS HTTPS-RR lookup (DNS leak); got {:?}",
-            rec.https_calls.lock().unwrap()
+            https_calls.is_empty(),
+            "remote-DNS routes must not perform a local DNS HTTPS-RR lookup (DNS leak); got {https_calls:?}"
         );
 
         // Direct route resolves locally → DNS-based H3 discovery is expected.
@@ -1350,21 +1520,255 @@ mod tests {
         let profile = lktls::profile::presets::chrome_144();
 
         let _ = session
-            .build_tls_connector(profile.clone(), None, "example.com", true)
+            .build_tls_connector(
+                profile.clone(),
+                None,
+                "example.com",
+                true,
+                DiscoveredHttpsRr::Unqueried,
+            )
             .await;
+        // Snapshot first — see the note on the sibling test above: re-locking in
+        // the assert message deadlocks instead of failing.
+        let https_calls = rec.https_calls.lock().unwrap().clone();
         assert!(
-            rec.https_calls.lock().unwrap().is_empty(),
-            "remote-DNS mode must not leak the target via a local DNS ECH lookup; got {:?}",
-            rec.https_calls.lock().unwrap()
+            https_calls.is_empty(),
+            "remote-DNS mode must not leak the target via a local DNS ECH lookup; got {https_calls:?}"
         );
 
         let _ = session
-            .build_tls_connector(profile, None, "example.com", false)
+            .build_tls_connector(
+                profile,
+                None,
+                "example.com",
+                false,
+                DiscoveredHttpsRr::Unqueried,
+            )
             .await;
         assert_eq!(
             rec.https_calls.lock().unwrap().as_slice(),
             ["example.com"],
             "local-DNS mode should attempt DNS-based ECH discovery exactly once",
+        );
+    }
+
+    /// D-08 regression: QUIC/H3 discovery and the TLS handshake each ran their
+    /// own HTTPS-RR (SVCB) query for the same host on the same request — two DNS
+    /// round trips per HTTPS request, and two answers that can disagree (TTL
+    /// expiry, a load-balanced resolver, a rotated ECH key), so the ECH config
+    /// used need not match the endpoint the H3 decision was based on.
+    /// One request ⇒ one query.
+    #[tokio::test]
+    async fn one_https_rr_lookup_per_request() {
+        let rec = RecordingDns::default();
+        let session = test_client_builder()
+            .dns_resolver(Arc::new(rec.clone()))
+            .quic_profile(test_quic_profile())
+            .build()
+            .session()
+            .build();
+
+        // A listener that accepts once and drops the socket: enough to get the
+        // TCP phase of `establish_connection` past `connect_tcp` and into
+        // `build_tls_connector`, without standing up a TLS server.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let discovery = discover_quic_support(
+            &session,
+            Scheme::Https,
+            "example.com",
+            port,
+            None,
+            &test_policy(),
+            PreferredHttpVersion::Auto,
+        )
+        .await;
+        assert!(
+            discovery.dns_https.is_none(),
+            "the recording resolver reports no HTTPS RR",
+        );
+
+        let config =
+            crate::connect::ConnectConfig::https(lktls::profile::presets::chrome_144(), None);
+        // The handshake fails (the peer hung up); only the lookup count matters.
+        let _ = session
+            .establish_connection("example.com", port, None, &config)
+            .await;
+        accept.abort();
+
+        // Snapshot before asserting: the guard from the compared expression
+        // outlives the statement, so locking again inside the failure message
+        // would deadlock instead of failing.
+        let calls = rec.https_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.as_slice(),
+            ["example.com"],
+            "protocol discovery and the TLS handshake must share one HTTPS-RR \
+             lookup per request; got {calls:?}",
+        );
+    }
+
+    /// Deduplicating the lookup must not cost us the DNS-discovered ECH config:
+    /// the record handed over by discovery still has to reach the connector.
+    #[tokio::test]
+    async fn handed_off_https_rr_still_configures_ech() {
+        let rec = RecordingDns::default();
+        let session = test_client_builder()
+            .dns_resolver(Arc::new(rec.clone()))
+            .build()
+            .session()
+            .build();
+        let record = HttpsRecord {
+            ech_config_list: Some(vec![0xAB, 0xCD]),
+            ..HttpsRecord::default()
+        };
+
+        let connector = session
+            .build_tls_connector(
+                lktls::profile::presets::chrome_144(),
+                None,
+                "example.com",
+                false,
+                DiscoveredHttpsRr::Queried(Some(&record)),
+            )
+            .await;
+
+        let calls = rec.https_calls.lock().unwrap().clone();
+        assert_eq!(
+            connector.ech_config_list(),
+            Some([0xAB, 0xCD].as_slice()),
+            "a caller-supplied HTTPS RR must still auto-configure ECH",
+        );
+        assert!(
+            calls.is_empty(),
+            "a caller-supplied record must not trigger a second lookup; got {calls:?}",
+        );
+    }
+
+    /// `require_close_notify` is only useful if it survives the trip from the
+    /// client builder down to the connector that actually reads the socket.
+    #[tokio::test]
+    async fn require_close_notify_reaches_the_tls_connector() {
+        for require in [false, true] {
+            let session = test_client_builder()
+                .require_close_notify(require)
+                .build()
+                .session()
+                .build();
+
+            let connector = session
+                .build_tls_connector(
+                    lktls::profile::presets::chrome_144(),
+                    None,
+                    "example.com",
+                    false,
+                    DiscoveredHttpsRr::Queried(None),
+                )
+                .await;
+
+            assert_eq!(
+                connector.requires_close_notify(),
+                require,
+                "the builder setting must reach the connector",
+            );
+        }
+    }
+
+    /// Default stays off: enforcing RFC 8446 section 6.1 would fail requests
+    /// against the many servers that just drop the connection, which browsers
+    /// accept.
+    #[test]
+    fn require_close_notify_is_off_by_default() {
+        assert!(!test_client_builder().build().require_close_notify());
+    }
+
+    /// The remote-DNS gate is about the *route*, not about who did the lookup:
+    /// even a record already in hand must not configure ECH on a socks5h /
+    /// HTTP-CONNECT route, and must certainly not provoke a local query.
+    #[tokio::test]
+    async fn handed_off_https_rr_is_ignored_on_remote_dns_routes() {
+        let rec = RecordingDns::default();
+        let session = test_client_builder()
+            .dns_resolver(Arc::new(rec.clone()))
+            .build()
+            .session()
+            .build();
+        let record = HttpsRecord {
+            ech_config_list: Some(vec![0xAB, 0xCD]),
+            ..HttpsRecord::default()
+        };
+
+        let connector = session
+            .build_tls_connector(
+                lktls::profile::presets::chrome_144(),
+                None,
+                "example.com",
+                true,
+                DiscoveredHttpsRr::Queried(Some(&record)),
+            )
+            .await;
+
+        let calls = rec.https_calls.lock().unwrap().clone();
+        assert!(
+            connector.ech_config_list().is_none(),
+            "remote-DNS routes must not pick up a DNS-derived ECH config",
+        );
+        assert!(
+            calls.is_empty(),
+            "remote-DNS routes must perform no local HTTPS-RR lookup; got {calls:?}",
+        );
+    }
+
+    /// ECH precedence is session > client > DNS, and the hand-off must not
+    /// reorder it.
+    #[tokio::test]
+    async fn ech_precedence_prefers_session_then_client_over_dns() {
+        let record = HttpsRecord {
+            ech_config_list: Some(vec![0xDD]),
+            ..HttpsRecord::default()
+        };
+        let profile = lktls::profile::presets::chrome_144();
+
+        let client_only = test_client_builder()
+            .dns_resolver(Arc::new(RecordingDns::default()))
+            .ech_config(vec![0xCC])
+            .build();
+        let session_and_client = client_only.session().ech_config(vec![0x55]).build();
+        let connector = session_and_client
+            .build_tls_connector(
+                profile.clone(),
+                None,
+                "example.com",
+                false,
+                DiscoveredHttpsRr::Queried(Some(&record)),
+            )
+            .await;
+        assert_eq!(
+            connector.ech_config_list(),
+            Some([0x55].as_slice()),
+            "the session-level ECH config outranks both client and DNS",
+        );
+
+        let client_session = client_only.session().build();
+        let connector = client_session
+            .build_tls_connector(
+                profile,
+                None,
+                "example.com",
+                false,
+                DiscoveredHttpsRr::Queried(Some(&record)),
+            )
+            .await;
+        assert_eq!(
+            connector.ech_config_list(),
+            Some([0xCC].as_slice()),
+            "the client-level ECH config outranks DNS",
         );
     }
 

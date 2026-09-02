@@ -124,6 +124,15 @@ impl LktlsQuicClientConfig {
         self
     }
 
+    /// The ECHConfigList this configuration will offer, if any.
+    ///
+    /// The [`Debug`] impl elides the whole handshake config, so this is how a
+    /// caller (or a test) checks which ECH config a QUIC connection was
+    /// actually configured with.
+    pub fn ech_config_list(&self) -> Option<&[u8]> {
+        self.handshake.ech_config_list.as_deref()
+    }
+
     pub fn keylog(mut self, callback: lktls::KeyLogCallback) -> Self {
         self.handshake.keylog_callback = Some(callback);
         self
@@ -179,7 +188,8 @@ impl ProtoClientConfig for LktlsQuicClientConfig {
         let resumed_ticket = handshake
             .session_store
             .as_ref()
-            .and_then(|store| store.take(&host_key));
+            .and_then(|store| store.take(&host_key))
+            .map(sanitize_quic_ticket_early_data);
         if let Some(ticket) = resumed_ticket.clone() {
             handshake.session_store = Some(Arc::new(SeededSessionStore::new(
                 ticket,
@@ -196,8 +206,13 @@ impl ProtoClientConfig for LktlsQuicClientConfig {
         let zero_rtt = resumed_ticket
             .as_ref()
             .filter(|ticket| {
+                // RFC 9001 §4.6.1: over QUIC the only legal `max_early_data_size`
+                // is 0xffffffff — QUIC's own flow control bounds early data, so a
+                // TLS-level byte budget is meaningless and any other value marks
+                // the ticket as not a QUIC ticket. `sanitize_quic_ticket_early_data`
+                // has already zeroed anything else, so this is an exact match.
                 ticket.tls_version == TicketTlsVersion::Tls13
-                    && ticket.max_early_data_size > 0
+                    && ticket.max_early_data_size == QUIC_MAX_EARLY_DATA_SIZE
                     && ticket.peer_transport_parameters.is_some()
             })
             .and_then(|ticket| derive_early_crypto(ticket, &initial_output).ok());
@@ -309,7 +324,7 @@ impl Session for LktlsQuicSession {
             // mutable buffer borrows.
             if let Some(ctx) = self.session_ticket_ctx.as_ref() {
                 self.post_handshake_buf.extend_from_slice(buf);
-                let consumed = process_post_handshake_messages(&self.post_handshake_buf, ctx);
+                let consumed = process_post_handshake_messages(&self.post_handshake_buf, ctx)?;
                 // Retain any trailing partial message for the next call.
                 self.post_handshake_buf.drain(..consumed);
                 // Bound the accumulator. A legitimate NewSessionTicket is small
@@ -838,6 +853,133 @@ impl SessionStore for SeededSessionStore {
     }
 }
 
+/// The only `max_early_data_size` a NewSessionTicket may carry over QUIC.
+///
+/// RFC 9001 §4.6.1: QUIC bounds early data with its own flow control, so the
+/// TLS-level byte budget is meaningless and the field is fixed at `0xffffffff`.
+/// A client MUST treat any other value as a connection error.
+const QUIC_MAX_EARLY_DATA_SIZE: u32 = 0xffff_ffff;
+
+/// What the `early_data` extension of a received NewSessionTicket says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TicketEarlyData {
+    /// No `early_data` extension: the ticket simply does not permit 0-RTT.
+    Absent,
+    /// `early_data` present, carrying this `max_early_data_size`.
+    Present(u32),
+    /// `early_data` present but not a 4-byte `max_early_data_size`.
+    Malformed,
+}
+
+/// Reads the `early_data` (0x002a) extension out of a NewSessionTicket.
+///
+/// `msg` is the complete handshake message (type byte + 3-byte length + body).
+/// A message that does not parse reports [`TicketEarlyData::Absent`]: this
+/// check is only about the early-data field, and the ticket parser in `lktls`
+/// is what decides whether the message is usable at all.
+fn new_session_ticket_early_data(msg: &[u8]) -> TicketEarlyData {
+    // handshake header (4) + ticket_lifetime (4) + ticket_age_add (4)
+    let mut pos = 4 + 4 + 4;
+    // ticket_nonce
+    let Some(&nonce_len) = msg.get(pos) else {
+        return TicketEarlyData::Absent;
+    };
+    pos += 1 + nonce_len as usize;
+    // ticket
+    if pos + 2 > msg.len() {
+        return TicketEarlyData::Absent;
+    }
+    let ticket_len = u16::from_be_bytes([msg[pos], msg[pos + 1]]) as usize;
+    pos += 2 + ticket_len;
+    // extensions
+    if pos + 2 > msg.len() {
+        return TicketEarlyData::Absent;
+    }
+    let ext_total = u16::from_be_bytes([msg[pos], msg[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = (pos + ext_total).min(msg.len());
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+        let ext_len = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]) as usize;
+        pos += 4;
+        if pos + ext_len > ext_end {
+            break;
+        }
+        if ext_type == 0x002a {
+            return if ext_len == 4 {
+                TicketEarlyData::Present(u32::from_be_bytes([
+                    msg[pos],
+                    msg[pos + 1],
+                    msg[pos + 2],
+                    msg[pos + 3],
+                ]))
+            } else {
+                TicketEarlyData::Malformed
+            };
+        }
+        pos += ext_len;
+    }
+    TicketEarlyData::Absent
+}
+
+/// RFC 9001 §4.6.1 check on a received NewSessionTicket.
+///
+/// > A client MUST treat receipt of a NewSessionTicket that contains an
+/// > `early_data` extension with any other value [than 0xffffffff] as a
+/// > connection error of type PROTOCOL_VIOLATION.
+///
+/// A ticket without the extension is fine — it only means no 0-RTT.
+fn validate_quic_new_session_ticket(msg: &[u8]) -> Result<(), TransportError> {
+    let reason = match new_session_ticket_early_data(msg) {
+        TicketEarlyData::Absent | TicketEarlyData::Present(QUIC_MAX_EARLY_DATA_SIZE) => {
+            return Ok(())
+        }
+        TicketEarlyData::Present(size) => format!(
+            "NewSessionTicket early_data max_early_data_size is {size:#010x}, \
+             but QUIC permits only 0xffffffff (RFC 9001 §4.6.1)"
+        ),
+        TicketEarlyData::Malformed => {
+            "NewSessionTicket early_data extension is not a 4-byte max_early_data_size \
+             (RFC 9001 §4.6.1)"
+                .to_string()
+        }
+    };
+    tracing::warn!(reason = %reason, "quic.tls_new_session_ticket_invalid_early_data");
+    Err(TransportError {
+        code: TransportErrorCode::PROTOCOL_VIOLATION,
+        frame: None,
+        reason,
+    })
+}
+
+/// Clamps a resumed ticket's early-data allowance to what RFC 9001 §4.6.1
+/// permits over QUIC.
+///
+/// A ticket whose `max_early_data_size` is neither 0 (no early data) nor
+/// [`QUIC_MAX_EARLY_DATA_SIZE`] is not a QUIC ticket: one delivered over QUIC
+/// would have failed the connection at receipt (see
+/// [`validate_quic_new_session_ticket`]), so anything else reaching the store
+/// came from elsewhere — a TCP TLS session sharing the store, say — and carries
+/// a TLS-level byte budget that has no meaning here.
+///
+/// The allowance is zeroed rather than the ticket dropped, so resumption (the
+/// PSK) still happens and only 0-RTT is refused. Zeroing *before* the
+/// ClientHello is built also keeps the `early_data` extension out of that
+/// ClientHello, so we never advertise early data we hold no keys for.
+fn sanitize_quic_ticket_early_data(mut ticket: SessionTicketData) -> SessionTicketData {
+    let has_legal_quic_early_data = ticket.max_early_data_size == QUIC_MAX_EARLY_DATA_SIZE
+        && ticket.peer_transport_parameters.is_some();
+    if ticket.max_early_data_size != 0 && !has_legal_quic_early_data {
+        tracing::warn!(
+            max_early_data_size = ticket.max_early_data_size,
+            has_peer_transport_parameters = ticket.peer_transport_parameters.is_some(),
+            "quic.tls_ticket_early_data_not_usable"
+        );
+        ticket.max_early_data_size = 0;
+    }
+    ticket
+}
+
 fn derive_early_crypto(
     ticket: &SessionTicketData,
     client_hello: &[u8],
@@ -869,7 +1011,14 @@ fn derive_early_crypto(
 /// returning the number of leading bytes fully consumed. Any trailing bytes
 /// that form only a partial message are left for the caller to retain and
 /// re-submit once more data arrives.
-fn process_post_handshake_messages(payload: &[u8], ctx: &SessionTicketContext) -> usize {
+///
+/// Returns the connection error RFC 9001 §4.6.1 mandates if a NewSessionTicket
+/// carries an `early_data` extension QUIC does not permit; that ticket is not
+/// stored.
+fn process_post_handshake_messages(
+    payload: &[u8],
+    ctx: &SessionTicketContext,
+) -> Result<usize, TransportError> {
     let mut pos = 0usize;
     while pos + 4 <= payload.len() {
         let len = ((payload[pos + 1] as usize) << 16)
@@ -881,11 +1030,12 @@ fn process_post_handshake_messages(payload: &[u8], ctx: &SessionTicketContext) -
         }
         if payload[pos] == 0x04 {
             tracing::debug!(ticket_len = len, "quic.tls_new_session_ticket");
+            validate_quic_new_session_ticket(&payload[pos..end])?;
             ctx.process_new_session_ticket(&payload[pos..end]);
         }
         pos = end;
     }
-    pos
+    Ok(pos)
 }
 
 fn hash_for_hkdf(algorithm: lktls::crypto::hkdf::HkdfAlgorithm, data: &[u8]) -> Vec<u8> {
@@ -1141,6 +1291,7 @@ mod tests {
             ticket: vec![1, 2, 3],
             resumption_psk: vec![0xAA; 32],
             tls_version: TicketTlsVersion::Tls13,
+            used_extended_master_secret: None,
             cipher_suite: 0x1301,
             lifetime_secs: 3600,
             age_add: 0,
@@ -1162,6 +1313,244 @@ mod tests {
         assert!(!state.rejected);
     }
 
+    // ====================================================================
+    // RFC 9001 §4.6.1 — `max_early_data_size` over QUIC is 0xffffffff or
+    // nothing
+    // ====================================================================
+
+    /// Builds a NewSessionTicket handshake message whose extension block is
+    /// `extensions` verbatim, so a test can hand the RFC 9001 §4.6.1 check
+    /// exactly the `early_data` extension it wants to exercise.
+    fn build_new_session_ticket(extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3600u32.to_be_bytes()); // ticket_lifetime
+        body.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
+        body.push(4); // ticket_nonce length
+        body.extend_from_slice(&[0, 0, 0, 1]); // ticket_nonce
+        body.extend_from_slice(&3u16.to_be_bytes()); // ticket length
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // ticket
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+
+        let body_len = body.len() as u32;
+        let mut message = vec![
+            0x04,
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ];
+        message.extend_from_slice(&body);
+        message
+    }
+
+    /// `early_data` (0x002a) carrying `max_early_data_size`.
+    fn early_data_extension(max_early_data_size: u32) -> Vec<u8> {
+        let mut ext = vec![0x00, 0x2a, 0x00, 0x04];
+        ext.extend_from_slice(&max_early_data_size.to_be_bytes());
+        ext
+    }
+
+    /// A server that issues a QUIC session ticket whose `early_data` extension
+    /// carries anything but 0xffffffff has violated RFC 9001 §4.6.1, and the
+    /// client MUST fail the connection with PROTOCOL_VIOLATION rather than
+    /// quietly keeping the ticket.
+    #[test]
+    fn new_session_ticket_early_data_size_must_be_0xffffffff() {
+        assert_eq!(
+            validate_quic_new_session_ticket(&build_new_session_ticket(&early_data_extension(
+                QUIC_MAX_EARLY_DATA_SIZE
+            ))),
+            Ok(()),
+            "0xffffffff is the value QUIC mandates and must be accepted",
+        );
+        assert_eq!(
+            validate_quic_new_session_ticket(&build_new_session_ticket(&[])),
+            Ok(()),
+            "a ticket with no early_data extension is legal — it just forbids 0-RTT",
+        );
+
+        for bad in [0u32, 1, 16_384, 0xffff_fffe] {
+            let err = validate_quic_new_session_ticket(&build_new_session_ticket(
+                &early_data_extension(bad),
+            ))
+            .expect_err("a non-0xffffffff max_early_data_size must fail the connection");
+            assert_eq!(
+                err.code,
+                TransportErrorCode::PROTOCOL_VIOLATION,
+                "RFC 9001 §4.6.1 mandates PROTOCOL_VIOLATION for max_early_data_size {bad:#x}",
+            );
+        }
+
+        // Present but not a 4-byte value: also not the mandated extension.
+        let malformed = validate_quic_new_session_ticket(&build_new_session_ticket(&[
+            0x00, 0x2a, 0x00, 0x02, 0xff, 0xff,
+        ]))
+        .expect_err("a malformed early_data extension must fail the connection");
+        assert_eq!(malformed.code, TransportErrorCode::PROTOCOL_VIOLATION);
+    }
+
+    fn ticket_context(store: Arc<dyn SessionStore>) -> SessionTicketContext {
+        SessionTicketContext {
+            resumption_master_secret: vec![0x5A; 32],
+            hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
+            aead_algorithm: AeadAlgorithm::Aes128Gcm,
+            cipher_suite: 0x1301,
+            alpn: Some("h3".into()),
+            peer_transport_parameters: Some(vec![0x01, 0x00]),
+            store,
+            host_key: "example.com:443".to_string(),
+        }
+    }
+
+    /// The post-handshake path must apply the §4.6.1 check where the ticket
+    /// arrives: an illegal `early_data` fails the connection *and* the ticket
+    /// never reaches the store, so no later connection can resume on it.
+    #[test]
+    fn post_handshake_ticket_with_illegal_early_data_fails_the_connection() {
+        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        let ctx = ticket_context(store.clone());
+
+        let bad = build_new_session_ticket(&early_data_extension(16_384));
+        let err = process_post_handshake_messages(&bad, &ctx)
+            .expect_err("an illegal early_data must fail the connection");
+        assert_eq!(err.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        assert!(
+            store.take("example.com:443").is_none(),
+            "a ticket that fails RFC 9001 §4.6.1 must not be stored",
+        );
+
+        let good = build_new_session_ticket(&early_data_extension(QUIC_MAX_EARLY_DATA_SIZE));
+        assert_eq!(
+            process_post_handshake_messages(&good, &ctx),
+            Ok(good.len()),
+            "a conforming ticket must be consumed without error",
+        );
+        assert!(
+            store.take("example.com:443").is_some(),
+            "a conforming ticket must still be stored",
+        );
+    }
+
+    /// Extension types of a ClientHello handshake message, in wire order.
+    fn client_hello_extension_types(ch: &[u8]) -> Vec<u16> {
+        assert_eq!(ch[0], 0x01, "expected a ClientHello handshake message");
+        let mut pos = 4 + 2 + 32; // header + legacy_version + random
+        pos += 1 + ch[pos] as usize; // legacy_session_id
+        pos += 2 + u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize; // cipher_suites
+        pos += 1 + ch[pos] as usize; // legacy_compression_methods
+        let ext_total = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
+        pos += 2;
+        let ext_end = pos + ext_total;
+        assert!(ext_end <= ch.len(), "ClientHello extension block truncated");
+
+        let mut types = Vec::new();
+        while pos + 4 <= ext_end {
+            types.push(u16::from_be_bytes([ch[pos], ch[pos + 1]]));
+            let ext_len = u16::from_be_bytes([ch[pos + 2], ch[pos + 3]]) as usize;
+            pos += 4 + ext_len;
+        }
+        types
+    }
+
+    fn ticket_with_early_data_size(max_early_data_size: u32) -> SessionTicketData {
+        SessionTicketData {
+            ticket: vec![1, 2, 3],
+            resumption_psk: vec![0xAA; 32],
+            tls_version: TicketTlsVersion::Tls13,
+            used_extended_master_secret: None,
+            cipher_suite: 0x1301,
+            lifetime_secs: 3600,
+            age_add: 0,
+            received_at: std::time::Instant::now(),
+            alpn: Some("h3".into()),
+            hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
+            aead_algorithm: AeadAlgorithm::Aes128Gcm,
+            master_secret: Vec::new(),
+            max_early_data_size,
+            peer_transport_parameters: Some(vec![0x01, 0x00]),
+        }
+    }
+
+    fn start_quic_session_with_ticket(ticket: SessionTicketData) -> (Box<dyn Session>, Vec<u16>) {
+        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        store.store("example.com:443", ticket);
+        // A QUIC preset: its extension order is the one that carries
+        // `early_data`, so the ClientHello below actually reflects what the
+        // ticket permits.
+        let mut profile = presets::chrome_146_quic();
+        profile.session_resumption.tls13_psk = true;
+        let config = Arc::new(LktlsQuicClientConfig::new(profile).session_store(store));
+        let transport_parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+        let mut session =
+            ProtoClientConfig::start_session(config, 1, "example.com", &transport_parameters)
+                .expect("start_session");
+        let mut client_hello = Vec::new();
+        assert!(
+            session.write_handshake(&mut client_hello).is_none(),
+            "the initial ClientHello yields no keys yet"
+        );
+        let extensions = client_hello_extension_types(&client_hello);
+        (session, extensions)
+    }
+
+    /// A stored ticket whose `max_early_data_size` is not the 0xffffffff QUIC
+    /// mandates is not a QUIC 0-RTT ticket. Resumption still happens, but no
+    /// early keys are derived — and, just as important, the ClientHello must
+    /// not advertise `early_data` (0x002a) we have no keys to back.
+    #[test]
+    fn non_quic_early_data_size_disables_zero_rtt_and_the_early_data_extension() {
+        const EARLY_DATA: u16 = 0x002a;
+        const PRE_SHARED_KEY: u16 = 0x0029;
+
+        let (session, extensions) =
+            start_quic_session_with_ticket(ticket_with_early_data_size(16_384));
+        assert!(
+            session.early_crypto().is_none(),
+            "a ticket with max_early_data_size = 16384 must not enable 0-RTT over QUIC",
+        );
+        assert!(
+            !extensions.contains(&EARLY_DATA),
+            "the ClientHello must not offer early_data without early keys; got {extensions:?}",
+        );
+        assert!(
+            extensions.contains(&PRE_SHARED_KEY),
+            "resumption itself is still valid — only 0-RTT is refused; got {extensions:?}",
+        );
+
+        let (session, extensions) =
+            start_quic_session_with_ticket(ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE));
+        assert!(
+            session.early_crypto().is_some(),
+            "0xffffffff is the value QUIC mandates and must enable 0-RTT",
+        );
+        assert!(
+            extensions.contains(&EARLY_DATA),
+            "a legal QUIC 0-RTT ticket must offer early_data; got {extensions:?}",
+        );
+    }
+
+    #[test]
+    fn quic_early_data_requires_transport_parameters_in_the_ticket() {
+        const EARLY_DATA: u16 = 0x002a;
+        const PRE_SHARED_KEY: u16 = 0x0029;
+
+        let mut ticket = ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE);
+        ticket.peer_transport_parameters = None;
+        let (session, extensions) = start_quic_session_with_ticket(ticket);
+
+        assert!(
+            session.early_crypto().is_none(),
+            "QUIC 0-RTT must not be enabled without cached transport parameters",
+        );
+        assert!(
+            !extensions.contains(&EARLY_DATA),
+            "early_data must not be offered without cached transport parameters; got {extensions:?}",
+        );
+        assert!(
+            extensions.contains(&PRE_SHARED_KEY),
+            "ordinary PSK resumption should remain available; got {extensions:?}",
+        );
+    }
     #[test]
     fn hrr_rejects_zero_rtt_before_handshake_completion() {
         let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
@@ -1171,6 +1560,7 @@ mod tests {
                 ticket: vec![1, 2, 3],
                 resumption_psk: vec![0xAA; 32],
                 tls_version: TicketTlsVersion::Tls13,
+                used_extended_master_secret: None,
                 cipher_suite: 0x1301,
                 lifetime_secs: 3600,
                 age_add: 0,
@@ -1179,7 +1569,9 @@ mod tests {
                 hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
                 aead_algorithm: AeadAlgorithm::Aes128Gcm,
                 master_secret: Vec::new(),
-                max_early_data_size: 16_384,
+                // RFC 9001 §4.6.1: the only value QUIC permits, and therefore
+                // the only one that makes 0-RTT available here.
+                max_early_data_size: QUIC_MAX_EARLY_DATA_SIZE,
                 peer_transport_parameters: Some(vec![0x01, 0x00]),
             },
         );

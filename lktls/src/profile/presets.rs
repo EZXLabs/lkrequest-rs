@@ -69,6 +69,11 @@ pub fn chrome_146() -> TlsProfile {
 /// profile. QUIC uses TLS 1.3 only, an empty legacy session id, ALPN `h3`, and
 /// carries QUIC transport parameters in extension `0x0039`.
 fn chromium_quic_profile(mut profile: TlsProfile, name: &str) -> TlsProfile {
+    let trust_anchor_ids = profile
+        .extensions
+        .iter()
+        .find(|extension| extension.extension_type == ext_type::TRUST_ANCHOR_IDS)
+        .cloned();
     profile.name = name.to_string();
     profile.tls_min_version = TlsVersion::Tls13;
     profile.tls_max_version = TlsVersion::Tls13;
@@ -104,6 +109,9 @@ fn chromium_quic_profile(mut profile: TlsProfile, name: &str) -> TlsProfile {
         source: ExtensionSource::Auto,
     })
     .collect();
+    if let Some(trust_anchor_ids) = trust_anchor_ids {
+        profile.extensions.push(trust_anchor_ids);
+    }
     profile
 }
 
@@ -188,6 +196,29 @@ pub fn chrome_151_quic() -> TlsProfile {
     profile
 }
 
+/// Load the built-in Chrome 152 profile.
+///
+/// Captured from Chrome 152.0.7977.65 against public Cloudflare endpoints.
+/// It adds the shuffled trust-anchor identifiers extension (`0xca34`) while
+/// retaining Chrome 151's other stable TCP TLS fields.
+pub fn chrome_152() -> TlsProfile {
+    let json_str = include_str!("../../profiles/chrome_152.json");
+    serde_json::from_str(json_str).expect("built-in chrome_152 profile should be valid")
+}
+
+/// Chrome 152 QUIC ClientHello profile.
+///
+/// Public Cloudflare capture keeps Chrome 151's QUIC signature-algorithm shape
+/// and carries the same trust-anchor identifier set as TCP TLS.
+pub fn chrome_152_quic() -> TlsProfile {
+    let mut profile = chromium_quic_profile(chrome_152(), "Chrome 152 QUIC");
+    profile.grease.signature_algorithms = false;
+    profile
+        .signature_algorithms
+        .retain(|algorithm| !matches!(*algorithm, 0x0904..=0x0906));
+    profile
+}
+
 /// Load the built-in Firefox 133 profile.
 ///
 /// **Unverified** — lacks real browser reference data and has not undergone JA3/JA4 consistency testing.
@@ -249,6 +280,7 @@ mod tests {
             chrome_149(),
             chrome_150(),
             chrome_151(),
+            chrome_152(),
         ] {
             assert_eq!(
                 profile.tls_client_hello_style,
@@ -340,6 +372,32 @@ mod tests {
         c151.as_object_mut().unwrap().remove("name");
         c150.as_object_mut().unwrap().remove("name");
         assert_eq!(c151, c150);
+    }
+
+    #[test]
+    fn chrome_152_adds_capture_verified_trust_anchor_ids() {
+        let profile = chrome_152();
+        let trust_anchors = profile
+            .extensions
+            .iter()
+            .find(|extension| extension.extension_type == ext_type::TRUST_ANCHOR_IDS)
+            .expect("Chrome 152 should advertise trust-anchor identifiers");
+
+        match &trust_anchors.source {
+            ExtensionSource::TrustAnchorIds { ids, shuffle } => {
+                assert_eq!(ids.len(), 32);
+                assert!(*shuffle);
+            }
+            source => panic!("unexpected trust-anchor source: {source:?}"),
+        }
+    }
+
+    #[test]
+    fn chrome_152_is_first_chromium_profile_with_signature_algorithm_grease() {
+        assert!(!chrome_149().grease.signature_algorithms);
+        assert!(!chrome_150().grease.signature_algorithms);
+        assert!(!chrome_151().grease.signature_algorithms);
+        assert!(chrome_152().grease.signature_algorithms);
     }
 
     #[test]
@@ -442,6 +500,23 @@ mod tests {
             quic.signature_algorithms,
             vec![0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201]
         );
+    }
+
+    #[test]
+    fn chrome_152_quic_matches_public_cloudflare_client_hello() {
+        let quic = chrome_152_quic();
+
+        assert_eq!(quic.name, "Chrome 152 QUIC");
+        assert!(!quic.grease.signature_algorithms);
+        assert_eq!(quic.alpn_protocols, vec!["h3".to_string()]);
+        assert_eq!(
+            quic.signature_algorithms,
+            vec![0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201]
+        );
+        assert!(quic
+            .extensions
+            .iter()
+            .any(|extension| extension.extension_type == ext_type::TRUST_ANCHOR_IDS));
     }
 
     #[test]

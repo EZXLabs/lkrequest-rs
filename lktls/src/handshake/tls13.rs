@@ -36,6 +36,7 @@ use crate::crypto::kx::{self, EphemeralKeyPair, KxGroup};
 use crate::error::{AlertDescription, Result, TlsError};
 use crate::extensions::pre_shared_key::{self, PskIdentity};
 use crate::extensions::quic_transport_params::{decode_transport_params, QuicTransportParams};
+use crate::extensions::record_size_limit::parse_peer_record_size_limit;
 use crate::handshake::client_hello::{ClientHelloBuilder, EchRetryState};
 use crate::handshake::handshake_type;
 use crate::handshake::server_hello::{self, ServerHello};
@@ -189,6 +190,11 @@ pub struct HandshakeComplete {
     /// The ALPN protocol negotiated by the server (from EncryptedExtensions).
     /// `None` if the server didn't include ALPN in EncryptedExtensions.
     pub negotiated_alpn: Option<String>,
+    /// The server's RFC 8449 `record_size_limit` from EncryptedExtensions.
+    ///
+    /// `None` if the server did not send the extension, in which case records
+    /// are chunked at the protocol maximum exactly as before.
+    pub peer_record_size_limit: Option<u16>,
     /// The resumption master secret (for deriving PSK from NewSessionTickets).
     /// This is needed by the connector to compute `resumption_psk` for tickets
     /// received as post-handshake messages.
@@ -215,6 +221,13 @@ pub struct HandshakeComplete {
     /// confirmation matched.  `false` if ECH was not offered, was rejected,
     /// or only GREASE was sent.
     pub ech_accepted: bool,
+    /// Whether *real* ECH was offered in the ClientHello.
+    ///
+    /// Distinguishes "ECH was never offered" from "ECH was offered and the
+    /// server rejected it" — only the latter must abort with `ech_required`.
+    /// GREASE ECH does not set this: it is not an ECH offer, and a server that
+    /// ignores it has rejected nothing.
+    pub ech_offered: bool,
 
     /// Server QUIC transport parameters from EncryptedExtensions.
     pub peer_quic_transport_params: Option<QuicTransportParams>,
@@ -262,6 +275,70 @@ fn cipher_suite_info(suite: u16) -> Result<(HkdfAlgorithm, AeadAlgorithm)> {
 }
 
 // ---------------------------------------------------------------------------
+// ClientHello re-parsing
+// ---------------------------------------------------------------------------
+
+/// Walk the extension block of a ClientHello handshake message we produced,
+/// yielding `(extension_type, extension_body)` in wire order.
+///
+/// Both handshake versions need to answer "what did we actually offer?" after
+/// the fact — TLS 1.3 to enforce RFC 8446 §4.2 (no unsolicited server
+/// extensions), TLS 1.2 to enforce RFC 8422 §5.4 / RFC 5246 §7.4.1.4.1 (the
+/// server must select a curve and a signature algorithm from ours). Reading it
+/// back off the bytes we sent, rather than off the profile, keeps the answer
+/// exact when the builder adds, drops, or permutes extensions at runtime.
+///
+/// Returns `None` if `message` is not a well-formed ClientHello, which callers
+/// treat as "the offer is unknown" rather than as a protocol violation — the
+/// message came from us, so a parse failure is a local bug, not a peer attack.
+pub(crate) fn client_hello_extensions(message: &[u8]) -> Option<Vec<(u16, &[u8])>> {
+    if message.first() != Some(&handshake_type::CLIENT_HELLO) {
+        return None;
+    }
+    // Handshake header (4) + legacy_version (2) + random (32)
+    let body = message.get(4..)?;
+    let session_id_len = *body.get(34)? as usize;
+    let mut pos = 35 + session_id_len;
+    let cipher_suites_len = u16::from_be_bytes([*body.get(pos)?, *body.get(pos + 1)?]) as usize;
+    pos = pos.checked_add(2)?.checked_add(cipher_suites_len)?;
+    let compression_len = *body.get(pos)? as usize;
+    pos = pos.checked_add(1)?.checked_add(compression_len)?;
+    let extensions_len = u16::from_be_bytes([*body.get(pos)?, *body.get(pos + 1)?]) as usize;
+    pos += 2;
+    let extensions_end = pos.checked_add(extensions_len)?;
+    if extensions_end > body.len() {
+        return None;
+    }
+
+    let mut extensions = Vec::new();
+    while pos + 4 <= extensions_end {
+        let extension_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let extension_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        pos += 4;
+        let extension_end = pos.checked_add(extension_len)?;
+        if extension_end > extensions_end {
+            return None;
+        }
+        extensions.push((extension_type, &body[pos..extension_end]));
+        pos = extension_end;
+    }
+    if pos != extensions_end {
+        return None;
+    }
+    Some(extensions)
+}
+
+/// The extension types present in a ClientHello we produced, in wire order.
+pub(crate) fn client_hello_offered_extensions(message: &[u8]) -> Option<Vec<u16>> {
+    Some(
+        client_hello_extensions(message)?
+            .into_iter()
+            .map(|(extension_type, _)| extension_type)
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tls13Handshake
 // ---------------------------------------------------------------------------
 
@@ -295,6 +372,19 @@ pub struct Tls13Handshake {
     grease_values: Option<crate::extensions::grease::GreaseValues>,
     /// Exact extension permutation selected for CH1.
     extension_order: Option<Vec<ExtensionSpec>>,
+    /// Extension types actually emitted in the ClientHello we sent.
+    ///
+    /// Read back off the finished ClientHello bytes rather than off the profile
+    /// so it is the wire truth: it already accounts for the extensions the
+    /// builder adds or drops at runtime (`pre_shared_key`, `early_data`,
+    /// `quic_transport_parameters`, ALPS suppression, GREASE placement) and for
+    /// any permutation applied. Backs the RFC 8446 §4.2 rule that the server
+    /// MUST NOT answer with an extension we never offered.
+    ///
+    /// `None` means the ClientHello has not been built through this handshake
+    /// (or was not parseable), in which case there is nothing to compare
+    /// against and the unsolicited-extension check is skipped.
+    offered_extensions: Option<Vec<u16>>,
     /// Complete fake ECH extension from CH1, reused byte-for-byte in CH2.
     ech_grease_extension: Option<Vec<u8>>,
 
@@ -331,6 +421,13 @@ pub struct Tls13Handshake {
     // --- Negotiated ALPN ---
     /// The ALPN protocol selected by the server (extracted from EncryptedExtensions).
     negotiated_alpn: Option<String>,
+
+    /// The server's RFC 8449 `record_size_limit`, from EncryptedExtensions.
+    ///
+    /// RFC 8449 §4: "In TLS 1.3, the server sends the 'record_size_limit'
+    /// extension in the EncryptedExtensions message." It bounds the records we
+    /// send to the server, not the ones it sends us.
+    peer_record_size_limit: Option<u16>,
 
     // --- ECH ---
     /// Runtime ECHConfigList provided by the caller (raw DER bytes).
@@ -415,6 +512,7 @@ impl Tls13Handshake {
             hrr_received: false,
             grease_values: None,
             extension_order: None,
+            offered_extensions: None,
             ech_grease_extension: None,
             cipher_suite: None,
             hkdf_algorithm: None,
@@ -428,6 +526,7 @@ impl Tls13Handshake {
             server_alps_data: None,
             alps_code_point: None,
             negotiated_alpn: None,
+            peer_record_size_limit: None,
             ech_config_list: None,
             ech_retry_configs: None,
             quic_transport_parameters: None,
@@ -736,9 +835,88 @@ impl Tls13Handshake {
         };
 
         self.buffered_client_hello = Some(final_msg.clone());
+        self.record_offered_extensions(&final_msg);
 
         self.state = Tls13State::WaitServerHello;
         Ok(final_msg)
+    }
+
+    /// Remember which extension types the ClientHello we just sent carried.
+    ///
+    /// Additive across ClientHellos: CH2 after a HelloRetryRequest re-offers CH1's
+    /// extensions plus `cookie`, and with real ECH the server answers the inner
+    /// ClientHello, so the union is the set the server may legitimately respond to.
+    fn record_offered_extensions(&mut self, client_hello: &[u8]) {
+        let Some(offered) = client_hello_offered_extensions(client_hello) else {
+            // The message came from our own builder, so this is a local bug, not
+            // a peer protocol violation — say so loudly but do not fail the
+            // handshake on it. The check simply has nothing to compare against.
+            tracing::warn!(
+                "tls13.client_hello_unparseable — RFC 8446 §4.2 unsolicited-extension check is disabled for this handshake"
+            );
+            return;
+        };
+        let known = self.offered_extensions.get_or_insert_with(Vec::new);
+        for extension_type in offered {
+            if !known.contains(&extension_type) {
+                known.push(extension_type);
+            }
+        }
+        if let Some(inner) = self.ech_inner_hello.clone() {
+            if let Some(inner_types) = client_hello_offered_extensions(&inner) {
+                let known = self.offered_extensions.get_or_insert_with(Vec::new);
+                for extension_type in inner_types {
+                    if !known.contains(&extension_type) {
+                        known.push(extension_type);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reject a ServerHello extension that RFC 8446 does not allow there, or
+    /// that answers something we never offered (RFC 8446 §4.2).
+    ///
+    /// Only for an ordinary ServerHello: a HelloRetryRequest may additionally
+    /// carry `cookie` (which a client never offers) and the ECH
+    /// accept-confirmation, and [`server_hello::parse_server_hello`] already
+    /// restricts the HRR extension set.
+    fn check_server_hello_extensions(&self, sh: &ServerHello) -> Result<()> {
+        for &extension_type in &sh.extension_types {
+            if !server_hello::server_hello_permits_extension(extension_type) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::UnsupportedExtension,
+                    format!(
+                        "extension 0x{extension_type:04x} is not permitted in ServerHello                          (RFC 8446 §4.1.3)"
+                    ),
+                ));
+            }
+            if let Some(ref offered) = self.offered_extensions {
+                if !offered.contains(&extension_type) {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::UnsupportedExtension,
+                        format!(
+                            "server sent unsolicited ServerHello extension                              0x{extension_type:04x}"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject an EncryptedExtensions extension we never offered (RFC 8446 §4.2).
+    fn check_encrypted_extension_offered(&self, extension_type: u16) -> Result<()> {
+        let Some(ref offered) = self.offered_extensions else {
+            return Ok(());
+        };
+        if offered.contains(&extension_type) {
+            return Ok(());
+        }
+        Err(TlsError::local_alert(
+            AlertDescription::UnsupportedExtension,
+            format!("server sent unsolicited EncryptedExtensions extension 0x{extension_type:04x}"),
+        ))
     }
 
     /// Append the `pre_shared_key` extension to a ClientHello message and compute
@@ -1030,6 +1208,10 @@ impl Tls13Handshake {
         if sh.is_hello_retry_request {
             return self.process_hello_retry_request(full_msg, &sh, hkdf_algo);
         }
+
+        // RFC 8446 §4.1.3 / §4.2: the ServerHello may only carry the extensions
+        // that establish the cryptographic context, and only ones we offered.
+        self.check_server_hello_extensions(&sh)?;
 
         // Check if server accepted our PSK
         if let Some(selected_identity) = sh.extensions.selected_psk_identity {
@@ -1407,6 +1589,11 @@ impl Tls13Handshake {
             }
         }
 
+        self.record_offered_extensions(&final_message);
+        if let Some(inner_ch2) = self.hrr_inner_ch2.clone() {
+            self.record_offered_extensions(&inner_ch2);
+        }
+
         Ok(final_message)
     }
 
@@ -1443,6 +1630,7 @@ impl Tls13Handshake {
         let mut pos = 2;
         let ext_end = 2 + ext_len;
         let mut saw_quic_transport_params = false;
+        let mut seen_extensions: Vec<u16> = Vec::new();
         while pos + 4 <= ext_end {
             let extension_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
             let ext_data_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
@@ -1450,6 +1638,17 @@ impl Tls13Handshake {
             if pos + ext_data_len > ext_end {
                 break;
             }
+
+            // RFC 8446 §4.2: at most one extension of each type per block, and
+            // never an extension the client did not offer.
+            if seen_extensions.contains(&extension_type) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!("duplicate EncryptedExtensions extension 0x{extension_type:04x}"),
+                ));
+            }
+            seen_extensions.push(extension_type);
+            self.check_encrypted_extension_offered(extension_type)?;
 
             let ext_data = &payload[pos..pos + ext_data_len];
 
@@ -1483,6 +1682,14 @@ impl Tls13Handshake {
                 0x002a => {
                     self.early_data_accepted = true;
                     tracing::debug!("Server accepted TLS early_data");
+                }
+                // record_size_limit (0x001c) — RFC 8449. The server's receive
+                // limit bounds the records *we* send once traffic keys are in
+                // place; a value below 64 is a fatal illegal_parameter.
+                ext_type::RECORD_SIZE_LIMIT => {
+                    let limit = parse_peer_record_size_limit(ext_data)?;
+                    tracing::debug!("Server record_size_limit: {limit}");
+                    self.peer_record_size_limit = Some(limit);
                 }
                 ext_type::QUIC_TRANSPORT_PARAMETERS => {
                     let params = decode_transport_params(ext_data)?;
@@ -1610,6 +1817,44 @@ impl Tls13Handshake {
     // CertificateVerify processing
     // =======================================================================
 
+    /// Enforce RFC 8446 §4.4.3 on the CertificateVerify signature scheme.
+    ///
+    /// Two rules, both independent of whether the certificate itself is trusted:
+    ///
+    /// * The scheme MUST be one the client advertised in `signature_algorithms`.
+    ///   Completing a handshake on an algorithm we never offered is a protocol
+    ///   violation and — for a client whose whole point is to look like a
+    ///   specific browser — a contradiction the server can see.
+    /// * `rsa_pkcs1_*` MUST NOT appear here. The profiles advertise those code
+    ///   points because TLS 1.3 still allows PKCS#1 v1.5 signatures *on
+    ///   certificates*; the CertificateVerify message itself is PSS-only.
+    fn check_certificate_verify_scheme(&self, scheme: u16) -> Result<()> {
+        // rsa_pkcs1_sha1 / _sha256 / _sha384 / _sha512
+        if matches!(scheme, 0x0201 | 0x0401 | 0x0501 | 0x0601) {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                format!(
+                    "rsa_pkcs1 scheme 0x{scheme:04x} is not allowed in CertificateVerify (RFC 8446 §4.4.3)"
+                ),
+            ));
+        }
+
+        // A profile with no advertised signature algorithms tells us nothing to
+        // compare against; the ClientHello would be malformed anyway.
+        if self.profile.signature_algorithms.is_empty() {
+            return Ok(());
+        }
+        if !self.profile.signature_algorithms.contains(&scheme) {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                format!(
+                    "server signed CertificateVerify with scheme 0x{scheme:04x}, which the client did not offer"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn process_certificate_verify(
         &mut self,
         full_msg: &[u8],
@@ -1628,11 +1873,6 @@ impl Tls13Handshake {
             transcript.update(full_msg);
         }
 
-        if self.verification_policy.is_insecure() {
-            self.state = Tls13State::WaitFinished;
-            return Ok(HandshakeAction::ContinueReading);
-        }
-
         // Parse CertificateVerify: signature_scheme (2) + signature<0..2^16-1>
         if payload.len() < 4 {
             return Err(TlsError::UnexpectedMessage(
@@ -1648,6 +1888,16 @@ impl Tls13Handshake {
         }
         let signature = &payload[4..4 + sig_len];
 
+        // Which algorithm the server was allowed to sign with is a protocol
+        // rule, not a trust decision — it holds even when certificate
+        // verification is switched off.
+        self.check_certificate_verify_scheme(sig_scheme)?;
+
+        if self.verification_policy.is_insecure() {
+            self.state = Tls13State::WaitFinished;
+            return Ok(HandshakeAction::ContinueReading);
+        }
+
         // Verify the signature against the leaf certificate's public key
         let leaf_cert = &self.server_certificates[0];
         self.verification_policy.verify_certificate_verify(
@@ -1657,16 +1907,48 @@ impl Tls13Handshake {
             signature,
         )?;
 
-        // Verify the certificate chain
+        // Verify the certificate chain.
+        //
+        // When ECH was offered and rejected, the server answered the *outer*
+        // ClientHello, whose SNI is the ECH config's `public_name` — so that is
+        // the identity it presents a certificate for, and the identity RFC 9849
+        // §6.1.6 says to authenticate. Checking the true hostname here would
+        // fail on a name the server never claimed, turning an ECH rejection into
+        // a misleading certificate error and discarding the `retry_configs` that
+        // make recovery possible. Acceptance is already known at this point: it
+        // is decided from ServerHello.random, which arrives before Certificate.
+        let verify_name = self.ech_rejection_public_name();
+        let verify_name = verify_name.as_deref().unwrap_or(&self.hostname);
         self.verification_policy.verify_certificate_chain(
             &self.server_certificates,
-            &self.hostname,
+            verify_name,
             std::time::SystemTime::now(),
             self.custom_ca_anchors.as_deref().map(|v| v.as_slice()),
         )?;
 
         self.state = Tls13State::WaitFinished;
         Ok(HandshakeAction::ContinueReading)
+    }
+
+    /// The `public_name` the server must be authenticated as, when ECH was
+    /// offered and rejected.
+    ///
+    /// Returns `None` whenever the true hostname is the right identity: ECH was
+    /// not offered, ECH was accepted (the server answered the *inner*
+    /// ClientHello), or the config that would name it is unavailable.
+    fn ech_rejection_public_name(&self) -> Option<String> {
+        if !self.ech_offered || self.ech_accepted {
+            return None;
+        }
+        let public_name = self.ech_retry_state.as_ref()?.config.public_name.clone();
+        if public_name.is_empty() {
+            return None;
+        }
+        tracing::debug!(
+            public_name = %public_name,
+            "ech.rejected — authenticating the public_name instead of the true host"
+        );
+        Some(public_name)
     }
 
     // =======================================================================
@@ -1842,11 +2124,13 @@ impl Tls13Handshake {
                 exporter_master_secret,
             },
             negotiated_alpn: self.negotiated_alpn.clone(),
+            peer_record_size_limit: self.peer_record_size_limit,
             resumption_master_secret,
             negotiated_cipher_suite: self.cipher_suite.unwrap_or(0x1301),
             server_certificates: self.server_certificates.clone(),
             ech_retry_configs: self.ech_retry_configs.clone(),
             ech_accepted: self.ech_accepted,
+            ech_offered: self.ech_offered,
             peer_quic_transport_params: self.peer_quic_transport_params.clone(),
             early_data_accepted: self.early_data_accepted,
         })))
@@ -2239,6 +2523,26 @@ fn decompress_certificate(
             }
             Ok(decompressed)
         }
+        3 => {
+            // Zstandard (RFC 8879 §7.3). Advertised by the Firefox profiles,
+            // which list `compress_cert_algorithms: [1, 2, 3]`; without this arm
+            // a server that picked zstd failed the handshake outright.
+            let mut decompressed = Vec::with_capacity(max_uncompressed_len);
+            let mut reader = zstd::Decoder::new(compressed).map_err(|e| {
+                TlsError::HandshakeFailure(format!("zstd decoder init failed: {e}"))
+            })?;
+            std::io::Read::read_to_end(&mut reader, &mut decompressed).map_err(|e| {
+                TlsError::HandshakeFailure(format!("zstd decompression failed: {e}"))
+            })?;
+            if decompressed.len() != max_uncompressed_len {
+                return Err(TlsError::HandshakeFailure(format!(
+                    "decompressed certificate size mismatch: expected {}, got {}",
+                    max_uncompressed_len,
+                    decompressed.len()
+                )));
+            }
+            Ok(decompressed)
+        }
         _ => Err(TlsError::HandshakeFailure(format!(
             "unsupported certificate compression algorithm: {algorithm}"
         ))),
@@ -2592,6 +2896,243 @@ mod tests {
         );
     }
 
+    /// RFC 8446 §4.4.3: the server must sign CertificateVerify with an
+    /// algorithm the client advertised. Completing on one we never offered is a
+    /// protocol violation, and for a client whose purpose is to look like a
+    /// specific browser it is a contradiction the server can see.
+    #[test]
+    fn certificate_verify_rejects_a_scheme_the_client_did_not_offer() {
+        let profile = crate::profile::presets::chrome_150();
+        // ed448 (0x0808) is not in any Chrome profile.
+        let not_offered = 0x0808;
+        assert!(
+            !profile.signature_algorithms.contains(&not_offered),
+            "test premise: chrome_150 must not advertise 0x{not_offered:04x}"
+        );
+        let handshake = Tls13Handshake::new(profile, "example.com");
+
+        let err = handshake
+            .check_certificate_verify_scheme(not_offered)
+            .expect_err("an unoffered scheme must be rejected");
+        assert!(
+            err.to_string().contains("did not offer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A scheme we did advertise is accepted — the check must not reject
+    /// everything.
+    #[test]
+    fn certificate_verify_accepts_an_offered_scheme() {
+        let profile = crate::profile::presets::chrome_150();
+        // ecdsa_secp256r1_sha256, offered by every Chrome profile and legal in
+        // CertificateVerify.
+        let offered = 0x0403;
+        assert!(
+            profile.signature_algorithms.contains(&offered),
+            "test premise: chrome_150 must advertise 0x{offered:04x}"
+        );
+        let handshake = Tls13Handshake::new(profile, "example.com");
+
+        assert!(
+            handshake.check_certificate_verify_scheme(offered).is_ok(),
+            "an offered, CertificateVerify-legal scheme must be accepted"
+        );
+    }
+
+    /// RFC 8446 §4.4.3 bans `rsa_pkcs1_*` from CertificateVerify even though the
+    /// profiles advertise those code points — they are legal for signatures *on
+    /// certificates*, not for this message. Advertised must not imply accepted
+    /// here.
+    #[test]
+    fn certificate_verify_rejects_rsa_pkcs1_even_though_it_is_advertised() {
+        let profile = crate::profile::presets::chrome_150();
+        for scheme in [0x0401u16, 0x0501, 0x0601] {
+            assert!(
+                profile.signature_algorithms.contains(&scheme),
+                "test premise: chrome_150 advertises rsa_pkcs1 0x{scheme:04x} \
+                 for certificate signatures"
+            );
+        }
+
+        let handshake = Tls13Handshake::new(profile, "example.com");
+        for scheme in [0x0201u16, 0x0401, 0x0501, 0x0601] {
+            let err = handshake
+                .check_certificate_verify_scheme(scheme)
+                .expect_err("rsa_pkcs1 must be refused in CertificateVerify");
+            assert!(
+                err.to_string().contains("rsa_pkcs1"),
+                "unexpected error for 0x{scheme:04x}: {err}"
+            );
+        }
+    }
+
+    /// RFC 8446 §4.2: a server must not answer with an extension the client
+    /// never offered, and the client must abort when it does.
+    #[test]
+    fn encrypted_extensions_reject_an_extension_never_offered() {
+        let profile = crate::profile::presets::chrome_150();
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+
+        // 0x0015 (padding) is never sent by these profiles in a way the server
+        // may echo, and is not an EncryptedExtensions response extension.
+        let never_offered = 0x0015;
+        assert!(
+            handshake
+                .offered_extensions
+                .as_ref()
+                .is_some_and(|offered| !offered.contains(&never_offered)),
+            "test premise: the ClientHello must not have offered 0x{never_offered:04x}"
+        );
+
+        assert!(
+            handshake
+                .check_encrypted_extension_offered(never_offered)
+                .is_err(),
+            "an unsolicited EncryptedExtensions extension must be rejected"
+        );
+    }
+
+    /// The same check must accept what we did offer, or every handshake breaks.
+    #[test]
+    fn encrypted_extensions_accept_an_offered_extension() {
+        let profile = crate::profile::presets::chrome_150();
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+
+        let offered = handshake
+            .offered_extensions
+            .as_ref()
+            .and_then(|offered| offered.first().copied())
+            .expect("the ClientHello offered at least one extension");
+
+        assert!(
+            handshake.check_encrypted_extension_offered(offered).is_ok(),
+            "an extension we offered (0x{offered:04x}) must be accepted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 8449 `record_size_limit` in EncryptedExtensions
+    // -----------------------------------------------------------------------
+
+    /// Build an EncryptedExtensions handshake message carrying `extensions`.
+    fn encrypted_extensions_message(extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for (ext_type, data) in extensions {
+            block.extend_from_slice(&ext_type.to_be_bytes());
+            block.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            block.extend_from_slice(data);
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&(block.len() as u16).to_be_bytes());
+        body.extend_from_slice(&block);
+
+        let mut message = vec![handshake_type::ENCRYPTED_EXTENSIONS];
+        let body_len = body.len();
+        message.extend_from_slice(&[
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ]);
+        message.extend_from_slice(&body);
+        message
+    }
+
+    /// A Firefox handshake that has already sent its ClientHello, so
+    /// `record_size_limit` counts as an offered extension.
+    fn firefox_handshake_after_client_hello() -> Tls13Handshake {
+        let profile = crate::profile::presets::firefox_147();
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+        assert!(
+            handshake
+                .offered_extensions
+                .as_ref()
+                .is_some_and(|offered| offered.contains(&ext_type::RECORD_SIZE_LIMIT)),
+            "test premise: the Firefox ClientHello offers record_size_limit"
+        );
+        handshake
+    }
+
+    /// RFC 8449 §4: "In TLS 1.3, the server sends the 'record_size_limit'
+    /// extension in the EncryptedExtensions message." We must read it.
+    #[test]
+    fn encrypted_extensions_record_size_limit_is_recorded() {
+        let mut handshake = firefox_handshake_after_client_hello();
+        assert_eq!(
+            handshake.peer_record_size_limit, None,
+            "no limit is known before EncryptedExtensions"
+        );
+
+        let message =
+            encrypted_extensions_message(&[(ext_type::RECORD_SIZE_LIMIT, vec![0x02, 0x00])]);
+        handshake
+            .process_encrypted_extensions(&message, &message[4..])
+            .unwrap();
+
+        assert_eq!(
+            handshake.peer_record_size_limit,
+            Some(512),
+            "the server's record_size_limit must be captured from EncryptedExtensions"
+        );
+    }
+
+    /// A server that stays quiet leaves us at the protocol maximum.
+    #[test]
+    fn encrypted_extensions_without_record_size_limit_leaves_it_unset() {
+        let mut handshake = firefox_handshake_after_client_hello();
+        let message =
+            encrypted_extensions_message(&[(ext_type::ALPN, vec![0x00, 0x03, 0x02, b'h', b'2'])]);
+        handshake
+            .process_encrypted_extensions(&message, &message[4..])
+            .unwrap();
+
+        assert_eq!(handshake.peer_record_size_limit, None);
+        assert_eq!(handshake.negotiated_alpn.as_deref(), Some("h2"));
+    }
+
+    /// RFC 8449 §4: "An endpoint MUST treat receipt of a smaller value [than
+    /// 64] as a fatal error and generate an 'illegal_parameter' alert."
+    #[test]
+    fn encrypted_extensions_record_size_limit_below_64_is_illegal_parameter() {
+        for raw in [0u16, 1, 63] {
+            let mut handshake = firefox_handshake_after_client_hello();
+            let message = encrypted_extensions_message(&[(
+                ext_type::RECORD_SIZE_LIMIT,
+                raw.to_be_bytes().to_vec(),
+            )]);
+            let error = handshake
+                .process_encrypted_extensions(&message, &message[4..])
+                .expect_err("a record_size_limit below 64 must abort the handshake");
+            let description = error.as_alert().map(|alert| alert.description);
+            assert_eq!(
+                description,
+                Some(AlertDescription::IllegalParameter),
+                "value {raw} must abort with illegal_parameter, got {description:?}"
+            );
+            assert_eq!(
+                handshake.peer_record_size_limit, None,
+                "a rejected value must not be stored"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_extensions_record_size_limit_at_64_is_accepted() {
+        let mut handshake = firefox_handshake_after_client_hello();
+        let message = encrypted_extensions_message(&[(
+            ext_type::RECORD_SIZE_LIMIT,
+            64u16.to_be_bytes().to_vec(),
+        )]);
+
+        handshake
+            .process_encrypted_extensions(&message, &message[4..])
+            .expect("the RFC 8449 minimum record_size_limit is legal");
+
+        assert_eq!(handshake.peer_record_size_limit, Some(64));
+    }
     #[test]
     fn test_hrr_rejects_group_already_offered_in_key_share() {
         let profile = crate::profile::presets::chrome_150();
@@ -2677,6 +3218,7 @@ mod tests {
             master_secret: Vec::new(),
             max_early_data_size: 0,
             peer_transport_parameters: None,
+            used_extended_master_secret: None,
         };
         let mut handshake = Tls13Handshake::new(profile, "secret.example.com");
         handshake.set_ech_config(build_test_ech_config_list());
@@ -2901,6 +3443,73 @@ mod tests {
     // ====================================================================
     // decompress_certificate — brotli compressed certificates (RFC 8879)
     // ====================================================================
+
+    /// Zstandard certificate compression (RFC 8879 §7.3). The Firefox profiles
+    /// advertise algorithm 3, so a server was free to pick it; without support
+    /// the handshake failed with `unsupported certificate compression
+    /// algorithm: 3`.
+    #[test]
+    fn zstd_decompress_round_trip() {
+        let original = b"This is a test certificate DER payload for zstd compression.";
+        let compressed = zstd::encode_all(&original[..], 3).expect("zstd encode");
+
+        let decompressed = decompress_certificate(3, &compressed, original.len()).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    /// The declared `uncompressed_length` is authoritative for zstd too: a
+    /// mismatch must abort rather than hand back a short or long chain.
+    #[test]
+    fn zstd_decompress_size_mismatch_fails() {
+        let original = b"small data";
+        let compressed = zstd::encode_all(&original[..], 3).expect("zstd encode");
+
+        let result = decompress_certificate(3, &compressed, original.len() + 10);
+        assert!(result.is_err(), "size mismatch must be rejected");
+    }
+
+    #[test]
+    fn compressed_certificate_zstd_is_decompressed_and_parsed() {
+        let certificate = vec![0x30, 0x03, 0x01, 0x02, 0x03];
+        let mut certificate_message = vec![0, 0, 0, 0];
+        let list_len = 3 + certificate.len() + 2;
+        certificate_message[1..4].copy_from_slice(&(list_len as u32).to_be_bytes()[1..4]);
+        certificate_message.extend_from_slice(&(certificate.len() as u32).to_be_bytes()[1..4]);
+        certificate_message.extend_from_slice(&certificate);
+        certificate_message.extend_from_slice(&[0, 0]);
+
+        let compressed = zstd::encode_all(&certificate_message[..], 3).expect("zstd encode");
+        let mut payload = Vec::with_capacity(8 + compressed.len());
+        payload.extend_from_slice(&3u16.to_be_bytes());
+        payload.extend_from_slice(&(certificate_message.len() as u32).to_be_bytes()[1..4]);
+        payload.extend_from_slice(&(compressed.len() as u32).to_be_bytes()[1..4]);
+        payload.extend_from_slice(&compressed);
+
+        let mut handshake = firefox_handshake_after_client_hello();
+        handshake
+            .process_compressed_certificate(&[0, 0, 0, payload.len() as u8], &payload)
+            .expect("zstd CompressedCertificate must be accepted");
+
+        assert_eq!(handshake.server_certificates, vec![certificate]);
+    }
+    /// The 256 KiB cap applies to every algorithm, zstd included — a declared
+    /// length beyond it is refused before any allocation.
+    #[test]
+    fn zstd_oversized_declared_length_is_rejected() {
+        let compressed = zstd::encode_all(&b"x"[..], 3).expect("zstd encode");
+        let result = decompress_certificate(3, &compressed, MAX_DECOMPRESSED_CERT_LEN + 1);
+        assert!(
+            result.is_err(),
+            "oversized declared length must be rejected"
+        );
+    }
+
+    /// Algorithms we neither advertise nor implement still fail cleanly.
+    #[test]
+    fn unknown_certificate_compression_algorithm_is_rejected() {
+        let result = decompress_certificate(9, b"whatever", 8);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn brotli_decompress_round_trip() {

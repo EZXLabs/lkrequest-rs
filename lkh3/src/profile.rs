@@ -6,8 +6,19 @@ pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 /// `SETTINGS_QPACK_BLOCKED_STREAMS` (RFC 9204 §4.2).
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 9220 §3 / RFC 8441 §3).
+pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 /// `SETTINGS_H3_DATAGRAM` (RFC 9297 §2.1.1).
 pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
+
+/// Setting identifiers RFC 9114 §7.2.4.1 reserves — the HTTP/2 settings that
+/// have no HTTP/3 meaning.
+///
+/// > Setting identifiers that were defined in \[HTTP/2\] where there is no
+/// > corresponding HTTP/3 setting have also been reserved
+/// > […]. These reserved settings MUST NOT be sent, and their receipt MUST be
+/// > treated as a connection error of type `H3_SETTINGS_ERROR`.
+const RESERVED_SETTING_IDS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 
 /// Pseudo-header identifier used by HTTP/3 HEADERS encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +379,21 @@ impl H3Profile {
     }
 
     /// Validates that the profile is internally consistent before backend use.
+    ///
+    /// Covers the pseudo-header order and the SETTINGS frame this profile would
+    /// emit. The SETTINGS checks are the ones a peer enforces with
+    /// `H3_SETTINGS_ERROR`, so a profile that trips them cannot open a
+    /// connection at all:
+    ///
+    /// - reserved identifiers (RFC 9114 §7.2.4.1) MUST NOT be sent;
+    /// - an identifier MUST NOT be repeated in one frame (RFC 9114 §7.2.4);
+    /// - `SETTINGS_H3_DATAGRAM` (RFC 9297 §2.1.1) and
+    ///   `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 9220 §3) are booleans: any
+    ///   value other than 0 or 1 is an error.
+    ///
+    /// Validation runs over [`effective_settings`](Self::effective_settings) —
+    /// the entries actually written to the wire — not the raw `settings` vec,
+    /// so a value injected by one of the individual fields is checked too.
     pub fn validate(&self) -> Result<(), String> {
         if self.pseudo_header_order.is_empty() {
             return Err("pseudo_header_order must not be empty".into());
@@ -382,6 +408,40 @@ impl H3Profile {
                 ));
             }
             seen.push(*pseudo);
+        }
+
+        let settings = self.effective_settings();
+        let mut seen_ids: Vec<u64> = Vec::with_capacity(settings.len());
+        for (id, value) in &settings {
+            if RESERVED_SETTING_IDS.contains(id) {
+                return Err(format!(
+                    "settings contains reserved identifier {id:#04x}; RFC 9114 §7.2.4.1 forbids \
+                     sending it (a peer answers H3_SETTINGS_ERROR)"
+                ));
+            }
+            if seen_ids.contains(id) {
+                return Err(format!(
+                    "settings contains duplicate identifier {id:#04x}; RFC 9114 §7.2.4 makes a \
+                     repeated setting an H3_SETTINGS_ERROR"
+                ));
+            }
+            seen_ids.push(*id);
+
+            let boolean_setting = match *id {
+                SETTINGS_H3_DATAGRAM => Some(("SETTINGS_H3_DATAGRAM", "RFC 9297 §2.1.1")),
+                SETTINGS_ENABLE_CONNECT_PROTOCOL => {
+                    Some(("SETTINGS_ENABLE_CONNECT_PROTOCOL", "RFC 9220 §3"))
+                }
+                _ => None,
+            };
+            if let Some((name, rfc)) = boolean_setting {
+                if *value > 1 {
+                    return Err(format!(
+                        "{name} must be 0 or 1, got {value}; {rfc} makes any other value an \
+                         H3_SETTINGS_ERROR"
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -823,6 +883,34 @@ pub fn chrome_151_quic() -> QuicProfile {
     profile
 }
 
+/// Chrome 152 HTTP/3 fingerprint profile.
+///
+/// The public Cloudflare capture established Chrome 152's QUIC ClientHello and
+/// transport parameters but did not complete far enough to recapture H3
+/// SETTINGS. Keep the latest capture-verified Chrome H3 baseline.
+pub fn chrome_152_h3() -> H3Profile {
+    chrome_151_h3()
+}
+
+/// Chrome 152 QUIC + HTTP/3 fingerprint profile.
+///
+/// Captured from Chrome 152.0.7977.65 against a public Cloudflare endpoint.
+/// Stable Chrome 151 transport fields remain, but Chrome 152 no longer sent
+/// the path-sensitive `google_initial_rtt` transport parameter (`0x3127`).
+pub fn chrome_152_quic() -> QuicProfile {
+    let mut profile = chrome_151_quic();
+    profile
+        .transport_params
+        .extra_transport_parameters
+        .retain(|(id, _)| *id != 0x3127);
+    profile
+        .transport_params
+        .transport_parameter_order
+        .retain(|id| *id != 0x3127);
+    profile.h3 = chrome_152_h3();
+    profile
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![
@@ -848,6 +936,138 @@ pub fn firefox_h3() -> H3Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ====================================================================
+    // SETTINGS validation (RFC 9114 §7.2.4 / §7.2.4.1, RFC 9297, RFC 9220)
+    // ====================================================================
+
+    fn all_shipped_h3_profiles() -> Vec<(&'static str, H3Profile)> {
+        vec![
+            ("chrome_h3", chrome_h3()),
+            ("chrome_146_h3", chrome_146_h3()),
+            ("chrome_150_h3", chrome_150_h3()),
+            ("chrome_151_h3", chrome_151_h3()),
+            ("chrome_152_h3", chrome_152_h3()),
+            ("firefox_h3", firefox_h3()),
+        ]
+    }
+
+    fn all_shipped_quic_profiles() -> Vec<(&'static str, QuicProfile)> {
+        vec![
+            ("chrome_quic", chrome_quic()),
+            ("chrome_146_quic", chrome_146_quic()),
+            ("chrome_150_quic", chrome_150_quic()),
+            ("chrome_151_quic", chrome_151_quic()),
+            ("chrome_152_quic", chrome_152_quic()),
+        ]
+    }
+
+    /// The new SETTINGS rules must not reject anything we actually ship: every
+    /// captured browser profile is, by definition, a legal SETTINGS frame.
+    #[test]
+    fn every_shipped_profile_still_validates() {
+        for (name, profile) in all_shipped_h3_profiles() {
+            assert_eq!(profile.validate(), Ok(()), "{name} must still validate");
+        }
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(profile.validate(), Ok(()), "{name} must still validate");
+            assert_eq!(
+                profile.h3.validate(),
+                Ok(()),
+                "{name}'s nested H3 profile must still validate",
+            );
+        }
+    }
+
+    /// RFC 9114 §7.2.4.1: identifiers 0x00 and 0x02–0x05 are reserved (they are
+    /// the HTTP/2 settings with no HTTP/3 meaning). A client MUST NOT send them.
+    #[test]
+    fn validate_rejects_reserved_setting_identifiers() {
+        for reserved in RESERVED_SETTING_IDS {
+            let mut profile = chrome_h3();
+            profile.settings.push((reserved, 1));
+            let err = profile
+                .validate()
+                .expect_err("a reserved setting identifier must be rejected");
+            assert!(
+                err.contains("reserved"),
+                "error should name the reserved identifier {reserved:#04x}; got {err}",
+            );
+        }
+    }
+
+    /// RFC 9114 §7.2.4: a repeated identifier in one SETTINGS frame is an
+    /// `H3_SETTINGS_ERROR`.
+    #[test]
+    fn validate_rejects_duplicate_setting_identifiers() {
+        let mut profile = chrome_h3();
+        profile.settings.push((SETTINGS_H3_DATAGRAM, 1));
+        let err = profile
+            .validate()
+            .expect_err("a duplicate setting identifier must be rejected");
+        assert!(
+            err.contains("duplicate"),
+            "error should call out the duplicate; got {err}",
+        );
+    }
+
+    /// `SETTINGS_H3_DATAGRAM` (RFC 9297 §2.1.1) and
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 9220 §3) are booleans; anything
+    /// but 0 or 1 is an `H3_SETTINGS_ERROR`.
+    #[test]
+    fn validate_rejects_non_boolean_boolean_settings() {
+        for id in [SETTINGS_H3_DATAGRAM, SETTINGS_ENABLE_CONNECT_PROTOCOL] {
+            for legal in [0u64, 1] {
+                let mut profile = chrome_h3();
+                profile.settings.retain(|(sid, _)| *sid != id);
+                profile.settings.push((id, legal));
+                assert_eq!(
+                    profile.validate(),
+                    Ok(()),
+                    "{id:#04x} = {legal} is a legal boolean and must be accepted",
+                );
+            }
+
+            for illegal in [2u64, 65_536] {
+                let mut profile = chrome_h3();
+                profile.settings.retain(|(sid, _)| *sid != id);
+                profile.settings.push((id, illegal));
+                let err = profile
+                    .validate()
+                    .expect_err("a non-boolean value must be rejected");
+                assert!(
+                    err.contains("must be 0 or 1"),
+                    "error should say the setting is a boolean; got {err}",
+                );
+            }
+        }
+    }
+
+    /// The check must see what goes on the wire: `effective_settings` rewrites
+    /// known ids from the individual fields, so a duplicate introduced there is
+    /// just as fatal as one written straight into `settings`.
+    #[test]
+    fn validate_checks_the_settings_that_reach_the_wire() {
+        let mut profile = chrome_h3();
+        profile.settings.push((SETTINGS_QPACK_BLOCKED_STREAMS, 7));
+        let effective_ids: Vec<u64> = profile
+            .effective_settings()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            effective_ids
+                .iter()
+                .filter(|id| **id == SETTINGS_QPACK_BLOCKED_STREAMS)
+                .count(),
+            2,
+            "the duplicate must survive into the emitted frame: {effective_ids:?}",
+        );
+        assert!(
+            profile.validate().is_err(),
+            "a duplicate in the emitted SETTINGS frame must be rejected",
+        );
+    }
 
     #[test]
     fn chrome_h3_preset_matches_expected_shape() {
@@ -1018,6 +1238,36 @@ mod tests {
         assert_eq!(profile.packetization.initial_datagram_size, Some(1250));
         assert_eq!(profile.h3.settings, chrome_150_h3().settings);
         assert_eq!(profile.h3.priority_updates, vec![(0, "u=0, i".into())]);
+    }
+
+    #[test]
+    fn chrome_152_matches_public_cloudflare_transport_parameters() {
+        let profile = chrome_152_quic();
+
+        assert_eq!(profile.transport_params.max_idle_timeout, 30_000);
+        assert_eq!(profile.transport_params.max_udp_payload_size, Some(1472));
+        assert_eq!(profile.transport_params.initial_max_data, 15_728_640);
+        assert_eq!(profile.transport_params.initial_max_streams_bidi, 100);
+        assert_eq!(profile.transport_params.initial_max_streams_uni, 103);
+        assert_eq!(
+            profile.transport_params.max_datagram_frame_size,
+            Some(65_536)
+        );
+        assert!(profile
+            .transport_params
+            .extra_transport_parameters
+            .iter()
+            .any(|(id, value)| *id == 0x3128 && value == "4f524947"));
+        assert!(!profile
+            .transport_params
+            .extra_transport_parameters
+            .iter()
+            .any(|(id, _)| *id == 0x3127));
+        assert!(!profile
+            .transport_params
+            .transport_parameter_order
+            .contains(&0x3127));
+        assert_eq!(profile.h3, chrome_151_h3());
     }
 
     #[test]

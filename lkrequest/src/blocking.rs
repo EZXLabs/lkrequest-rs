@@ -204,6 +204,29 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the preset's outbound HTTP/2 DATA framing policy.
+    pub fn h2_data_frame_policy(mut self, policy: crate::H2DataFramePolicy) -> Self {
+        self.inner = self.inner.h2_data_frame_policy(policy);
+        self
+    }
+
+    /// Configure whether TLS session tickets are cached and offered as PSKs.
+    pub fn tls_session_resumption_policy(
+        mut self,
+        policy: crate::TlsSessionResumptionPolicy,
+    ) -> Self {
+        self.inner = self.inner.tls_session_resumption_policy(policy);
+        self
+    }
+
+    /// Configure browser-style TLS session-cache partitioning.
+    pub fn tls_session_cache_partition_policy(
+        mut self,
+        policy: crate::TlsSessionCachePartitionPolicy,
+    ) -> Self {
+        self.inner = self.inner.tls_session_cache_partition_policy(policy);
+        self
+    }
     /// Bound HTTP/2 requests waiting for remote stream capacity.
     pub fn max_pending_h2_requests(mut self, max: usize) -> Self {
         self.inner = self.inner.max_pending_h2_requests(max);

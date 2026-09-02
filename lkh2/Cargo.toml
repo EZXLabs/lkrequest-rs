@@ -1,12 +1,15 @@
 [package]
 name = "lkh2"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "HTTP/2 fingerprint-controlled connection library"
 
 [features]
 default = ["h2-native"]
+# Backward-compatible alias. The fingerprint-controlled native engine is now
+# the only HTTP/2 implementation and is always compiled.
 h2-native = []
+
 
 [dependencies]
 fluke-hpack = "0.3"

@@ -372,10 +372,15 @@ async fn socks5_handshake(tcp: &mut TcpStream, auth: Option<&ProxyAuth>) -> io::
                     "proxy requested user/pass auth but no credentials configured",
                 )
             })?;
-            if auth.username.len() > 255 || auth.password.len() > 255 {
+            // RFC 1929 §2 fixes UNAME and PASSWD at 1-255 bytes each: both are
+            // length-prefixed by a single octet, so 0 is as unrepresentable
+            // as 256.
+            if !(1..=255).contains(&auth.username.len())
+                || !(1..=255).contains(&auth.password.len())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "SOCKS5 user/pass exceeds 255 bytes",
+                    "SOCKS5 user/pass must be 1-255 bytes each (RFC 1929)",
                 ));
             }
             let mut buf = Vec::with_capacity(3 + auth.username.len() + auth.password.len());

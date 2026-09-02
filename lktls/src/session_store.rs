@@ -82,6 +82,22 @@ pub struct SessionTicketData {
 
     /// Cached peer QUIC transport parameters associated with this ticket.
     pub peer_transport_parameters: Option<Vec<u8>>,
+
+    /// TLS 1.2: whether the session this ticket resumes negotiated Extended
+    /// Master Secret (RFC 7627).
+    ///
+    /// §5.4 says a client "SHOULD store the extended master secret flag in the
+    /// session state" precisely so the §5.3 checks can run on resumption: a
+    /// server that adds the extension to a session that lacked it, or drops it
+    /// from a session that had it, must abort the abbreviated handshake.
+    ///
+    /// `None` means the flag was never recorded, and the checks are skipped
+    /// rather than guessed. Neither default is safe: assuming `false` would
+    /// abort every resumption against the near-universal servers that do
+    /// negotiate EMS, and assuming `true` would abort every resumption of a
+    /// legacy non-EMS session. Always `None` for TLS 1.3, where EMS does not
+    /// exist — its key schedule provides the same binding unconditionally.
+    pub used_extended_master_secret: Option<bool>,
 }
 
 /// Which TLS version issued this ticket.
@@ -91,11 +107,52 @@ pub enum TicketTlsVersion {
     Tls12,
 }
 
+/// The longest a ticket may be cached, in seconds — 604800 (7 days).
+///
+/// RFC 8446 §4.6.1 makes this a hard client-side rule for TLS 1.3 tickets:
+/// "Clients MUST NOT cache tickets for longer than 7 days, regardless of the
+/// `ticket_lifetime`, and MAY delete tickets earlier based on local policy."
+/// The server's `ticket_lifetime` is therefore an upper bound *request*, not
+/// an instruction — a server that sends `0xFFFFFFFF` (≈136 years) does not get
+/// to pin a resumption secret in the client for that long.
+///
+/// TLS 1.2 tickets (RFC 5077 §3.3) carry a `ticket_lifetime_hint` with weaker
+/// semantics — it is only "a hint from the server about how long the ticket
+/// should be stored", with no normative ceiling. RFC 5077 does say the client
+/// "MAY delete the ticket earlier based on local policy", so the same 7-day
+/// bound is applied to TLS 1.2 tickets as *local policy* rather than as a
+/// protocol requirement. Both versions cache a long-lived symmetric secret
+/// that is worth exactly as much to an attacker, so they get the same cap.
+///
+/// The lower bound is left alone: a shorter server lifetime always wins, and
+/// the TLS 1.3 "value of zero means discard immediately" rule falls out of the
+/// comparison in [`SessionTicketData::is_expired`].
+pub const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
+
 impl SessionTicketData {
+    /// The lifetime this client actually honours for the ticket, in seconds.
+    ///
+    /// This is the server-advertised [`Self::lifetime_secs`] clamped to
+    /// [`MAX_TICKET_LIFETIME_SECS`]; see that constant for why the clamp
+    /// applies to both TLS 1.3 and TLS 1.2 tickets.
+    pub fn effective_lifetime_secs(&self) -> u32 {
+        self.lifetime_secs.min(MAX_TICKET_LIFETIME_SECS)
+    }
+
     /// Check if this ticket has expired.
+    ///
+    /// Expiry is measured against [`Self::effective_lifetime_secs`], not the
+    /// raw server-advertised lifetime.
     pub fn is_expired(&self) -> bool {
-        let age = self.received_at.elapsed();
-        age > Duration::from_secs(self.lifetime_secs as u64)
+        self.is_expired_at_age(self.received_at.elapsed())
+    }
+
+    /// [`Self::is_expired`] with the ticket's age supplied explicitly.
+    ///
+    /// Split out so the expiry rule can be tested without waiting on (or
+    /// rewinding) a monotonic clock.
+    fn is_expired_at_age(&self, age: Duration) -> bool {
+        age > Duration::from_secs(self.effective_lifetime_secs() as u64)
     }
 
     /// Compute the obfuscated ticket age for TLS 1.3 `pre_shared_key` extension.
@@ -307,6 +364,9 @@ pub fn parse_tls13_new_session_ticket(
         ticket,
         resumption_psk,
         tls_version: TicketTlsVersion::Tls13,
+        // EMS is a TLS 1.2 concept; the TLS 1.3 key schedule binds the
+        // handshake transcript unconditionally.
+        used_extended_master_secret: None,
         cipher_suite,
         lifetime_secs: lifetime,
         age_add,
@@ -328,6 +388,7 @@ pub fn parse_tls12_new_session_ticket(
     master_secret: &[u8],
     alpn: Option<String>,
     negotiated_suite: Option<crate::crypto::tls12_cipher::Tls12CipherSuite>,
+    used_extended_master_secret: Option<bool>,
 ) -> std::result::Result<SessionTicketData, String> {
     let data = if payload.len() > 4 && payload[0] == 0x04 {
         &payload[4..]
@@ -377,6 +438,7 @@ pub fn parse_tls12_new_session_ticket(
         ticket,
         resumption_psk: Vec::new(),
         tls_version: TicketTlsVersion::Tls12,
+        used_extended_master_secret,
         cipher_suite: cipher_suite_code,
         lifetime_secs: lifetime_hint,
         age_add: 0,
@@ -413,7 +475,48 @@ mod tests {
             master_secret: Vec::new(),
             max_early_data_size: 0,
             peer_transport_parameters: None,
+            used_extended_master_secret: None,
         }
+    }
+
+    /// RFC 7627 §5.4: the EMS flag must be persisted with the ticket, because
+    /// the §5.3 resumption checks in `tls12.rs` are skipped when it is `None`.
+    /// Without this the checks compile, pass their own unit tests, and never
+    /// run against a real handshake.
+    #[test]
+    fn tls12_ticket_carries_the_extended_master_secret_flag() {
+        // NewSessionTicket body: lifetime(4) + ticket length(2) + ticket.
+        let mut payload = vec![0x04, 0x00, 0x00, 0x0b];
+        payload.extend_from_slice(&3600u32.to_be_bytes());
+        payload.extend_from_slice(&3u16.to_be_bytes());
+        payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        for recorded in [Some(true), Some(false), None] {
+            let ticket = parse_tls12_new_session_ticket(
+                &payload,
+                &[0x11; 48],
+                Some("http/1.1".to_string()),
+                None,
+                recorded,
+            )
+            .expect("ticket parses");
+            assert_eq!(
+                ticket.used_extended_master_secret, recorded,
+                "the EMS flag must survive into the stored ticket"
+            );
+        }
+    }
+
+    /// EMS does not exist in TLS 1.3 — its key schedule binds the transcript
+    /// unconditionally — so a 1.3 ticket must never claim a flag either way.
+    #[test]
+    fn tls13_tickets_never_record_an_extended_master_secret_flag() {
+        let ticket = make_ticket(3600);
+        assert_eq!(ticket.tls_version, TicketTlsVersion::Tls13);
+        assert_eq!(
+            ticket.used_extended_master_secret, None,
+            "a TLS 1.3 ticket must not carry an EMS flag"
+        );
     }
 
     #[test]
@@ -475,6 +578,7 @@ mod tests {
             master_secret: Vec::new(),
             max_early_data_size: 0,
             peer_transport_parameters: None,
+            used_extended_master_secret: None,
         };
         // Age is ~0ms, so obfuscated_age ≈ age_add
         let age = ticket.obfuscated_ticket_age();
@@ -508,6 +612,7 @@ mod tests {
             master_secret: vec![0xBB; 48],
             max_early_data_size: 0,
             peer_transport_parameters: None,
+            used_extended_master_secret: None,
         }
     }
 
@@ -544,5 +649,114 @@ mod tests {
 
         let taken = store.take("example.com:443").unwrap();
         assert_eq!(taken.alpn, Some("h2".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // Ticket lifetime ceiling (RFC 8446 §4.6.1 / RFC 5077 §3.3)
+    // ------------------------------------------------------------------
+
+    /// RFC 8446 §4.6.1: a TLS 1.3 ticket is never cached longer than 7 days,
+    /// "regardless of the ticket_lifetime".
+    #[test]
+    fn tls13_ticket_lifetime_is_clamped_to_seven_days() {
+        for advertised in [
+            u32::MAX,
+            MAX_TICKET_LIFETIME_SECS + 1,
+            365 * 24 * 60 * 60, // a year
+        ] {
+            let ticket = make_ticket(advertised);
+            assert_eq!(ticket.tls_version, TicketTlsVersion::Tls13);
+            assert_eq!(
+                ticket.effective_lifetime_secs(),
+                MAX_TICKET_LIFETIME_SECS,
+                "server-advertised lifetime {advertised} must be capped at 7 days"
+            );
+        }
+    }
+
+    /// RFC 5077 §3.3's `ticket_lifetime_hint` is only a hint, and the client
+    /// "MAY delete the ticket earlier based on local policy" — so the same
+    /// 7-day ceiling is applied to TLS 1.2 tickets.
+    #[test]
+    fn tls12_ticket_lifetime_hint_is_clamped_to_seven_days() {
+        let ticket = make_tls12_ticket(u32::MAX);
+        assert_eq!(ticket.tls_version, TicketTlsVersion::Tls12);
+        assert_eq!(ticket.effective_lifetime_secs(), MAX_TICKET_LIFETIME_SECS);
+    }
+
+    /// A lifetime at or below the ceiling is honoured verbatim — the clamp is
+    /// an upper bound only, and must not extend a short-lived ticket.
+    #[test]
+    fn lifetime_below_the_ceiling_is_left_alone() {
+        for advertised in [0, 1, 3600, MAX_TICKET_LIFETIME_SECS] {
+            assert_eq!(
+                make_ticket(advertised).effective_lifetime_secs(),
+                advertised,
+                "lifetime {advertised} is within the cap and must not change"
+            );
+        }
+    }
+
+    /// The ceiling actually governs expiry: a ticket whose server lifetime is
+    /// effectively unbounded still expires once it is older than 7 days.
+    #[test]
+    fn overlong_lifetime_still_expires_after_seven_days() {
+        let cap = Duration::from_secs(MAX_TICKET_LIFETIME_SECS as u64);
+
+        for ticket in [make_ticket(u32::MAX), make_tls12_ticket(u32::MAX)] {
+            assert!(
+                !ticket.is_expired_at_age(cap),
+                "{:?}: exactly 7 days old is still usable",
+                ticket.tls_version
+            );
+            assert!(
+                ticket.is_expired_at_age(cap + Duration::from_secs(1)),
+                "{:?}: past 7 days the ticket must be treated as expired \
+                 regardless of the server's lifetime",
+                ticket.tls_version
+            );
+            assert!(
+                ticket.is_expired_at_age(Duration::from_secs(30 * 24 * 60 * 60)),
+                "{:?}: a month-old ticket must be expired",
+                ticket.tls_version
+            );
+        }
+    }
+
+    /// A server-chosen lifetime shorter than the cap still ends the ticket
+    /// early — the cap must not become the lifetime.
+    #[test]
+    fn short_server_lifetime_expires_before_the_ceiling() {
+        let ticket = make_ticket(60);
+        assert!(!ticket.is_expired_at_age(Duration::from_secs(59)));
+        assert!(ticket.is_expired_at_age(Duration::from_secs(61)));
+    }
+
+    /// An over-cap ticket that is older than the cap is dropped by the store,
+    /// not handed back for resumption.
+    #[test]
+    fn store_discards_tickets_older_than_the_ceiling() {
+        let over_cap = Duration::from_secs(MAX_TICKET_LIFETIME_SECS as u64 + 60);
+        let mut ticket = make_ticket(u32::MAX);
+
+        // `Instant` counts from an arbitrary epoch (process/boot start on some
+        // platforms), so it cannot always be rewound a full week. Where it
+        // can't, the age-parameterised rule above is the coverage.
+        match Instant::now().checked_sub(over_cap) {
+            Some(received_at) => {
+                ticket.received_at = received_at;
+                assert!(ticket.is_expired(), "a week-old ticket must be expired");
+
+                let store = InMemorySessionStore::new();
+                store.store("example.com:443", ticket);
+                assert!(
+                    store.take("example.com:443").is_none(),
+                    "an over-age ticket must never be returned for resumption"
+                );
+            }
+            None => {
+                assert_eq!(ticket.effective_lifetime_secs(), MAX_TICKET_LIFETIME_SECS);
+            }
+        }
     }
 }

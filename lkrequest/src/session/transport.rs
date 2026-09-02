@@ -112,22 +112,23 @@ impl RequestBuilder {
 
                 // Learn dynamic HSTS from a Strict-Transport-Security response,
                 // if the policy is stateful (no-op for NoHsts/StaticHsts).
+                // `hsts_host_to_record` applies the RFC 6797 §8.1 gates.
                 if let Some(sts) = resp
                     .headers()
                     .get(http::header::STRICT_TRANSPORT_SECURITY)
                     .and_then(|v| v.to_str().ok())
                 {
-                    if let Some(host) = Url::parse(&current_url)
-                        .ok()
-                        .and_then(|u| u.host_str().map(str::to_string))
-                    {
+                    if let Some(host) = hsts_host_to_record(&current_url) {
                         self.session.inner.hsts_policy.record_sts(&host, sts);
                     }
                 }
 
-                // Check for redirect status codes
+                // Check for redirect status codes. Only the *followable* 3xx
+                // codes count: 300/304/305/306 carry no `Location` and are
+                // returned to the caller as-is (RFC 9110 §15.4) — see
+                // `pipeline::is_followable_redirect`.
                 let status = resp.status();
-                let is_redirect = status.is_redirection();
+                let is_redirect = pipeline::is_followable_redirect(status);
 
                 if !is_redirect || !follow_redirects || redirects_remaining == 0 {
                     if is_redirect && follow_redirects && redirects_remaining == 0 {
@@ -189,26 +190,34 @@ impl RequestBuilder {
                     redirect_to_str.clone(),
                 ));
 
-                // Update method and body based on status code
+                // Update method and body based on status code.
                 match status.as_u16() {
                     301..=303 => {
-                        // 301/302 (historically POST->GET) and 303 See Other:
-                        // follow with GET, drop the body and all request-body
-                        // headers (Fetch "request-body-header name" set). 303 was
-                        // previously not followed at all.
-                        current_method = http::Method::GET;
-                        current_body = None;
-                        current_headers.remove(http::header::CONTENT_TYPE);
-                        current_headers.remove(http::header::CONTENT_LENGTH);
-                        current_headers.remove(http::header::CONTENT_ENCODING);
-                        current_headers.remove(http::header::CONTENT_LANGUAGE);
-                        current_headers.remove(http::header::CONTENT_LOCATION);
+                        // Only *some* method/status combinations are rewritten
+                        // to GET — see `redirect_rewrites_method_to_get`. When
+                        // the method is preserved, so are the body and the
+                        // request-body headers that describe it.
+                        if redirect_rewrites_method_to_get(status.as_u16(), &current_method) {
+                            current_method = http::Method::GET;
+                            current_body = None;
+                            // Fetch "request-body-header name" set.
+                            current_headers.remove(http::header::CONTENT_ENCODING);
+                            current_headers.remove(http::header::CONTENT_LANGUAGE);
+                            current_headers.remove(http::header::CONTENT_LOCATION);
+                            current_headers.remove(http::header::CONTENT_TYPE);
+                            // Not in Fetch's set (browsers compute it), but a
+                            // caller-supplied Content-Length would now describe
+                            // a body that no longer exists.
+                            current_headers.remove(http::header::CONTENT_LENGTH);
+                        }
                     }
                     307 | 308 => {
                         // 307/308: Preserve method and body
                     }
                     _ => {
-                        // Other 3xx codes (300/304/305/306): return as-is
+                        // Defensive: `is_followable_redirect` already routed
+                        // every non-followable 3xx (300/304/305/306) to the
+                        // early return above, before `Location` was required.
                         let mut resp = resp;
                         resp.set_redirect_history(redirect_history);
                         return Ok(resp);
@@ -1644,7 +1653,7 @@ impl RequestBuilder {
         // If there was a body, it was already included in the first request.
         // For requests with bodies, the body was sent inline as part of the
         // HEADERS+DATA frames in the first request.
-        // (The h2-native driver handles DATA frame emission for first requests
+        // (The lkh2 driver handles DATA frame emission for first requests
         // that have a body.)
         let _ = body;
 
@@ -1751,8 +1760,14 @@ impl RequestBuilder {
             .parse()
             .map_err(|e| Error::Http(format!("invalid request path '{}': {e}", path)))?;
 
-        // Build request with Full<Bytes> body
-        let body_bytes = body.unwrap_or_default();
+        // Build request with Full<Bytes> body.
+        //
+        // `body` is *this hop's* body, which is not always `self.body`: a
+        // redirect that rewrites the method to GET drops it. Content-Length
+        // must be derived from this one — see the `auto_insert_content_length`
+        // call below.
+        let hop_body = body;
+        let body_bytes = hop_body.clone().unwrap_or_default();
         let has_body = !body_bytes.is_empty();
         let full_body = Full::new(body_bytes);
 
@@ -1774,7 +1789,12 @@ impl RequestBuilder {
             client.cookie_order(),
         );
 
-        pipeline::auto_insert_content_length(request.headers_mut(), self.body.as_ref());
+        // Every other send path passes the per-hop body here; this one used to
+        // pass `self.body`. On a redirect that rewrote the method to GET that
+        // re-inserted the *original* body's Content-Length onto a bodyless
+        // request, and the server then blocked waiting for a body that never
+        // came — on a pooled H1 connection, until the total timeout fired.
+        pipeline::auto_insert_content_length(request.headers_mut(), hop_body.as_ref());
 
         self.merge_headers(
             request.headers_mut(),
@@ -2364,6 +2384,38 @@ pub(crate) fn redirect_is_cross_origin(from: &Url, to: &Url) -> bool {
         || from.port_or_known_default() != to.port_or_known_default()
 }
 
+/// Whether following a `status` redirect rewrites `method` to `GET` (and
+/// therefore drops the request body).
+///
+/// This is the Fetch Standard's "HTTP-redirect fetch" step, which is what
+/// browsers actually implement:
+///
+/// > If one of the following is true
+/// >
+/// > - internalResponse's status is 301 or 302 and request's method is `POST`
+/// > - internalResponse's status is 303 and request's method is not `GET` or
+/// >   `HEAD`
+/// >
+/// > then:
+/// >
+/// > 1. Set request's method to `GET` and request's body to null.
+/// > 2. For each headerName of request-body-header name, delete headerName
+/// >    from request's header list.
+///
+/// It agrees with RFC 9110: §15.4.2 (301) and §15.4.3 (302) permit the rewrite
+/// only "from POST to GET"; §15.4.4 (303) directs the user agent to perform "a
+/// GET or HEAD request", and calls out HEAD separately ("Except for responses
+/// to a HEAD request, ..."), so a HEAD stays a HEAD.
+///
+/// 307/308 never rewrite, and the non-followable 3xx codes never reach here.
+pub(crate) fn redirect_rewrites_method_to_get(status: u16, method: &http::Method) -> bool {
+    match status {
+        301 | 302 => *method == http::Method::POST,
+        303 => *method != http::Method::GET && *method != http::Method::HEAD,
+        _ => false,
+    }
+}
+
 /// Apply an HSTS scheme upgrade to `url` if `policy` marks its host HTTPS-only.
 ///
 /// Returns the rewritten `https://` URL (with an explicit `:80` bumped to
@@ -2383,6 +2435,35 @@ fn hsts_upgrade(url: &str, policy: &dyn crate::hsts::HstsPolicy) -> Option<Strin
         parsed.set_port(Some(443)).ok()?;
     }
     Some(parsed.to_string())
+}
+
+/// The host to note as a Known HSTS Host from a `Strict-Transport-Security`
+/// response header, or `None` when RFC 6797 §8.1 forbids noting this response.
+///
+/// Two gates, both mandatory:
+///
+/// * **Secure transport only.** "If an HTTP response is received over insecure
+///   transport, the UA MUST ignore any present STS header field(s)." Without
+///   this, anyone able to answer (or tamper with) a cleartext `http://`
+///   response can pin — or, with `max-age=0`, un-pin — a host for the rest of
+///   the session.
+/// * **No IP-literal hosts.** "If the substring matching the host production
+///   … is an IP address, the UA MUST NOT note this host as a Known HSTS Host."
+///   `Url::host_str` yields IPv6 in bracketed form (`[::1]`), so this uses
+///   [`lktls::handshake::hostname_is_ip_literal`], which accepts both forms,
+///   rather than a bare `IpAddr` parse.
+fn hsts_host_to_record(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    // Secure transport: the only scheme this client sends requests over that
+    // is TLS-protected. (`wss://` never reaches here — see `crate::ws`.)
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if lktls::handshake::hostname_is_ip_literal(host) {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 /// Any `Cookie` set on the request (defaults or per-request headers) is taken
@@ -2631,6 +2712,109 @@ mod tests {
             &u("https://a.com/x"),
             &u("https://a.com:8443/y")
         ));
+    }
+
+    /// Fetch "HTTP-redirect fetch": 301/302 rewrite **POST only**; every other
+    /// method survives the hop unchanged. RFC 9110 §15.4.2/§15.4.3 say the same
+    /// ("change the request method from POST to GET").
+    #[test]
+    fn redirect_301_302_rewrite_post_only() {
+        for status in [301u16, 302] {
+            assert!(
+                redirect_rewrites_method_to_get(status, &http::Method::POST),
+                "{status} must rewrite POST to GET"
+            );
+            for method in [
+                http::Method::GET,
+                http::Method::HEAD,
+                http::Method::PUT,
+                http::Method::DELETE,
+                http::Method::PATCH,
+                http::Method::OPTIONS,
+            ] {
+                assert!(
+                    !redirect_rewrites_method_to_get(status, &method),
+                    "{status} must preserve {method}, not rewrite it to GET"
+                );
+            }
+        }
+    }
+
+    /// Fetch: 303 rewrites every method **except GET and HEAD**. RFC 9110
+    /// §15.4.4 says the follow-up is "a GET or HEAD request", and treats HEAD
+    /// separately, so a HEAD must not gain a body it never asked for.
+    #[test]
+    fn redirect_303_rewrites_everything_but_get_and_head() {
+        for method in [
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::PATCH,
+            http::Method::OPTIONS,
+        ] {
+            assert!(
+                redirect_rewrites_method_to_get(303, &method),
+                "303 must rewrite {method} to GET"
+            );
+        }
+        assert!(
+            !redirect_rewrites_method_to_get(303, &http::Method::GET),
+            "303 must leave GET alone"
+        );
+        assert!(
+            !redirect_rewrites_method_to_get(303, &http::Method::HEAD),
+            "303 must leave HEAD as HEAD"
+        );
+    }
+
+    /// 307/308 preserve method and body for every method, and the
+    /// non-followable 3xx codes never rewrite either.
+    #[test]
+    fn redirect_307_308_never_rewrite() {
+        for status in [300u16, 304, 305, 306, 307, 308] {
+            for method in [
+                http::Method::GET,
+                http::Method::HEAD,
+                http::Method::POST,
+                http::Method::PUT,
+                http::Method::DELETE,
+                http::Method::PATCH,
+            ] {
+                assert!(
+                    !redirect_rewrites_method_to_get(status, &method),
+                    "{status} must never rewrite {method}"
+                );
+            }
+        }
+    }
+
+    /// RFC 6797 §8.1: an STS header is only noted when the response came over
+    /// a secure transport, and never for an IP-address host.
+    #[test]
+    fn hsts_record_gate_requires_https_and_dns_host() {
+        // Secure transport + DNS host → note it.
+        assert_eq!(
+            hsts_host_to_record("https://example.com/a"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            hsts_host_to_record("https://sub.example.com:8443/a?b=c"),
+            Some("sub.example.com".to_string())
+        );
+
+        // Insecure transport → MUST ignore the header. A cleartext response
+        // must not be able to pin (or, with max-age=0, un-pin) a host.
+        assert_eq!(hsts_host_to_record("http://example.com/a"), None);
+        assert_eq!(hsts_host_to_record("http://example.com:8080/a"), None);
+
+        // IP-address host → MUST NOT be noted, in either literal form.
+        assert_eq!(hsts_host_to_record("https://127.0.0.1:8443/a"), None);
+        assert_eq!(hsts_host_to_record("https://192.0.2.10/a"), None);
+        assert_eq!(hsts_host_to_record("https://[::1]:8443/a"), None);
+        assert_eq!(hsts_host_to_record("https://[2001:db8::1]/a"), None);
+
+        // Unparseable / host-less URLs are simply ignored.
+        assert_eq!(hsts_host_to_record("not a url"), None);
     }
 
     #[test]

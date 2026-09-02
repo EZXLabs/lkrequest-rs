@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::crypto::aead::{Aead, AeadAlgorithm};
 use crate::crypto::hkdf::HkdfAlgorithm;
 use crate::crypto::to_hex;
-use crate::error::{Result, TlsError};
+use crate::error::{AlertDescription, AlertLevel, Result, TlsError};
 use crate::extensions::quic_transport_params::QuicTransportParams;
 use crate::handshake::content_type;
 use crate::handshake::server_hello::{check_downgrade_sentinel, detect_version_from_server_hello};
@@ -350,10 +350,20 @@ pub struct HandshakeDriver {
 
 impl HandshakeDriver {
     pub fn new(config: HandshakeConfig) -> Self {
+        let mut reader = RecordReader::new();
+        // RFC 8449 §4: the `record_size_limit` this profile puts in the
+        // ClientHello bounds the records the *peer* may send us, and "an
+        // endpoint that receives a record larger than its advertised limit MUST
+        // generate a fatal 'record_overflow' alert". Arm the reader here: the
+        // extension goes out in the first flight, so the limit is in force from
+        // the first protected record the server sends. Mirrors
+        // `writer.set_peer_record_size_limit()` on the send side, which is fed
+        // from the server's extension instead.
+        reader.set_own_record_size_limit(config.profile.record_size_limit);
         Self {
             config,
             state: DriverState::Start,
-            reader: RecordReader::new(),
+            reader,
             writer: RecordWriter::new(),
             hs_buffer: Vec::new(),
             original_ticket: None,
@@ -699,11 +709,55 @@ impl HandshakeDriver {
                 .write_record(content_type::HANDSHAKE, &complete.client_finished)?,
         );
 
+        // ECH offered but not accepted: the outer handshake exists only to
+        // authenticate the `public_name` (already done during certificate
+        // verification) and to collect `retry_configs`. RFC 9849 §6.1.6 forbids
+        // carrying application data on it — the true server name was never
+        // protected — so finish the flight, send `ech_required`, and abort.
+        //
+        // Deliberately before installing application keys and before building
+        // the session-ticket context: no traffic keys are handed out, and no
+        // ticket from this connection may be cached, since it is bound to the
+        // public_name identity rather than the one the caller asked for.
+        if complete.ech_offered && !complete.ech_accepted {
+            tracing::warn!(
+                host = %self.config.hostname,
+                retry_configs = complete.ech_retry_configs.as_ref().map_or(0, |c| c.len()),
+                "tls.ech_rejected — aborting with ech_required",
+            );
+            // `send_buf` already holds the client flight. Append the alert (the
+            // writer still holds handshake keys — application keys are installed
+            // below, which this path never reaches) and hand both to the caller
+            // through the same `pending_alert` channel `progress()` uses for
+            // local alerts, so the peer sees a completed flight then
+            // `ech_required` rather than a bare disconnect.
+            let alert_record = self.writer.write_record(
+                content_type::ALERT,
+                &[
+                    AlertLevel::Fatal.as_byte(),
+                    AlertDescription::EchRequired.as_byte(),
+                ],
+            )?;
+            send_buf.extend_from_slice(&alert_record);
+            self.pending_alert = Some(send_buf);
+            return Err(TlsError::EchRejected {
+                retry_configs: complete.ech_retry_configs.clone(),
+            });
+        }
+
         let ts = &complete.traffic_secrets;
         self.reader
             .set_keys(Aead::new(ts.aead_algorithm, &ts.server_key, &ts.server_iv)?);
         self.writer
             .set_keys(Aead::new(ts.aead_algorithm, &ts.client_key, &ts.client_iv)?);
+        // RFC 8449: the server's `record_size_limit` from EncryptedExtensions
+        // bounds the application records we send. Installed after the client
+        // flight above so the handshake records stay byte-identical.
+        self.writer
+            .set_peer_record_size_limit(complete.peer_record_size_limit);
+        if let Some(limit) = complete.peer_record_size_limit {
+            tracing::debug!(limit, "tls.honouring_peer_record_size_limit");
+        }
 
         if complete.ech_accepted {
             tracing::info!(host = %self.config.hostname, "tls.ech_accepted");
@@ -791,7 +845,12 @@ impl HandshakeDriver {
         if let Some(ticket) = self.original_ticket.take() {
             if ticket.tls_version == TicketTlsVersion::Tls12 && !ticket.master_secret.is_empty() {
                 tracing::debug!(host = %self.config.hostname, "tls12.attempting_session_ticket_resumption");
-                tls12.set_session_ticket_master_secret(ticket.master_secret.clone());
+                // Carry the stored EMS flag so RFC 7627 §5.3 can be checked
+                // once the server commits to resuming.
+                tls12.set_session_ticket_resumption(
+                    ticket.master_secret.clone(),
+                    ticket.used_extended_master_secret,
+                );
             }
         }
 
@@ -886,6 +945,11 @@ impl HandshakeDriver {
         abbr_flight
             .traffic_keys
             .install_on_writer(&mut self.writer)?;
+        // RFC 8449: honour the server's ServerHello `record_size_limit`.
+        // Resumption renegotiates the limit, so it is read from this
+        // handshake's ServerHello rather than carried over.
+        self.writer
+            .set_peer_record_size_limit(handshake.peer_record_size_limit());
         let fin = self
             .writer
             .write_record(content_type::HANDSHAKE, &abbr_flight.client_finished)?;
@@ -935,6 +999,9 @@ impl HandshakeDriver {
             .writer
             .write_record(content_type::CHANGE_CIPHER_SPEC, &[0x01])?;
         flight.traffic_keys.install_on_writer(&mut self.writer)?;
+        // RFC 8449: honour the server's ServerHello `record_size_limit`.
+        self.writer
+            .set_peer_record_size_limit(handshake.peer_record_size_limit());
         let fin = self
             .writer
             .write_record(content_type::HANDSHAKE, &flight.client_finished)?;
@@ -1081,6 +1148,9 @@ impl HandshakeDriver {
             ms,
             handshake.negotiated_alpn().map(|s| s.to_string()),
             handshake.negotiated_cipher_suite(),
+            // RFC 7627 §5.4: persist the EMS flag so §5.3 can be checked when
+            // this ticket is later used to resume.
+            Some(handshake.used_extended_master_secret()),
         ) {
             Ok(td) => {
                 store.store(&host_key, td);
@@ -1255,6 +1325,22 @@ impl QuicHandshakeDriver {
     }
 
     fn finish_quic_tls13(&mut self, complete: HandshakeComplete) -> Result<QuicHandshakeOutput> {
+        // Same rule as the TCP path: an ECH offer the server did not accept must
+        // not carry application data (RFC 9849 §6.1.6). Abort before any traffic
+        // keys or session-ticket context are produced, and surface the
+        // retry_configs. QUIC signals the alert through a CRYPTO_ERROR frame
+        // rather than a TLS alert record, which the caller maps from this error.
+        if complete.ech_offered && !complete.ech_accepted {
+            tracing::warn!(
+                host = %self.config.tls.hostname,
+                retry_configs = complete.ech_retry_configs.as_ref().map_or(0, |c| c.len()),
+                "tls.ech_rejected — aborting QUIC handshake",
+            );
+            return Err(TlsError::EchRejected {
+                retry_configs: complete.ech_retry_configs.clone(),
+            });
+        }
+
         let mut to_send = Vec::new();
         if let Some(ref cee) = complete.client_encrypted_extensions {
             to_send.extend_from_slice(cee);
@@ -1568,6 +1654,7 @@ mod tests {
             master_secret: Vec::new(),
             max_early_data_size: 0,
             peer_transport_parameters: None,
+            used_extended_master_secret: None,
         }
     }
 
@@ -1576,6 +1663,7 @@ mod tests {
             alpn: Some("h3".to_string()),
             max_early_data_size: 16_384,
             peer_transport_parameters: Some(vec![0x0f, 0x00]),
+            used_extended_master_secret: None,
             ..make_tls13_ticket()
         }
     }
@@ -1595,6 +1683,7 @@ mod tests {
             master_secret: vec![0xBB; 48],
             max_early_data_size: 0,
             peer_transport_parameters: None,
+            used_extended_master_secret: None,
         }
     }
 
@@ -1966,5 +2055,181 @@ mod tests {
         let before = state.server_app_secret.clone();
         let _ = state.process_key_update().unwrap();
         assert_ne!(before, state.server_app_secret);
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 8449 `record_size_limit` reaches the record writer
+    //
+    // Parsing the peer's limit is worthless if it never lands on the writer
+    // that frames application data, so these lock in the hand-off at both
+    // completion points.
+    // -----------------------------------------------------------------------
+
+    fn make_config() -> HandshakeConfig {
+        HandshakeConfig {
+            profile: crate::profile::presets::firefox_147(),
+            hostname: "example.com".to_string(),
+            port: 443,
+            verification_policy: VerificationPolicy::default(),
+            alps_payload: None,
+            session_store: None,
+            ech_config_list: None,
+            custom_ca_anchors: None,
+            keylog_callback: None,
+            client_hello_callback: None,
+        }
+    }
+
+    fn make_handshake_complete(peer_record_size_limit: Option<u16>) -> HandshakeComplete {
+        HandshakeComplete {
+            client_encrypted_extensions: None,
+            client_certificate: None,
+            client_finished: hs_msg(crate::handshake::handshake_type::FINISHED, 0xAA, 32),
+            traffic_secrets: TrafficSecrets {
+                aead_algorithm: AeadAlgorithm::Aes128Gcm,
+                hkdf_algorithm: HkdfAlgorithm::Sha256,
+                client_key: vec![0x11; 16],
+                client_iv: vec![0x22; 12],
+                server_key: vec![0x33; 16],
+                server_iv: vec![0x44; 12],
+                server_app_secret: vec![0x55; 32],
+                client_app_secret: vec![0x66; 32],
+                exporter_master_secret: vec![0x77; 32],
+            },
+            negotiated_alpn: Some("h2".to_string()),
+            peer_record_size_limit,
+            resumption_master_secret: vec![0x88; 32],
+            negotiated_cipher_suite: 0x1301,
+            server_certificates: Vec::new(),
+            ech_retry_configs: None,
+            ech_accepted: false,
+            ech_offered: false,
+            peer_quic_transport_params: None,
+            early_data_accepted: false,
+        }
+    }
+
+    fn completed_writer_limit(peer_record_size_limit: Option<u16>) -> Option<u16> {
+        let mut driver = HandshakeDriver::new(make_config());
+        let output = driver
+            .finish_tls13(make_handshake_complete(peer_record_size_limit))
+            .expect("TLS 1.3 completion");
+        match output {
+            HandshakeOutput::Done { result, .. } => result.writer.peer_record_size_limit(),
+            _ => panic!("finish_tls13 must complete the handshake"),
+        }
+    }
+
+    #[test]
+    fn tls13_completion_installs_the_peer_record_size_limit_on_the_writer() {
+        assert_eq!(
+            completed_writer_limit(Some(512)),
+            Some(512),
+            "the server's EncryptedExtensions limit must reach the record writer"
+        );
+    }
+
+    #[test]
+    fn tls13_completion_without_a_peer_limit_leaves_the_writer_unbounded() {
+        assert_eq!(
+            completed_writer_limit(None),
+            None,
+            "no server limit must leave the writer chunking at the protocol maximum"
+        );
+    }
+
+    /// TLS 1.2 ServerHello body carrying `record_size_limit`, wrapped as a
+    /// handshake message.
+    fn tls12_server_hello_with_record_size_limit(limit: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // server_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id_len
+        body.extend_from_slice(&0xC02Fu16.to_be_bytes()); // ECDHE_RSA_AES128_GCM_SHA256
+        body.push(0x00); // compression
+        body.extend_from_slice(&6u16.to_be_bytes()); // extensions_length
+        body.extend_from_slice(&[0x00, 0x1c, 0x00, 0x02]);
+        body.extend_from_slice(&limit.to_be_bytes());
+
+        let mut message = vec![crate::handshake::handshake_type::SERVER_HELLO];
+        let body_len = body.len();
+        message.extend_from_slice(&[
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ]);
+        message.extend_from_slice(&body);
+        message
+    }
+
+    #[test]
+    fn tls12_full_flight_installs_the_peer_record_size_limit_on_the_writer() {
+        let mut driver = HandshakeDriver::new(make_config());
+
+        let mut handshake =
+            Tls12Handshake::new([7u8; 32], "example.com", VerificationPolicy::default());
+        handshake.feed_client_hello(b"ch");
+        handshake
+            .process_handshake_record(&tls12_server_hello_with_record_size_limit(512))
+            .expect("ServerHello with record_size_limit");
+        assert_eq!(handshake.peer_record_size_limit(), Some(512));
+
+        let flight = crate::handshake::tls12::Tls12ClientFlight {
+            client_certificate: None,
+            client_key_exchange: hs_msg(0x10, 0x01, 8),
+            client_finished: hs_msg(crate::handshake::handshake_type::FINISHED, 0x02, 12),
+            traffic_keys: Tls12TrafficKeys {
+                cipher_suite:
+                    crate::crypto::tls12_cipher::Tls12CipherSuite::EcdheRsaAes128GcmSha256,
+                client_write_key: vec![0x11; 16],
+                server_write_key: vec![0x22; 16],
+                client_write_iv: vec![0x01, 0x02, 0x03, 0x04],
+                server_write_iv: vec![0x05, 0x06, 0x07, 0x08],
+                client_write_mac_key: Vec::new(),
+                server_write_mac_key: Vec::new(),
+            },
+        };
+
+        driver
+            .finish_tls12_full(handshake, [7u8; 32], flight)
+            .expect("TLS 1.2 client flight");
+
+        assert_eq!(
+            driver.writer.peer_record_size_limit(),
+            Some(512),
+            "the server's ServerHello limit must reach the record writer"
+        );
+    }
+
+    /// The other direction of RFC 8449 §4: the limit *we* advertise has to reach
+    /// the record reader, or an over-large inbound record is never caught.
+    #[test]
+    fn driver_arms_the_reader_with_the_limit_we_advertise() {
+        let firefox = make_config();
+        assert_eq!(
+            firefox.profile.record_size_limit,
+            Some(16385),
+            "firefox_147 is the profile that advertises record_size_limit"
+        );
+        assert_eq!(
+            HandshakeDriver::new(firefox).reader.own_record_size_limit(),
+            Some(16385),
+            "the ClientHello limit must reach the record reader that enforces it"
+        );
+    }
+
+    #[test]
+    fn driver_leaves_the_reader_unbounded_when_we_advertise_nothing() {
+        let mut chrome = make_config();
+        chrome.profile = crate::profile::presets::chrome_146();
+        assert_eq!(
+            chrome.profile.record_size_limit, None,
+            "Chrome does not send record_size_limit"
+        );
+        assert_eq!(
+            HandshakeDriver::new(chrome).reader.own_record_size_limit(),
+            None,
+            "advertising nothing must leave only the protocol maximum in force"
+        );
     }
 }

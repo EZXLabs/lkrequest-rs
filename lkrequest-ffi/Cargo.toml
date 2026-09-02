@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest-ffi"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [lib]
@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 debug-registry = []
 quic-h3 = ["lkrequest/quic-h3"]
+doh = ["lkrequest/doh"]
 # Synthetic (Tier 3a/3b) fingerprint randomization. Mirrors lkrequest's
 # off-by-default `synthetic-fp`; without it the recombine/full randomize modes
 # return an error instead of being applied (off/extension_order always work).

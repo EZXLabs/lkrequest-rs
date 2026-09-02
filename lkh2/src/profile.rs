@@ -653,6 +653,14 @@ pub fn chrome_151_h2() -> H2Profile {
     chrome_150_h2()
 }
 
+/// Returns the Chrome 152 H2 fingerprint profile.
+///
+/// Public Cloudflare capture retained Chrome 151's SETTINGS order, connection
+/// window update, pseudo-header order, and initial HEADERS priority fields.
+pub fn chrome_152_h2() -> H2Profile {
+    chrome_151_h2()
+}
+
 /// Returns the Chrome 131 H2 fingerprint profile.
 ///
 /// Same H2 parameters as Chrome 144 (H2 fingerprint hasn't changed).
@@ -1093,6 +1101,11 @@ pub fn chrome_150_header_order() -> Vec<String> {
 /// Same as Chrome 150 (verified unchanged vs the Chrome 151 capture).
 pub fn chrome_151_header_order() -> Vec<String> {
     chrome_150_header_order()
+}
+
+/// Returns the Chrome 152 HTTP header sending order.
+pub fn chrome_152_header_order() -> Vec<String> {
+    chrome_151_header_order()
 }
 
 /// Returns the Chrome 131 HTTP header sending order.

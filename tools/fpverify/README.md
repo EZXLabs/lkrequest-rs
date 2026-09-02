@@ -28,13 +28,21 @@ make.
 |------|-------|---------|-------------------|-------------|
 | **A — offline gate** | `lkrequest/tests/fingerprint_regression.rs` | "Did the on-wire fingerprint change vs the frozen snapshot?" | none (Tier 0) | every change; CI |
 | **B — real-browser** | `lkrequest/tests/b_layer_real_chrome.rs` | "Does the snapshot still equal a *real* Chrome?" | real Chrome + network (Tier 2, `#[ignore]`) | when you change a profile / add a version |
-| **wire-level** | `lkrequest/tests/quic_local_e2e.rs`, `lktls` `shuffle_pins_grease_bookends_and_psk_last` | dimensions the canonical form folds away (GREASE *position*, PRIORITY_UPDATE / control-stream frames) | loopback only | when you touch those areas |
+| **wire-level** | `lkrequest/tests/quic_local_e2e.rs`, focused `lktls` ClientHello tests | exact randomized GREASE values, extension permutation, PRIORITY_UPDATE / control-stream frames | loopback only | when you touch those areas |
 
-Why three layers? The A-layer and JA3/JA4 deliberately **normalize GREASE away**
-(values *and* position) so a fingerprint stays matchable despite per-connection
-randomization — which also makes them **blind** to GREASE-position and
-control-stream-frame bugs. The wire-level tests cover exactly those blind spots;
+Why three layers? The A-layer tokenizes GREASE **values in place**, preserving
+their slots in cipher suites, supported groups, supported versions, key shares,
+and signature algorithms while still allowing captures with different random
+code points to compare equal. For profiles that shuffle extensions, their exact
+per-connection extension order is folded away by the shape spec. Wire-level
+tests cover the randomized values, permutation rules, and control-stream frames;
 the B-layer proves a (re)frozen snapshot is actually Chrome-shaped.
+
+Chrome 152 demonstrates why the ordered raw fields matter: JA3/JA3N omit
+`signature_algorithms`, and JA4 strips GREASE, so all three can match while the
+leading sigalgs GREASE slot is absent. Peetprint retains that slot. The Chrome
+152 golden therefore stores `GREASE_TOKEN` at `signature_algorithms[0]`, which
+ignores only the random code point and still fails if the slot moves or vanishes.
 
 > **Mental model:** A-layer catches *"did it change"* (run always, blocks
 > regressions). B-layer catches *"is it correct"* (run when changing a profile).
@@ -100,7 +108,7 @@ TEST_ALLOW_NETWORK=1 cargo test -p lkrequest --features quic-h3 \
   --test b_layer_real_chrome -- --ignored --nocapture
 
 # ④ If you touched GREASE / priority / control-stream emission, also run the
-#    wire-level tests (the canonical gate is blind to these):
+#    focused wire-level tests for the exact emission rules:
 cargo test -p lkrequest --features quic-h3 --test quic_local_e2e
 cargo test -p lktls shuffle_pins_grease
 ```

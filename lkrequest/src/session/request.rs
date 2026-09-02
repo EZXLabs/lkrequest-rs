@@ -846,6 +846,11 @@ impl RequestBuilder {
     /// Encodes the multipart form and automatically sets the `Content-Type`
     /// header with the correct boundary.
     ///
+    /// If a part's field name, filename or content type contains a CR or an
+    /// LF — which would let it inject extra part headers or forge the
+    /// boundary — the form is rejected and the error surfaces from
+    /// [`Self::send`], the same way a bad `json()` or `form()` body does.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -870,9 +875,16 @@ impl RequestBuilder {
     /// ```
     pub fn multipart(mut self, form: crate::multipart::Multipart) -> Self {
         let content_type = form.content_type_header();
-        self.body = Some(bytes::Bytes::from(form.encode()));
-        if let Ok(v) = http::header::HeaderValue::from_str(&content_type) {
-            self.headers.insert(http::header::CONTENT_TYPE, v);
+        match form.encode() {
+            Ok(body) => {
+                self.body = Some(bytes::Bytes::from(body));
+                if let Ok(v) = http::header::HeaderValue::from_str(&content_type) {
+                    self.headers.insert(http::header::CONTENT_TYPE, v);
+                }
+            }
+            Err(e) => {
+                self.deferred_error = Some(e);
+            }
         }
         self
     }
@@ -1033,6 +1045,23 @@ impl RequestBuilder {
                                 if let Some(delay) =
                                     policy.should_retry(attempt, None, Some(status))
                                 {
+                                    // The server answered, so a status code
+                                    // cannot prove that an unsafe request was
+                                    // not applied. Only safe methods or an
+                                    // explicit idempotency opt-in may replay
+                                    // the buffered request (RFC 9110 §9.2.2).
+                                    if !crate::retry::status_retry_is_replay_safe(
+                                        &ctx.method,
+                                        ctx.idempotency,
+                                        status,
+                                    ) {
+                                        tracing::debug!(
+                                            method = %ctx.method,
+                                            status = status.as_u16(),
+                                            "http.retry_on_status_skipped_not_replay_safe",
+                                        );
+                                        break Ok(resp);
+                                    }
                                     tracing::warn!(
                                         attempt = attempt,
                                         status = status.as_u16(),

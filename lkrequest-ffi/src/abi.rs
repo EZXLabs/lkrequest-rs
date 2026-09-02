@@ -96,10 +96,13 @@ pub enum lk_rotation_strategy_t {
 pub enum lk_dns_config_t {
     LK_DNS_SYSTEM = 0,
     LK_DNS_GOOGLE = 1,
+    #[cfg(feature = "doh")]
     LK_DNS_GOOGLE_HTTPS = 2,
     LK_DNS_CLOUDFLARE = 3,
+    #[cfg(feature = "doh")]
     LK_DNS_CLOUDFLARE_HTTPS = 4,
     LK_DNS_QUAD9 = 5,
+    #[cfg(feature = "doh")]
     LK_DNS_QUAD9_HTTPS = 6,
 }
 

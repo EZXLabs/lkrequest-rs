@@ -51,6 +51,7 @@ fn source_rank(source: &CanonicalExtSource) -> u8 {
         CanonicalExtSource::Auto => 0,
         CanonicalExtSource::Grease => 1,
         CanonicalExtSource::Raw { .. } => 2,
+        CanonicalExtSource::TrustAnchorIds { .. } => 3,
     }
 }
 

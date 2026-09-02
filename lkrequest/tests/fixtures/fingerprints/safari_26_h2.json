@@ -1,0 +1,29 @@
+{
+  "headers_priority": null,
+  "priority_frames": [],
+  "pseudo_header_order": [
+    "method",
+    "scheme",
+    "authority",
+    "path"
+  ],
+  "settings": [
+    {
+      "id": "enable_push",
+      "value": 0
+    },
+    {
+      "id": "max_concurrent_streams",
+      "value": 100
+    },
+    {
+      "id": "initial_window_size",
+      "value": 2097152
+    },
+    {
+      "id": "no_rfc7540_priorities",
+      "value": 1
+    }
+  ],
+  "window_update": 10420225
+}
