@@ -1,7 +1,7 @@
 //! Canonical (normalized) fingerprint representation for regression gating.
 //!
 //! This is the rich, comparison-oriented fingerprint type used by the
-//! fingerprint-regression gate (see `docs/fingerprint-regression-design.md`).
+//! fingerprint-regression gate (see `design/fingerprint-regression-design.md`).
 //! It differs from a raw capture in one crucial way: **per-connection random
 //! values are normalized while their positions are preserved.**
 //!

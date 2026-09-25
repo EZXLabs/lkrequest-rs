@@ -1,3 +1,6 @@
+#[path = "support/server_regressions.rs"]
+mod server_regressions;
+
 use std::ffi::{c_char, c_void, CString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -40,7 +43,14 @@ impl TestServer {
         let thread = thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_connection(stream),
+                    Ok((stream, _)) => {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // Windows can inherit the listener's nonblocking mode.
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        handle_connection(stream);
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -62,7 +72,13 @@ impl Drop for TestServer {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
-            thread.join().expect("join server thread");
+            if let Err(failure) = thread.join() {
+                // Preserve the original test panic; a second unwind aborts Windows
+                // test processes with 0xc0000409 and hides the first failure.
+                if !thread::panicking() {
+                    std::panic::resume_unwind(failure);
+                }
+            }
         }
     }
 }

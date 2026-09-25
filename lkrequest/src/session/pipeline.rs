@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
+use crate::body::WireBody;
 use http::HeaderMap;
-use http_body_util::Full;
 use url::Url;
 
 use crate::alt_svc::{
@@ -103,7 +103,6 @@ pub(crate) struct QuicDiscovery {
 }
 
 impl QuicDiscovery {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn should_attempt_quic(&self) -> bool {
         (self.force_attempt || self.source.is_some()) && self.skip_reason.is_none()
     }
@@ -120,6 +119,51 @@ pub(crate) enum ProtocolDecision {
     Tcp,
     Quic,
     Race,
+}
+
+#[cfg(feature = "quic-h3")]
+#[derive(Clone)]
+pub(crate) struct RaceSendGate {
+    selected: tokio::sync::watch::Sender<Option<ProtocolDecision>>,
+    branch: ProtocolDecision,
+}
+
+#[cfg(feature = "quic-h3")]
+impl RaceSendGate {
+    pub(crate) fn pair() -> (
+        Self,
+        Self,
+        tokio::sync::watch::Receiver<Option<ProtocolDecision>>,
+    ) {
+        let (selected, receiver) = tokio::sync::watch::channel(None);
+        (
+            Self {
+                selected: selected.clone(),
+                branch: ProtocolDecision::Quic,
+            },
+            Self {
+                selected,
+                branch: ProtocolDecision::Tcp,
+            },
+            receiver,
+        )
+    }
+
+    /// Claim the request after acquisition, before writing any HTTP headers/body.
+    pub(crate) async fn acquired(&self) {
+        self.selected.send_if_modified(|selected| {
+            if selected.is_none() {
+                *selected = Some(self.branch);
+                true
+            } else {
+                false
+            }
+        });
+        let won = *self.selected.borrow() == Some(self.branch);
+        if !won {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 impl ProtocolDecision {
@@ -156,6 +200,23 @@ pub(crate) fn decide_protocol(
 
     if discovery.skip_reason.is_some() {
         return ProtocolDecision::Tcp;
+    }
+
+    // A MASQUE proxy relays UDP and nothing else (RFC 9298), so on this route
+    // QUIC is not an upgrade to be discovered and raced against TCP — it is the
+    // only transport there is, and TCP through such a proxy is a hard error by
+    // design. Nothing would ever advertise H3 here either: an `alt-svc` header
+    // needs an H2 response first, and there is no H2 to carry one.
+    //
+    // Deliberately *after* the skip check, so a route whose tunnels are failing
+    // still short-circuits to the explicit "MASQUE cannot carry TCP" error
+    // instead of paying the tunnel timeout on every single request.
+    //
+    // Gated with the variant it tests for: without the `masque` feature
+    // `ProxyRouteKind::Masque` does not exist, and no route could name it.
+    #[cfg(feature = "masque")]
+    if discovery.route.proxy_kind == crate::protocol::ProxyRouteKind::Masque {
+        return ProtocolDecision::Quic;
     }
 
     let h3_ready = matches!(
@@ -335,6 +396,9 @@ pub(crate) fn log_background_probe_decision(
 
 #[cfg(any(feature = "quic-h3", test))]
 pub(crate) fn fallback_permitted(policy: &ProtocolPolicy, error: &Error) -> bool {
+    if error.is_address_family_mismatch() {
+        return false;
+    }
     match policy.fallback {
         FallbackPolicy::AllowFallback => true,
         FallbackPolicy::AllowFallbackOnNetworkErrors => {
@@ -465,13 +529,13 @@ pub(crate) fn build_h1_only_connect_config(
 pub(crate) async fn handshake_h1(
     stream: crate::connect::TransportStream,
 ) -> Result<(
-    hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
+    hyper::client::conn::http1::SendRequest<WireBody>,
     Arc<tokio::task::JoinHandle<()>>,
 )> {
     let mut builder = hyper::client::conn::http1::Builder::new();
     builder.title_case_headers(true).preserve_header_case(true);
     let (sender, conn) = builder
-        .handshake::<crate::connect::TransportStream, Full<bytes::Bytes>>(stream)
+        .handshake::<crate::connect::TransportStream, WireBody>(stream)
         .await
         .map_err(|e| Error::Http(format!("HTTP/1.1 handshake failed: {e}")))?;
 
@@ -493,6 +557,36 @@ pub(crate) async fn handshake_h1(
 // ALPN protocol selection
 // ---------------------------------------------------------------------------
 
+/// Discards an unfinished upload's connection on cancellation or early response.
+/// Streaming downloads retain the guard until response consumption ends.
+pub(crate) struct H1UploadGuard {
+    task: Arc<tokio::task::JoinHandle<()>>,
+    completion: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl H1UploadGuard {
+    pub(crate) fn new(task: Arc<tokio::task::JoinHandle<()>>, body: &WireBody) -> Self {
+        Self {
+            task,
+            completion: body.upload_completion(),
+        }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.completion
+            .as_ref()
+            .is_none_or(|complete| complete.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+impl Drop for H1UploadGuard {
+    fn drop(&mut self) {
+        if !self.is_complete() {
+            self.task.abort();
+        }
+    }
+}
+
 /// Decide whether to use HTTP/2 based on ALPN negotiation result and the
 /// caller's version preference. Returns `Err` when `Http2Only` is required
 /// but the server did not negotiate h2.
@@ -508,6 +602,26 @@ pub(crate) fn should_use_h2(
         )),
         _ => Ok(false),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Response header deadline
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn await_response_headers<T>(
+    client: &Client,
+    response: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    let timeout = client
+        .timeouts()
+        .ttfb_timeout_or(std::time::Duration::from_secs(30));
+    tokio::time::timeout(timeout, response).await.map_err(|_| {
+        Error::timeout(
+            format!("response headers exceeded TTFB timeout of {timeout:?}"),
+            Some(crate::error::ConnectionPhase::HttpRequest),
+            Some(timeout),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +642,7 @@ pub(crate) async fn establish_h2_and_pool(
         client.h2_profile(),
         None,
         client.max_pending_h2_requests(),
+        client.h2_dispatch_batch_size(),
     )
     .await?;
     let sender = h2_conn.clone_sender();
@@ -569,6 +684,7 @@ pub(crate) async fn establish_h2_with_first_request(
         client.h2_profile(),
         Some(first_request),
         client.max_pending_h2_requests(),
+        client.h2_dispatch_batch_size(),
     )
     .await?;
 
@@ -666,6 +782,18 @@ pub(crate) fn auto_insert_content_length(headers: &mut HeaderMap, body: Option<&
             }
         }
     }
+}
+
+pub(crate) fn into_wire_request(
+    mut request: http::Request<()>,
+    body: Option<crate::body::RequestBody>,
+) -> Result<http::Request<WireBody>> {
+    let body = body.unwrap_or_default();
+    if body.is_streaming() {
+        body.prepare_headers(request.headers_mut())?;
+    }
+    let (parts, ()) = request.into_parts();
+    Ok(http::Request::from_parts(parts, body.into_http_body()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +916,40 @@ pub(crate) fn merge_headers(
 // ---------------------------------------------------------------------------
 // Pool acquisition
 // ---------------------------------------------------------------------------
+
+/// Reuse TCP when QUIC is unavailable, preserving viable H3 acquisition/probes.
+/// Return the discovery result so a pool miss does not repeat the DNS query.
+pub(crate) async fn acquire_pooled(
+    session: &Session,
+    conn_key: &ConnectionKey,
+    http_version: PreferredHttpVersion,
+    policy: &ProtocolPolicy,
+    proxy: Option<&ProxyConfig>,
+) -> (Option<AcquiredConnection>, Option<QuicDiscovery>) {
+    let pooled = try_acquire_pooled(session, conn_key, http_version);
+    if pooled.is_some() || http_version != PreferredHttpVersion::Http3WithFallback {
+        return (pooled, None);
+    }
+
+    let discovery = discover_quic_support(
+        session,
+        conn_key.scheme,
+        conn_key.host.as_ref(),
+        conn_key.port,
+        proxy,
+        policy,
+        http_version,
+    )
+    .await;
+    let pooled = if !discovery.should_attempt_quic()
+        && decide_protocol(http_version, policy, &discovery) == ProtocolDecision::Tcp
+    {
+        try_acquire_pooled(session, conn_key, PreferredHttpVersion::Auto)
+    } else {
+        None
+    };
+    (pooled, Some(discovery))
+}
 
 /// Try to acquire a pooled connection, filtering by HTTP version preference.
 pub(crate) fn try_acquire_pooled(
@@ -1054,7 +1216,7 @@ pub(crate) async fn discover_quic_support(
         };
     }
 
-    let learned_state = learned_protocol_state_for_route(
+    let mut learned_state = learned_protocol_state_for_route(
         session.alt_svc_cache(),
         session.broken_quic_tracker(),
         &route,
@@ -1101,11 +1263,28 @@ pub(crate) async fn discover_quic_support(
         (None, None, None)
     };
 
+    if source == Some(QuicDiscoverySource::DnsHttps)
+        && learned_state.h3_status == H3Reachability::Unknown
+    {
+        learned_state.h3_status = H3Reachability::Advertised;
+    }
+
     let force = matches!(http_version, PreferredHttpVersion::Http3Only)
         || matches!(policy.intent, HttpIntent::H3Only);
 
     let is_http_proxy =
         proxy.is_some_and(|p| matches!(p.scheme, crate::proxy::ProxyScheme::Http { .. }));
+
+    // A MASQUE proxy relays UDP and nothing else (RFC 9298 CONNECT-UDP), so on
+    // such a route H3 is not an upgrade to be discovered — it is the only
+    // transport that exists, and TCP fails outright. Attempt it without waiting
+    // for an Alt-Svc advertisement, which on this route could never arrive
+    // anyway: an Alt-Svc header needs an H2 response first, and there is no H2.
+    //
+    // Deliberately **not** folded into `force`: forcing would also override the
+    // route quarantine below, and a proxy whose tunnels are failing should still
+    // short-circuit instead of paying the tunnel timeout on every request.
+    let masque_route = proxy.is_some_and(|p| p.scheme.is_masque());
 
     // A route-level quarantine (e.g. the proxy's SOCKS5 UDP ASSOCIATE failed)
     // makes QUIC impossible for *every* origin behind that proxy, regardless of
@@ -1116,7 +1295,11 @@ pub(crate) async fn discover_quic_support(
 
     let skip_reason = if route_udp_broken && !force {
         Some(QuicSkipReason::ProxyUdpUnavailable)
-    } else if source.is_none() {
+    } else if source.is_none() && !masque_route {
+        // Nothing advertised H3, so there is nothing to skip. A MASQUE route is
+        // the exception: it attempts H3 with no advertisement at all, so its
+        // per-origin quarantine has to be consulted here or a target the proxy
+        // refuses by name would be retried on every single request.
         None
     } else if is_http_proxy && !force {
         Some(QuicSkipReason::HttpProxyConfigured)
@@ -1135,7 +1318,7 @@ pub(crate) async fn discover_quic_support(
         origin,
         learned_state,
         source,
-        force_attempt: force,
+        force_attempt: force || masque_route,
         advertised_host,
         advertised_port,
         dns_https,
@@ -1891,6 +2074,67 @@ mod tests {
             Some("svc.example:8443")
         );
         assert!(discovery.should_attempt_quic());
+        assert_eq!(
+            discovery.learned_state.h3_status,
+            H3Reachability::Advertised
+        );
+        assert_eq!(
+            decide_protocol(
+                PreferredHttpVersion::Http3WithFallback,
+                &test_policy(),
+                &discovery,
+            ),
+            ProtocolDecision::Race
+        );
+        assert!(should_background_probe(&test_policy(), &discovery));
+    }
+
+    #[cfg(feature = "quic-h3")]
+    #[tokio::test]
+    async fn dns_h3_advertisement_preserves_validation_and_quarantine() {
+        let session = session_with_dns(Some(HttpsRecord {
+            alpn: vec!["h3".into()],
+            ..HttpsRecord::default()
+        }));
+        let origin = Origin::https("example.com", 443);
+        session.alt_svc_cache().mark_h3_validated(&origin);
+        let validated = discover_quic_support(
+            &session,
+            Scheme::Https,
+            "example.com",
+            443,
+            None,
+            &test_policy(),
+            PreferredHttpVersion::Http3WithFallback,
+        )
+        .await;
+        assert_eq!(validated.learned_state.h3_status, H3Reachability::Validated);
+        assert!(!should_background_probe(&test_policy(), &validated));
+
+        session.broken_quic_tracker().mark_broken(&origin);
+        let broken = discover_quic_support(
+            &session,
+            Scheme::Https,
+            "example.com",
+            443,
+            None,
+            &test_policy(),
+            PreferredHttpVersion::Http3WithFallback,
+        )
+        .await;
+        assert_eq!(
+            broken.learned_state.h3_status,
+            H3Reachability::FailedTransiently
+        );
+        assert_eq!(broken.skip_reason, Some(QuicSkipReason::BrokenOrigin));
+        assert_eq!(
+            decide_protocol(
+                PreferredHttpVersion::Http3WithFallback,
+                &test_policy(),
+                &broken
+            ),
+            ProtocolDecision::Tcp,
+        );
     }
 
     #[cfg(feature = "quic-h3")]

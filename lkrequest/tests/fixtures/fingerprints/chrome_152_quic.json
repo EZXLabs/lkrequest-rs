@@ -1,4 +1,5 @@
 {
+  "chromium_grease": true,
   "connection_id_length": 0,
   "extra_transport_parameters": [
     [
@@ -37,15 +38,17 @@
   "h3_settings_fingerprint": "1:65536;6:262144;7:100;51:1",
   "h3_settings_hash": "766911b264ace59f10e4028b429669df274476b6f23b6653bb292e003b86617c",
   "initial_destination_connection_id_length": 8,
+  "initial_packet_chaos": true,
   "packetization": {
     "disable_mtu_discovery": false,
     "enable_ecn": false,
     "enable_segmentation_offload": false,
     "initial_datagram_size": 1250,
+    "initial_frame_layout": "chromium_chaos",
     "initial_mtu": 1250
   },
-  "packetization_fingerprint": "initial_mtu:1250;initial_datagram_size:1250;disable_mtu_discovery:false;enable_segmentation_offload:false;enable_ecn:false;initial_frame_layout:none",
-  "packetization_hash": "a0b240a0706d7bf3aacde68d2cdd84d5f492505a88bdfa63039f28befff0fd83",
+  "packetization_fingerprint": "initial_mtu:1250;initial_datagram_size:1250;disable_mtu_discovery:false;enable_segmentation_offload:false;enable_ecn:false;initial_frame_layout:chromium_chaos",
+  "packetization_hash": "8a690c07a343bdd79d545e9b50a1043260dd689523ca9006d616c220baaa42f7",
   "priority_updates": [
     [
       0,
@@ -59,6 +62,7 @@
     ":path"
   ],
   "pseudo_header_order_token": "masp",
+  "randomize_grease_shape": true,
   "send_control_grease_frame": true,
   "send_min_ack_delay": false,
   "send_reserved_transport_parameter": false,

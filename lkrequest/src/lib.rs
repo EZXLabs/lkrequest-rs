@@ -105,6 +105,7 @@
 
 pub mod alt_svc;
 pub mod blocking;
+mod body;
 pub mod client;
 pub mod connect;
 pub mod connection_pool;
@@ -139,7 +140,9 @@ pub use alt_svc::{
 pub use client::{Client, FallbackConfig, H2DataFramePolicy, ResourceLimits, TimeoutConfig};
 pub use connect::{EstablishedConnection, TransportStream};
 pub use connection_pool::PoolStats;
-pub use dns::{CachedSystemDns, DnsConfig, DnsResolver, HttpsRecord, SystemDnsCacheConfig};
+pub use dns::{
+    CachedSystemDns, DnsConfig, DnsResolver, HttpsRecord, IpFamily, SystemDnsCacheConfig,
+};
 pub use error::{
     ConnectionClosedKind, ConnectionError, ConnectionPhase, ProxyError, ProxyErrorKind, QuicError,
     QuicPhase,
@@ -165,7 +168,7 @@ pub use response::{
 };
 pub use retry::{ExponentialBackoff, FixedInterval, RetryPolicy};
 pub use session::{
-    can_send_early_data, AcceptEncoding, ChromeLikeProtocolConfig, Idempotency,
+    can_send_early_data, AcceptEncoding, ChromeLikeProtocolConfig, CookieInfo, Idempotency,
     PreferredHttpVersion, PrefetchResult, ProtocolSelectionPolicy, RedirectPolicy, Session,
 };
 pub use session_pool::{

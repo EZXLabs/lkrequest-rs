@@ -1,3 +1,6 @@
+#[path = "support/server_regressions.rs"]
+mod server_regressions;
+
 use std::ffi::{c_char, CStr, CString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -59,6 +62,10 @@ impl TestServer {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // Drop's empty wake-up connection is not an HTTP request.
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
                         stream.set_nonblocking(false).expect("blocking stream");
                         handle_connection(stream);
                     }
@@ -87,7 +94,12 @@ impl Drop for TestServer {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
-            thread.join().expect("join server");
+            if let Err(failure) = thread.join() {
+                // Report server assertions, but never panic twice during cleanup.
+                if !thread::panicking() {
+                    std::panic::resume_unwind(failure);
+                }
+            }
         }
     }
 }
@@ -116,7 +128,16 @@ fn handle_connection(mut stream: TcpStream) {
             &[b"hello ".as_ref(), b"world".as_ref()],
             40,
         ),
-        "/stream-slow" => write_chunked_response(
+        // The delay comes *before* the first chunk here, not after it. The
+        // caller uses this route to prove that a second concurrent
+        // `lk_stream_read_async` is refused as busy, which requires the first
+        // read to still be in flight when the second is issued. With the delay
+        // after each chunk, the first chunk is flushed immediately and the
+        // first read could complete before the second was even issued — which
+        // made the assertion fail about one run in six. Delaying the first
+        // chunk instead makes the read pending for a known 150ms while the
+        // second call happens microseconds later.
+        "/stream-slow" => write_chunked_response_after(
             &mut stream,
             "200 OK",
             &[("Content-Type", "text/plain"), ("X-Stream", "slow")],
@@ -176,12 +197,39 @@ fn handle_connection(mut stream: TcpStream) {
     }
 }
 
+/// Chunked response that sleeps **before** each chunk, so the first byte of the
+/// body is delayed too.
+///
+/// [`write_chunked_response`] sleeps after each chunk, which delays everything
+/// except the first chunk — fine for "arrives in pieces", useless for "a read
+/// is still outstanding".
+fn write_chunked_response_after(
+    stream: &mut TcpStream,
+    status: &str,
+    headers: &[(&str, &str)],
+    chunks: &[&[u8]],
+    delay_ms: u64,
+) {
+    write_chunked_response_inner(stream, status, headers, chunks, delay_ms, true)
+}
+
 fn write_chunked_response(
     stream: &mut TcpStream,
     status: &str,
     headers: &[(&str, &str)],
     chunks: &[&[u8]],
     delay_ms: u64,
+) {
+    write_chunked_response_inner(stream, status, headers, chunks, delay_ms, false)
+}
+
+fn write_chunked_response_inner(
+    stream: &mut TcpStream,
+    status: &str,
+    headers: &[(&str, &str)],
+    chunks: &[&[u8]],
+    delay_ms: u64,
+    delay_before_chunk: bool,
 ) {
     let mut response =
         format!("HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n");
@@ -198,6 +246,9 @@ fn write_chunked_response(
     stream.flush().expect("flush headers");
 
     for chunk in chunks {
+        if delay_before_chunk {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
         let header = format!("{:X}\r\n", chunk.len());
         if stream.write_all(header.as_bytes()).is_err() {
             return;
@@ -211,7 +262,9 @@ fn write_chunked_response(
         if stream.flush().is_err() {
             return;
         }
-        thread::sleep(Duration::from_millis(delay_ms));
+        if !delay_before_chunk {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
     }
 
     let _ = stream.write_all(b"0\r\n\r\n");

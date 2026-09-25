@@ -27,7 +27,7 @@ pub use synthesis::{validate as validate_h2_profile, H2Constraints, InvalidH2Spe
 
 pub use adapter::{
     H2FlowControl, H2ReadySender, H2RecvStream, H2ResponseFuture, H2SendError, H2SendStream,
-    H2Sender, UnifiedH2Connection,
+    H2Sender, NativeH2Request, UnifiedH2Connection, UploadStream,
 };
 
 pub use adapter::await_first_response;

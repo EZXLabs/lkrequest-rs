@@ -1,7 +1,15 @@
 [package]
 name = "lkrequest-ffi"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
+description = "Stable C ABI for the lkrequest HTTP client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/lkrequest-ffi"
+keywords = ["ffi", "http", "client", "tls", "fingerprint"]
+categories = ["api-bindings", "network-programming"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -10,6 +18,12 @@ crate-type = ["cdylib", "rlib"]
 default = []
 debug-registry = []
 quic-h3 = ["lkrequest/quic-h3"]
+# MASQUE (RFC 9298 CONNECT-UDP) proxy support. Mirrors lkrequest's
+# off-by-default `masque`, which implies `quic-h3`. Without it
+# `lk_proxy_config_parse` rejects a `masque://` URL with
+# `LK_ERR_INVALID_CONFIG` instead of building a config that could never be
+# used.
+masque = ["lkrequest/masque"]
 doh = ["lkrequest/doh"]
 # Synthetic (Tier 3a/3b) fingerprint randomization. Mirrors lkrequest's
 # off-by-default `synthetic-fp`; without it the recombine/full randomize modes
@@ -21,7 +35,7 @@ synthetic-fp = ["lkrequest/synthetic-fp"]
 telemetry = ["lkrequest/telemetry"]
 
 [dependencies]
-lkrequest = { path = "../lkrequest" }
+lkrequest = { path = "../lkrequest", version = "0.2.3" }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 http = { workspace = true }
@@ -34,3 +48,19 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 flate2 = { workspace = true }
+# The MASQUE FFI test stands up a real private-CA CONNECT-UDP proxy and an H3
+# origin in-process, the way `lkrequest`'s own `masque_*_e2e` tests do. Same
+# crates and same versions as those dev-dependencies -- nothing new enters the
+# lockfile, and `masque_config_ffi` is the only target that uses them.
+rcgen = { version = "0.14", features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+quinn = { workspace = true, features = ["runtime-tokio", "ring", "rustls"] }
+h3 = { path = "../deps/h3/h3" }
+h3-quinn = { path = "../deps/h3/h3-quinn" }
+
+# The MASQUE surface only exists with the `masque` feature; without it the
+# entry points' "not compiled in" behaviour is covered in
+# `v2_capabilities_smoke`.
+[[test]]
+name = "masque_config_ffi"
+required-features = ["masque"]

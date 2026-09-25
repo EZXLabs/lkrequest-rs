@@ -108,7 +108,7 @@ impl StaticHsts {
     }
 
     /// Also upgrade every host under a gTLD that Chrome preloads in full
-    /// (`.dev`, `.app`, …; see [`FULLY_PRELOADED_TLDS`]). Off by default.
+    /// (`.dev`, `.app`, …; see `FULLY_PRELOADED_TLDS`). Off by default.
     pub fn with_preloaded_tlds(mut self) -> Self {
         self.preloaded_tlds = true;
         self

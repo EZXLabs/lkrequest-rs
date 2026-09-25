@@ -74,6 +74,11 @@ impl HandleMeta for OpHandle {
 }
 
 #[cfg(feature = "debug-registry")]
+impl HandleMeta for crate::ProxyConfigHandle {
+    const TYPE_TAG: u32 = 18;
+}
+
+#[cfg(feature = "debug-registry")]
 impl HandleMeta for crate::ProxyPoolHandle {
     const TYPE_TAG: u32 = 10;
 }
@@ -111,6 +116,11 @@ impl HandleMeta for crate::MultipartHandle {
 #[cfg(feature = "debug-registry")]
 impl HandleMeta for crate::Socks5UdpProbeReportHandle {
     const TYPE_TAG: u32 = 17;
+}
+
+#[cfg(all(feature = "debug-registry", feature = "masque"))]
+impl HandleMeta for crate::MasqueConfigHandle {
+    const TYPE_TAG: u32 = 19;
 }
 
 #[cfg(feature = "debug-registry")]

@@ -1096,6 +1096,10 @@ async fn dial_tcp_address(
     // Set non-blocking before connect (required for tokio)
     socket.set_nonblocking(true)?;
 
+    // Interactive HTTP traffic benefits from disabling Nagle by default.
+    // A configured fingerprint can still explicitly restore TCP_NODELAY=false.
+    socket.set_tcp_nodelay(true)?;
+
     // Apply TCP fingerprint parameters BEFORE connect — this is critical
     // because TTL, window size, and MSS must be set before the SYN packet.
     let is_ipv6 = socket_addr.is_ipv6();
@@ -1237,6 +1241,35 @@ mod tests {
             stream.peer_addr().unwrap().ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_defaults_to_nodelay() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let stream = dial_tcp_address(address, None).await.unwrap();
+
+        assert!(stream.nodelay().unwrap());
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_nodelay_false_overrides_transport_default() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let fingerprint = TcpFingerprint::default().with_tcp_nodelay(false);
+
+        let stream = dial_tcp_address(address, Some(&fingerprint)).await.unwrap();
+
+        assert!(!stream.nodelay().unwrap());
         accept.await.unwrap();
     }
 

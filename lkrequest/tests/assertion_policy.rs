@@ -98,7 +98,7 @@ fn should_skip_dir(path: &Path) -> bool {
             matches!(
                 name,
                 "target" | "deps" | ".cargo" | ".git" | ".cursor" | ".uv-cache"
-            )
+            ) || name.starts_with(".codex")
         })
 }
 

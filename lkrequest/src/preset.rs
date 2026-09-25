@@ -176,6 +176,26 @@ fn chrome_152_quic_profile() -> Option<QuicProfile> {
     None
 }
 
+#[cfg(feature = "quic-h3")]
+fn chrome_153_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_153_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_153_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
+#[cfg(feature = "quic-h3")]
+fn chrome_154_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_154_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_154_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
 /// Chrome 131 client preset.
 ///
 /// QUIC/H3 currently uses the shared generic Chromium profile.
@@ -359,6 +379,44 @@ pub fn chrome_152() -> ClientPreset {
     }
 }
 
+/// Chrome 153 client preset.
+///
+/// Captured from real Chrome 153.0.8010.37 on Windows. TLS and H2 use the
+/// version-specific capture profiles; the QUIC/H3 profile is supplied by the
+/// lower fingerprint layers.
+pub fn chrome_153() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_153(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_153_quic()),
+        h2_profile: crate::h2::profile::chrome_153_h2(),
+        quic_profile: chrome_153_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
+/// Chrome 154 client preset.
+///
+/// Captured from Chrome 154.0.8037.58 on Windows against public Cloudflare.
+/// TLS, H2, QUIC TLS, and QUIC transport retain Chrome 153's stable shape;
+/// H3 application settings inherit the latest completed Chrome 153 baseline.
+pub fn chrome_154() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_154(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_154_quic()),
+        h2_profile: crate::h2::profile::chrome_154_h2(),
+        quic_profile: chrome_154_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
 /// Firefox 133 client preset.
 ///
 /// A dedicated QUIC transport capture is not modelled yet, so this preset does
@@ -390,6 +448,25 @@ pub fn firefox_147() -> ClientPreset {
         default_protocol_policy: Some(ProtocolPolicy::crawler_throughput()),
         tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Firefox,
         header_order: header_names(crate::h2::profile::firefox_147_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
+/// Firefox 156 client preset.
+///
+/// TLS and H2 were captured from Firefox 156.0.1 on Windows against public
+/// Cloudflare. QUIC/H3 remains disabled because the current transport cannot
+/// represent every observed Firefox QUIC parameter without wire drift.
+pub fn firefox_156() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::firefox_156(),
+        quic_tls_profile: None,
+        h2_profile: crate::h2::profile::firefox_156_h2(),
+        quic_profile: None,
+        default_protocol_policy: Some(ProtocolPolicy::crawler_throughput()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Firefox,
+        header_order: header_names(crate::h2::profile::firefox_156_header_order()),
         h3_header_order: None,
         cookie_order: None,
     }
@@ -532,10 +609,75 @@ mod tests {
     }
 
     #[test]
+    fn chrome_153_preset_applies_the_complete_chromium_bundle() {
+        let preset = chrome_153();
+        assert_eq!(preset.tls_profile.name, "Chrome 153");
+        assert_eq!(
+            preset
+                .quic_tls_profile
+                .as_ref()
+                .expect("chrome_153 preset should set QUIC TLS profile")
+                .name,
+            "Chrome 153 QUIC"
+        );
+        assert_eq!(preset.h2_profile.window_update, 15_663_105);
+        assert_eq!(
+            preset.default_protocol_policy,
+            Some(ProtocolPolicy::chrome_standard())
+        );
+        assert_eq!(
+            preset.tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Chromium
+        );
+        #[cfg(feature = "quic-h3")]
+        assert_eq!(preset.quic_profile, Some(lkh3::chrome_153_quic()));
+        #[cfg(not(feature = "quic-h3"))]
+        assert!(preset.quic_profile.is_none());
+    }
+
+    #[test]
+    fn chrome_154_preset_applies_the_complete_chromium_bundle() {
+        let preset = chrome_154();
+        assert_eq!(preset.tls_profile.name, "Chrome 154");
+        assert_eq!(
+            preset
+                .quic_tls_profile
+                .as_ref()
+                .expect("chrome_154 preset should set QUIC TLS profile")
+                .name,
+            "Chrome 154 QUIC"
+        );
+        assert_eq!(preset.h2_profile.window_update, 15_663_105);
+        assert_eq!(preset.h2_profile.settings.len(), 4);
+        assert_eq!(
+            preset.default_protocol_policy,
+            Some(ProtocolPolicy::chrome_standard())
+        );
+        #[cfg(feature = "quic-h3")]
+        assert_eq!(preset.quic_profile, Some(lkh3::chrome_154_quic()));
+        #[cfg(not(feature = "quic-h3"))]
+        assert!(preset.quic_profile.is_none());
+    }
+
+    #[test]
     fn firefox_147_preset_leaves_quic_profile_unspecified() {
         let preset = firefox_147();
         assert!(preset.quic_profile.is_none());
         assert_eq!(preset.tls_profile.name, "Firefox 147");
+    }
+
+    #[test]
+    fn firefox_156_preset_uses_capture_profiles_without_claiming_h3() {
+        let preset = firefox_156();
+        assert_eq!(preset.tls_profile.name, "Firefox 156");
+        assert_eq!(preset.h2_profile.window_update, 12_517_377);
+        assert_eq!(preset.h2_profile.settings.len(), 4);
+        assert!(preset.quic_tls_profile.is_none());
+        assert!(preset.quic_profile.is_none());
+        assert_eq!(
+            preset.tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Firefox
+        );
     }
 
     #[test]
@@ -613,8 +755,11 @@ mod tests {
             chrome_150(),
             chrome_151(),
             chrome_152(),
+            chrome_153(),
+            chrome_154(),
             firefox_133(),
             firefox_147(),
+            firefox_156(),
             safari_18(),
             safari_26(),
         ] {
@@ -642,6 +787,10 @@ mod tests {
         );
         assert_eq!(
             firefox_147().tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Firefox
+        );
+        assert_eq!(
+            firefox_156().tls_session_cache_partition_policy,
             TlsSessionCachePartitionPolicy::Firefox
         );
         assert_eq!(

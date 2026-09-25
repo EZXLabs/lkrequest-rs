@@ -45,6 +45,28 @@ async fn hsts_policy_upgrades_http_to_https() {
     assert_eq!(resp.status().as_u16(), 200);
 }
 
+#[tokio::test]
+async fn streaming_hsts_upgrades_initial_url_for_h1_and_h2() {
+    let srv = start_local_https_server().await;
+    for version in [
+        lkrequest::PreferredHttpVersion::Http1Only,
+        lkrequest::PreferredHttpVersion::Http2Only,
+    ] {
+        let session = chrome_client()
+            .session()
+            .hsts_policy(StaticHsts::new(["127.0.0.1"]))
+            .build();
+        let response = session
+            .get(&format!("{}/get", http_base(&srv.base_url)))
+            .preferred_http_version(version)
+            .send_streaming()
+            .await
+            .expect("streaming must upgrade the protected URL before connecting");
+        assert_eq!(response.status().as_u16(), 200);
+        assert!(!response.bytes().await.unwrap().is_empty());
+    }
+}
+
 /// A closure policy works the same way.
 #[tokio::test]
 async fn hsts_closure_policy_upgrades() {
@@ -370,4 +392,40 @@ async fn sts_over_https_with_dns_host_is_noted() {
         policy.should_upgrade("sub.sts.test"),
         "includeSubDomains must still apply to a noted host"
     );
+}
+
+#[tokio::test]
+async fn streaming_sts_learning_requires_https_and_dns_host() {
+    for (tls, host, learns) in [
+        (true, "sts.test", true),
+        (false, "sts.test", false),
+        (true, "127.0.0.1", false),
+    ] {
+        let srv = start_sts_server(tls).await;
+        let policy = SharedHsts::default();
+        let session = loopback_dns_client()
+            .session()
+            .hsts_policy(policy.clone())
+            .build();
+        let scheme = if tls { "https" } else { "http" };
+        let response = session
+            .get(&format!("{scheme}://{host}:{}/", srv.port))
+            .send_streaming()
+            .await
+            .expect("streaming STS response");
+        assert_eq!(response.status().as_u16(), 200);
+        assert!(response.headers().contains_key("strict-transport-security"));
+        assert_eq!(policy.should_upgrade(host), learns, "tls={tls} host={host}");
+        assert_eq!(response.text().await.unwrap(), "ok");
+
+        if learns {
+            let next = session
+                .get(&format!("http://{host}:{}/", srv.port))
+                .send()
+                .await
+                .expect("buffered request must use HSTS learned by streaming");
+            assert_eq!(next.status().as_u16(), 200);
+            assert!(next.url().starts_with("https://"));
+        }
+    }
 }

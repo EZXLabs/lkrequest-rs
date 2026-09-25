@@ -1,0 +1,23 @@
+schema_version = 1
+reviewed_at = "2026-09-06"
+required_dataset_fields = ["release_version", "git_commit", "target_triple", "profile", "features", "ci_job", "artifact_path", "sha256", "signing_status", "verification_status"]
+allowed_signing_statuses = ["signed", "unsigned", "not-applicable", "unknown"]
+allowed_verification_statuses = ["built", "smoke-tested", "integration-tested", "package-verified", "published"]
+
+[[artifact_kind]]
+name = "dynamic-library"
+examples = ["lkrequest_ffi.dll", "liblkrequest_ffi.so", "liblkrequest_ffi.dylib"]
+
+[[artifact_kind]]
+name = "c-header"
+examples = ["lkrequest.h"]
+generated = true
+tracked = false
+
+[[artifact_kind]]
+name = "source-archive"
+examples = ["lkrequest-rs-vX.Y.Z.tar.gz"]
+
+[[artifact_kind]]
+name = "checksum"
+examples = ["SHA256SUMS"]

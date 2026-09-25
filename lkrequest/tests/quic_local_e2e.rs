@@ -531,6 +531,32 @@ async fn lkrequest_http3_preconnect_is_idempotent() {
 ///     present and precede the PRIORITY_UPDATE (Chrome's order).
 #[tokio::test]
 async fn lkrequest_http3_emits_chrome_control_stream_frames() {
+    for (preset, priority) in [
+        (lkrequest::preset::chrome_144(), "u=1, i"),
+        (lkrequest::preset::chrome_146(), "u=1, i"),
+        (lkrequest::preset::chrome_150(), "u=0, i"),
+        (lkrequest::preset::chrome_151(), "u=0, i"),
+        (lkrequest::preset::chrome_152(), "u=0, i"),
+        (lkrequest::preset::chrome_153(), "u=0, i"),
+        (lkrequest::preset::chrome_154(), "u=0, i"),
+    ] {
+        let mut expected_priority = vec![0];
+        expected_priority.extend_from_slice(priority.as_bytes());
+        assert_eq!(
+            captured_chrome_control_stream(preset, priority).await,
+            (0xF0700, expected_priority),
+            "navigation PRIORITY_UPDATE for {priority}"
+        );
+    }
+}
+
+/// Run one H3 request with `preset` against a local server, validate the
+/// captured control stream's SETTINGS and GREASE frames, and return the
+/// trailing PRIORITY_UPDATE frame as `(frame type, payload)`.
+async fn captured_chrome_control_stream(
+    preset: lkrequest::preset::ClientPreset,
+    priority: &str,
+) -> (u64, Vec<u8>) {
     use std::time::Duration;
 
     ensure_rustls_provider();
@@ -584,7 +610,7 @@ async fn lkrequest_http3_emits_chrome_control_stream_frames() {
     });
 
     let client = lkrequest::Client::builder()
-        .preset(lkrequest::preset::chrome_146())
+        .preset(preset)
         .add_ca_cert_der(cert_der.as_ref())
         .dns_resolver(Arc::new(LocalIpv4Dns))
         .build();
@@ -594,10 +620,10 @@ async fn lkrequest_http3_emits_chrome_control_stream_frames() {
     assert_eq!(
         client
             .quic_profile()
-            .expect("chrome_146 has a QUIC profile")
+            .expect("captured Chrome preset has a QUIC profile")
             .h3
             .priority_updates,
-        vec![(0, "u=1, i".to_string())],
+        vec![(0, priority.to_string())],
     );
 
     let session = client.session().http3_only().build();
@@ -614,54 +640,57 @@ async fn lkrequest_http3_emits_chrome_control_stream_frames() {
         .expect("control-stream bytes channel");
     client_task.abort();
 
-    // PRIORITY_UPDATE_REQUEST frame type 0xF0700 == varint [80, 0F, 07, 00].
-    const PU_TYPE: [u8; 4] = [0x80, 0x0F, 0x07, 0x00];
-    let pu_pos = control
-        .windows(PU_TYPE.len())
-        .position(|w| w == PU_TYPE)
-        .unwrap_or_else(|| {
-            panic!("no PRIORITY_UPDATE frame on control stream; bytes={control:02x?}")
-        });
-    let after = &control[pu_pos + PU_TYPE.len()..];
-
-    // length(=7) | element_id(=0) | field_value("u=1, i")
+    use lktls::extensions::quic_transport_params::decode_varint;
+    let read_varint = |input: &mut &[u8]| {
+        let mut length = 0;
+        let value = decode_varint(input, &mut length).expect("complete QUIC varint");
+        *input = &input[length..];
+        value
+    };
+    let mut input = control.as_slice();
+    assert_eq!(read_varint(&mut input), 0, "control stream type");
+    let mut frames = Vec::new();
+    while !input.is_empty() {
+        let frame_type = read_varint(&mut input);
+        let length = read_varint(&mut input) as usize;
+        assert!(length <= input.len(), "complete HTTP/3 frame");
+        frames.push((frame_type, input[..length].to_vec()));
+        input = &input[length..];
+    }
+    assert_eq!(frames.len(), 3, "SETTINGS, GREASE, PRIORITY_UPDATE only");
+    assert_eq!(frames[0].0, 4);
+    let mut settings = frames[0].1.as_slice();
+    let mut entries = Vec::new();
+    while !settings.is_empty() {
+        entries.push((read_varint(&mut settings), read_varint(&mut settings)));
+    }
     assert_eq!(
-        after.first(),
-        Some(&0x07),
-        "PRIORITY_UPDATE length must be 7"
+        &entries[..4],
+        &[(1, 65_536), (6, 262_144), (7, 100), (51, 1)]
     );
-    assert_eq!(
-        &after[1..8],
-        b"\x00u=1, i",
-        "PRIORITY_UPDATE payload must be element_id=0 + \"u=1, i\""
-    );
-    // The frame is exactly 7 payload bytes: the next byte must NOT start a
-    // duplicated field_value (the encode-duplication regression).
-    assert_ne!(
-        after.get(8),
-        Some(&b'u'),
-        "field_value must not be emitted twice (control stream would be corrupted)"
-    );
-
-    // A reserved GREASE frame (payload `b"grease"`) must precede PRIORITY_UPDATE.
-    let grease_pos = control
-        .windows(6)
-        .position(|w| w == b"grease")
-        .unwrap_or_else(|| panic!("no control-stream GREASE frame; bytes={control:02x?}"));
-    assert!(
-        grease_pos < pu_pos,
-        "GREASE frame must come before PRIORITY_UPDATE (grease@{grease_pos} pu@{pu_pos})"
-    );
+    assert_eq!(entries.len(), 5);
+    let (reserved, value) = entries[4];
+    assert!(reserved >= 33 && (reserved - 33) % 31 == 0);
+    assert!((reserved - 33) / 31 <= u32::MAX as u64);
+    assert!(value <= u32::MAX as u64);
+    let (frame_type, payload) = &frames[1];
+    assert!(*frame_type >= 33 && (*frame_type - 33) % 31 == 0);
+    let random = (*frame_type - 33) / 31;
+    assert!(random <= u32::MAX as u64);
+    assert_eq!(payload.len(), (random % 4) as usize);
 
     server_task.await.unwrap();
     server.wait_idle().await;
+    frames.swap_remove(2)
 }
 
 /// Resolver that advertises H3 at a **different** hostname than the origin, the
 /// way an HTTPS RR with an explicit `TargetName` does. Every name still resolves
 /// to the local server, so only the TLS identity distinguishes the two.
 #[derive(Clone)]
-struct AlternativeTargetDns;
+struct AlternativeTargetDns {
+    https_lookups: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 #[async_trait]
 impl lkrequest::DnsResolver for AlternativeTargetDns {
@@ -673,6 +702,8 @@ impl lkrequest::DnsResolver for AlternativeTargetDns {
         &self,
         _host: &str,
     ) -> std::io::Result<Option<lkrequest::dns::HttpsRecord>> {
+        self.https_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(lkrequest::dns::HttpsRecord {
             target: Some("alt.invalid".to_string()),
             alpn: vec!["h3".to_string()],
@@ -693,6 +724,23 @@ impl lkrequest::DnsResolver for AlternativeTargetDns {
 /// it actually received.
 #[tokio::test]
 async fn alt_service_target_does_not_become_the_tls_identity() {
+    assert_eq!(
+        dns_alt_service_origin_identity(lkrequest::ProtocolPolicy::h3_strict()).await,
+        lkrequest::HttpVersion::H3,
+    );
+}
+
+#[tokio::test]
+async fn dns_advertised_h3_is_acquired_automatically() {
+    assert_eq!(
+        dns_alt_service_origin_identity(lkrequest::ProtocolPolicy::chrome_standard()).await,
+        lkrequest::HttpVersion::H3,
+    );
+}
+
+async fn dns_alt_service_origin_identity(
+    policy: lkrequest::ProtocolPolicy,
+) -> lkrequest::HttpVersion {
     ensure_rustls_provider();
     let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
@@ -749,16 +797,19 @@ async fn alt_service_target_does_not_become_the_tls_identity() {
         }
     });
 
+    let https_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let client = lkrequest::Client::builder()
         .fingerprint(lktls::profile::presets::chrome_144())
         .quic_profile(lkh3::chrome_quic())
         // Verification stays on: the certificate names `localhost`, so an SNI of
         // `alt.invalid` also fails the identity check, not just this assertion.
         .add_ca_cert_der(cert_der.as_ref())
-        .dns_resolver(Arc::new(AlternativeTargetDns))
+        .dns_resolver(Arc::new(AlternativeTargetDns {
+            https_lookups: https_lookups.clone(),
+        }))
         .build();
 
-    let session = client.session().http3_only().build();
+    let session = client.session().protocol_policy(policy).build();
     let url = format!("https://localhost:{}/alt", server_addr.port());
     let response = session
         .get(&url)
@@ -767,7 +818,13 @@ async fn alt_service_target_does_not_become_the_tls_identity() {
         .expect("the origin identity must be used, so the localhost certificate matches");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.version(), lkrequest::HttpVersion::H3);
     assert_eq!(response.text().unwrap(), "origin-identity");
+    assert_eq!(
+        https_lookups.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "pool selection and connection establishment must share DNS discovery"
+    );
 
     let sni = sni_rx.await.expect("server reports the SNI it received");
     assert_eq!(
@@ -778,4 +835,5 @@ async fn alt_service_target_does_not_become_the_tls_identity() {
 
     server_task.await.unwrap();
     server.wait_idle().await;
+    response.version()
 }

@@ -7,6 +7,9 @@
 //! `Session` is `Clone + Send + Sync`.  Cloning is cheap (Arc reference count).
 //! Multiple tasks can send requests through the same Session concurrently.
 
+mod cookie_jar;
+#[cfg(feature = "masque")]
+mod masque;
 pub(crate) mod pipeline;
 mod prefetch;
 mod request;
@@ -39,6 +42,16 @@ use crate::retry::RetryPolicy;
 #[cfg(feature = "synthetic-fp")]
 use lktls::session_store::InMemorySessionStore;
 use lktls::session_store::SessionStore;
+
+/// The initial MTU a QUIC connection uses when nothing configures one.
+///
+/// Mirrors quinn's private `INITIAL_MTU` (`deps/quinn/quinn-proto/src/lib.rs`),
+/// which is the RFC 9000 §14.1 minimum every endpoint must support. A profile
+/// with no `initial_mtu` of its own is emitting packets of this size, so this is
+/// the value a MASQUE route must not exceed *or* raise — see
+/// [`Session::connect_quic_via_masque`].
+#[cfg(feature = "masque")]
+const QUIC_DEFAULT_INITIAL_MTU: u16 = 1200;
 
 #[cfg(feature = "quic-h3")]
 pub(crate) enum H3ConnectOutcome {
@@ -113,25 +126,19 @@ fn shuffle_transport_parameter_order(order: &mut [quinn::VarInt]) {
     }
 }
 
-/// Map 4 random bytes to a Chrome-style reserved GREASE transport-parameter id.
+/// Map 8 random bytes to a Chromium reserved GREASE transport-parameter id.
 ///
-/// The returned id always satisfies the RFC 9000 §18.1 reserved form
-/// `31*N + 27`, and is constrained so that it:
-/// - is always encoded as an **8-byte** QUIC varint (value in `[2^30, 2^62)`),
-///   matching the captured Chrome reserved id's on-wire width on every
-///   connection — a sub-`2^30` id would encode shorter and shift the byte
-///   layout, itself a fingerprint tell; and
-/// - is **never** a transport parameter Quinn encodes locally (`0x00..=0x10`,
-///   `0x20`, `0xb6`, `0x2ab2`, `0xff04de1a`), which `extra_transport_parameters`
-///   rejects with `LocallyEncoded` (a connection-setup failure). All of those
-///   are `< 2^30` except `0xff04de1a`, which is not of the `31*N + 27` form, so
-///   none are reachable from this generator.
+/// Chromium reduces `RandUint64()` modulo `2^62 - 31`, then rounds down to
+/// a multiple of 31 and adds 27 (RFC 9000 §18.1). This spans the full QUIC
+/// varint range; 8-byte IDs are overwhelmingly likely but not mandatory.
 #[cfg(feature = "quic-h3")]
-fn grease_reserved_tp_id(rand: u32) -> quinn::VarInt {
-    // Smallest N whose id (= 31*N + 27) reaches the 8-byte-varint threshold 2^30.
-    let n_min = ((1u64 << 30) - 27).div_ceil(31);
-    let id = 27 + 31 * (n_min + rand as u64);
-    // id ∈ [2^30, 2^30 + 31·2^32) ⊂ [2^30, 2^62) → always an 8-byte varint.
+fn grease_reserved_tp_id(rand: u64) -> quinn::VarInt {
+    let mut id = (rand % ((1u64 << 62) - 31)) / 31 * 31 + 27;
+    // 0xb6 is the only reserved ID Quinn encodes locally. Avoid a rejected
+    // extra parameter even when a deterministic or failed RNG yields it.
+    if id == 0xb6 {
+        id += 31;
+    }
     quinn::VarInt::from_u64(id).expect("reserved GREASE id fits a QUIC varint")
 }
 
@@ -143,23 +150,63 @@ fn grease_reserved_tp_id(rand: u32) -> quinn::VarInt {
 /// - `version_information` (0x11) gets a fresh random GREASE version
 ///   (`0x?a?a?a?a`, RFC 9000 §15.1) in its first available-version slot.
 ///
+/// With `randomize_shape`, Chromium uses 0..15-byte reserved payloads and
+/// inserts the GREASE version at a random available-version position instead.
+///
 /// The `order` list's reference to the GREASE id is patched to the new id so the
 /// (subsequently shuffled) wire order stays consistent.
 #[cfg(feature = "quic-h3")]
 fn randomize_quic_grease_params(
     extra: &mut [(quinn::VarInt, Vec<u8>)],
     order: &mut [quinn::VarInt],
+    randomize_shape: bool,
 ) {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
     let rng = SystemRandom::new();
-    let fill = |b: &mut [u8]| {
+    randomize_quic_grease_params_with_random_bytes(extra, order, randomize_shape, |b| {
         let _ = rng.fill(b);
-    };
+    });
+}
 
+#[cfg(feature = "quic-h3")]
+fn randomize_quic_grease_params_with_random_bytes(
+    extra: &mut [(quinn::VarInt, Vec<u8>)],
+    order: &mut [quinn::VarInt],
+    randomize_shape: bool,
+    mut fill: impl FnMut(&mut [u8]),
+) {
     for (id, value) in extra.iter_mut() {
         let id_v = id.into_inner();
         if id_v == 0x11 {
+            if randomize_shape {
+                if value.len() < 8 || !value.len().is_multiple_of(4) {
+                    continue;
+                }
+                // Preserve the chosen version and every real available version.
+                let mut available: Vec<[u8; 4]> = value[4..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|version| !version.iter().all(|byte| byte & 0x0f == 0x0a))
+                    .copied()
+                    .collect();
+                let mut grease = [0u8; 4];
+                fill(&mut grease);
+                for byte in &mut grease {
+                    *byte = (*byte & 0xf0) | 0x0a;
+                }
+                let mut position = [0u8; 8];
+                fill(&mut position);
+                let position =
+                    (u64::from_le_bytes(position) % (available.len() as u64 + 1)) as usize;
+                available.insert(position, grease);
+                value.truncate(4);
+                for version in available {
+                    value.extend_from_slice(&version);
+                }
+                continue;
+            }
             // version_information = chosen(4) | available[GREASE(4), v1(4), …].
             // Randomize the GREASE version (first available slot, bytes 4..8).
             if value.len() >= 8 {
@@ -174,15 +221,19 @@ fn randomize_quic_grease_params(
             // Reserved GREASE TP → fresh random reserved id and value. A
             // non-empty profile placeholder locks the captured wire length;
             // an empty placeholder retains the legacy randomized 1..=16 range.
-            // `grease_reserved_tp_id` guarantees an 8-byte-varint, non-locally-
-            // encoded id, so the encode below cannot be rejected.
-            let mut n = [0u8; 4];
+            // `grease_reserved_tp_id` guarantees a valid, non-locally-encoded ID.
+            let mut n = [0u8; 8];
             fill(&mut n);
-            let new_id = grease_reserved_tp_id(u32::from_le_bytes(n));
-            let value_len = if value.is_empty() {
+            let new_id = grease_reserved_tp_id(u64::from_le_bytes(n));
+            let value_len = if randomize_shape || value.is_empty() {
                 let mut lb = [0u8; 1];
                 fill(&mut lb);
-                1 + (lb[0] as usize % 16)
+                let length = lb[0] as usize % 16;
+                if randomize_shape {
+                    length
+                } else {
+                    length + 1
+                }
             } else {
                 value.len()
             };
@@ -328,7 +379,7 @@ impl RedirectPolicy {
 ///   session exists and this predicate says the request is replay-safe. If the
 ///   server rejects early data, the speculative H3 request is dropped and
 ///   replayed after the normal handshake.
-/// - **Automatic retries** — a configured [`RetryPolicy`](crate::retry::RetryPolicy)
+/// - **Automatic retries** — a configured [`RetryPolicy`]
 ///   re-sends the (buffered) request body. For non-idempotent methods, a retry
 ///   only happens when the failure *proves* the request was never processed
 ///   (see [`Error::is_safe_to_replay`](crate::error::Error::is_safe_to_replay))
@@ -449,7 +500,82 @@ pub(crate) fn next_request_id() -> u64 {
     REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+pub(crate) use cookie_jar::CookieJar;
 pub use cookie_store::CookieStore;
+
+/// A cookie from the jar, with the attributes that decide when it is sent.
+///
+/// [`Session::get_cookies`] returns only names and values, which is enough to
+/// read a cookie but not to reason about one: two cookies with the same name
+/// and different paths are two distinct cookies, and a name/value pair cannot
+/// tell them apart. The attributes here are also what a caller needs in order
+/// to hand a jar to something else — a browser automation context, or a file to
+/// be restored later — and to answer why a cookie the jar holds was not sent.
+///
+/// Every field is owned, so this type does not leak the cookie store's own
+/// types into the public API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieInfo {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie value.
+    pub value: String,
+    /// The domain this cookie is scoped to.
+    pub domain: Option<String>,
+    /// `true` when the cookie matches [`domain`](Self::domain) exactly, because
+    /// the `Set-Cookie` carried no `Domain` attribute; `false` when a `Domain`
+    /// was given and subdomains match too.
+    pub host_only: bool,
+    /// The effective path: the `Path` attribute, or the default path derived
+    /// from the request URI when the server sent none.
+    pub path: String,
+    /// Send only over HTTPS.
+    pub secure: bool,
+    /// Hidden from client-side scripts.
+    pub http_only: bool,
+    /// `"Strict"`, `"Lax"` or `"None"` — the wire spelling — or `None` when the
+    /// cookie carries no `SameSite` attribute.
+    pub same_site: Option<String>,
+    /// Expiry as a Unix timestamp in seconds, or `None` for a session cookie —
+    /// one that carried neither `Expires` nor `Max-Age` and should be dropped
+    /// when the session ends rather than persisted.
+    ///
+    /// Seconds rather than a `time::OffsetDateTime` so that the type stays free
+    /// of the cookie store's dependencies and maps directly onto the language
+    /// bindings.
+    pub expires_unix: Option<i64>,
+}
+
+impl CookieInfo {
+    /// `true` when the cookie has an expiry and so should survive a restart.
+    pub fn is_persistent(&self) -> bool {
+        self.expires_unix.is_some()
+    }
+}
+
+/// Project a stored cookie onto the owned [`CookieInfo`] view.
+fn cookie_info(cookie: &cookie_store::Cookie<'_>) -> CookieInfo {
+    let (domain, host_only) = match &cookie.domain {
+        cookie_store::CookieDomain::HostOnly(d) => (Some(d.clone()), true),
+        cookie_store::CookieDomain::Suffix(d) => (Some(d.clone()), false),
+        _ => (None, false),
+    };
+    let expires_unix = match cookie.expires {
+        cookie_store::CookieExpiration::AtUtc(at) => Some(at.unix_timestamp()),
+        cookie_store::CookieExpiration::SessionEnd => None,
+    };
+    CookieInfo {
+        name: cookie.name().to_string(),
+        value: cookie.value().to_string(),
+        domain,
+        host_only,
+        path: cookie.path.to_string(),
+        secure: cookie.secure().unwrap_or(false),
+        http_only: cookie.http_only().unwrap_or(false),
+        same_site: cookie.same_site().map(|s| s.to_string()),
+        expires_unix,
+    }
+}
 
 /// The two cookie name prefixes defined by RFC 6265bis §4.1.3.
 const SECURE_COOKIE_PREFIX: &str = "__Secure-";
@@ -659,7 +785,7 @@ pub(crate) struct SessionInner {
     ///
     /// Reads (every request, to inject Cookie header) are lock-free via `load()`.
     /// Writes (Set-Cookie responses) use `rcu()` for safe copy-on-write.
-    pub cookie_jar: ArcSwap<CookieStore>,
+    pub cookie_jar: ArcSwap<CookieJar>,
 
     /// Connection pool — per-session, protected by Mutex (short critical sections).
     pub pool: Mutex<ConnectionPool>,
@@ -738,6 +864,15 @@ pub(crate) struct SessionInner {
     pub quic_in_flight: Mutex<
         std::collections::HashMap<crate::connection_pool::ConnectionKey, Arc<tokio::sync::Notify>>,
     >,
+
+    /// Outer HTTP/3 connections to MASQUE proxies, one per proxy identity.
+    ///
+    /// Lives here, on the session, precisely because it must **not** be shared:
+    /// tunnels multiplex onto one outer connection within a session (RFC 9298's
+    /// whole point), but two sessions are two virtual users and must never meet
+    /// on the proxy's side of the wire. See [`masque::MasquePool`].
+    #[cfg(feature = "masque")]
+    pub masque_pool: masque::MasquePool,
 }
 
 impl Session {
@@ -1113,6 +1248,58 @@ impl Session {
             .collect()
     }
 
+    /// Like [`get_cookies`](Self::get_cookies), but each cookie keeps the
+    /// attributes that decide when it is sent.
+    ///
+    /// Use this when a name and a value are not enough: to tell apart two
+    /// cookies that share a name at different paths, to hand the jar to a
+    /// browser context, or to find out why a cookie the jar holds is missing
+    /// from a request.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use lkrequest::Client;
+    /// # use lktls::profile::presets;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::builder().fingerprint(presets::chrome_131()).build();
+    /// # let session = client.session().build();
+    /// for cookie in session.get_cookies_with_attrs("https://example.com/api/users") {
+    ///     println!("{}={} path={} secure={}", cookie.name, cookie.value, cookie.path, cookie.secure);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_cookies_with_attrs(&self, url: &str) -> Vec<CookieInfo> {
+        let parsed = match Url::parse(url) {
+            Ok(u) => u,
+            Err(_) => return Vec::new(),
+        };
+        let jar = self.inner.cookie_jar.load();
+        jar.matches(&parsed).into_iter().map(cookie_info).collect()
+    }
+
+    /// Every unexpired cookie in the jar, across all domains.
+    ///
+    /// [`get_cookies_with_attrs`](Self::get_cookies_with_attrs) answers "what
+    /// would be sent to this URL"; this answers "what does this session hold",
+    /// which is the question to ask when persisting a jar, since a session's
+    /// cookies rarely all belong to one origin.
+    ///
+    /// Expired cookies are left out: they would not be sent, and writing them
+    /// to a file only to drop them on load is noise.
+    ///
+    /// Cookies are returned oldest first. Chrome orders the `Cookie` header by
+    /// path length and then by creation time, so setting these cookies into a
+    /// fresh session in this order reproduces the same `Cookie` headers.
+    pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
+        let jar = self.inner.cookie_jar.load();
+        jar.unexpired_in_creation_order()
+            .into_iter()
+            .map(cookie_info)
+            .collect()
+    }
+
     /// Get the value of a specific cookie by name for the given URL.
     ///
     /// If multiple cookies with the same name match (different paths),
@@ -1135,8 +1322,7 @@ impl Session {
     pub fn get_cookie(&self, url: &str, name: &str) -> Option<String> {
         let parsed = Url::parse(url).ok()?;
         let jar = self.inner.cookie_jar.load();
-        // CookieStore::matches returns cookies sorted by path specificity
-        // (most specific first, per RFC 6265 Section 5.4)
+        // CookieJar::matches sorts longer paths first (RFC 6265 §5.4, Chrome)
         jar.matches(&parsed)
             .into_iter()
             .find(|c| c.name() == name)
@@ -1232,7 +1418,7 @@ impl Session {
     /// # }
     /// ```
     pub fn clear_cookies(&self) {
-        self.inner.cookie_jar.store(Arc::new(CookieStore::new()));
+        self.inner.cookie_jar.store(Arc::new(CookieJar::default()));
     }
 
     /// Get the cookie header string that would be sent for the given URL.
@@ -1550,6 +1736,13 @@ impl Session {
         config: &crate::connect::ConnectConfig,
     ) -> crate::error::Result<crate::connect::EstablishedConnection> {
         let client = &self.inner.client;
+        let override_addr = client.connect_target(host, port);
+        let override_host = override_addr.map(|addr| addr.ip().to_string());
+        let dial_host = override_host.as_deref().unwrap_or(host);
+        let dial_port = override_addr.map_or(port, |addr| addr.port());
+        if let Some(ip) = crate::dns::literal_ip(dial_host) {
+            client.ip_family().check(ip)?;
+        }
         let timeouts = client.timeouts();
         let is_remote_dns = crate::protocol::proxy_uses_remote_dns(proxy);
 
@@ -1577,8 +1770,8 @@ impl Session {
         let tcp_start = std::time::Instant::now();
         let tcp_timeout = timeouts.tcp_connect_timeout_or(std::time::Duration::from_secs(10));
         let tcp = crate::connect::connect_tcp(
-            host,
-            port,
+            dial_host,
+            dial_port,
             proxy,
             client.tcp_fingerprint(),
             client.resolver(),
@@ -1633,8 +1826,8 @@ impl Session {
                 // The first connection is gone — it was aborted with
                 // `ech_required` — so dial again.
                 let tcp = crate::connect::connect_tcp(
-                    host,
-                    port,
+                    dial_host,
+                    dial_port,
                     proxy,
                     client.tcp_fingerprint(),
                     client.resolver(),
@@ -1710,8 +1903,16 @@ impl Session {
         let quic_profile = client.quic_profile().ok_or_else(|| {
             Error::InvalidConfig("HTTP/3 requested but client has no QUIC/H3 profile".into())
         })?;
-        let dial_host = advertised_host.unwrap_or(host);
-        let dial_port = advertised_port.unwrap_or(port);
+        let override_addr = client.connect_target(host, port);
+        let override_host = override_addr.map(|addr| addr.ip().to_string());
+        let dial_host = override_host
+            .as_deref()
+            .unwrap_or_else(|| advertised_host.unwrap_or(host));
+        let dial_port =
+            override_addr.map_or_else(|| advertised_port.unwrap_or(port), |addr| addr.port());
+        if let Some(ip) = crate::dns::literal_ip(dial_host) {
+            client.ip_family().check(ip)?;
+        }
         // The alternative endpoint says *where* to send packets, never *who* to
         // authenticate. RFC 7838 §3.1 and RFC 9460 §2.3 both require it to prove
         // it may serve the origin, so the origin host is the SNI and the name
@@ -1772,7 +1973,7 @@ impl Session {
         };
 
         let crypto = self
-            .build_h3_crypto(tls_profile, alps_payload, host, dial_port, is_remote_dns)
+            .build_h3_crypto(tls_profile, alps_payload, host, port, is_remote_dns)
             .await;
 
         let mut quinn_config = crypto.into_quinn();
@@ -1828,6 +2029,7 @@ impl Session {
             randomize_quic_grease_params(
                 &mut extra_transport_parameters,
                 &mut transport_parameter_order,
+                tp.randomize_grease_shape,
             );
             shuffle_transport_parameter_order(&mut transport_parameter_order);
         }
@@ -1842,6 +2044,7 @@ impl Session {
                 Error::InvalidConfig(format!("invalid QUIC transport parameter order: {err}"))
             })?;
         let packetization = &quic_profile.packetization;
+        transport_config.initial_packet_chaos(packetization.initial_packet_chaos);
         if let Some(initial_mtu) = packetization.initial_mtu {
             transport_config.initial_mtu(initial_mtu);
         }
@@ -1869,6 +2072,21 @@ impl Session {
                  based on the configured local connection ID length"
             );
         }
+        // A MASQUE route cannot finish the transport config here: the inner MTU
+        // is whatever one HTTP Datagram can carry, and that is only known once
+        // the tunnel exists. Hand the config over instead of wrapping it, so the
+        // MASQUE arm revises exactly two fields and nothing else — the profile's
+        // transport parameters, their wire order and the GREASE shape are
+        // already baked in above and must survive untouched, or the inner
+        // connection would be fingerprintable as "tunnelled".
+        #[cfg(feature = "masque")]
+        let masque_transport_config = if proxy.is_some_and(|proxy| proxy.scheme.is_masque()) {
+            Some(transport_config)
+        } else {
+            quinn_config.transport_config(Arc::new(transport_config));
+            None
+        };
+        #[cfg(not(feature = "masque"))]
         quinn_config.transport_config(Arc::new(transport_config));
 
         let tcp_timeout = client
@@ -1900,13 +2118,38 @@ impl Session {
                 )
                 .await?
             }
+            // `ProxyScheme::Masque` only exists with the `masque` feature, so
+            // there is no "MASQUE route in a build without the machinery" case
+            // to handle here: `ProxyConfig::parse` refuses `masque://` up front
+            // and names the feature, which is where the user can still act on
+            // it — at configuration time rather than on the first request.
+            #[cfg(feature = "masque")]
+            Some(proxy_cfg) if proxy_cfg.scheme.is_masque() => {
+                self.connect_quic_via_masque(
+                    proxy_cfg,
+                    dial_host,
+                    dial_port,
+                    server_name,
+                    quinn_config,
+                    masque_transport_config.expect(
+                        "the MASQUE arm is the only consumer of the deferred transport config",
+                    ),
+                    packetization.initial_mtu,
+                    packetization.initial_datagram_size,
+                    client,
+                    tcp_timeout,
+                    quic_timeout,
+                )
+                .await?
+            }
             Some(proxy_cfg) => {
-                // A non-SOCKS5 proxy (e.g. HTTP CONNECT) cannot relay UDP, so
-                // there is no way to carry QUIC/H3 through it. Fail loudly rather
-                // than silently dialing the origin directly — a direct UDP
-                // connection would bypass the proxy and leak the real client IP.
+                // A non-SOCKS5, non-MASQUE proxy (e.g. HTTP CONNECT) cannot
+                // relay UDP, so there is no way to carry QUIC/H3 through it.
+                // Fail loudly rather than silently dialing the origin directly —
+                // a direct UDP connection would bypass the proxy and leak the
+                // real client IP.
                 return Err(Error::InvalidConfig(format!(
-                    "HTTP/3 requires a SOCKS5 proxy to relay UDP; proxy scheme {:?} cannot carry QUIC",
+                    "HTTP/3 requires a SOCKS5 or MASQUE proxy to relay UDP; proxy scheme {:?} cannot carry QUIC",
                     proxy_cfg.scheme
                 )));
             }
@@ -1917,7 +2160,7 @@ impl Session {
                     )
                 })?;
                 let started = {
-                    let mut manager = client.quic_endpoint_manager().lock().await;
+                    let mut manager = client.quic_endpoint_manager_for(addr).lock().await;
                     manager
                         .start_connect(lkquic::ConnectRequest::new(addr, server_name, quinn_config))
                         .await
@@ -2070,6 +2313,7 @@ impl Session {
 
         let assoc = match associate {
             Ok(value) => value,
+            Err(error) if error.is_address_family_mismatch() => return Err(error),
             Err(error) => {
                 // UDP ASSOCIATE failed *before* any QUIC bytes ever hit the
                 // wire — this is a property of the proxy, not the origin.
@@ -2094,6 +2338,7 @@ impl Session {
         // `inner_relays` are the chain's inner-hop relays, stacked as nested
         // headers. `control_conns` holds every hop's control TCP connection.
         let relay_addr = assoc.first_relay;
+        client.ip_family().check(relay_addr.ip())?;
         let intermediate_relays = assoc.inner_relays;
 
         let bind_addr: std::net::SocketAddr = if relay_addr.is_ipv4() {
@@ -2111,9 +2356,12 @@ impl Session {
 
         let target = match remote_addr {
             Some(addr) => SocksTarget::Ip(addr),
-            None => SocksTarget::Domain {
-                host: dial_host.to_string(),
-                port: dial_port,
+            None => match crate::dns::literal_ip(dial_host) {
+                Some(ip) => SocksTarget::Ip(std::net::SocketAddr::new(ip, dial_port)),
+                None => SocksTarget::Domain {
+                    host: dial_host.to_string(),
+                    port: dial_port,
+                },
             },
         };
 
@@ -2191,6 +2439,328 @@ impl Session {
             .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))
     }
 
+    /// Establish a QUIC connection through a MASQUE CONNECT-UDP tunnel
+    /// (RFC 9298).
+    ///
+    /// Three things happen here that the SOCKS5 path does not need:
+    ///
+    /// * **The proxy host is resolved with this session's resolver.** The bridge
+    ///   takes an already-resolved address on purpose — a second resolver inside
+    ///   the proxy layer would be a second happy-eyeballs and DoH policy. The
+    ///   *target* is never resolved locally: it travels in the tunnel's `:path`
+    ///   and RFC 9298 §3.1 requires the proxy to resolve it, which is why this
+    ///   route is classified as remote-DNS.
+    /// * **The outer connection is pooled per session.** Several targets share
+    ///   one outer HTTP/3 connection ([`masque::MasquePool`]); two sessions
+    ///   never do.
+    /// * **The tunnel caps the inner MTU.** One inner QUIC packet must fit in
+    ///   one HTTP Datagram, and a probe larger than that is silently discarded
+    ///   rather than answered — so inner path MTU discovery is turned off, which
+    ///   it would otherwise resolve as "the bigger size worked". The cap only
+    ///   ever *lowers* the MTU: raising it to whatever the tunnel happens to
+    ///   allow would pad Initial packets to a size the profile never asks for,
+    ///   and the origin would see the difference.
+    ///
+    /// SNI and certificate verification stay pointed at the **origin**: the
+    /// tunnel is a pipe, not an endpoint, and `quinn_config` is the one the
+    /// browser profile produced for `host`.
+    #[cfg(feature = "masque")]
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_quic_via_masque(
+        &self,
+        proxy_cfg: &crate::proxy::ProxyConfig,
+        dial_host: &str,
+        dial_port: u16,
+        server_name: &str,
+        mut quinn_config: quinn::ClientConfig,
+        mut transport_config: quinn::TransportConfig,
+        profile_initial_mtu: Option<u16>,
+        profile_initial_datagram_size: Option<u16>,
+        client: &crate::client::Client,
+        proxy_timeout: std::time::Duration,
+        quic_timeout: std::time::Duration,
+    ) -> crate::error::Result<quinn::Connection> {
+        let route = crate::protocol::RouteKey::from_proxy(Some(proxy_cfg));
+        let origin = crate::alt_svc::Origin::https(dial_host, dial_port);
+        let (proxy_host, proxy_port) = proxy_cfg.host_port();
+
+        tracing::debug!(
+            proxy = %format_args!("{proxy_host}:{proxy_port}"),
+            target = %format_args!("{dial_host}:{dial_port}"),
+            server_name = %server_name,
+            proxy_timeout_ms = proxy_timeout.as_millis() as u64,
+            quic_timeout_ms = quic_timeout.as_millis() as u64,
+            "quic.masque_connect_prepare"
+        );
+
+        let tunnel = self
+            .open_masque_tunnel(
+                proxy_cfg,
+                proxy_host,
+                proxy_port,
+                dial_host,
+                dial_port,
+                client,
+                proxy_timeout,
+            )
+            .await;
+        let socket = match tunnel {
+            Ok(socket) => socket,
+            Err(error) => {
+                // No fallback to a direct connection: a MASQUE proxy is there to
+                // hide the client's address, so dialing the origin ourselves
+                // would leak exactly what the user configured it to hide
+                // (`design/masque-connect-udp-design.md`, "失败语义与隔离").
+                self.quarantine_masque_failure(&route, &origin, &error);
+                tracing::warn!(
+                    proxy = %format_args!("{proxy_host}:{proxy_port}"),
+                    target = %format_args!("{dial_host}:{dial_port}"),
+                    error = %error,
+                    "quic.masque_tunnel_failed"
+                );
+                return Err(error);
+            }
+        };
+
+        // One HTTP Datagram's worth of payload, minus the two varint prefixes.
+        // The CONNECT-UDP response can arrive before the outer path-MTU probe is
+        // acknowledged. Poll the live Quinn value rather than treating that
+        // transient 1200-byte outer MTU as the route's permanent ceiling.
+        let mtu_wait = proxy_timeout.min(std::time::Duration::from_millis(250));
+        let mtu_deadline = tokio::time::Instant::now() + mtu_wait;
+        let outer = socket.connection();
+        let mut capacity = socket.capacity();
+        while capacity < usize::from(QUIC_DEFAULT_INITIAL_MTU) {
+            outer.refresh_max_datagram_size();
+            capacity = socket.capacity();
+            if capacity >= usize::from(QUIC_DEFAULT_INITIAL_MTU)
+                || tokio::time::Instant::now() >= mtu_deadline
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let capacity_u16 = u16::try_from(capacity).unwrap_or(u16::MAX);
+        if capacity_u16 < QUIC_DEFAULT_INITIAL_MTU {
+            // RFC 9000 §14.1: a QUIC endpoint must be able to put 1200 bytes in
+            // one datagram, and a tunnel narrower than that discards every
+            // Initial packet in silence (RFC 9298 §5 makes an over-capacity
+            // payload a drop, not an error). Refusing here turns a handshake
+            // that would hang until the timeout into one sentence naming the
+            // cause.
+            let error = Error::proxy(
+                crate::error::ProxyErrorKind::ProtocolError,
+                format!(
+                    "MASQUE proxy {proxy_host}:{proxy_port} offers only {capacity} bytes per \
+                     HTTP Datagram, below the {QUIC_DEFAULT_INITIAL_MTU}-byte minimum QUIC \
+                     requires; the outer path MTU is too small to carry a tunnelled connection"
+                ),
+                None,
+            );
+            // Capacity can increase after a delayed PMTU acknowledgment. Do not
+            // quarantine the UDP-only route and force subsequent requests into
+            // an impossible TCP fallback; the next request gets a fresh check.
+            return Err(error);
+        }
+        // The tunnel is a **ceiling**, never a floor. Setting the inner MTU to
+        // the tunnel capacity would raise it above what this connection would
+        // otherwise use and pad every Initial packet to a size the profile never
+        // asks for — a difference the origin can see, which is exactly the leak
+        // this whole design exists to avoid. So take the smaller of what the
+        // route allows and what the connection would have used anyway, where a
+        // profile that says nothing inherits quinn's own default.
+        let inner_mtu = profile_initial_mtu
+            .unwrap_or(QUIC_DEFAULT_INITIAL_MTU)
+            .min(capacity_u16);
+        transport_config.initial_mtu(inner_mtu);
+        // RFC 9298 §5 / design "MTU 与超限": a probe above the tunnel capacity is
+        // discarded, not rejected, so discovery has no signal to back off from.
+        transport_config.mtu_discovery_config(None);
+        if profile_initial_datagram_size.is_some_and(|size| size > inner_mtu) {
+            // The profile pads Initial datagrams above what this tunnel can
+            // carry. Padding to the profile's size would make every Initial
+            // vanish, so the padding shrinks and the first flight is, to that
+            // extent, not the browser's. Loud on purpose: it is a fingerprint
+            // deviation the user can fix by finding a proxy with a larger path
+            // MTU, and silently degrading it is how such things go unnoticed.
+            tracing::warn!(
+                proxy = %format_args!("{proxy_host}:{proxy_port}"),
+                target = %format_args!("{dial_host}:{dial_port}"),
+                profile_initial_datagram_size = profile_initial_datagram_size,
+                tunnel_capacity = capacity,
+                "quic.masque_initial_datagram_size_clamped"
+            );
+            transport_config.initial_datagram_size(inner_mtu);
+        }
+        quinn_config.transport_config(Arc::new(transport_config));
+
+        let quinn_addr = socket.quinn_addr();
+        let manager = client.quic_endpoint_manager().lock().await;
+        let backend = manager.backend();
+        let endpoint = backend
+            .create_endpoint_with_socket(
+                socket as Arc<dyn quinn::AsyncUdpSocket>,
+                manager.cid_len(),
+                manager.endpoint_max_udp_payload_size(),
+                manager.grease_quic_bit_enabled(),
+                manager.endpoint_initial_destination_cid_len(),
+            )
+            .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?;
+        drop(manager);
+
+        tracing::debug!(
+            proxy = %format_args!("{proxy_host}:{proxy_port}"),
+            target = %format_args!("{dial_host}:{dial_port}"),
+            quinn_addr = %quinn_addr,
+            tunnel_capacity = capacity,
+            inner_mtu,
+            "quic.masque_tunnel_ready"
+        );
+
+        let connecting = endpoint
+            .connect_with(quinn_config, quinn_addr, server_name)
+            .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?;
+
+        let connection = tokio::time::timeout(quic_timeout, connecting)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    target = %format_args!("{dial_host}:{dial_port}"),
+                    server_name = %server_name,
+                    timeout_ms = quic_timeout.as_millis() as u64,
+                    "quic.masque_handshake_timeout"
+                );
+                Error::timeout(
+                    format!(
+                        "QUIC handshake to {dial_host}:{dial_port} through MASQUE proxy \
+                         {proxy_host}:{proxy_port} timed out after {quic_timeout:?}"
+                    ),
+                    Some(crate::error::ConnectionPhase::QuicHandshake),
+                    Some(quic_timeout),
+                )
+            })?
+            .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?;
+
+        tracing::debug!(
+            target = %format_args!("{dial_host}:{dial_port}"),
+            server_name = %server_name,
+            "quic.masque_connect_established"
+        );
+        Ok(connection)
+    }
+
+    /// Resolve the proxy, reuse or open this session's outer connection to it,
+    /// and open one CONNECT-UDP tunnel to the target.
+    ///
+    /// Split out from [`Self::connect_quic_via_masque`] so every failure between
+    /// "we have a proxy configured" and "we have a usable socket" arrives at one
+    /// place and gets classified once.
+    #[cfg(feature = "masque")]
+    #[allow(clippy::too_many_arguments)]
+    async fn open_masque_tunnel(
+        &self,
+        proxy_cfg: &crate::proxy::ProxyConfig,
+        proxy_host: &str,
+        proxy_port: u16,
+        dial_host: &str,
+        dial_port: u16,
+        client: &crate::client::Client,
+        proxy_timeout: std::time::Duration,
+    ) -> crate::error::Result<Arc<crate::proxy::MasqueUdpSocket>> {
+        let masque_config = client.masque_config();
+
+        let proxy_addr = client
+            .resolver()
+            .resolve(proxy_host, proxy_port)
+            .await
+            .map_err(|e| {
+                Error::proxy(
+                    crate::error::ProxyErrorKind::IoError,
+                    format!("MASQUE proxy {proxy_host}:{proxy_port} did not resolve: {e}"),
+                    Some(Box::new(e)),
+                )
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                Error::proxy(
+                    crate::error::ProxyErrorKind::IoError,
+                    format!("DNS resolution returned no addresses for MASQUE proxy {proxy_host}:{proxy_port}"),
+                    None,
+                )
+            })?;
+
+        let deadline = format!(
+            "MASQUE CONNECT-UDP to {dial_host}:{dial_port} through {proxy_host}:{proxy_port} \
+             timed out after {proxy_timeout:?}"
+        );
+        tokio::time::timeout(proxy_timeout, async {
+            let connection = self
+                .inner
+                .masque_pool
+                .acquire(proxy_cfg, proxy_addr, masque_config)
+                .await?;
+            connection.open_tunnel(dial_host, dial_port).await
+        })
+        .await
+        .map_err(|_| {
+            Error::timeout(
+                deadline,
+                Some(crate::error::ConnectionPhase::ProxyTunnel),
+                Some(proxy_timeout),
+            )
+        })?
+    }
+
+    /// Quarantine the right thing after a MASQUE tunnel could not be opened.
+    ///
+    /// A tunnel failure is almost always a property of the **proxy**: a dead
+    /// outer connection, a rejected credential, a proxy that does not implement
+    /// the Capsule Protocol. None of those say anything about the origin that
+    /// happened to be first in the queue, so they quarantine the *route* and
+    /// every origin behind it skips H3 for the cooldown — the same shape as
+    /// SOCKS5's `UDP ASSOCIATE` failure.
+    ///
+    /// The exception is a 4xx refusal. RFC 9298 §3.1 has the proxy resolve and
+    /// evaluate the target before answering, so a `403` means "not this
+    /// destination" from a proxy that is working perfectly. Quarantining the
+    /// route for that would cost every *other* origin its H3 path over one
+    /// blocked host, so it is recorded per-origin instead. (401 and 407 never
+    /// reach this branch: the bridge classifies both as
+    /// [`ProxyErrorKind::AuthenticationFailed`](crate::error::ProxyErrorKind::AuthenticationFailed),
+    /// which is a credential — that is, a route — problem.)
+    #[cfg(feature = "masque")]
+    fn quarantine_masque_failure(
+        &self,
+        route: &crate::protocol::RouteKey,
+        origin: &crate::alt_svc::Origin,
+        error: &Error,
+    ) {
+        use crate::error::ProxyErrorKind;
+
+        let target_specific = matches!(
+            error.as_proxy_error().map(|details| details.kind),
+            Some(ProxyErrorKind::TunnelRefused { status_code })
+                if (400..500).contains(&status_code)
+        );
+        // A misconfiguration (no trust anchors, an unusable credential shape)
+        // fails identically on every route and is fixed by editing the config,
+        // not by waiting out a cooldown.
+        let misconfigured =
+            matches!(error, Error::InvalidConfig(_)) || error.is_address_family_mismatch();
+
+        if misconfigured {
+            return;
+        }
+        if target_specific {
+            self.broken_quic_tracker()
+                .mark_broken_for_route(route, origin);
+        } else {
+            self.broken_quic_tracker()
+                .mark_route_broken(route, crate::alt_svc::BrokenReason::MasqueTunnelUnavailable);
+        }
+    }
+
     #[cfg(feature = "quic-h3")]
     fn preconnect_h3<'a>(
         &'a self,
@@ -2215,10 +2785,12 @@ impl Session {
             {
                 Ok(h3_conn) => h3_conn,
                 Err(error) => {
-                    self.broken_quic_tracker()
-                        .mark_broken_for_route(&discovery.route, &discovery.origin);
-                    self.alt_svc_cache()
-                        .clear_h3_validation_for_route(&discovery.route, &discovery.origin);
+                    if error.is_quic_handshake_failure() {
+                        self.broken_quic_tracker()
+                            .mark_broken_for_route(&discovery.route, &discovery.origin);
+                        self.alt_svc_cache()
+                            .clear_h3_validation_for_route(&discovery.route, &discovery.origin);
+                    }
                     return Err(error);
                 }
             };
@@ -2266,6 +2838,7 @@ impl Session {
                     client.h2_profile(),
                     None,
                     client.max_pending_h2_requests(),
+                    client.h2_dispatch_batch_size(),
                 )
                 .await?;
                 let mut pool = self.inner.pool.lock();
@@ -2279,10 +2852,9 @@ impl Session {
                 let mut builder = hyper::client::conn::http1::Builder::new();
                 builder.title_case_headers(true).preserve_header_case(true);
                 let (sender, conn_driver) = builder
-                    .handshake::<
-                        crate::connect::TransportStream,
-                        http_body_util::Full<bytes::Bytes>,
-                    >(conn.into_tcp_stream()?)
+                    .handshake::<crate::connect::TransportStream, crate::body::WireBody>(
+                        conn.into_tcp_stream()?,
+                    )
                     .await
                     .map_err(|e| {
                         crate::error::Error::Http(format!(
@@ -2457,6 +3029,14 @@ impl Session {
         let decision =
             pipeline::decide_protocol(preferred_http_version, &protocol_policy, &quic_discovery);
         pipeline::log_protocol_decision(&quic_discovery, &protocol_policy, decision);
+
+        if preferred_http_version == PreferredHttpVersion::Http3WithFallback
+            && !quic_discovery.should_attempt_quic()
+            && decision == pipeline::ProtocolDecision::Tcp
+            && self.inner.pool.lock().has_connection(&conn_key)
+        {
+            return Ok(());
+        }
 
         match decision {
             pipeline::ProtocolDecision::Tcp => {
@@ -3346,7 +3926,7 @@ impl SessionBuilder {
         Session {
             inner: Arc::new(SessionInner {
                 client,
-                cookie_jar: ArcSwap::from_pointee(CookieStore::new()),
+                cookie_jar: ArcSwap::from_pointee(CookieJar::default()),
                 pool: Mutex::new(pool),
                 proxy,
                 redirect_policy,
@@ -3371,6 +3951,8 @@ impl SessionBuilder {
                 https_rr_handoff: Mutex::new(HttpsRrHandoff::default()),
                 #[cfg(feature = "quic-h3")]
                 quic_in_flight: Mutex::new(std::collections::HashMap::new()),
+                #[cfg(feature = "masque")]
+                masque_pool: masque::MasquePool::default(),
             }),
         }
     }
@@ -4016,6 +4598,121 @@ mod tests {
     // AcceptEncoding — browser encoding negotiation
     // ====================================================================
 
+    // ====================================================================
+    // MASQUE failure classification
+    //
+    // The split these three pin is not cosmetic: a route quarantine takes
+    // *every* origin behind the proxy off H3 for the cooldown, and on a MASQUE
+    // route H3 is the only transport there is. Getting it wrong either strands
+    // a whole proxy over one blocked destination, or re-pays a broken proxy's
+    // tunnel timeout on every request.
+    // ====================================================================
+
+    #[cfg(feature = "masque")]
+    fn masque_route() -> (crate::proxy::ProxyConfig, crate::protocol::RouteKey) {
+        let proxy = crate::proxy::ProxyConfig::parse("masque://proxy.example.com:443").unwrap();
+        let route = crate::protocol::RouteKey::from_proxy(Some(&proxy));
+        (proxy, route)
+    }
+
+    #[test]
+    #[cfg(feature = "masque")]
+    fn a_proxy_side_tunnel_failure_quarantines_the_whole_route() {
+        let session = test_session();
+        let (_proxy, route) = masque_route();
+        let origin = crate::Origin::https("example.com", 443);
+
+        session.quarantine_masque_failure(
+            &route,
+            &origin,
+            &Error::proxy(
+                crate::error::ProxyErrorKind::TunnelRefused { status_code: 502 },
+                "proxy could not reach its upstream",
+                None,
+            ),
+        );
+
+        assert!(
+            session.broken_quic_tracker().is_route_broken(&route),
+            "a 5xx is the proxy failing on its own side and says nothing about the target"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "masque")]
+    fn a_rejected_credential_quarantines_the_whole_route() {
+        let session = test_session();
+        let (_proxy, route) = masque_route();
+        let origin = crate::Origin::https("example.com", 443);
+
+        session.quarantine_masque_failure(
+            &route,
+            &origin,
+            &Error::proxy(
+                crate::error::ProxyErrorKind::AuthenticationFailed,
+                "bad credentials",
+                None,
+            ),
+        );
+
+        assert!(
+            session.broken_quic_tracker().is_route_broken(&route),
+            "credentials belong to the route, not to whichever origin was asked for first"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "masque")]
+    fn a_blocked_destination_leaves_the_route_alone() {
+        let session = test_session();
+        let (_proxy, route) = masque_route();
+        let origin = crate::Origin::https("blocked.example.com", 443);
+        let other = crate::Origin::https("allowed.example.com", 443);
+
+        session.quarantine_masque_failure(
+            &route,
+            &origin,
+            &Error::proxy(
+                crate::error::ProxyErrorKind::TunnelRefused { status_code: 403 },
+                "this destination is not allowed",
+                None,
+            ),
+        );
+
+        assert!(
+            !session.broken_quic_tracker().is_route_broken(&route),
+            "RFC 9298 §3.1 has the proxy evaluate the target before answering, so a 4xx is \
+             about that target and must not take every other origin's only transport with it"
+        );
+        assert!(session
+            .broken_quic_tracker()
+            .is_broken_for_route(&route, &origin));
+        assert!(!session
+            .broken_quic_tracker()
+            .is_broken_for_route(&route, &other));
+    }
+
+    #[test]
+    #[cfg(feature = "masque")]
+    fn a_misconfiguration_quarantines_nothing() {
+        let session = test_session();
+        let (_proxy, route) = masque_route();
+        let origin = crate::Origin::https("example.com", 443);
+
+        session.quarantine_masque_failure(
+            &route,
+            &origin,
+            &Error::InvalidConfig("no trust anchors for the outer connection".into()),
+        );
+
+        // Waiting out a cooldown does not fix a config file, and quarantining
+        // would only hide the real message behind a second, vaguer one.
+        assert!(!session.broken_quic_tracker().is_route_broken(&route));
+        assert!(!session
+            .broken_quic_tracker()
+            .is_broken_for_route(&route, &origin));
+    }
+
     #[test]
     fn session_builder_defaults_to_strict_broken_quic_policy() {
         let session = test_client().session().build();
@@ -4205,6 +4902,228 @@ mod tests {
             session.get_cookie("https://example.com", "tracking"),
             Some("xyz789".to_string())
         );
+    }
+
+    #[test]
+    fn cookie_header_follows_chrome_order_in_every_session() {
+        // Chrome sends longer paths first, then older cookies first. The jar
+        // used to iterate in hash order, which changed from session to session.
+        for _ in 0..20 {
+            let session = test_session();
+            for set_cookie in [
+                "b=1; Path=/",
+                "a=2; Path=/",
+                "api=3; Path=/api",
+                "c=4; Path=/",
+            ] {
+                session.set_cookie_raw("https://example.com/", set_cookie);
+            }
+            assert_eq!(
+                session
+                    .cookie_header("https://example.com/api/users")
+                    .as_deref(),
+                Some("api=3; b=1; a=2; c=4")
+            );
+        }
+    }
+
+    #[test]
+    fn get_cookie_returns_the_longest_path_match() {
+        for _ in 0..20 {
+            let session = test_session();
+            session.set_cookie_raw("https://example.com/", "token=root; Path=/");
+            session.set_cookie_raw("https://example.com/", "token=api; Path=/api");
+            assert_eq!(
+                session
+                    .get_cookie("https://example.com/api/users", "token")
+                    .as_deref(),
+                Some("api")
+            );
+            assert_eq!(
+                session.get_cookie_values("https://example.com/api/users", "token"),
+                vec!["api".to_string(), "root".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn clear_cookies_resets_creation_order() {
+        let session = test_session();
+        session.set_cookie_raw("https://example.com/", "a=1; Path=/");
+        session.clear_cookies();
+        session.set_cookie_raw("https://example.com/", "b=2; Path=/");
+        session.set_cookie_raw("https://example.com/", "a=1; Path=/");
+        assert_eq!(
+            session.cookie_header("https://example.com/").as_deref(),
+            Some("b=2; a=1")
+        );
+    }
+
+    #[test]
+    fn cookies_with_attrs_reports_every_attribute() {
+        let session = test_session();
+        session.set_cookie_raw(
+            "https://example.com/api/users",
+            "sid=abc; Domain=example.com; Path=/api; Secure; HttpOnly; \
+             SameSite=Lax; Max-Age=3600",
+        );
+
+        let cookies = session.get_cookies_with_attrs("https://example.com/api/users");
+        assert_eq!(cookies.len(), 1);
+        let cookie = &cookies[0];
+        assert_eq!(cookie.name, "sid");
+        assert_eq!(cookie.value, "abc");
+        assert_eq!(cookie.domain.as_deref(), Some("example.com"));
+        // A Domain attribute was sent, so subdomains match too.
+        assert!(!cookie.host_only);
+        assert_eq!(cookie.path, "/api");
+        assert!(cookie.secure);
+        assert!(cookie.http_only);
+        assert_eq!(cookie.same_site.as_deref(), Some("Lax"));
+        assert!(cookie.is_persistent());
+        let expires = cookie.expires_unix.expect("Max-Age implies an expiry");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is not before the Unix epoch")
+            .as_secs() as i64;
+        assert!(
+            (expires - now - 3600).abs() < 60,
+            "Max-Age=3600 should land about an hour out, got {expires} vs now {now}"
+        );
+    }
+
+    #[test]
+    fn cookies_with_attrs_tells_same_name_cookies_apart() {
+        // The reason name/value alone is not enough: both entries below are
+        // named `token`, and only the path says which is which.
+        let session = test_session();
+        session.set_cookie_raw("https://example.com/", "token=root_val; Path=/");
+        session.set_cookie_raw("https://example.com/api", "token=api_val; Path=/api");
+
+        let cookies = session.get_cookies_with_attrs("https://example.com/api/users");
+        let mut by_path: Vec<(String, String)> = cookies
+            .iter()
+            .filter(|c| c.name == "token")
+            .map(|c| (c.path.clone(), c.value.clone()))
+            .collect();
+        by_path.sort();
+        assert_eq!(
+            by_path,
+            vec![
+                ("/".to_string(), "root_val".to_string()),
+                ("/api".to_string(), "api_val".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_cookie_has_no_expiry_and_is_not_persistent() {
+        let session = test_session();
+        session.set_cookie_raw("https://example.com", "sid=abc; Path=/");
+
+        let cookies = session.get_cookies_with_attrs("https://example.com/");
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].expires_unix, None);
+        assert!(!cookies[0].is_persistent());
+    }
+
+    #[test]
+    fn host_only_is_set_when_no_domain_attribute_was_sent() {
+        let session = test_session();
+        session.set_cookie_raw("https://example.com", "a=1; Path=/");
+        session.set_cookie_raw("https://example.com", "b=2; Path=/; Domain=example.com");
+
+        let cookies = session.get_cookies_with_attrs("https://example.com/");
+        let host_only: Vec<(String, bool)> = {
+            let mut v: Vec<(String, bool)> = cookies
+                .iter()
+                .map(|c| (c.name.clone(), c.host_only))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            host_only,
+            vec![("a".to_string(), true), ("b".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn all_cookies_spans_domains_while_url_lookup_does_not() {
+        let session = test_session();
+        session.set_cookie("https://a.example.com", "ka", "va");
+        session.set_cookie("https://b.example.com", "kb", "vb");
+
+        let mut all: Vec<String> = session
+            .get_all_cookies()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["ka".to_string(), "kb".to_string()]);
+
+        // The per-URL view stays scoped to the origin it was asked about.
+        let scoped: Vec<String> = session
+            .get_cookies_with_attrs("https://a.example.com/")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(scoped, vec!["ka".to_string()]);
+    }
+
+    #[test]
+    fn cookies_with_attrs_round_trip_into_a_fresh_session() {
+        // The acceptance test for the whole feature: what comes out of one jar
+        // must be enough to rebuild it, so that the second session sends the
+        // same `Cookie` header as the first.
+        let source = test_session();
+        source.set_cookie_raw(
+            "https://example.com/api",
+            "sid=abc; Domain=example.com; Path=/api; Secure; HttpOnly; SameSite=Lax",
+        );
+        source.set_cookie_raw("https://example.com/", "pref=dark; Path=/");
+        source.set_cookie_raw("https://example.com/", "lang=en; Path=/");
+
+        let restored = test_session();
+        for cookie in source.get_all_cookies() {
+            let mut header = format!("{}={}", cookie.name, cookie.value);
+            if !cookie.host_only {
+                if let Some(domain) = &cookie.domain {
+                    header.push_str(&format!("; Domain={domain}"));
+                }
+            }
+            header.push_str(&format!("; Path={}", cookie.path));
+            if cookie.secure {
+                header.push_str("; Secure");
+            }
+            if cookie.http_only {
+                header.push_str("; HttpOnly");
+            }
+            if let Some(same_site) = &cookie.same_site {
+                header.push_str(&format!("; SameSite={same_site}"));
+            }
+            // A host-only cookie must be re-seeded from a URL on that host, so
+            // that the jar derives HostOnly rather than a Domain suffix.
+            let origin = format!(
+                "https://{}/",
+                cookie.domain.as_deref().unwrap_or("example.com")
+            );
+            restored.set_cookie_raw(&origin, &header);
+        }
+
+        let url = "https://example.com/api/users";
+
+        // Same cookies, same attributes, same order: `get_all_cookies` lists
+        // them oldest first, so the restore reproduces the creation order.
+        assert_eq!(
+            source.get_cookies_with_attrs(url),
+            restored.get_cookies_with_attrs(url)
+        );
+        assert_eq!(
+            source.cookie_header(url).as_deref(),
+            Some("sid=abc; pref=dark; lang=en")
+        );
+        assert_eq!(source.cookie_header(url), restored.cookie_header(url));
     }
 
     #[test]
@@ -4520,7 +5439,7 @@ mod tests {
         /// Transport parameters Quinn encodes itself. An *extra* TP carrying one
         /// of these ids is rejected by `extra_transport_parameters` with
         /// `LocallyEncoded`, failing connection setup. Kept in sync with
-        /// `deps/quinn/quinn-proto/src/config.rs::is_locally_encoded_transport_parameter`.
+        /// `deps/quinn/quinn-proto/src/config/transport.rs::is_locally_encoded_transport_parameter`.
         const LOCALLY_ENCODED: &[u64] = &[
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x20, 0xb6, 0x2ab2, 0xff04de1a,
@@ -4539,19 +5458,177 @@ mod tests {
         }
 
         #[test]
-        fn grease_id_is_reserved_pattern_8byte_and_never_locally_encoded() {
-            // Boundary + adversarial inputs, including the value (5) that the old
-            // `27 + 31*k` generator mapped to 0xb6, a Quinn-local TP.
+        fn chromium_profiles_randomize_grease_payload_length_and_version_position() {
+            for profile in [
+                lkh3::chrome_146_quic(),
+                lkh3::chrome_150_quic(),
+                lkh3::chrome_151_quic(),
+                lkh3::chrome_152_quic(),
+                lkh3::chrome_153_quic(),
+                lkh3::chrome_154_quic(),
+            ] {
+                let mut saw_real_version_first = false;
+                for random_byte in 0..=15 {
+                    let mut extra = decode_extra_transport_parameters(
+                        &profile.transport_params.extra_transport_parameters,
+                    )
+                    .unwrap();
+                    let mut order = decode_transport_parameter_order(
+                        &profile.transport_params.transport_parameter_order,
+                    )
+                    .unwrap();
+                    randomize_quic_grease_params_with_random_bytes(
+                        &mut extra,
+                        &mut order,
+                        profile.transport_params.randomize_grease_shape,
+                        |bytes| bytes.fill(random_byte),
+                    );
+                    let reserved = extra
+                        .iter()
+                        .find(|(id, _)| id.into_inner() >= 27 && (id.into_inner() - 27) % 31 == 0)
+                        .unwrap();
+                    assert_eq!(reserved.1.len(), random_byte as usize);
+                    assert!(order.contains(&reserved.0));
+                    let versions = &extra
+                        .iter()
+                        .find(|(id, _)| id.into_inner() == 0x11)
+                        .unwrap()
+                        .1;
+                    saw_real_version_first |= versions[4..8] == [0, 0, 0, 1];
+                }
+                assert!(
+                    saw_real_version_first,
+                    "Chromium varies the GREASE version position"
+                );
+            }
+        }
+
+        #[test]
+        fn chrome153_grease_shape_covers_length_and_version_position_boundaries() {
+            for (random_byte, expected_length, grease_offset) in [(0, 0, 4), (15, 15, 8)] {
+                let reserved = vi(0x17af394a4ef8da0a);
+                let mut extra = vec![(vi(0x11), version_info_value()), (reserved, vec![0; 3])];
+                let mut order = vec![reserved, vi(0x11)];
+                randomize_quic_grease_params_with_random_bytes(
+                    &mut extra,
+                    &mut order,
+                    true,
+                    |bytes| bytes.fill(random_byte),
+                );
+                assert_eq!(extra[1].1.len(), expected_length);
+                assert_eq!(order[0], extra[1].0);
+                assert!(!order.contains(&reserved));
+                assert_eq!(&extra[0].1[..4], &[0, 0, 0, 1]);
+                assert_eq!(&extra[0].1[grease_offset..grease_offset + 4], &[0x0a; 4]);
+                let real_offset = if grease_offset == 4 { 8 } else { 4 };
+                assert_eq!(&extra[0].1[real_offset..real_offset + 4], &[0, 0, 0, 1]);
+            }
+        }
+
+        #[test]
+        fn chrome153_grease_shape_preserves_real_versions_and_malformed_values() {
+            let chosen = [0x12, 0x34, 0x56, 0x78];
+            for available in [
+                vec![[0, 0, 0, 1], [0x0a; 4], [0x6b, 0x33, 0x43, 0xcf], [0x2a; 4]],
+                vec![[0, 0, 0, 1], [0x6b, 0x33, 0x43, 0xcf]],
+            ] {
+                let mut value = chosen.to_vec();
+                value.extend(available.into_iter().flatten());
+                let mut extra = vec![(vi(0x11), value)];
+                randomize_quic_grease_params_with_random_bytes(
+                    &mut extra,
+                    &mut [],
+                    true,
+                    |bytes| bytes.fill(0),
+                );
+                assert_eq!(
+                    extra[0].1,
+                    vec![
+                        0x12, 0x34, 0x56, 0x78, 0x0a, 0x0a, 0x0a, 0x0a, 0, 0, 0, 1, 0x6b, 0x33,
+                        0x43, 0xcf
+                    ],
+                );
+            }
+            for length in (0..18).filter(|length| *length < 8 || length % 4 != 0) {
+                let value = vec![0x31; length];
+                let mut extra = vec![(vi(0x11), value.clone())];
+                randomize_quic_grease_params_with_random_bytes(&mut extra, &mut [], true, |_| {
+                    panic!("malformed versions must not consume randomness")
+                });
+                assert_eq!(extra[0].1, value);
+            }
+        }
+
+        #[test]
+        fn chrome153_grease_shape_opt_out_preserves_legacy_bounds_and_positions() {
+            for (random_byte, expected_length) in [(0, 1), (15, 16)] {
+                let mut extra = vec![
+                    (vi(0x11), version_info_value()),
+                    (vi(0x17af394a4ef8da0a), Vec::new()),
+                ];
+                randomize_quic_grease_params_with_random_bytes(
+                    &mut extra,
+                    &mut [],
+                    false,
+                    |bytes| bytes.fill(random_byte),
+                );
+                assert_eq!(extra[1].1.len(), expected_length);
+                assert_eq!(&extra[0].1[..4], &[0, 0, 0, 1]);
+                assert_eq!(&extra[0].1[4..8], &[0x0a; 4]);
+                assert_eq!(&extra[0].1[8..12], &[0, 0, 0, 1]);
+            }
+        }
+
+        #[test]
+        fn randomized_grease_id_uses_full_chromium_range() {
+            for (random, expected_id) in [
+                (0u64, 0x1b),
+                (155, 0xd5), // 0xb6 is reserved but encoded locally by Quinn.
+                (0x1234_5678_9abc_def0, 0x1234_5678_9abc_defc),
+                (0x3fff_ffff_ffff_ffe0, 0x3fff_ffff_ffff_fff8),
+                (0x3fff_ffff_ffff_ffe1, 0x1b),
+                (u64::MAX, 0x78),
+            ] {
+                let old_id = vi(0x17af394a4ef8da0a);
+                let mut extra = vec![(old_id, Vec::new())];
+                let mut order = vec![old_id];
+                randomize_quic_grease_params_with_random_bytes(
+                    &mut extra,
+                    &mut order,
+                    true,
+                    |bytes| {
+                        if bytes.len() == 8 {
+                            bytes.copy_from_slice(&random.to_le_bytes());
+                        } else {
+                            bytes.fill(0);
+                        }
+                    },
+                );
+                assert_eq!(extra[0].0.into_inner(), expected_id, "random {random:#x}");
+                assert_eq!(order, vec![extra[0].0]);
+                quinn::TransportConfig::default()
+                    .extra_transport_parameters(extra)
+                    .expect("generated GREASE id must be accepted by the QUIC backend");
+            }
+        }
+
+        #[test]
+        fn grease_id_is_reserved_pattern_and_never_locally_encoded() {
             let samples = [
-                0u32,
+                0u64,
                 1,
                 2,
                 5,
                 31,
+                155,
+                185,
                 1000,
-                u32::MAX / 2,
-                u32::MAX - 1,
-                u32::MAX,
+                u32::MAX as u64,
+                (1 << 62) - 32,
+                (1 << 62) - 31,
+                u64::MAX / 2,
+                u64::MAX - 1,
+                u64::MAX,
             ];
             for &r in &samples {
                 let id = grease_reserved_tp_id(r).into_inner();
@@ -4559,10 +5636,6 @@ mod tests {
                     (id - 27) % 31,
                     0,
                     "id {id:#x} must be reserved-pattern 31*N+27"
-                );
-                assert!(
-                    id >= (1 << 30),
-                    "id {id:#x} must encode as an 8-byte varint (>= 2^30)"
                 );
                 assert!(
                     id < (1u64 << 62),
@@ -4580,6 +5653,37 @@ mod tests {
             // Regression: `27 + 31*5 == 0xb6` (a Quinn-local TP) in the old
             // generator. The remapped generator must never produce it.
             assert_ne!(grease_reserved_tp_id(5).into_inner(), 0xb6);
+            for random in 155..186 {
+                let id = grease_reserved_tp_id(random);
+                assert_eq!(id.into_inner(), 0xd5);
+                quinn::TransportConfig::default()
+                    .extra_transport_parameters(vec![(id, Vec::new())])
+                    .expect("reserved IDs must not collide with Quinn-local parameters");
+            }
+        }
+
+        #[test]
+        fn grease_id_encodes_full_varint_width_range() {
+            for (random, expected) in [
+                (0, vec![0x1b]),
+                (62, vec![0x40, 0x59]),
+                (16_384, vec![0x80, 0x00, 0x40, 0x0b]),
+                (
+                    0x1234_5678_9abc_def0,
+                    vec![0xd2, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xfc],
+                ),
+                (
+                    0x3fff_ffff_ffff_ffe0,
+                    vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8],
+                ),
+            ] {
+                let mut encoded = Vec::new();
+                lktls::extensions::quic_transport_params::encode_varint(
+                    grease_reserved_tp_id(random).into_inner(),
+                    &mut encoded,
+                );
+                assert_eq!(encoded, expected, "random {random:#x}");
+            }
         }
 
         #[test]
@@ -4592,7 +5696,7 @@ mod tests {
                     (vi(0x3127), vec![0x80, 0x09, 0xdf, 0x94]), // google_initial_rtt
                 ];
                 let mut order = vec![vi(0x03), vi(0x11), grease, vi(0x3127), vi(0x07)];
-                randomize_quic_grease_params(&mut extra, &mut order);
+                randomize_quic_grease_params(&mut extra, &mut order, false);
 
                 let new_id = extra[1].0;
                 assert_ne!(new_id, grease, "GREASE id must be rerandomized");
@@ -4629,7 +5733,7 @@ mod tests {
             for _ in 0..100 {
                 let mut extra = vec![(grease, vec![0])];
                 let mut order = vec![grease];
-                randomize_quic_grease_params(&mut extra, &mut order);
+                randomize_quic_grease_params(&mut extra, &mut order, false);
                 assert_eq!(extra[0].1.len(), 1);
                 assert_ne!(extra[0].0, grease);
                 assert_eq!(order, vec![extra[0].0]);
@@ -4641,7 +5745,7 @@ mod tests {
             for _ in 0..2_000 {
                 let mut extra = vec![(vi(0x11), version_info_value())];
                 let mut order = vec![vi(0x11)];
-                randomize_quic_grease_params(&mut extra, &mut order);
+                randomize_quic_grease_params(&mut extra, &mut order, false);
                 let v = &extra[0].1;
                 assert_eq!(v.len(), 12, "length unchanged");
                 assert_eq!(

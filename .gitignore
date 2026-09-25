@@ -4,8 +4,10 @@
 **/target/
 # Local release-build output (e.g. FFI DLLs assembled to mirror CI artifacts)
 /artifacts/
+/benchmark-results/
+**/__pycache__/
+*.pyc
 .DS_Store
-/docs
 /.cursor
 /.vscode
 /.idea
@@ -20,3 +22,6 @@ CLAUDE.md
 /scripts
 # Captured fingerprint output from the peet_ws_fingerprint example (throwaway)
 /tlsleak/
+
+# Local debugging scratch: contains live proxy credentials, must never be committed.
+/lkrequest/examples/basic_proxy.rs

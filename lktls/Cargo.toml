@@ -1,8 +1,15 @@
 [package]
 name = "lktls"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Sans-I/O TLS fingerprint protocol engine for lkrequest"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/lktls"
+keywords = ["tls", "fingerprint", "clienthello", "browser", "sans-io"]
+categories = ["cryptography", "network-programming"]
 
 [dependencies]
 aws-lc-rs = { workspace = true }

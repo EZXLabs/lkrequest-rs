@@ -264,18 +264,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ═══════════════════════════════════════════════════════════════════════
     println!("\n=== 6. Health checking (static proxies, TCP probe) ===\n");
 
+    // `HealthCheckConfig` is `#[non_exhaustive]` — its MASQUE fields only exist
+    // with the `masque` feature — so it is built from `Default` and adjusted,
+    // never with a struct literal.
+    let mut health_check = lkrequest::proxy_pool::HealthCheckConfig::default();
+    health_check.interval = Duration::from_secs(60);
+    health_check.timeout = Duration::from_secs(5);
+    health_check.target_host = "www.google.com".into();
+    health_check.target_port = 443;
+
     let _monitored_pool = ProxyPool::builder()
         .proxies(vec![
             ProxyConfig::parse("socks5://user:pass@monitored-1.example.com:1080")?,
             ProxyConfig::parse("socks5://user:pass@monitored-2.example.com:1080")?,
         ])
         .max_proxies(10)
-        .health_check(lkrequest::proxy_pool::HealthCheckConfig {
-            interval: Duration::from_secs(60),
-            timeout: Duration::from_secs(5),
-            target_host: "www.google.com".into(),
-            target_port: 443,
-        })
+        .health_check(health_check)
         .bad_proxy_config(BadProxyConfig {
             failure_threshold: 2,
             window: Duration::from_secs(30),

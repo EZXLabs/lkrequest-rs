@@ -61,6 +61,8 @@ pub struct MiddlewareRequest {
     /// Request headers.
     pub headers: HeaderMap,
     /// Request body (if any).  Uses `Bytes` for zero-copy sharing.
+    /// Streaming uploads expose `None` here without reading their source.
+    /// Setting `Some(bytes)` replaces the streaming upload with buffered bytes.
     pub body: Option<Bytes>,
 }
 
@@ -133,6 +135,23 @@ pub(crate) fn apply_request_middlewares(
 ) -> Result<MiddlewareRequest> {
     for mw in stack {
         ctx = mw.on_request(ctx)?;
+    }
+    Ok(ctx)
+}
+
+pub(crate) fn apply_upload_middlewares(
+    stack: &[std::sync::Arc<dyn Middleware>],
+    mut ctx: MiddlewareRequest,
+    stream: &mut Option<crate::body::RequestBody>,
+) -> Result<MiddlewareRequest> {
+    if stream.is_none() {
+        return apply_request_middlewares(stack, ctx);
+    }
+    for middleware in stack {
+        ctx = middleware.on_request(ctx)?;
+        if ctx.body.is_some() {
+            *stream = None;
+        }
     }
     Ok(ctx)
 }

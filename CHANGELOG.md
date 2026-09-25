@@ -6,7 +6,398 @@ All important changes to this project will be documented in this file.
 
 ## Unreleased
 
-No unreleased changes yet.
+### Features
+
+- Add Rust `ClientBuilder::ip_family(IpFamily::{Any, Ipv4, Ipv6})` for local
+  TCP/QUIC candidate filtering, with explicit address-family errors that do not
+  trigger proxy-to-direct fallback. Add `connect_to(host, port, address)` to
+  override a dial target while preserving the origin's TLS and HTTP identity,
+  including through HTTP CONNECT. The family restriction is local-only:
+  DNS/DoH query transport and proxy-resolved target addresses are not constrained.
+  A remote-DNS proxy can still connect to IPv6 targets with `Ipv4` selected;
+  `connect_to` is an optional caller-maintained IP mapping for those targets.
+  Python and C ABI configuration are unchanged.
+
+- **Chrome 154 fingerprint preset** — Adds `chrome_154` across TLS, H2,
+  QUIC/H3, the high-level Rust preset, FFI, synthesis, profile collection, and
+  fingerprint regression fixtures. Public Cloudflare captures from Chrome
+  154.0.8037.58 on Windows verify that TCP TLS, H2, QUIC TLS, QUIC transport
+  parameters, and Chromium Initial packetization retain Chrome 153's stable
+  shape. H3 application settings retain the completed Chrome 153 navigation
+  baseline because the current public capture path received no QUIC response.
+
+- **Firefox 156 fingerprint preset** — Adds capture-verified `firefox_156`
+  TLS and H2 profiles to the Rust and FFI APIs. Firefox 156.0.1 removes two
+  ECDSA CBC suites and both FFDHE groups from Firefox 147 and switches ECH
+  GREASE to AES-128-GCM; its H2 fingerprint remains unchanged. QUIC/H3 stays
+  disabled because the current stack cannot yet reproduce several observed
+  Firefox transport and Initial-packet fields exactly.
+
+### Fixes
+
+- Preserve MASQUE tunnel errors and retry eligibility after temporary datagram
+  capacity failures in streaming requests and preconnect, matching buffered
+  requests. Streaming requests no longer attempt TCP fallback through a MASQUE
+  proxy. Fix IPv4 target selection in the FFI MASQUE relay fixture and stabilize
+  the PMTU regression tests with a bounded probe gate.
+
+## lkrequest 0.2.3
+
+### Upgrade from 0.2.2
+
+This release contains Rust source-level breaking changes despite its patch
+version. Cargo may select it automatically for a `^0.2.2` requirement, so
+downstream crates using the APIs below should update their source before
+upgrading:
+
+- Replace `ProxyConfig { scheme, auth, chain }` literals with
+  `ProxyConfig::new(scheme)` or `ProxyConfig::parse(url)`, then set credentials
+  and chain through the existing fields or setters. `ProxyConfig` now has new
+  authentication fields and is `#[non_exhaustive]`.
+- Replace `HealthCheckConfig { ..., ..Default::default() }` literals with
+  `let mut health = HealthCheckConfig::default();` followed by field assignments.
+  It is now `#[non_exhaustive]`.
+- Complete `H3Profile`, `QuicTransportParams`, and `QuicPacketizationProfile`
+  literals need the new `chromium_grease`, `randomize_grease_shape`, and
+  `initial_packet_chaos` fields, respectively. Set them to `false` to retain
+  the previous custom-profile behavior. Old serialized profiles still load.
+- With the new `masque` feature enabled, exhaustive `ProxyScheme` matches need
+  a `Masque` arm. The feature is experimental and off by default.
+
+### Features
+
+- **MASQUE CONNECT-UDP proxies (experimental)** — A `masque://` proxy now carries a
+  QUIC/HTTP-3 connection to the target over an outer HTTP/3 connection: RFC
+  9298 (Proxying UDP in HTTP) on top of RFC 9297 (HTTP Datagrams and the
+  Capsule Protocol). It is the UDP counterpart of the existing SOCKS5 UDP
+  ASSOCIATE path. Behind the new `masque` feature, which is off by default and
+  implies `quic-h3`. MASQUE-specific APIs and proxy interoperability may change
+  while validation against independent proxy implementations is pending;
+  without the feature a `masque://` URL is rejected by
+  `ProxyConfig::parse` with an error naming the feature, rather than parsed
+  into a configuration every request would fail on. The proxy must support
+  HTTP/3 *and* HTTP Datagrams; the port defaults to 443, and the target is
+  encoded in the CONNECT-UDP path, so the route resolves DNS remotely like
+  `socks5h`.
+
+  The wire format and the tunnel state machine live in a new crate,
+  **`lkmasque`**: varint and two-layer HTTP Datagram coding, a
+  `QuarterStreamId` newtype, minimal Capsule framing, URI Template expansion,
+  the two independent payload size limits, and a `TunnelTable` that
+  demultiplexes connection-level datagrams. It performs no I/O, reads no clock
+  and depends only on `thiserror`, so it is usable on its own — from another
+  QUIC stack, to implement a MASQUE endpoint, or to debug framing. The I/O
+  bridge stays in `lkrequest` (`proxy::masque`), because it can only be built
+  against this workspace's patched `h3` and `quinn` forks; it presents each
+  tunnel to the inner QUIC stack as a `quinn::AsyncUdpSocket`, so the inner
+  connection never learns it is tunneled.
+
+  One outer connection per (session, proxy identity) multiplexes as many
+  tunnels as the session needs, and that sharing stops at the session boundary
+  so a proxy cannot correlate identities the client separated on purpose.
+  `ClientBuilder::masque` takes the whole `MasqueOuterConfig` (bind address,
+  SNI, trust anchors, certificate verification, ALPN);
+  `masque_tunnel_idle_timeout` (default 120s, `None`
+  disables idle reclamation) and `masque_max_idle_tunnels` (default 256, `0`
+  removes the cap) are the two tunnel-lifecycle knobs.
+
+  The outer hop's certificate verification is configured separately from the
+  origin's, and never inherits from it: a debugging CA or a relaxed `verify`
+  meant for one hop must not silently become the trust decision for the other.
+  `MasqueOuterConfig::add_ca_certs_pem` loads a private CA from the PEM bundle
+  it is actually distributed as (`extra_roots` is DER), reporting a malformed
+  bundle — or one holding no certificate — as `Error::InvalidConfig` rather
+  than leaving the trust store silently unchanged. `MasqueOuterConfig::verify`
+  (default `true`) is the development-only escape hatch that skips outer
+  certificate verification entirely; with it off, anything answering on the
+  proxy's address terminates the outer TLS connection and sees every tunnel's
+  CONNECT-UDP target, so that hop is fully open to a man in the middle.
+  `ClientBuilder` mirrors the cluster field by field —
+  `masque_add_ca_certs_pem` (fallible), `masque_add_ca_cert_der`,
+  `masque_use_native_certs`, `masque_server_name`, `masque_verify` — so
+  changing one setting no longer means constructing the whole struct. The
+  CONNECT-UDP health-check probe takes its trust anchors from the same
+  configuration.
+
+  Three known limitations:
+
+  1. **DNS-discovered ECH configs and H3 hints are unavailable on a MASQUE
+     route.** It is a remote-DNS route, so no local HTTPS/SVCB query is made
+     for the target — the same reason as `socks5h`, and for the same purpose:
+     the query would leak the target hostname out-of-band from the proxy.
+     Explicitly configured ECH (`ClientBuilder::ech_config`,
+     `SessionBuilder::ech_config`) still applies.
+  2. **The outer connection is not a browser fingerprint.** It uses quinn's own
+     rustls defaults with ALPN `h3`, so an observer on the path can tell it is
+     not a browser. The inner fingerprint the origin sees is unaffected.
+  3. **UDP only.** With a MASQUE proxy configured, HTTP/1.1 and HTTP/2 requests
+     (including cleartext `http://` targets) fail with an explicit proxy
+     protocol error naming HTTP CONNECT or SOCKS5 as the alternative — never a
+     silent direct connection. A failed tunnel does not fall back to a direct
+     connection either, even with `proxy_fallback_direct` enabled, because that
+     would leak the source address the tunnel exists to hide.
+
+  Tunnel failures are classified and quarantined: 401/407 as
+  `ProxyErrorKind::AuthenticationFailed`, other 4xx/5xx as
+  `ProxyErrorKind::TunnelRefused { status_code }`. A 4xx refusal is recorded
+  per-origin (RFC 9298 §3.1 has the proxy evaluate the target, so a `403` means
+  "not this destination" from a working proxy); everything else quarantines the
+  whole route as `BrokenReason::MasqueTunnelUnavailable`, kept distinct from
+  SOCKS5's `ProxyUdpUnavailable`. MASQUE is rejected as a proxychain hop:
+  nested tunnels shrink the usable MTU, which is already bounded by the outer
+  datagram limit.
+
+- **`ProxyCredential`: proxy credentials beyond username/password** — Proxy
+  authentication is now an enum. `ProxyCredential::UserPass` is what the URL
+  form and `ProxyConfig::auth` have always produced (`Basic` on header proxies,
+  the RFC 1929 sub-negotiation on SOCKS5). `ProxyCredential::Http { scheme,
+  credentials }`, set with `ProxyConfig::with_http_auth`, carries a static HTTP
+  auth-scheme plus already-encoded credentials — `Preshared`, `PrivateToken`,
+  `Bearer` and the like. `ProxyCredential::Custom`, set with
+  `with_custom_auth`, takes a `ProxyAuthenticator` that computes the
+  authorization value per attempt; it is Rust-only, because a trait object
+  cannot cross the C ABI.
+
+  `ProxyAuthHeader` selects the field name, because there is no interoperable
+  answer: RFC 9298 does not specify proxy authentication at all, several
+  deployments read `Proxy-Authorization` (the default) and masque-go's
+  documented example and RFC 9484 §11 use `Authorization`. `ProxyConfig::auth`
+  keeps working unchanged and is now sugar for `UserPass`; setting both `auth`
+  and `credential` is rejected by `validate`, as is a header credential on a
+  SOCKS5 proxy, which has no way to carry one.
+
+- **Opt-in CONNECT-UDP health-check probe** — `HealthCheckConfig` gained
+  `tunnel_probe` and `masque_outer_config` under the `masque` feature. The
+  ordinary check establishes a TCP connection and calls the proxy alive, which
+  for a MASQUE proxy proves nothing: a reachable TCP port says nothing about
+  HTTP Datagram support, `connect-udp` acceptance, or the credentials. So by
+  default MASQUE proxies are skipped by the active checker entirely — neither
+  credited nor blamed, and never blacklisted by it. With `tunnel_probe` on
+  *and* an outer config supplied, each one gets a real probe: outer HTTP/3
+  connection, one CONNECT-UDP tunnel to the health-check target, verified ready
+  (2xx, and not in violation of RFC 9297 §3.2), then closed. `tunnel_probe` on with
+  `masque_outer_config` left `None` skips too, with a `warn`: probing a proxy
+  fronted by a private CA against guessed trust anchors would fail the
+  handshake and blacklist a healthy proxy, and a false negative there is worse
+  than not checking at all.
+
+- **MASQUE outer configuration on the C ABI** — `lkrequest-ffi` gained
+  `lk_masque_config_t`, an opaque handle built with `lk_masque_config_new` and
+  released with `lk_masque_config_free`, plus
+  `lk_masque_config_add_ca_certs_pem` (a bundle, reporting how many
+  certificates it loaded), `lk_masque_config_add_ca_cert_der`,
+  `lk_masque_config_set_use_native_certs`, `lk_masque_config_set_verify`,
+  `lk_masque_config_set_server_name`,
+  `lk_masque_config_set_tunnel_idle_timeout` and
+  `lk_masque_config_set_max_idle_tunnels`. Two entry points consume it —
+  `lk_client_builder_set_masque_config` for the request path, and
+  `lk_proxy_pool_builder_set_masque_tunnel_probe` /
+  `lk_session_pool_builder_set_masque_tunnel_probe` for the health check's
+  CONNECT-UDP probe — and both copy the settings, so one handle can feed both
+  and is freed once.
+
+  This fixes the C side of the false negative above: a MASQUE proxy fronted by
+  a private CA could not be named as trusted from C at all, so the probe
+  verified it against the operating system's store, failed the handshake and
+  blacklisted a working proxy. The probe setter is order-independent with
+  respect to `set_health_check`; configuring it with no health check at all is
+  reported by `build` as `LK_ERR_INVALID_CONFIG` rather than silently never
+  probing.
+
+  `lk_masque_config_set_verify` is the last resort rather than the private-CA
+  answer — the anchors above are, and they keep the hop authenticated. It
+  exists because the false negative is not language-specific: a C caller facing
+  a certificate that cannot be made to verify at all would otherwise have only
+  the blacklisted-healthy-proxy outcome and no way out of it, while a Rust
+  caller has `masque_verify(false)`. It carries the same risk as the Rust
+  switch, and is independent of `lk_client_builder_set_verify`, which governs
+  the hop to the origin.
+
+  All of these symbols require the `masque` feature; without it they exist but
+  refuse, so the header does not change shape with a Cargo feature.
+
+- **Readable cookie attributes** — Added `CookieInfo` plus
+  `Session::get_cookies_with_attrs(url)` and `Session::get_all_cookies()`, and
+  the same two on the blocking `Session`. `get_cookies` returns `(name, value)`
+  pairs, which cannot distinguish two cookies that share a name at different
+  paths: the jar holds both, and only the attributes say which is which. The
+  new view carries `name`, `value`, `domain`, `host_only`, `path`, `secure`,
+  `http_only`, `same_site` and `expires_unix`, which is what a caller needs to
+  hand a jar to a browser automation context, to persist a login and tell
+  session cookies from persistent ones, and to work out why a cookie the jar
+  holds was not sent. `get_cookies_with_attrs` is scoped to a URL like
+  `get_cookies`; `get_all_cookies` spans every domain and skips expired
+  entries, which is the view to persist.
+
+  `CookieInfo` owns every field and reports `expires_unix` as a Unix timestamp
+  rather than an `OffsetDateTime`, so the cookie store's types stay out of the
+  public API and the shape maps directly onto the language bindings.
+
+  `get_all_cookies` lists cookies oldest first, so setting them into a fresh
+  session in that order reproduces the same `Cookie` headers.
+
+- **Chrome 153 TLS / H2 / QUIC preset** — Captured from Chrome 153.0.8010.37
+  on Windows with Wireshark against Cloudflare on September 15, 2026. TCP TLS
+  retains signature-algorithm GREASE and reduces the shuffled `0xca34`
+  trust-anchor identifier set from 32 to 28 values, removing `d6790902`,
+  `d6790903`, `d6790909`, and `d679090e`. H2 retains the verified Chrome 152
+  SETTINGS, connection window, pseudo-header order, and initial HEADERS
+  priority. QUIC retains the classic nine signature algorithms, shuffled
+  ClientHello extensions, and the 28 trust-anchor identifiers. A completed H3
+  navigation returned HTTP 200 with SETTINGS `1=65536`, `6=262144`, `7=100`,
+  and `51=1`, plus GREASE and navigation priority `u=0, i`. The reserved
+  transport-parameter payload remains randomized.
+- **Chromium QUIC wire generation** — Chrome 146 and 150–153 presets now use
+  Chromium's generation rules for three randomized parts of the H3/QUIC wire
+  image. H3 sends a random reserved SETTINGS id/value, a 0–3 byte
+  control-stream GREASE frame, and no request-stream GREASE
+  (`H3Profile::chromium_grease`). Reserved transport parameters use the full
+  62-bit GREASE id space with 0–15 byte payloads and a randomized GREASE
+  version position. Client Initials split, pad, and shuffle CRYPTO data with
+  interleaved PING/PADDING per connection
+  (`QuicPacketizationProfile::initial_packet_chaos`), including across loss,
+  Retry, and 0-RTT. All three new profile fields default to `false`, so custom and
+  previously serialized profiles keep their existing behavior. The patches live
+  in the `deps/h3` and `deps/quinn` forks on `lkrequest-patches`.
+
+### Breaking changes
+
+- **Custom H3/QUIC profile struct literals need new fields** — `H3Profile`,
+  `QuicTransportParams`, and `QuicPacketizationProfile` now have
+  `chromium_grease`, `randomize_grease_shape`, and `initial_packet_chaos`,
+  respectively. External code that constructs these structs with complete
+  literals must add the corresponding field (usually `false`). Existing
+  serialized profiles still deserialize because all three fields have Serde
+  defaults; presets supply their own values. Code that starts with a preset or
+  `QuicPacketizationProfile::default()` and mutates fields is unaffected.
+
+- **`ProxyConfig` is `#[non_exhaustive]`** — A struct literal no longer
+  compiles outside the crate. Build one with `ProxyConfig::parse` (a URL),
+  `ProxyConfig::parse_chain` (a proxychain) or the new
+  `ProxyConfig::new(scheme)` (a `ProxyScheme` already in hand), then layer the
+  rest on with the chaining setters (`with_user_pass`, `with_http_auth`,
+  `with_custom_auth`, `with_auth_header`, `through`). There is deliberately no
+  `Default`: every `ProxyScheme` carries a host and a port, and no address
+  could stand in for them without inventing one. The fields stay public and
+  readable/writable — sealing applies only to literals, so `config.auth = …`
+  style mutation keeps working. Proxy authentication is still an open-ended
+  area (`credential` and `auth_header` were themselves added here), and this
+  keeps the next field from being a breaking change for every downstream crate.
+
+  Enabling `masque` also adds `ProxyScheme::Masque`; exhaustive matches on
+  `ProxyScheme` need another arm when that feature is active.
+
+- **`HealthCheckConfig` is `#[non_exhaustive]`** — A struct literal no longer
+  compiles outside the crate, and `..Default::default()` does not rescue it
+  either. Build one from `HealthCheckConfig::default()` and assign the fields
+  that matter, e.g. `health.interval = …; health.target_host = …;`.
+
+  Its MASQUE fields exist only with the `masque` feature, so a literal would
+  otherwise have to name a different set of fields depending on which features
+  the final binary happens to turn on — something a downstream crate cannot
+  control. `BadProxyConfig` is unaffected.
+
+- **`MasqueOuterConfig` is `#[non_exhaustive]`** — A struct literal no longer
+  compiles outside the crate, `..Default::default()` included. Build one from
+  `MasqueOuterConfig::default()` and assign the fields that matter, or use the
+  per-field `ClientBuilder::masque_*` setters, which need no struct at all.
+
+  This is the growing end of the MASQUE surface, and it is sealed while that is
+  still free: `verify` arrived after the rest, the C ABI entry points below
+  want more, and challenge-based proxy authentication will want more again.
+  MASQUE ships in this release, so no downstream literal exists to break. As
+  with the two above, the fields stay public and writable — only the literal
+  form is sealed.
+
+### Fixes
+
+- **MASQUE response validation followed the wrong half of the specification** —
+  An RFC compliance audit found the check in `TunnelDriver::feed_response`
+  inverted: it enforced a SHOULD as fatal while ignoring the two MUSTs beside
+  it.
+
+  A 2xx response that omitted `capsule-protocol: ?1` failed the tunnel and,
+  through the route quarantine, blacklisted the proxy. But RFC 9298 §3.5
+  imports the requirements of **RFC 9297 §3.2**, and that header is not among
+  them — its own requirement is in RFC 9297 §3.4 and reads "endpoints SHOULD
+  send the Capsule-Protocol header field to simplify intermediary processing",
+  while §3.2 notes an intermediary may instead rely on "understanding the
+  chosen HTTP Upgrade token". For a 2xx answer to `connect-udp` the Capsule
+  Protocol is already in force. So the client was refusing proxies that were
+  within the specification. It no longer does: the observation is available as
+  `TunnelDriver::capsule_protocol_header` and logged as
+  `masque.capsule_protocol_header_absent` / `_not_true` / `_repeated`, and
+  `TunnelError::CapsuleProtocolNotNegotiated` is gone, since nothing fails for
+  that reason any more. A repeated field is now reported as repeated rather
+  than resolved to its last value, which RFC 9297 §3.4 calls out by name (the
+  field's type becomes a List and "MUST be handled as if the field were not
+  present") — with `?0` followed by `?1`, the old loop reported a negotiation
+  the field never expressed.
+
+  What §3.2 does require was unchecked and now is, as
+  `TunnelError::MalformedResponse`: status 204, 205 and 206 "MUST NOT be sent
+  on responses that use the Capsule Protocol", and neither may the message
+  carry `content-length`, `content-type` or `transfer-encoding`; a receiver
+  seeing either "MUST treat the HTTP message as malformed". The realistic case
+  is `content-length: 0` on a bodyless 200, which HTTP frameworks add on their
+  own. Accepting it meant parsing the data stream of a message that declares
+  HTTP content as capsules — failing later with an error that blamed the
+  capsule framing, or swallowing content as if it were capsules. The error now
+  names the offending field.
+
+- **An over-large MASQUE capsule killed the tunnel instead of being skipped** —
+  RFC 9297 §3.2 requires an unknown Capsule Type be "silently drop[ped] and
+  skip[ped] over ... to parse the next Capsule", and RFC 9298 §5 asks that an
+  over-large DATAGRAM capsule be discarded "without buffering the capsule
+  contents". `TunnelDriver` did the opposite: it accumulated the whole Value
+  and, once the residue passed `max_stream_buffer`, failed the tunnel — which
+  reset the request stream, killed the inner QUIC connection and quarantined
+  the route, over one capsule it had no use for. The same §3.2 warns against
+  that accumulation directly ("This approach SHOULD be avoided because it can
+  consume flow control in underlying layers").
+
+  `CapsuleParser::peek_header` now reads a capsule's Type and Length without
+  its Value, and the driver steps over anything declaring more than
+  `max_stream_buffer`, counting it in
+  `TunnelStats::capsules_skipped_over_limit`. Buffering is bounded by
+  construction — the limit plus one capsule header — so
+  `TunnelError::CapsuleBufferOverflow` is removed rather than left unreachable.
+  A stream that ends mid-skip is still a truncated capsule and still malformed
+  under §3.3.
+
+  Two things this also fixes. The old check looked at leftover bytes rather
+  than at the declared length, so the same byte sequence passed in one
+  `feed_stream` call and failed across several — a protocol outcome decided by
+  how the peer chopped up its writes. And `DEFAULT_MAX_STREAM_BUFFER` rises
+  from 64 KiB to 128 KiB: RFC 9000 §16 permits non-minimal varint encodings, so
+  a *legal* DATAGRAM capsule carrying the largest permitted UDP payload can
+  have a 65535-byte Value, which the old ceiling cleared by 9 bytes and would
+  now have skipped.
+
+- **Chrome cookie order** — The session jar iterated `cookie_store`'s hash
+  maps, so the `Cookie` header order was arbitrary and differed between
+  sessions, and `get_cookie` / `get_cookie_values` did not reliably return the
+  longest-path match first as documented. The jar now records creation order
+  and sorts like Chrome's `CookieSorter`: longer paths first, then older
+  cookies first. As in Chrome, re-setting a cookie with the same value keeps
+  its creation time, and a new value makes it a new cookie. A local capture of
+  Chrome 153 sending the same `Set-Cookie` sequence produced the identical
+  `Cookie` header. An explicit `cookie_order` still takes precedence; cookies
+  it does not name now follow this order instead of an arbitrary one.
+
+### Deprecations
+
+- **`h2-native` is scheduled for complete removal in 0.3.0** — it remains a
+  no-op compatibility alias during the 0.2.x line. HTTP/2 always uses `lkh2`;
+  applications that explicitly enable `features = ["h2-native"]` should remove
+  that entry now. The alias will be removed from both `lkrequest` and `lkh2`.
+
+### 弃用
+
+- **`h2-native` 将在 0.3.0 完全删除** — 该名称在 0.2.x 中仅作为 no-op 兼容
+  别名保留，HTTP/2 始终使用 `lkh2`。显式配置
+  `features = ["h2-native"]` 的应用应立即移除该项；`0.3.0` 会同时从
+  `lkrequest` 和 `lkh2` 删除此别名。
 
 
 

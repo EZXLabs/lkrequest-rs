@@ -234,6 +234,79 @@ async fn test_middleware_client_and_session_both_execute() {
     assert_eq!(session_resp_count.load(Ordering::Relaxed), 1);
 }
 
+#[tokio::test]
+async fn streaming_runs_request_hooks_in_order_without_response_hooks() {
+    let srv = start_local_https_server().await;
+    let (client_mw, client_requests, client_responses) = CountingMiddleware::new();
+    let (session_mw, session_requests, session_responses) = CountingMiddleware::new();
+    let client = Client::builder()
+        .fingerprint(presets::chrome_144())
+        .h2_profile(chrome_144_h2())
+        .verify(false)
+        .middleware(client_mw)
+        .middleware(AddHeaderMiddleware {
+            name: "x-middleware-order".into(),
+            value: "client".into(),
+        })
+        .build();
+    let session = client
+        .session()
+        .middleware(session_mw)
+        .middleware(AddHeaderMiddleware {
+            name: "x-middleware-order".into(),
+            value: "session".into(),
+        })
+        .build();
+    let response = session
+        .get(&url_join(&srv.base_url, "/headers"))
+        .send_streaming()
+        .await
+        .expect("streaming request");
+    let body: serde_json::Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["headers"]["x-middleware-order"], "session");
+    assert_eq!(client_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(session_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(client_responses.load(Ordering::Relaxed), 0);
+    assert_eq!(session_responses.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn streaming_honors_middleware_url_method_and_body_before_hsts() {
+    struct RewriteRequest(String);
+    impl Middleware for RewriteRequest {
+        fn on_request(
+            &self,
+            mut request: MiddlewareRequest,
+        ) -> Result<MiddlewareRequest, lkrequest::error::Error> {
+            request.url = self.0.clone();
+            request.method = http::Method::POST;
+            request.body = Some(bytes::Bytes::from_static(b"rewritten-body"));
+            Ok(request)
+        }
+    }
+
+    let srv = start_local_https_server().await;
+    let mut rewritten_url = url::Url::parse(&url_join(&srv.base_url, "/post")).unwrap();
+    rewritten_url.set_scheme("http").unwrap();
+    let session = Client::builder()
+        .fingerprint(presets::chrome_144())
+        .h2_profile(chrome_144_h2())
+        .verify(false)
+        .build()
+        .session()
+        .middleware(RewriteRequest(rewritten_url.into()))
+        .hsts_policy(lkrequest::hsts::StaticHsts::new(["127.0.0.1"]))
+        .build();
+    let response = session
+        .get(&url_join(&srv.base_url, "/get"))
+        .send_streaming()
+        .await
+        .expect("middleware target must receive HSTS upgrade");
+    let body: serde_json::Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["data"], "rewritten-body");
+    assert_eq!(srv.request_counter.load(Ordering::Relaxed), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Error short-circuit
 // ---------------------------------------------------------------------------
@@ -258,6 +331,30 @@ async fn test_middleware_short_circuit_aborts_request() {
         err_msg.contains("blocked by middleware"),
         "error: {err_msg}"
     );
+}
+
+#[tokio::test]
+async fn streaming_request_middleware_can_block_before_connecting() {
+    let srv = start_local_https_server().await;
+    for client_level in [false, true] {
+        let mut builder = Client::builder().verify(false);
+        if client_level {
+            builder = builder.middleware(ShortCircuitMiddleware);
+        }
+        let client = builder.build();
+        let mut builder = client.session();
+        if !client_level {
+            builder = builder.middleware(ShortCircuitMiddleware);
+        }
+        let error = builder
+            .build()
+            .get(&url_join(&srv.base_url, "/get"))
+            .send_streaming()
+            .await
+            .expect_err("request middleware must abort streaming");
+        assert!(error.to_string().contains("blocked by middleware"));
+        assert_eq!(srv.tcp_accept_counter.load(Ordering::Relaxed), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------

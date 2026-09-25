@@ -5,6 +5,7 @@ use tracing::Instrument;
 use http::HeaderMap;
 use url::Url;
 
+use crate::body::RequestBody;
 use crate::error::{Error, Result};
 use crate::protocol::{HttpIntent, ProtocolPolicy};
 use crate::proxy::ProxyConfig;
@@ -50,7 +51,7 @@ pub struct RequestBuilder {
     pub(crate) method: http::Method,
     pub(crate) url: String,
     pub(crate) headers: HeaderMap,
-    pub(crate) body: Option<bytes::Bytes>,
+    pub(crate) body: Option<RequestBody>,
     pub(crate) query_params: Vec<(String, String)>,
     /// Request-level cookies (appended to jar cookies at send time).
     pub(crate) extra_cookies: Vec<(String, String)>,
@@ -149,7 +150,7 @@ impl RequestBuilder {
     pub(crate) fn from_shared_context(
         session: Session,
         ctx: Arc<SharedRequestContext>,
-        body: Option<bytes::Bytes>,
+        body: Option<RequestBody>,
     ) -> Self {
         Self {
             session,
@@ -768,13 +769,90 @@ impl RequestBuilder {
     /// Accepts any type that implements `Into<Bytes>`, including `Vec<u8>`,
     /// `&'static [u8]`, `String`, `Bytes`, etc.
     pub fn body(mut self, body: impl Into<bytes::Bytes>) -> Self {
-        self.body = Some(body.into());
+        self.body = Some(RequestBody::from(body.into()));
+        self
+    }
+
+    /// Upload from an asynchronous reader without buffering the complete body.
+    ///
+    /// `length` is the exact byte count, or `None` for an unknown-length body.
+    /// Unknown-length HTTP/1.1 uploads use chunked framing. The source is
+    /// single-use: once claimed by a transport, it cannot be retried or replayed
+    /// for a body-preserving redirect. Works with both `send` and `send_streaming`.
+    ///
+    /// Pass an owned source; `Unpin` is not required. This setter performs no I/O
+    /// and replaces any previous body. The source must reach EOF even when its
+    /// exact length is supplied, so close a pipe's writer after its final bytes.
+    /// Short/oversized bodies and conflicting framing headers fail during send.
+    /// Request middleware sees `None` instead of buffering this source.
+    ///
+    /// For `std::io::Read`, use the identically named method on
+    /// [`crate::blocking::RequestBuilder::body_reader`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn upload(session: &lkrequest::Session) -> Result<(), Box<dyn std::error::Error>> {
+    /// let file = tokio::fs::File::open("archive.zip").await?;
+    /// let length = file.metadata().await?.len();
+    /// let response = session.post("https://example.com/upload")
+    ///     .body_reader(file, Some(length))
+    ///     .send().await?;
+    /// assert!(response.status().is_success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn body_reader(
+        mut self,
+        reader: impl tokio::io::AsyncRead + Send + 'static,
+        length: Option<u64>,
+    ) -> Self {
+        self.body = Some(RequestBody::reader(reader, length));
+        self
+    }
+
+    /// Upload a single-use stream of byte chunks, with optional exact length.
+    ///
+    /// Empty chunks are skipped. Source errors abort the upload. Chunks are
+    /// requested as the transport makes progress, without collecting the stream.
+    ///
+    /// The stream need not implement `Unpin`. Length validation, middleware and
+    /// replay restrictions match [`body_reader`](Self::body_reader). Source errors
+    /// do not undo bytes already sent. Keep producer queues bounded and terminate
+    /// the stream after the last chunk, including when `length` is known.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use bytes::Bytes;
+    /// use std::{io, pin::Pin, task::{Context, Poll}};
+    /// struct Chunks(std::vec::IntoIter<io::Result<Bytes>>);
+    /// impl futures_core::Stream for Chunks {
+    ///     type Item = io::Result<Bytes>;
+    ///     fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    ///         Poll::Ready(self.0.next())
+    ///     }
+    /// }
+    /// # async fn upload(session: &lkrequest::Session) -> Result<(), lkrequest::error::Error> {
+    /// let chunks = Chunks(vec![Ok(Bytes::from_static(b"hello"))].into_iter());
+    /// let response = session.post("https://example.com/upload")
+    ///     .body_stream(chunks, None)
+    ///     .send().await?;
+    /// assert!(response.status().is_success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn body_stream<S>(mut self, stream: S, length: Option<u64>) -> Self
+    where
+        S: futures_core::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    {
+        self.body = Some(RequestBody::stream(Box::pin(stream), length));
         self
     }
 
     /// Set the request body as a UTF-8 string.
     pub fn text_body(mut self, text: &str) -> Self {
-        self.body = Some(bytes::Bytes::copy_from_slice(text.as_bytes()));
+        self.body = Some(bytes::Bytes::copy_from_slice(text.as_bytes()).into());
         self
     }
 
@@ -786,7 +864,7 @@ impl RequestBuilder {
     pub fn json<T: serde::Serialize>(mut self, value: &T) -> Self {
         match serde_json::to_vec(value) {
             Ok(body) => {
-                self.body = Some(bytes::Bytes::from(body));
+                self.body = Some(bytes::Bytes::from(body).into());
                 self.headers.insert(
                     http::header::CONTENT_TYPE,
                     http::header::HeaderValue::from_static("application/json"),
@@ -827,7 +905,7 @@ impl RequestBuilder {
     pub fn form<T: serde::Serialize>(mut self, value: &T) -> Self {
         match serde_urlencoded::to_string(value) {
             Ok(body) => {
-                self.body = Some(bytes::Bytes::from(body));
+                self.body = Some(bytes::Bytes::from(body).into());
                 self.headers.insert(
                     http::header::CONTENT_TYPE,
                     http::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -877,7 +955,7 @@ impl RequestBuilder {
         let content_type = form.content_type_header();
         match form.encode() {
             Ok(body) => {
-                self.body = Some(bytes::Bytes::from(body));
+                self.body = Some(bytes::Bytes::from(body).into());
                 if let Ok(v) = http::header::HeaderValue::from_str(&content_type) {
                     self.headers.insert(http::header::CONTENT_TYPE, v);
                 }
@@ -955,6 +1033,23 @@ impl RequestBuilder {
         result
     }
 
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn send_transport_only_for_benchmark(self) -> Result<Response> {
+        if let Some(err) = self.deferred_error {
+            return Err(err);
+        }
+        let deadline = tokio::time::Instant::now() + self.effective_total_timeout();
+        self.send_single_request(
+            &self.url,
+            &self.method,
+            &self.headers,
+            self.body.clone(),
+            deadline,
+        )
+        .await
+    }
+
     async fn send_impl(self) -> Result<Response> {
         if let Some(err) = self.deferred_error {
             return Err(err);
@@ -987,24 +1082,32 @@ impl RequestBuilder {
             }
         }
 
+        let mut streaming_body = self
+            .body
+            .as_ref()
+            .filter(|body| body.is_streaming())
+            .cloned();
+
         // --- Middleware: on_request phase ---
         let mw_req = crate::middleware::MiddlewareRequest {
             method: self.method,
             url: self.url,
             headers,
-            body: self.body,
+            body: self.body.as_ref().and_then(|body| body.buffered()).cloned(),
         };
 
         let client_mws = self.session.inner.client.middlewares();
         let session_mws = &self.session.inner.middlewares;
 
-        let mw_req = crate::middleware::apply_request_middlewares(client_mws, mw_req)?;
-        let mw_req = crate::middleware::apply_request_middlewares(session_mws, mw_req)?;
+        let mw_req =
+            crate::middleware::apply_upload_middlewares(client_mws, mw_req, &mut streaming_body)?;
+        let mw_req =
+            crate::middleware::apply_upload_middlewares(session_mws, mw_req, &mut streaming_body)?;
 
         // Destructure middleware-processed request for retries.
         // Immutable fields are wrapped in Arc to avoid deep cloning on retries.
         let session = self.session;
-        let body = mw_req.body;
+        let body = mw_req.body.map(RequestBody::from).or(streaming_body);
         let ctx = Arc::new(SharedRequestContext {
             method: mw_req.method,
             url: mw_req.url,
@@ -1035,12 +1138,15 @@ impl RequestBuilder {
                         ctx.clone(),
                         body.clone(),
                     );
-                    let result = rb.send_with_redirects().await;
+                    let mut replay_safe = true;
+                    let result = rb.send_with_redirects(&mut replay_safe).await;
 
                     match result {
                         Ok(resp) => {
                             let status = resp.status();
-                            if crate::retry::is_retryable_status(status) {
+                            if crate::retry::is_retryable_status(status)
+                                && body.as_ref().is_none_or(RequestBody::can_replay)
+                            {
                                 attempt += 1;
                                 if let Some(delay) =
                                     policy.should_retry(attempt, None, Some(status))
@@ -1084,11 +1190,14 @@ impl RequestBuilder {
                                 // non-idempotent POST that failed *after*
                                 // transmission must surface the error rather
                                 // than be silently re-sent.
-                                if crate::retry::retry_is_replay_safe(
-                                    &ctx.method,
-                                    ctx.idempotency,
-                                    &e,
-                                ) {
+                                if replay_safe
+                                    && body.as_ref().is_none_or(RequestBody::can_replay)
+                                    && crate::retry::retry_is_replay_safe(
+                                        &ctx.method,
+                                        ctx.idempotency,
+                                        &e,
+                                    )
+                                {
                                     tracing::warn!(
                                         attempt = attempt,
                                         error = %e,
@@ -1111,7 +1220,8 @@ impl RequestBuilder {
                 }
             } else {
                 let rb = RequestBuilder::from_shared_context(session.clone(), ctx, body);
-                rb.send_with_redirects().await
+                let mut replay_safe = true;
+                rb.send_with_redirects(&mut replay_safe).await
             };
 
             // --- Middleware: on_response phase ---
@@ -1167,6 +1277,10 @@ impl RequestBuilder {
     /// does **not** follow redirects, does **not** apply the session retry
     /// policy, and returns the first response as-is. Inspect `status()`, read
     /// `Location`, and retry or follow manually if you need redirect behavior.
+    ///
+    /// Client and session request middleware run in the same order as [`send`](Self::send),
+    /// followed by the session's HSTS URL upgrade. Response headers update HSTS,
+    /// cookies, and Alt-Svc state; full-body response middleware does not run.
     ///
     /// Unlike [`send`](Self::send), the response body is **not** fully
     /// buffered. Instead, the body is read on demand via
@@ -1237,12 +1351,34 @@ impl RequestBuilder {
             }
         }
 
-        // Apply query parameters
+        let mut streaming_body = self
+            .body
+            .as_ref()
+            .filter(|body| body.is_streaming())
+            .cloned();
+        let mw_req = crate::middleware::MiddlewareRequest {
+            method: self.method,
+            url: self.url,
+            headers,
+            body: self.body.as_ref().and_then(|body| body.buffered()).cloned(),
+        };
+        let mw_req = crate::middleware::apply_upload_middlewares(
+            self.session.inner.client.middlewares(),
+            mw_req,
+            &mut streaming_body,
+        )?;
+        let mw_req = crate::middleware::apply_upload_middlewares(
+            &self.session.inner.middlewares,
+            mw_req,
+            &mut streaming_body,
+        )?;
+
+        // Apply query parameters after middleware, matching the buffered path.
         let url = if self.query_params.is_empty() {
-            self.url
+            mw_req.url
         } else {
-            let mut parsed =
-                Url::parse(&self.url).map_err(|e| Error::UrlParse(format!("{}: {e}", self.url)))?;
+            let mut parsed = Url::parse(&mw_req.url)
+                .map_err(|e| Error::UrlParse(format!("{}: {e}", mw_req.url)))?;
             {
                 let mut pairs = parsed.query_pairs_mut();
                 for (key, value) in &self.query_params {
@@ -1251,6 +1387,9 @@ impl RequestBuilder {
             }
             parsed.to_string()
         };
+        let hsts_policy = Arc::clone(&self.session.inner.hsts_policy);
+        let url = super::transport::hsts_upgrade(&url, &*hsts_policy).unwrap_or(url);
+        let hsts_host = super::transport::hsts_host_to_record(&url);
 
         let read_timeout = self.timeout.unwrap_or_else(|| {
             self.session
@@ -1261,10 +1400,10 @@ impl RequestBuilder {
         });
         let rb = StreamRequestBuilder {
             session: self.session,
-            method: self.method,
+            method: mw_req.method,
             url,
-            headers,
-            body: self.body,
+            headers: mw_req.headers,
+            body: mw_req.body.map(RequestBody::from).or(streaming_body),
             extra_cookies: self.extra_cookies,
             cookie_overrides: self.cookie_overrides,
             proxy_override: self.proxy_override,
@@ -1276,6 +1415,9 @@ impl RequestBuilder {
             cookie_order: self.cookie_order,
             header_insertion_order: self.header_insertion_order,
             priority: self.priority,
+            idempotency: self.idempotency,
+            #[cfg(feature = "quic-h3")]
+            race_send_gate: None,
         };
 
         let result = async move {
@@ -1294,6 +1436,15 @@ impl RequestBuilder {
 
         match &result {
             Ok(resp) => {
+                if let Some(sts) = resp
+                    .headers()
+                    .get(http::header::STRICT_TRANSPORT_SECURITY)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    if let Some(host) = hsts_host {
+                        hsts_policy.record_sts(&host, sts);
+                    }
+                }
                 span.record("status", resp.status().as_u16());
             }
             Err(err) => {
@@ -1398,7 +1549,7 @@ mod tests {
             rb.headers.get(http::header::CONTENT_TYPE).unwrap(),
             "application/x-www-form-urlencoded",
         );
-        let body_str = std::str::from_utf8(rb.body.as_ref().unwrap()).unwrap();
+        let body_str = std::str::from_utf8(rb.body.as_ref().unwrap().buffered().unwrap()).unwrap();
         assert!(body_str.contains("user=alice"));
         assert!(body_str.contains("pass=secret"));
     }

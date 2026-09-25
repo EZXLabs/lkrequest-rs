@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-4c1.svg">
+  <img alt="Version 0.2.3" src="https://img.shields.io/badge/version-0.2.3-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -35,7 +35,7 @@ The core invariant is simple: **a browser preset should match the target browser
 - **TLS ClientHello control** — extension ordering, GREASE, cipher suites, signature algorithms, key shares, ECH, ALPS, certificate compression, and handshake behavior.
 - **Native HTTP/2 fingerprinting** — SETTINGS order, WINDOW_UPDATE, PRIORITY, pseudo-header order, HPACK behavior, and request priority.
 - **HTTP/3 and QUIC** — optional H3 stack with QUIC Transport Parameters, QPACK settings, PRIORITY_UPDATE, Alt-Svc discovery, session resumption, and SOCKS5 UDP support.
-- **Capture-backed browser presets** — Chrome 131 and 144–152, Firefox 133/147, and Safari 18/26.
+- **Capture-backed browser presets** — Chrome 131 and 144–153, Firefox 133/147, and Safari 18/26.
 - **Browser-like sessions** — isolated cookie jars, configurable physical connection limits, H2 stream backpressure, redirects, retries, decompression, streaming, WebSocket, system-DNS singleflight with optional positive caching, and HSTS policies.
 - **Proxy orchestration** — HTTP CONNECT, SOCKS5, multi-hop proxy chains, resolved-address fallback, `ProxyPool`, and `SessionPool`.
 - **Stable C ABI** — `lkrequest-ffi` mirrors the Rust Client/Session/Request model for other languages.
@@ -43,53 +43,52 @@ The core invariant is simple: **a browser preset should match the target browser
 
 ## Project Status
 
-- Current workspace release: **0.2.2**.
+- Current workspace release: **0.2.3**.
+- **0.2.3 Rust upgrade notice:** public proxy and H3/QUIC profile construction has source-level breaking changes; see [migration steps](CHANGELOG.md#upgrade-from-022) before updating from 0.2.2.
 - The public API is usable but still evolving before 1.0.
-- The repository is currently consumed **from source**; examples below use a local checkout.
+- The crate is currently consumed through a Cargo Git dependency; cloning the workspace is only required for contributors.
 - HTTP/3, synthetic fingerprints, telemetry, and public-network tests are opt-in features.
+- MASQUE CONNECT-UDP is experimental and opt-in via `masque`; its dedicated APIs and proxy interoperability may change. See the [MASQUE guide](docs/guides/networking.md#masque-connect-udp-代理).
 - Real-browser fidelity is version-, platform-, Finch-, GREASE-, and request-context-sensitive. Preset documentation distinguishes captured stable fields from variable behavior.
 
 ## Quick Start
 
-### 1. Clone and build
+### 1. Add the dependency
 
-Git submodules are mandatory because `deps/quinn` and `deps/h3` contain the patched transport behavior used by the workspace.
-
-```bash
-git clone --recurse-submodules <repository-url>
-cd lkrequest
-cargo test --workspace
-```
-
-If the repository was cloned without submodules:
-
-```bash
-git submodule update --init --recursive
-```
-
-Build requirements:
-
-- Rust toolchain with Cargo.
-- NASM, CMake, and libclang where required by the crypto toolchain.
-- `cbindgen` only when generating or changing the C header.
-
-### 2. Use the local crate
-
-From another Rust project:
+Add lkrequest directly from the public repository; no manual checkout is required:
 
 ```toml
 [dependencies]
-lkrequest = { path = "../lkrequest/lkrequest" }
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs" }
+```
+
+Or use Cargo:
+
+```bash
+cargo add lkrequest --git https://github.com/EZXLabs/lkrequest-rs
+```
+
+This is sufficient for `lkrequest::blocking`. Tokio is used internally by lkrequest, but synchronous applications do not need to declare it directly. Applications using the async API should additionally add:
+
+```toml
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 For HTTP/3:
 
 ```toml
-lkrequest = { path = "../lkrequest/lkrequest", features = ["quic-h3"] }
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs", features = ["quic-h3"] }
 ```
 
-### 3. Send a request with an explicit browser preset
+Pin a tested commit for reproducible production builds:
+
+```toml
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs", rev = "<tested-commit>" }
+```
+
+Build requirements are Rust/Cargo plus NASM, CMake, and libclang where required by the crypto toolchain. `cbindgen` is only needed when generating the C header.
+
+### 2. Send a request with an explicit browser preset
 
 ```rust
 use lkrequest::Client;
@@ -97,7 +96,7 @@ use lkrequest::Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
-        .preset(lkrequest::preset::chrome_151())
+        .preset(lkrequest::preset::chrome_154())
         .build();
 
     // A Session represents one virtual browser user: cookies and connections
@@ -128,7 +127,7 @@ Enable the `quic-h3` feature, then choose an explicit protocol policy:
 use lkrequest::Client;
 
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_154())
     .build();
 
 // Prefer H3 and fall back to H2 when QUIC is unavailable.
@@ -154,23 +153,43 @@ cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 
 The high-level presets bundle TLS, H2, optional QUIC/H3, protocol policy, and header ordering:
 
-| Family | Presets |
-|---|---|
-| Chrome | `chrome_131`, `chrome_144`–`chrome_152` |
-| Firefox | `firefox_133`, `firefox_147` |
-| Safari | `safari_18`, `safari_26` |
+| Family | Presets | TLS / H2 | QUIC / H3 |
+|---|---|---|---|
+| Chrome | `chrome_131`, `chrome_144`–`chrome_154` | Supported | Requires `quic-h3` |
+| Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Supported | Not provided |
+| Safari | `safari_18`, `safari_26` | Supported | Not provided |
+
+All 17 names are available through Rust and the C ABI. Enabling `quic-h3` does
+not add a QUIC/H3 fingerprint to Firefox or Safari presets. See the
+[support and verification matrix](docs/reference/presets.md) for the evidence
+behind each protocol layer.
+
+| New preset | Captured browser | Verification boundary |
+|---|---|---|
+| `chrome_154` | Chrome 154.0.8037.58, Windows | TLS/H2 and outgoing QUIC fields captured; H3 SETTINGS inherited from Chrome 153 |
+| `firefox_156` | Firefox 156.0.1, Windows | TLS/H2 captured; the complete preset returned HTTP 200 over H2; no QUIC/H3 preset |
 
 Use explicit versions for reproducible behavior:
 
 ```rust
 let client = lkrequest::Client::builder()
-    .preset(lkrequest::preset::chrome_152())
+    .preset(lkrequest::preset::chrome_154())
     .build();
 ```
+
+For Firefox, use `lkrequest::preset::firefox_156()`. In C, pass `"firefox_156"`
+to `lk_client_builder_set_preset`. Presets configure header order; set User-Agent
+and other browser header values explicitly for the intended request context.
 
 Chrome 152 is capture-verified on Windows against public Cloudflare endpoints and `example.com`. TCP TLS prepends an independently randomized GREASE code point to `signature_algorithms` before the ML-DSA entries (`0x0904`–`0x0906`) and adds Chromium's shuffled `0xCA34` trust-anchor identifier set while retaining Chrome 151's other stable fields; H2 is unchanged, and QUIC no longer sends `google_initial_rtt` (`0x3127`). The public QUIC flow did not complete far enough to independently recapture H3 SETTINGS, so the preset retains the latest verified Chrome H3 baseline.
 
 When validating Chrome 152, compare the raw ordered `signature_algorithms` sequence or a GREASE-preserving fingerprint such as peetprint. JA3/JA3N do not include this field, while JA4 removes GREASE, so those hashes cannot detect a missing sigalgs GREASE slot. The regression fixture therefore normalizes the random GREASE value in place but still requires it at index 0.
+
+Chrome 153.0.8010.37 was captured on Windows with Wireshark against Cloudflare on September 15, 2026. TCP TLS retains signature-algorithm GREASE and reduces the shuffled `0xca34` trust-anchor set from 32 to 28 identifiers, removing `d6790902`, `d6790903`, `d6790909`, and `d679090e`; H2 retains the verified Chrome 152 SETTINGS, connection window, pseudo-header order, and initial HEADERS priority. QUIC retains the classic nine signature algorithms, shuffled ClientHello extensions, and the 28 trust-anchor identifiers, but has no ordinary TLS GREASE slots; ECH and QUIC GREASE remain. A completed H3 navigation returned HTTP 200 with SETTINGS `1=65536`, `6=262144`, `7=100`, and `51=1`, plus GREASE and navigation priority `u=0, i`. The reserved transport-parameter payload ranges from 0 to 15 bytes and the GREASE version position is randomized per profile. H3 now emits Chromium-style GREASE: a random reserved SETTINGS id/value, a 0–3 byte control-stream GREASE frame, and no request-stream GREASE. Client Initials are generated per connection with Chromium's CRYPTO split, PING, PADDING, and shuffle algorithm. The Chrome 146 and 150–154 presets enable these modes; custom profiles keep the previous behavior unless they opt in. Random GREASE values and Initial layouts differ on every connection, so a library capture matches the browser's generation rules and stable fields rather than any single capture byte for byte.
+
+Chrome 154.0.8037.58 was captured on Windows against public Cloudflare endpoints on September 24, 2026. Its stable TCP TLS, H2, QUIC TLS, QUIC transport, and Initial-packet generation rules match Chrome 153. The public capture path did not receive a QUIC response, so the preset inherits Chrome 153's completed H3 SETTINGS and navigation priority rather than claiming a new application-layer observation.
+
+Firefox 156.0.1 was captured on Windows against public Cloudflare on September 25, 2026. Compared with Firefox 147, TLS removes two ECDSA CBC suites and FFDHE groups 256/257 and uses AES-128-GCM for ECH GREASE; H2 retains SETTINGS `1=65536, 2=0, 4=131072, 5=16384`, connection window `12517377`, pseudo-header order `m,p,a,s`, and priority weight 42. Its public QUIC Initial was captured, but the current transport cannot reproduce all observed Firefox fields exactly, so `firefox_156` intentionally remains TLS/H2-only.
 
 ## Browser Network-State Policies
 
@@ -180,7 +199,7 @@ Browser presets model network behavior in addition to handshake bytes. Chrome pr
 use lkrequest::{Client, H2DataFramePolicy};
 
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_153())
     .h2_data_frame_policy(H2DataFramePolicy::BrowserDefault)
     .build();
 ```
@@ -194,7 +213,7 @@ use lkrequest::{
 };
 
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_153())
     .tls_session_resumption_policy(TlsSessionResumptionPolicy::Enabled {
         max_tickets_per_server: 2,
     })
@@ -361,7 +380,7 @@ Public-network tests are ignored by default. Run them only with explicit authori
 TEST_ALLOW_NETWORK=1 cargo test --workspace -- --include-ignored
 ```
 
-See [docs/TESTING.md](docs/TESTING.md) for test tiers and environment requirements.
+See [docs/development/testing.md](docs/development/testing.md) for test tiers and environment requirements.
 
 ## C ABI
 
@@ -383,13 +402,14 @@ See [lkrequest-ffi/README.md](lkrequest-ffi/README.md) for ownership, threading,
 
 ## Documentation and Examples
 
-- [Testing guide](docs/TESTING.md)
+- [Documentation index](docs/README.md)
+- [HTTP/2 performance fixes and Linux validation plan](docs/development/http2-performance.md)
+- [HTTP/2 write batching and fingerprint boundaries](docs/development/h2-write-batching.md)
+- [Testing guide](docs/development/testing.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Security and responsible use](SECURITY.md)
 - [FFI guide](lkrequest-ffi/README.md)
 - [Rust examples](lkrequest/examples)
-- [Fingerprint regression design](docs/fingerprint-regression-design.md)
-- [QUIC/H3 fingerprint notes](docs/chrome146-quic-h3-fingerprint.md)
 
 ## Contributing
 

@@ -1,0 +1,24 @@
+[package]
+name = "http-client-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http2", "server"] }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "http2", "server", "tokio"] }
+lkh2 = { path = "../../lkh2" }
+lkrequest = { path = "../../lkrequest", features = ["bench-internals"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["http2"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

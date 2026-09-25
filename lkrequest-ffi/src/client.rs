@@ -33,8 +33,11 @@ pub(crate) fn parse_preset_name(name: &str) -> Result<PresetKind, FfiError> {
         "chrome_150" => Ok(PresetKind::Chrome150),
         "chrome_151" => Ok(PresetKind::Chrome151),
         "chrome_152" => Ok(PresetKind::Chrome152),
+        "chrome_153" => Ok(PresetKind::Chrome153),
+        "chrome_154" => Ok(PresetKind::Chrome154),
         "firefox_133" => Ok(PresetKind::Firefox133),
         "firefox_147" => Ok(PresetKind::Firefox147),
+        "firefox_156" => Ok(PresetKind::Firefox156),
         "safari_18" => Ok(PresetKind::Safari18),
         "safari_26" | "safari_26_2" => Ok(PresetKind::Safari26),
         _ => Err(FfiError::invalid_config(format!("unknown preset: {name}"))),
@@ -53,8 +56,11 @@ pub(crate) fn preset_bundle(preset: PresetKind) -> lkrequest::preset::ClientPres
         PresetKind::Chrome150 => lkrequest::preset::chrome_150(),
         PresetKind::Chrome151 => lkrequest::preset::chrome_151(),
         PresetKind::Chrome152 => lkrequest::preset::chrome_152(),
+        PresetKind::Chrome153 => lkrequest::preset::chrome_153(),
+        PresetKind::Chrome154 => lkrequest::preset::chrome_154(),
         PresetKind::Firefox133 => lkrequest::preset::firefox_133(),
         PresetKind::Firefox147 => lkrequest::preset::firefox_147(),
+        PresetKind::Firefox156 => lkrequest::preset::firefox_156(),
         PresetKind::Safari18 => lkrequest::preset::safari_18(),
         PresetKind::Safari26 => lkrequest::preset::safari_26(),
     }
@@ -217,6 +223,10 @@ fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShare
 
     if state.use_native_certs {
         builder = builder.use_native_certs();
+    }
+    #[cfg(feature = "masque")]
+    if let Some(masque) = &state.masque {
+        builder = builder.masque(masque.clone());
     }
     if let Some(dns_source) = &state.dns_source {
         builder = match dns_source {
@@ -688,6 +698,49 @@ pub extern "C" fn lk_client_builder_set_dns_resolver(
     })
 }
 
+/// Configure the **outer** hop of `masque://` routes for clients built from
+/// this builder: its trust anchors, certificate name, and tunnel reclamation.
+///
+/// The counterpart of
+/// [`ClientBuilder::masque`](lkrequest::client::ClientBuilder::masque). None of it
+/// touches the inner connection — the browser profile still drives every byte
+/// the origin sees, which is the whole point of presenting the tunnel to the
+/// inner stack as a plain UDP socket.
+///
+/// The settings are **copied**, so `config` can be freed straight afterwards
+/// and the same handle can also be given to a pool builder's tunnel probe.
+/// Calling this again replaces the previous settings wholesale.
+///
+/// Leaving it unset keeps the Rust defaults (OS trust store, no extra roots),
+/// which is what a public-CA proxy wants.
+///
+/// Returns `LK_ERR` without the `masque` feature; see `lk_masque_config_new`.
+#[no_mangle]
+// Without `masque` the body never dereferences anything.
+#[cfg_attr(not(feature = "masque"), allow(unused_unsafe))]
+pub extern "C" fn lk_client_builder_set_masque_config(
+    builder: *mut lk_client_builder_t,
+    config: *const crate::handles::lk_masque_config_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        #[cfg(feature = "masque")]
+        {
+            let masque = crate::masque_config::masque_config_ref(config)?.clone();
+            let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+            builder.state.masque = Some(masque);
+            Ok(())
+        }
+
+        #[cfg(not(feature = "masque"))]
+        {
+            let _ = (builder, config);
+            Err(FfiError::invalid_config(
+                "MASQUE support is not compiled in; rebuild lkrequest-ffi with the `masque` feature",
+            ))
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn lk_client_builder_set_use_native_certs(
     builder: *mut lk_client_builder_t,
@@ -968,6 +1021,11 @@ pub extern "C" fn lk_client_builder_set_fallback_h2_to_h1(
     })
 }
 
+/// Enable or disable proxy->direct fallback (default: disabled).
+///
+/// Does not apply to MASQUE proxies: a MASQUE tunnel exists to hide the
+/// client's source address, so those routes fail instead of connecting
+/// directly even when this is enabled. HTTP CONNECT and SOCKS5 are unaffected.
 #[no_mangle]
 pub extern "C" fn lk_client_builder_set_fallback_proxy_to_direct(
     builder: *mut lk_client_builder_t,

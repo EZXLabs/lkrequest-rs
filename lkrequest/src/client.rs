@@ -8,6 +8,8 @@
 //! [`Session`](crate::session::Session)s from the same `Client` to represent
 //! different "virtual users".
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +25,7 @@ use lktls::session_store::SessionStore;
 use lktls::KeyLogCallback;
 use rustls_pki_types::TrustAnchor;
 
-use crate::dns::{DnsConfig, DnsResolver, SystemDns, SystemDnsCacheConfig};
+use crate::dns::{DnsConfig, DnsResolver, IpFamily, SystemDns, SystemDnsCacheConfig};
 use crate::h2::H2Profile;
 use crate::network_partition::{TlsSessionCachePartitionPolicy, TlsSessionResumptionPolicy};
 use crate::protocol::ProtocolPolicy;
@@ -361,6 +363,9 @@ pub struct FallbackConfig {
     /// to a direct connection (bypassing the proxy).
     ///
     /// **Default: `false`** — for safety, proxy bypass is opt-in.
+    ///
+    /// **Exception — MASQUE routes ignore this flag** and never fall back; see
+    /// [`ClientBuilder::proxy_fallback_direct`] for why.
     pub proxy_to_direct: bool,
 
     /// When true, if a request on a **reused** (pooled) connection fails due
@@ -517,6 +522,9 @@ pub(crate) struct ClientInner {
     /// Optional bound for HTTP/2 requests waiting on remote stream capacity.
     pub max_pending_h2_requests: Option<usize>,
 
+    /// Maximum ready HTTP/2 requests coalesced into one driver write turn.
+    pub h2_dispatch_batch_size: usize,
+
     /// Optional TLS key log callback for SSLKEYLOGFILE output.
     pub keylog_callback: Option<KeyLogCallback>,
 
@@ -530,10 +538,23 @@ pub(crate) struct ClientInner {
 
     /// DNS resolver used for all connections from this client.
     pub resolver: Arc<dyn DnsResolver>,
+    pub ip_family: IpFamily,
+    pub connect_targets: HashMap<(String, u16), SocketAddr>,
 
     /// Shared QUIC endpoint manager for real QUIC/H3 connections.
     #[cfg(feature = "quic-h3")]
     pub quic_endpoint_manager: SharedQuicEndpointManager,
+    #[cfg(feature = "quic-h3")]
+    pub quic_endpoint_manager_ipv6: SharedQuicEndpointManager,
+
+    /// Settings for the **outer** hop of a MASQUE route: how the HTTP/3
+    /// connection to the proxy itself is built, and how long its tunnels live.
+    ///
+    /// Deliberately separate from everything in [`Fingerprint`]: the outer hop
+    /// is not emulating a browser, so nothing here may reach the inner
+    /// connection's wire image.
+    #[cfg(feature = "masque")]
+    pub masque: Arc<crate::proxy::MasqueOuterConfig>,
 
     /// Shared TLS/QUIC session ticket cache for sessions created from this
     /// client. Browsers cache QUIC PSKs at the profile/client level, not per
@@ -589,6 +610,15 @@ impl Client {
     /// Returns a reference to the QUIC fingerprint profile.
     pub fn quic_profile(&self) -> Option<&QuicProfile> {
         self.fingerprint.quic_profile.as_ref()
+    }
+
+    /// Settings for the outer hop of a MASQUE route.
+    ///
+    /// See [`ClientBuilder::masque`] for why this is client-level state while
+    /// the connections it configures are per session.
+    #[cfg(feature = "masque")]
+    pub fn masque_config(&self) -> &crate::proxy::MasqueOuterConfig {
+        &self.inner.masque
     }
 
     /// The fingerprint randomization policy this client was built with.
@@ -670,6 +700,11 @@ impl Client {
         self.inner.max_pending_h2_requests
     }
 
+    /// Returns the configured HTTP/2 dispatch batch size.
+    pub fn h2_dispatch_batch_size(&self) -> usize {
+        self.inner.h2_dispatch_batch_size
+    }
+
     /// Returns the connect timeout (TCP + TLS combined, for backward compat).
     ///
     /// Computed as `tcp_connect_timeout + tls_handshake_timeout`.
@@ -749,9 +784,34 @@ impl Client {
         &*self.inner.resolver
     }
 
+    /// Address-family policy for locally selected connection endpoints.
+    pub fn ip_family(&self) -> IpFamily {
+        self.inner.ip_family
+    }
+
+    pub(crate) fn connect_target(&self, host: &str, port: u16) -> Option<SocketAddr> {
+        if self.inner.connect_targets.is_empty() {
+            return None;
+        }
+        let host = url::Host::parse(host).ok()?.to_string();
+        self.inner.connect_targets.get(&(host, port)).copied()
+    }
+
     #[cfg(feature = "quic-h3")]
     pub(crate) fn quic_endpoint_manager(&self) -> &SharedQuicEndpointManager {
         &self.inner.quic_endpoint_manager
+    }
+
+    #[cfg(feature = "quic-h3")]
+    pub(crate) fn quic_endpoint_manager_for(
+        &self,
+        address: SocketAddr,
+    ) -> &SharedQuicEndpointManager {
+        if address.is_ipv6() {
+            &self.inner.quic_endpoint_manager_ipv6
+        } else {
+            self.quic_endpoint_manager()
+        }
     }
 
     // -------------------------------------------------------------------
@@ -867,14 +927,19 @@ pub struct ClientBuilder {
     timeouts: TimeoutConfig,
     resource_limits: ResourceLimits,
     max_pending_h2_requests: Option<usize>,
+    h2_dispatch_batch_size: usize,
     keylog_callback: Option<KeyLogCallback>,
     verify: bool,
     require_close_notify: bool,
     resolver: Option<Arc<dyn DnsResolver>>,
+    ip_family: IpFamily,
+    connect_targets: HashMap<(String, u16), SocketAddr>,
     h2_data_frame_policy: H2DataFramePolicy,
     tls_session_resumption_policy: TlsSessionResumptionPolicy,
     tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy,
     randomize: crate::randomize::Randomize,
+    #[cfg(feature = "masque")]
+    masque: crate::proxy::MasqueOuterConfig,
 }
 
 impl ClientBuilder {
@@ -897,14 +962,19 @@ impl ClientBuilder {
             timeouts: TimeoutConfig::default(),
             resource_limits: ResourceLimits::default(),
             max_pending_h2_requests: None,
+            h2_dispatch_batch_size: 1,
             keylog_callback: None,
             verify: true,
             require_close_notify: false,
             resolver: None,
+            ip_family: IpFamily::Any,
+            connect_targets: HashMap::new(),
             h2_data_frame_policy: H2DataFramePolicy::BrowserDefault,
             tls_session_resumption_policy: TlsSessionResumptionPolicy::BrowserDefault,
             tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Unpartitioned,
             randomize: crate::randomize::Randomize::off(),
+            #[cfg(feature = "masque")]
+            masque: crate::proxy::MasqueOuterConfig::default(),
         }
     }
 
@@ -1020,9 +1090,186 @@ impl ClientBuilder {
         self
     }
 
+    /// Batch ready HTTP/2 requests into fewer driver socket writes.
+    ///
+    /// The default is one, preserving fingerprint-sensitive frame-group write
+    /// boundaries. Values above one are an explicit throughput mode that can
+    /// change TLS record boundaries, TCP segmentation, and timing behavior.
+    /// See `docs/h2-write-batching.md` for validation requirements.
+    pub fn h2_dispatch_batch_size(mut self, max: usize) -> Self {
+        assert!(max > 0, "h2_dispatch_batch_size must be greater than zero");
+        self.h2_dispatch_batch_size = max;
+        self
+    }
+
     /// Set the QUIC / HTTP/3 fingerprint profile.
     pub fn quic_profile(mut self, profile: QuicProfile) -> Self {
         self.quic_profile = Some(Some(profile));
+        self
+    }
+
+    /// Configure the **outer** hop of `masque://` routes wholesale.
+    ///
+    /// This covers the HTTP/3 connection to the proxy — its trust anchors, SNI,
+    /// ALPN and local bind address — plus the tunnel lifecycle knobs
+    /// [`tunnel_idle_timeout`](crate::proxy::MasqueOuterConfig::tunnel_idle_timeout)
+    /// and
+    /// [`max_idle_tunnels`](crate::proxy::MasqueOuterConfig::max_idle_tunnels).
+    /// None of it touches the inner connection: the browser profile still drives
+    /// every byte the origin sees, which is the entire reason the tunnel is
+    /// presented to the inner stack as a plain UDP socket.
+    ///
+    /// The settings are client-level while the connections they configure are
+    /// session-level, matching how the QUIC endpoint manager and the ticket
+    /// cache are shared: configuration is a property of the fingerprint
+    /// template, connections are a property of the identity using it.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use lkrequest::Client;
+    /// use lkrequest::proxy::MasqueOuterConfig;
+    /// use std::time::Duration;
+    ///
+    /// // `MasqueOuterConfig` is `#[non_exhaustive]`: from `Default`, then
+    /// // assign. The single-knob setters below are the shorter route.
+    /// let mut outer = MasqueOuterConfig::default();
+    /// outer.tunnel_idle_timeout = Some(Duration::from_secs(30));
+    ///
+    /// let client = Client::builder().masque(outer).build();
+    /// ```
+    #[cfg(feature = "masque")]
+    pub fn masque(mut self, config: crate::proxy::MasqueOuterConfig) -> Self {
+        self.masque = config;
+        self
+    }
+
+    /// Retire a MASQUE tunnel that has carried nothing for `timeout`.
+    ///
+    /// `None` disables idle reclamation entirely: a tunnel then lives exactly as
+    /// long as the inner QUIC connection using it, and the outer connection
+    /// carrying it is pinned for as long as any tunnel survives.
+    /// [`ClientBuilder::masque_max_idle_tunnels`] is what keeps that from being
+    /// unbounded.
+    #[cfg(feature = "masque")]
+    pub fn masque_tunnel_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.masque.tunnel_idle_timeout = timeout;
+        self
+    }
+
+    /// Cap the tunnels one outer MASQUE connection carries, shedding the least
+    /// recently active first. `0` removes the cap.
+    #[cfg(feature = "masque")]
+    pub fn masque_max_idle_tunnels(mut self, max: usize) -> Self {
+        self.masque.max_idle_tunnels = max;
+        self
+    }
+
+    /// Add a CA certificate, in DER form, that the **MASQUE proxy** may be
+    /// fronted by.
+    ///
+    /// Appends to
+    /// [`MasqueOuterConfig::extra_roots`](crate::proxy::MasqueOuterConfig::extra_roots),
+    /// which is what a self-hosted or vendor-issued proxy behind a private CA
+    /// needs. Can be called repeatedly.
+    ///
+    /// This is **not** [`add_ca_cert_der`](Self::add_ca_cert_der): that one
+    /// trusts a CA for the origin the request is aimed at, this one for the
+    /// proxy hop. They are separate on purpose — a debugging CA for one hop
+    /// should not silently become a trust anchor for the other — so a private
+    /// CA used by both has to be handed to both.
+    ///
+    /// The bytes are parsed when the outer connection is configured, so a
+    /// certificate that is not valid DER surfaces as an
+    /// [`Error::InvalidConfig`](crate::error::Error::InvalidConfig) on the first
+    /// request through a `masque://` proxy rather than here.
+    #[cfg(feature = "masque")]
+    pub fn masque_add_ca_cert_der(mut self, der: &[u8]) -> Self {
+        self.masque
+            .extra_roots
+            .push(rustls_pki_types::CertificateDer::from(der.to_vec()));
+        self
+    }
+
+    /// Add the CA certificates in a PEM bundle that the **MASQUE proxy** may be
+    /// fronted by.
+    ///
+    /// The PEM counterpart of
+    /// [`masque_add_ca_cert_der`](Self::masque_add_ca_cert_der), and the one to
+    /// reach for: a CA is normally distributed as PEM. Delegates to
+    /// [`MasqueOuterConfig::add_ca_certs_pem`](crate::proxy::MasqueOuterConfig::add_ca_certs_pem).
+    ///
+    /// See [`masque_add_ca_cert_der`](Self::masque_add_ca_cert_der) for why this
+    /// is separate from [`add_ca_certs_pem`](Self::add_ca_certs_pem).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidConfig`](crate::error::Error::InvalidConfig) if the bundle is
+    /// malformed or holds no certificate. Unlike
+    /// [`add_ca_certs_pem`](Self::add_ca_certs_pem), which logs and moves on,
+    /// this reports the failure: a proxy whose CA quietly failed to load is a
+    /// connection that cannot be made at all, not a slightly less trusting one.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use lkrequest::Client;
+    ///
+    /// let pem = std::fs::read("proxy-ca.pem")?;
+    /// let client = Client::builder()
+    ///     .masque_use_native_certs(false)
+    ///     .masque_add_ca_certs_pem(&pem)?
+    ///     .build();
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "masque")]
+    pub fn masque_add_ca_certs_pem(mut self, pem: &[u8]) -> crate::error::Result<Self> {
+        self.masque.add_ca_certs_pem(pem)?;
+        Ok(self)
+    }
+
+    /// Trust the operating system's certificate store on the hop to a MASQUE
+    /// proxy. **Default: `true`.**
+    ///
+    /// Set it to `false` for a proxy behind a private CA: the outer connection
+    /// then verifies against
+    /// [`masque_add_ca_certs_pem`](Self::masque_add_ca_certs_pem) /
+    /// [`masque_add_ca_cert_der`](Self::masque_add_ca_cert_der) and nothing
+    /// else, so an unrelated public CA cannot vouch for something answering on
+    /// the proxy's address.
+    #[cfg(feature = "masque")]
+    pub fn masque_use_native_certs(mut self, enabled: bool) -> Self {
+        self.masque.use_native_certs = enabled;
+        self
+    }
+
+    /// SNI and certificate name for the hop to a MASQUE proxy.
+    ///
+    /// `None` — the default — uses the host from the proxy URL. Override it when
+    /// the proxy is addressed by something its certificate does not name, most
+    /// often an IP address.
+    #[cfg(feature = "masque")]
+    pub fn masque_server_name(mut self, name: impl Into<String>) -> Self {
+        self.masque.server_name = Some(name.into());
+        self
+    }
+
+    /// Enable or disable certificate verification on the hop to a MASQUE proxy.
+    ///
+    /// **Default: `true`**. Set to `false` to skip all certificate verification
+    /// on the connection to the proxy. **For development/testing only --
+    /// insecure!** It leaves that hop completely open to a man in the middle,
+    /// which sees the CONNECT-UDP targets and carries the inner QUIC connection
+    /// for you; see
+    /// [`MasqueOuterConfig::verify`](crate::proxy::MasqueOuterConfig::verify).
+    ///
+    /// Distinct from [`verify`](Self::verify), which governs the connection to
+    /// the origin. Neither implies the other.
+    #[cfg(feature = "masque")]
+    pub fn masque_verify(mut self, enabled: bool) -> Self {
+        self.masque.verify = enabled;
         self
     }
 
@@ -1360,6 +1607,22 @@ impl ClientBuilder {
     /// the client falls back to a direct connection.
     ///
     /// **Warning**: this can leak the client's real IP address.
+    ///
+    /// # Exception: MASQUE proxies
+    ///
+    /// This switch has **no effect on MASQUE routes** (`ProxyScheme::Masque`,
+    /// which only exists with the `masque` feature) — enabling
+    /// it does not make them fall back. A MASQUE tunnel (RFC 9298 CONNECT-UDP)
+    /// is chosen precisely to keep the client's source address away from the
+    /// target, so bypassing it silently would hand the target the real IP: the
+    /// one outcome the configuration was meant to prevent. Here a visible
+    /// failure is the safer answer than a success, so the route-level rule wins
+    /// over the opt-in rather than the other way round.
+    ///
+    /// HTTP CONNECT and SOCKS5 routes are unaffected and honour the flag
+    /// exactly as before. The rule is
+    /// [`ProxyConfig::forbids_direct_fallback`](crate::proxy::ProxyConfig::forbids_direct_fallback),
+    /// and MASQUE is the only scheme it currently covers.
     pub fn proxy_fallback_direct(mut self, enabled: bool) -> Self {
         self.fallback.proxy_to_direct = enabled;
         self
@@ -1669,6 +1932,56 @@ impl ClientBuilder {
         self
     }
 
+    /// Restrict locally selected TCP/QUIC endpoints to an address family.
+    ///
+    /// Defaults to [`IpFamily::Any`]. Applies to the final configured resolver,
+    /// including custom resolvers, regardless of builder call order. A name
+    /// with no permitted address fails; a policy rejection never triggers
+    /// proxy-to-direct fallback. DNS queries themselves are not restricted.
+    /// Remote-DNS proxies still choose their target addresses. To specify the
+    /// target sent to HTTP CONNECT or SOCKS5h, use [`Self::connect_to`].
+    ///
+    /// For example, `Ipv4` restricts the local connection to an HTTP proxy, but
+    /// `CONNECT example.com:443` can still cause that proxy to dial IPv6. The
+    /// same boundary applies to SOCKS5h, MASQUE, and remote hops in proxy chains.
+    /// This is not a process-wide or end-to-end IPv6 disable switch.
+    pub fn ip_family(mut self, family: IpFamily) -> Self {
+        self.ip_family = family;
+        self
+    }
+
+    /// Override where connections to `host:port` are dialed.
+    ///
+    /// The URL, HTTP Host/authority, TLS SNI and certificate verification name,
+    /// cookie scope, and pool origin remain unchanged. Applies to direct TCP,
+    /// HTTP CONNECT, SOCKS5, and QUIC (including MASQUE). Explicit overrides
+    /// take precedence over Alt-Svc/SVCB alternative endpoints. The address
+    /// must satisfy [`Self::ip_family`]. Proxy server addresses are unaffected.
+    /// This is an optional fixed mapping: callers supply and maintain the IP;
+    /// it does not automatically resolve or refresh IPv4 addresses for a name.
+    ///
+    /// ```rust
+    /// use lkrequest::{Client, IpFamily};
+    /// let client = Client::builder()
+    ///     .ip_family(IpFamily::Ipv4)
+    ///     .connect_to("example.com", 443, "192.0.2.1:443".parse().unwrap())
+    ///     .build();
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `host` is invalid or either port is zero.
+    pub fn connect_to(mut self, host: &str, port: u16, address: SocketAddr) -> Self {
+        assert!(
+            port != 0 && address.port() != 0,
+            "connect_to ports must be nonzero"
+        );
+        let host = url::Host::parse(host)
+            .expect("connect_to requires a valid host")
+            .to_string();
+        self.connect_targets.insert((host, port), address);
+        self
+    }
+
     /// Build the `Client`.
     ///
     /// If no TLS fingerprint was set via [`.fingerprint()`](Self::fingerprint),
@@ -1713,11 +2026,17 @@ impl ClientBuilder {
             Some(Arc::new(self.custom_ca_anchors))
         };
 
-        let resolver = self.resolver.unwrap_or_else(|| Arc::new(SystemDns));
+        let mut resolver = self.resolver.unwrap_or_else(|| Arc::new(SystemDns));
+        if self.ip_family != IpFamily::Any || !self.connect_targets.is_empty() {
+            resolver = Arc::new(crate::dns::FamilyResolver {
+                inner: resolver,
+                family: self.ip_family,
+            });
+        }
         let default_protocol_policy = self.protocol_policy.unwrap_or_default();
 
         #[cfg(feature = "quic-h3")]
-        let endpoint_manager = {
+        let endpoint_managers = {
             let (
                 cid_len,
                 initial_destination_cid_len,
@@ -1734,25 +2053,32 @@ impl ClientBuilder {
                     )
                 })
                 .unwrap_or((ChromeConnectionIdGenerator::DEFAULT_LEN, None, None, true));
-            let mut manager = QuicEndpointManager::with_backend(
-                QuinnBackend::default(),
-                ChromeConnectionIdGenerator::new(cid_len)
-                    .expect("quic profile connection_id_length must be valid"),
+            let create = |bind_addr| {
+                let mut manager = QuicEndpointManager::with_backend(
+                    QuinnBackend::default(),
+                    ChromeConnectionIdGenerator::new(cid_len)
+                        .expect("quic profile connection_id_length must be valid"),
+                )
+                .bind_addr(bind_addr)
+                .grease_quic_bit(grease_transport_params)
+                .with_initial_destination_cid_len(initial_destination_cid_len);
+                if cid_len == 0 {
+                    tracing::debug!(
+                        "client.build: using per-session QUIC endpoints for zero-length connection IDs"
+                    );
+                    manager = manager.strategy(QuicEndpointStrategy::PerSession);
+                }
+                if let Some(value) = max_udp_payload_size {
+                    let value = u16::try_from(value)
+                        .expect("quic profile max_udp_payload_size must fit into u16");
+                    manager = manager.max_udp_payload_size(value);
+                }
+                manager
+            };
+            (
+                create(SocketAddr::from(([0, 0, 0, 0], 0))),
+                create(SocketAddr::from(([0u16; 8], 0))),
             )
-            .grease_quic_bit(grease_transport_params)
-            .with_initial_destination_cid_len(initial_destination_cid_len);
-            if cid_len == 0 {
-                tracing::debug!(
-                    "client.build: using per-session QUIC endpoints for zero-length connection IDs"
-                );
-                manager = manager.strategy(QuicEndpointStrategy::PerSession);
-            }
-            if let Some(value) = max_udp_payload_size {
-                let value = u16::try_from(value)
-                    .expect("quic profile max_udp_payload_size must fit into u16");
-                manager = manager.max_udp_payload_size(value);
-            }
-            manager
         };
 
         Client {
@@ -1776,12 +2102,19 @@ impl ClientBuilder {
                 timeouts: self.timeouts,
                 resource_limits: self.resource_limits,
                 max_pending_h2_requests: self.max_pending_h2_requests,
+                h2_dispatch_batch_size: self.h2_dispatch_batch_size,
                 keylog_callback: self.keylog_callback,
                 verify: self.verify,
                 require_close_notify: self.require_close_notify,
                 resolver,
+                ip_family: self.ip_family,
+                connect_targets: self.connect_targets,
                 #[cfg(feature = "quic-h3")]
-                quic_endpoint_manager: tokio::sync::Mutex::new(endpoint_manager),
+                quic_endpoint_manager: tokio::sync::Mutex::new(endpoint_managers.0),
+                #[cfg(feature = "quic-h3")]
+                quic_endpoint_manager_ipv6: tokio::sync::Mutex::new(endpoint_managers.1),
+                #[cfg(feature = "masque")]
+                masque: Arc::new(self.masque),
                 session_store: self.tls_session_resumption_policy.create_store(),
                 tls_session_resumption_policy: self.tls_session_resumption_policy,
                 tls_session_cache_partition_policy: self.tls_session_cache_partition_policy,
@@ -1818,6 +2151,24 @@ mod tests {
     #[should_panic(expected = "max_pending_h2_requests must be greater than zero")]
     fn zero_pending_h2_request_limit_is_rejected() {
         let _ = Client::builder().max_pending_h2_requests(0);
+    }
+
+    #[test]
+    fn h2_dispatch_batch_defaults_to_fingerprint_safe_single_request() {
+        let client = Client::builder().build();
+        assert_eq!(client.h2_dispatch_batch_size(), 1);
+    }
+
+    #[test]
+    fn h2_dispatch_batch_can_be_configured() {
+        let client = Client::builder().h2_dispatch_batch_size(64).build();
+        assert_eq!(client.h2_dispatch_batch_size(), 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "h2_dispatch_batch_size must be greater than zero")]
+    fn zero_h2_dispatch_batch_is_rejected() {
+        let _ = Client::builder().h2_dispatch_batch_size(0);
     }
 
     #[test]

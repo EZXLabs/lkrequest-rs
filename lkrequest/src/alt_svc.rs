@@ -358,6 +358,23 @@ pub enum BrokenReason {
     /// tunneled through that proxy, not just the one currently being
     /// attempted.
     ProxyUdpUnavailable,
+    /// A MASQUE proxy (RFC 9298 CONNECT-UDP) could not give us a tunnel: the
+    /// outer HTTP/3 connection failed, the credentials were rejected, or the
+    /// proxy answered the `CONNECT` in a way the Capsule Protocol forbids.
+    /// Recorded **per-route** for the same reason as
+    /// [`BrokenReason::ProxyUdpUnavailable`] — none of those failures says
+    /// anything about the origin that happened to be asked for first.
+    ///
+    /// Kept distinct from `ProxyUdpUnavailable` so a diagnostic can tell "this
+    /// SOCKS5 server refused UDP ASSOCIATE" from "this MASQUE proxy would not
+    /// open a tunnel"; the two are reached through completely different code
+    /// and are fixed in completely different ways.
+    ///
+    /// Requires the `masque` feature. Without it no MASQUE route can be
+    /// configured at all (`ProxyScheme::Masque` does not exist), so nothing
+    /// could ever record this reason.
+    #[cfg(feature = "masque")]
+    MasqueTunnelUnavailable,
 }
 
 /// Tunable behavior for [`BrokenQuicTracker`].
@@ -378,7 +395,8 @@ pub struct BrokenQuicConfig {
     /// calls — equivalent to disabling the quarantine entirely.
     pub enabled: bool,
     /// Cooldown applied to **per-route** failures
-    /// ([`BrokenReason::ProxyUdpUnavailable`] today). Independent of the
+    /// ([`BrokenReason::ProxyUdpUnavailable`] and, with the `masque` feature,
+    /// `BrokenReason::MasqueTunnelUnavailable`). Independent of the
     /// per-origin escalation curve because proxy capability is binary —
     /// "failed twice" doesn't mean "wait twice as long".
     pub route_cooldown: Duration,
@@ -716,6 +734,9 @@ impl BrokenQuicTracker {
         route: &RouteKey,
         origin: &Origin,
     ) -> Option<H3Reachability> {
+        if !self.config.enabled {
+            return None;
+        }
         let key = RouteOriginKey::new(route.clone(), origin.clone());
         let mut broken = self.broken.write();
         let entry = broken.get(&key)?;
@@ -1397,6 +1418,46 @@ mod tests {
             !tracker.is_broken(&origin),
             "Disabled policy must report origin as healthy even after mark_broken"
         );
+        assert_eq!(tracker.h3_reachability(&origin), None);
+    }
+
+    #[test]
+    fn route_h3_reachability_respects_quarantine_policy() {
+        let proxy = ProxyConfig::parse("socks5h://proxy.example.com:1080").unwrap();
+        let route = RouteKey::from_proxy(Some(&proxy));
+        let origin = Origin::https("example.com", 443);
+
+        for (policy, broken, reachability, learned_status) in [
+            (
+                BrokenQuicPolicy::Strict,
+                true,
+                Some(H3Reachability::FailedTransiently),
+                H3Reachability::FailedTransiently,
+            ),
+            (
+                BrokenQuicPolicy::Disabled,
+                false,
+                None,
+                H3Reachability::Advertised,
+            ),
+        ] {
+            let tracker = BrokenQuicTracker::with_config(policy.resolve());
+            let cache = AltSvcCache::new();
+            cache.store_from_header_for_route(&route, &origin, r#"h3=":443"; ma=86400"#);
+            tracker.mark_broken_for_route(&route, &origin);
+
+            assert_eq!(tracker.is_broken_for_route(&route, &origin), broken);
+            assert_eq!(
+                tracker.h3_reachability_for_route(&route, &origin),
+                reachability
+            );
+            assert_eq!(
+                learned_protocol_state_for_route(&cache, &tracker, &route, &origin).h3_status,
+                learned_status
+            );
+            assert!(!tracker.is_broken(&origin));
+            assert_eq!(tracker.h3_reachability(&origin), None);
+        }
     }
 
     #[test]

@@ -36,21 +36,21 @@
 //! negative-model / blocklist targets only; against an allowlist they fail
 //! instantly):
 //!
-//! - [`Randomize::recombine`] — **Tier 3a**: one novel-but-capability-safe
+//! - `Randomize::recombine` — **Tier 3a**: one novel-but-capability-safe
 //!   identity per session, recombined from the real-preset corpus across **all**
-//!   layers (TLS + H2 + H3). [`Randomize::recombine_layers`] restricts it to a
-//!   [`Layers`] subset.
-//! - [`Randomize::full`] — **Tier 3b**: the widest synthesis — like recombine,
+//!   layers (TLS + H2 + H3). `Randomize::recombine_layers` restricts it to a
+//!   `Layers` subset.
+//! - `Randomize::full` — **Tier 3b**: the widest synthesis — like recombine,
 //!   but the advertise-only layers (H2 SETTINGS, QUIC transport-param values)
-//!   additionally take novel out-of-corpus numbers. [`Randomize::full_layers`]
-//!   restricts it to a [`Layers`] subset.
+//!   additionally take novel out-of-corpus numbers. `Randomize::full_layers`
+//!   restricts it to a `Layers` subset.
 //!
 //! ### "No layer left constant"
 //!
 //! `recombine`/`full` synthesize **every** layer by default. Half-synthesis (a
 //! novel TLS fingerprint next to an unchanged Chrome H2 profile) is itself an
 //! anomalous combination, easier to flag than full synthesis — so the per-layer
-//! [`Layers`] variants are a deliberate opt-in, not the default.
+//! `Layers` variants are a deliberate opt-in, not the default.
 //!
 //! ```rust
 //! # #[cfg(feature = "synthetic-fp")] {

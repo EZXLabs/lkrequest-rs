@@ -6,12 +6,11 @@ use http::HeaderMap;
 use crate::profile::{H3Profile, PseudoHeaderId};
 use crate::sender::H3Sender;
 
-type QuinnRequestStream = client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type QuinnSendRequest = client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// Receive side of a live HTTP/3 request stream.
 pub struct H3RecvStream {
-    pub(crate) inner: QuinnRequestStream,
+    pub(crate) inner: client::RequestStream<h3_quinn::RecvStream, Bytes>,
 }
 
 impl H3RecvStream {
@@ -44,6 +43,8 @@ impl H3RecvStream {
 
 #[derive(Debug, thiserror::Error)]
 pub enum H3Error {
+    #[error("h3 upload error: {0}")]
+    Upload(#[from] std::io::Error),
     #[error("invalid H3 profile: {0}")]
     InvalidProfile(String),
     #[error("h3 connection error: {0}")]
@@ -71,7 +72,10 @@ pub struct H3Connection {
 fn h3_builder(h3_profile: &H3Profile) -> client::Builder {
     let mut builder = client::builder();
     builder.send_grease(h3_profile.grease_settings);
+    builder.chromium_grease(h3_profile.chromium_grease);
     builder.control_grease_frame(h3_profile.send_control_grease_frame);
+    builder.qpack_max_table_capacity(h3_profile.qpack_max_table_capacity);
+    builder.qpack_blocked_streams(h3_profile.qpack_blocked_streams);
     builder.ordered_settings(h3_profile.effective_settings());
     builder.pseudo_header_order(
         h3_profile

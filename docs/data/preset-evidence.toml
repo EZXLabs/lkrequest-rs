@@ -1,0 +1,300 @@
+schema_version = 1
+reviewed_at = "2026-09-25"
+allowed_statuses = ["verified", "inherited", "partial", "fixture-only", "unverified"]
+
+[[preset]]
+name = "chrome_131"
+browser_version = "131"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/chrome_131.json", "lkrequest/tests/fixtures/fingerprints/chrome_131_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_131_h2.json"]
+notes = ["The profile source explicitly marks this preset unverified."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "unverified"
+h2 = "fixture-only"
+quic_tls = "fixture-only"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_144"
+browser_version = "144.0.0.0"
+platform = "Windows 10"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/chrome_144.json", "lkrequest/tests/fixtures/fingerprints/chrome_144_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_144_h2.json"]
+notes = ["TCP TLS was captured from a real browser; QUIC/H3 uses the Chrome 146 transport baseline."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "fixture-only"
+quic_tls = "fixture-only"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_145"
+browser_version = "145"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/chrome_145.json", "lkrequest/tests/fixtures/fingerprints/chrome_145_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_145_h2.json"]
+notes = ["TLS was captured by profile-collector; field-trial-only extension and SETTINGS values are intentionally excluded.", "QUIC/H3 uses the Chrome 146 transport baseline."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "partial"
+h2 = "fixture-only"
+quic_tls = "fixture-only"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_146"
+browser_version = "146"
+platform = "Windows 11"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/chrome_146.json", "lkrequest/tests/fixtures/fingerprints/chrome_146_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_146_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_146_quic.json"]
+notes = ["Dedicated Chrome 146 QUIC/H3 profile is the inherited baseline for several adjacent Chrome milestones."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "verified"
+h3_settings = "verified"
+
+[[preset]]
+name = "chrome_147"
+browser_version = "147"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/chrome_147.json", "lkrequest/tests/fixtures/fingerprints/chrome_147_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_147_h2.json"]
+notes = ["TLS extension order and ECH range came from a real Chrome capture; QUIC/H3 uses the Chrome 146 baseline."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "inherited"
+quic_tls = "fixture-only"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_148"
+browser_version = "148"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/chrome_148.json", "lkrequest/tests/fixtures/fingerprints/chrome_148_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_148_h2.json"]
+notes = ["TLS extension-order sample came from a real Chrome capture; stable H2 and QUIC/H3 fields are inherited."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "inherited"
+quic_tls = "fixture-only"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_149"
+browser_version = "149.0.7827.54"
+platform = "unspecified"
+captured_at = "2026-06-04"
+verified_commit = "40a7645"
+evidence = ["lktls/profiles/chrome_149.json", "lkrequest/tests/fixtures/fingerprints/chrome_149_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_149_h2.json"]
+notes = ["Real Chrome 149 was verified against Chrome 148 stable TLS/H2 fields; randomized GREASE and extension order are normalized.", "QUIC/H3 uses the Chrome 146 transport baseline."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "fixture-only"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_150"
+browser_version = "150.0.7871.47"
+platform = "Windows"
+verified_commit = "3fc5d48"
+evidence = ["lktls/profiles/chrome_150.json", "lkrequest/tests/fixtures/fingerprints/chrome_150_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_150_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_150_quic.json"]
+notes = ["TCP TLS includes the observed ML-DSA algorithms.", "The Outlook QUIC/H3 capture showed request-context and packet-layout gaps, so QUIC/H3 is not classified as fully verified."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "partial"
+quic_tls = "partial"
+quic_transport = "partial"
+h3_settings = "partial"
+
+[[preset]]
+name = "chrome_151"
+browser_version = "151.0.7922.72"
+platform = "Windows"
+captured_at = "2026-07-31"
+verified_commit = "8d58420"
+evidence = ["lktls/profiles/chrome_151.json", "lkrequest/tests/fixtures/fingerprints/chrome_151_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_151_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_151_quic.json"]
+notes = ["TCP TLS/H2 stable fields matched Chrome 150.", "Public-site QUIC TLS was captured directly; transport and H3 shape retain the Chrome 150 baseline."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "inherited"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_152"
+browser_version = "152.0.7977.65"
+platform = "Windows"
+captured_at = "2026-08-28"
+verified_commit = "da2f8c7"
+evidence = ["CHANGELOG.md", "lktls/profiles/chrome_152.json", "lkrequest/tests/fixtures/fingerprints/chrome_152_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_152_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_152_quic.json"]
+notes = ["TCP TLS signature-algorithm GREASE slot and trust-anchor identifier set were matched against real Chrome.", "H2 retains Chrome 151 stable fields.", "QUIC capture proved ClientHello and transport-parameter changes but did not prove a complete H3 SETTINGS exchange."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "inherited"
+quic_tls = "verified"
+quic_transport = "partial"
+h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_153"
+browser_version = "153.0.8010.37"
+platform = "Windows"
+captured_at = "2026-09-15"
+verified_commit = "a115fd0"
+evidence = ["CHANGELOG.md", "lktls/profiles/chrome_153.json", "lkrequest/tests/fixtures/fingerprints/chrome_153_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_153_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_153_quic.json", "lkrequest/tests/fixtures/fingerprints/chrome_153_quic_tls_fresh.json"]
+notes = ["TCP TLS keeps the signature-algorithm GREASE slot and reduces the shuffled 0xca34 trust-anchor set from 32 to 28 identifiers.", "H2 SETTINGS, connection window, pseudo-header order and navigation HEADERS priority were captured directly and match the verified Chrome 152 values.", "QUIC TLS was captured directly: classic nine signature algorithms, shuffled ClientHello extensions, no ordinary TLS GREASE slots, same 28 trust anchors.", "A completed H3 navigation returned HTTP 200 with SETTINGS 1=65536, 6=262144, 7=100 and 51=1, plus a control-stream GREASE frame and navigation priority u=0, i.", "Randomized parts (reserved transport parameter, H3 GREASE, Initial CRYPTO/PING/PADDING layout) follow Chromium generation rules rather than a fixed capture; see the audit record."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "verified"
+h3_settings = "verified"
+
+[[preset]]
+name = "chrome_154"
+browser_version = "154.0.8037.58"
+platform = "Windows"
+captured_at = "2026-09-24"
+verified_commit = "ff74d8b"
+evidence = ["CHANGELOG.md", "lktls/profiles/chrome_154.json", "lkrequest/tests/fixtures/fingerprints/chrome_154_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_154_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_154_quic.json", "lkrequest/tests/fixtures/fingerprints/chrome_154_quic_tls_fresh.json"]
+notes = ["TCP TLS and H2 were captured from successful public Cloudflare HTTP 200 navigations and retain Chrome 153's stable fields.", "Three public QUIC ClientHello flights retain Chrome 153's classic nine signature algorithms, shuffled extensions, 28 trust anchors, stable transport values, and Chromium Initial packetization.", "The current capture path received no QUIC response, so H3 SETTINGS and request priority explicitly inherit the completed Chrome 153 navigation baseline."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "verified"
+h3_settings = "inherited"
+
+[[preset]]
+name = "firefox_133"
+browser_version = "133"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/firefox_133.json", "lkrequest/tests/fixtures/fingerprints/firefox_133_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/firefox_133_h2.json"]
+notes = ["The TLS profile source explicitly marks this preset unverified.", "No dedicated QUIC/H3 profile is provided."]
+[preset.support]
+rust = true
+ffi = true
+h3 = false
+[preset.layers]
+tcp_tls = "unverified"
+h2 = "fixture-only"
+
+[[preset]]
+name = "firefox_147"
+browser_version = "147.0.3"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/firefox_147.json", "lkrequest/tests/fixtures/fingerprints/firefox_147_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/firefox_147_h2.json"]
+notes = ["TLS was calibrated from a BrowserLeaks capture.", "No dedicated QUIC/H3 profile is provided."]
+[preset.support]
+rust = true
+ffi = true
+h3 = false
+[preset.layers]
+tcp_tls = "verified"
+h2 = "fixture-only"
+
+[[preset]]
+name = "firefox_156"
+browser_version = "156.0.1"
+platform = "Windows"
+captured_at = "2026-09-25"
+verified_commit = "ff74d8b"
+evidence = ["CHANGELOG.md", "lktls/profiles/firefox_156.json", "lkrequest/tests/fixtures/fingerprints/firefox_156_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/firefox_156_h2.json"]
+notes = ["Two public Cloudflare TCP connections directly verify the TLS fields, including cipher/group removals and AES-128-GCM ECH GREASE.", "A successful H2 navigation returned 200 with the same SETTINGS, window, pseudo-header order, priority, and navigation header order as Firefox 147.", "A public QUIC Initial exposed Firefox-specific transport and packetization fields, but the current stack cannot represent all of them exactly, so the preset deliberately disables QUIC/H3."]
+[preset.support]
+rust = true
+ffi = true
+h3 = false
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+
+[[preset]]
+name = "safari_18"
+browser_version = "18"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/safari_18.json", "lkrequest/tests/fixtures/fingerprints/safari_18_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/safari_18_h2.json"]
+notes = ["The TLS profile source explicitly marks this preset unverified.", "No dedicated QUIC/H3 profile is provided."]
+[preset.support]
+rust = true
+ffi = true
+h3 = false
+[preset.layers]
+tcp_tls = "unverified"
+h2 = "fixture-only"
+
+[[preset]]
+name = "safari_26"
+browser_version = "26.2"
+platform = "unspecified"
+verified_commit = "264d90a"
+evidence = ["lktls/profiles/safari_26.json", "lkrequest/tests/fixtures/fingerprints/safari_26_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/safari_26_h2.json"]
+notes = ["TLS was calibrated from a BrowserLeaks capture.", "No dedicated QUIC/H3 profile is provided."]
+[preset.support]
+rust = true
+ffi = true
+h3 = false
+[preset.layers]
+tcp_tls = "verified"
+h2 = "fixture-only"

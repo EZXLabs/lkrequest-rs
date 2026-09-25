@@ -27,8 +27,11 @@ pub enum PresetKind {
     Chrome150,
     Chrome151,
     Chrome152,
+    Chrome153,
+    Chrome154,
     Firefox133,
     Firefox147,
+    Firefox156,
     Safari18,
     Safari26,
 }
@@ -70,6 +73,11 @@ pub struct ClientBuilderState {
     pub randomize_mode: u8,
     /// Layer bitmask for synthetic modes (TLS=1, H2=2, QUIC=4; 0=all).
     pub randomize_layers: u32,
+    /// Outer-connection settings for `masque://` routes, from
+    /// `lk_client_builder_set_masque_config`. `None` leaves the Rust-side
+    /// default (OS trust store, no extra roots).
+    #[cfg(feature = "masque")]
+    pub masque: Option<lkrequest::proxy::MasqueOuterConfig>,
 }
 
 impl Default for ClientBuilderState {
@@ -109,6 +117,8 @@ impl Default for ClientBuilderState {
             keylog_file: None,
             randomize_mode: 0,
             randomize_layers: 0,
+            #[cfg(feature = "masque")]
+            masque: None,
         }
     }
 }
@@ -179,6 +189,9 @@ impl SessionHandle {
 pub struct SessionBuilderState {
     pub client: Arc<ClientShared>,
     pub proxy: Option<String>,
+    /// Set by `lk_session_builder_set_proxy_config`; takes precedence over
+    /// `proxy` (the URL form cannot express every credential).
+    pub proxy_config: Option<lkrequest::proxy::ProxyConfig>,
     pub redirect_policy: lkrequest::RedirectPolicy,
     pub ech_config: Option<Vec<u8>>,
     pub preferred_http_version: SessionHttpVersionPreference,
@@ -219,6 +232,7 @@ impl SessionBuilderState {
         Self {
             client,
             proxy: None,
+            proxy_config: None,
             redirect_policy: lkrequest::RedirectPolicy::default(),
             ech_config: None,
             preferred_http_version: SessionHttpVersionPreference::Auto,
@@ -587,6 +601,40 @@ pub struct PoolBuilderState {
     pub health_check: Option<lkrequest::session_pool::HealthCheckConfig>,
     pub provider: Option<FfiProxyProvider>,
     pub proxy_buffer: Option<usize>,
+    /// Outer-connection settings for a MASQUE `tunnel_probe`, from
+    /// `lk_*_pool_builder_set_masque_tunnel_probe`.
+    ///
+    /// Kept beside `health_check` rather than folded into it because
+    /// `lk_*_pool_builder_set_health_check` replaces that whole config from
+    /// `Default`: merging at build time is what makes the two setters
+    /// order-independent from C, where there is no builder chain to make the
+    /// order obvious.
+    #[cfg(feature = "masque")]
+    pub masque_probe: Option<lkrequest::proxy::MasqueOuterConfig>,
+}
+
+/// Fold a configured MASQUE probe into the health check it belongs to.
+///
+/// Turning the probe on needs both halves: the flag, and the trust anchors the
+/// outer connection is verified against. `HealthCheckConfig` documents why
+/// there is no default for the second — probing a privately-fronted proxy
+/// against the OS store blacklists a *healthy* proxy — so a C caller that asked
+/// for the probe without configuring health checking at all is told, rather
+/// than handed a pool that quietly never probes.
+#[cfg(feature = "masque")]
+pub fn apply_masque_probe(state: &mut PoolBuilderState) -> Result<(), FfiError> {
+    let Some(outer) = state.masque_probe.clone() else {
+        return Ok(());
+    };
+    let Some(health_check) = state.health_check.as_mut() else {
+        return Err(FfiError::invalid_config(
+            "a MASQUE tunnel probe was configured but health checking is off; \
+             call set_health_check on this builder as well",
+        ));
+    };
+    health_check.tunnel_probe = true;
+    health_check.masque_outer_config = Some(outer);
+    Ok(())
 }
 
 pub struct ProxyPoolBuilderHandle {
@@ -660,11 +708,18 @@ pub struct SessionPoolGuardHandle {
     pub client: Arc<ClientShared>,
 }
 
+/// Render a proxy back to its URL form.
+///
+/// Only username/password credentials have a URL form; `ProxyCredential::Http`
+/// and `Custom` are carried on the handle, not in the URL, so they render as an
+/// anonymous URL. Callers that need the full credential should keep the
+/// `lk_proxy_config_t` handle.
 pub fn proxy_url_bytes(proxy: &lkrequest::proxy::ProxyConfig) -> Vec<u8> {
     let auth = proxy
-        .auth
+        .resolved_credential()
         .as_ref()
-        .map(|auth| format!("{}:{}@", auth.username, auth.password))
+        .and_then(|credential| credential.user_pass())
+        .map(|(username, password)| format!("{username}:{password}@"))
         .unwrap_or_default();
 
     match &proxy.scheme {
@@ -679,7 +734,61 @@ pub fn proxy_url_bytes(proxy: &lkrequest::proxy::ProxyConfig) -> Vec<u8> {
             let scheme = if *remote_dns { "socks5h" } else { "socks5" };
             format!("{scheme}://{auth}{host}:{port}").into_bytes()
         }
+        #[cfg(feature = "masque")]
+        lkrequest::proxy::ProxyScheme::Masque { host, port } => {
+            format!("masque://{auth}{host}:{port}").into_bytes()
+        }
     }
+}
+
+/// A `ProxyConfig` behind the FFI boundary.
+///
+/// Exists because credentials other than username/password (`Preshared`,
+/// `PrivateToken`, `Bearer`, …) and the choice of authorization header have no
+/// URL form; the `lk_proxy_config_*` entry points build one of these and hand
+/// it to a Session or ProxyPool.
+pub struct ProxyConfigHandle {
+    pub config: lkrequest::proxy::ProxyConfig,
+    /// Cached rendering for `lk_proxy_config_url`; the C caller borrows it.
+    pub url: Vec<u8>,
+    /// Cached rendering for `lk_proxy_config_identity`.
+    pub identity: Vec<u8>,
+}
+
+impl ProxyConfigHandle {
+    pub fn new(config: lkrequest::proxy::ProxyConfig) -> Self {
+        let url = proxy_url_bytes(&config);
+        let identity = config.identity().into_bytes();
+        Self {
+            config,
+            url,
+            identity,
+        }
+    }
+
+    /// Re-render the cached strings after the config changed.
+    pub fn refresh(&mut self) {
+        self.url = proxy_url_bytes(&self.config);
+        self.identity = self.config.identity().into_bytes();
+    }
+}
+
+/// A [`MasqueOuterConfig`](lkrequest::proxy::MasqueOuterConfig) behind the FFI
+/// boundary.
+///
+/// Built by `lk_masque_config_new`, mutated by the `lk_masque_config_set_*` /
+/// `lk_masque_config_add_*` setters and then *copied* into whatever consumes it
+/// (a client builder, a pool builder's health check). Consumption copies rather
+/// than takes ownership so one handle can front several consumers — the usual
+/// shape, since the probe wants the same trust anchors the requests use — and
+/// the caller still frees the handle exactly once.
+///
+/// `MasqueOuterConfig::verify` is deliberately **not** reachable from here; see
+/// `lkrequest-ffi/README.md`.
+#[cfg(feature = "masque")]
+#[derive(Default)]
+pub struct MasqueConfigHandle {
+    pub config: lkrequest::proxy::MasqueOuterConfig,
 }
 
 pub enum OpSuccess {
@@ -769,6 +878,8 @@ impl Default for PoolBuilderState {
             health_check: None,
             provider: None,
             proxy_buffer: None,
+            #[cfg(feature = "masque")]
+            masque_probe: None,
         }
     }
 }

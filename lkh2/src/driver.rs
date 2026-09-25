@@ -15,13 +15,15 @@ use crate::engine::{H2Engine, H2Event};
 use crate::frame::H2Frame;
 use crate::policy::{FrameWritePolicy, H2Behavior};
 use crate::profile::H2Profile;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
@@ -55,7 +57,7 @@ pub(crate) enum DriverCommand {
 #[derive(Debug, Clone)]
 pub struct NativeResponseHeaders {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: http::HeaderMap,
 }
 
 // ─── First Request (piggybacked on connection setup) ─────────────────────────
@@ -133,13 +135,41 @@ impl From<std::io::Error> for DriverError {
 // ─── NativeSendRequest ───────────────────────────────────────────────────────
 
 /// Runtime controls for the native HTTP/2 connection driver.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H2DriverConfig {
     /// Maximum requests that may wait for a remote stream slot.
     ///
     /// None keeps the default unbounded queue. A positive value applies
     /// asynchronous backpressure before additional requests enter the driver.
     pub max_pending_requests: Option<usize>,
+
+    /// Maximum ready request commands drained before dispatching writes.
+    ///
+    /// The default of one preserves the existing fingerprint-sensitive
+    /// scheduling. Larger values reduce driver wakeups without changing frame
+    /// grouping or explicitly concatenating writes.
+    pub max_ready_commands_per_turn: usize,
+
+    /// Maximum requests encoded into one socket write.
+    ///
+    /// The default of one preserves frame-group write boundaries. Values above
+    /// one are an explicit throughput mode and may change TLS record and TCP
+    /// segmentation behavior.
+    pub max_requests_per_write: usize,
+
+    /// Maximum encoded bytes accumulated for one socket write.
+    pub max_write_batch_bytes: usize,
+}
+
+impl Default for H2DriverConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_requests: None,
+            max_ready_commands_per_turn: 1,
+            max_requests_per_write: 1,
+            max_write_batch_bytes: 64 * 1024,
+        }
+    }
 }
 
 /// Cloneable handle to send HTTP/2 requests through a native H2 connection.
@@ -244,7 +274,6 @@ impl NativeSendRequest {
     }
 
     /// Send a request using a pre-ordered `NativeH2Request` and receive a streaming response.
-    #[allow(dead_code)]
     pub(crate) async fn send_native_request(
         &mut self,
         request: crate::adapter::NativeH2Request,
@@ -291,6 +320,9 @@ impl fmt::Debug for NativeSendRequest {
 // ─── Pending response state ─────────────────────────────────────────────────
 
 struct PendingStream {
+    upload: Option<PendingUpload>,
+    // Keep cancellation alive after upload EOF, until the response is released.
+    cancelled: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
     /// Sends response headers (used once, then becomes None).
     headers_tx: Option<oneshot::Sender<Result<NativeResponseHeaders, DriverError>>>,
     /// Streams body data chunks to the consumer.
@@ -311,12 +343,86 @@ impl PendingStream {
         body_tx: mpsc::UnboundedSender<Result<Bytes, DriverError>>,
     ) -> Self {
         Self {
+            upload: None,
+            cancelled: None,
             headers_tx: Some(headers_tx),
             body_tx,
             method,
             content_length: None,
         }
     }
+}
+
+pub(crate) struct PendingUpload {
+    source: crate::adapter::UploadStream,
+    chunk: Bytes,
+}
+
+impl PendingUpload {
+    pub(crate) fn new(source: crate::adapter::UploadStream) -> Self {
+        Self {
+            source,
+            chunk: Bytes::new(),
+        }
+    }
+}
+
+impl fmt::Debug for PendingUpload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingUpload")
+            .field("buffered_bytes", &self.chunk.len())
+            .finish_non_exhaustive()
+    }
+}
+
+enum UploadAction {
+    Data(Bytes),
+    End,
+    Failed(DriverError),
+    Cancel,
+}
+
+fn poll_uploads(
+    pending: &mut HashMap<u32, PendingStream>,
+    engine: &H2Engine,
+    context: &mut Context<'_>,
+    allow_data: bool,
+) -> Poll<(u32, UploadAction)> {
+    // Cancellation must progress even with no peer window or a blocked writer.
+    for (&stream_id, response) in pending.iter_mut() {
+        let Some(cancelled) = response.cancelled.as_mut() else {
+            continue;
+        };
+        if response.body_tx.is_closed() || cancelled.as_mut().poll(context).is_ready() {
+            return Poll::Ready((stream_id, UploadAction::Cancel));
+        }
+    }
+    if !allow_data {
+        return Poll::Pending;
+    }
+    for (&stream_id, response) in pending.iter_mut() {
+        let Some(upload) = response.upload.as_mut() else {
+            continue;
+        };
+        let capacity = engine.upload_capacity(stream_id);
+        if upload.chunk.is_empty() {
+            match upload.source.as_mut().poll_next(context) {
+                Poll::Pending => continue,
+                Poll::Ready(None) => return Poll::Ready((stream_id, UploadAction::End)),
+                Poll::Ready(Some(Err(error))) => {
+                    return Poll::Ready((stream_id, UploadAction::Failed(error.into())))
+                }
+                Poll::Ready(Some(Ok(chunk))) => upload.chunk = chunk,
+            }
+        }
+        if capacity == 0 && !upload.chunk.is_empty() {
+            continue;
+        }
+        let count = capacity.min(upload.chunk.len());
+        return Poll::Ready((stream_id, UploadAction::Data(upload.chunk.split_to(count))));
+    }
+    Poll::Pending
 }
 
 /// Running comparison of a response's declared `content-length` against the
@@ -463,6 +569,21 @@ where
             "max_pending_requests must be greater than zero".into(),
         ));
     }
+    if config.max_ready_commands_per_turn == 0 {
+        return Err(DriverError::Protocol(
+            "max_ready_commands_per_turn must be greater than zero".into(),
+        ));
+    }
+    if config.max_requests_per_write == 0 {
+        return Err(DriverError::Protocol(
+            "max_requests_per_write must be greater than zero".into(),
+        ));
+    }
+    if config.max_write_batch_bytes == 0 {
+        return Err(DriverError::Protocol(
+            "max_write_batch_bytes must be greater than zero".into(),
+        ));
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCommand>(64);
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
@@ -479,6 +600,9 @@ where
         hpack_policy = ?behavior.hpack_policy,
         max_data_frame_payload = ?max_data_frame_payload,
         max_pending_requests = ?config.max_pending_requests,
+        max_ready_commands_per_turn = config.max_ready_commands_per_turn,
+        max_requests_per_write = config.max_requests_per_write,
+        max_write_batch_bytes = config.max_write_batch_bytes,
         "h2.native.behavior_applied"
     );
 
@@ -503,6 +627,9 @@ where
             ready_tx,
             first_request,
             pending_slots: pending_slots.clone(),
+            max_ready_commands_per_turn: config.max_ready_commands_per_turn,
+            max_requests_per_write: config.max_requests_per_write,
+            max_write_batch_bytes: config.max_write_batch_bytes,
         },
     ));
 
@@ -529,9 +656,96 @@ struct DriverRuntime {
     ready_tx: oneshot::Sender<Result<(), DriverError>>,
     first_request: Option<FirstRequest>,
     pending_slots: Option<Arc<Semaphore>>,
+    max_ready_commands_per_turn: usize,
+    max_requests_per_write: usize,
+    max_write_batch_bytes: usize,
 }
 
 struct PendingSlotsCloseGuard(Option<Arc<Semaphore>>);
+
+/// Queues encoded writes so socket backpressure cannot block reads or cancellation.
+/// Original buffered request batches remain intact; streaming admission waits for
+/// pending writes to drain rather than collecting the producer's entire body.
+#[derive(Default)]
+struct PendingWrites {
+    buffers: VecDeque<Bytes>,
+    buffered_bytes: usize,
+    flushing: bool,
+    admitting_buffered_batch: bool,
+    control_limit: usize,
+}
+
+impl PendingWrites {
+    const LIMIT: usize = 1024 * 1024;
+
+    fn is_empty(&self) -> bool {
+        self.buffers.is_empty() && !self.flushing
+    }
+
+    fn poll_drain<S: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut S,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.flushing {
+            std::task::ready!(std::pin::Pin::new(&mut *writer).poll_flush(context))?;
+            self.flushing = false;
+            if self.buffers.is_empty() {
+                self.control_limit = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        let Some(buffer) = self.buffers.front_mut() else {
+            return Poll::Pending;
+        };
+        let count = std::task::ready!(std::pin::Pin::new(writer).poll_write(context, buffer))?;
+        if count == 0 {
+            return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+        }
+        buffer.advance(count);
+        self.buffered_bytes -= count;
+        if buffer.is_empty() {
+            self.buffers.pop_front();
+            self.flushing = true;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for PendingWrites {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if !self.admitting_buffered_batch
+            && self.buffered_bytes.saturating_add(data.len()) > self.control_limit.max(Self::LIMIT)
+        {
+            return Poll::Ready(Err(std::io::Error::other(
+                "H2 pending write limit exceeded",
+            )));
+        }
+        if !data.is_empty() {
+            self.buffers.push_back(Bytes::copy_from_slice(data));
+            self.buffered_bytes += data.len();
+        }
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 impl Drop for PendingSlotsCloseGuard {
     fn drop(&mut self) {
@@ -556,6 +770,9 @@ async fn driver_loop<S>(
         ready_tx,
         first_request,
         pending_slots,
+        max_ready_commands_per_turn,
+        max_requests_per_write,
+        max_write_batch_bytes,
     } = runtime;
     let _pending_slots_guard = PendingSlotsCloseGuard(pending_slots);
 
@@ -619,12 +836,17 @@ async fn driver_loop<S>(
 
     let _ = ready_tx.send(Ok(()));
 
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut stream = PendingWrites::default();
+
     // ── Main loop ────────────────────────────────────────────────────
     let mut shutdown = false;
+    let mut terminating = false;
     let mut cancel_rx_open = true;
     let mut shutdown_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        let allow_upload_data = stream.is_empty();
         let sleep_fut = async {
             if let Some(deadline) = shutdown_deadline {
                 tokio::time::sleep_until(deadline).await;
@@ -634,7 +856,6 @@ async fn driver_loop<S>(
         };
 
         tokio::select! {
-            biased;
 
             cancelled = cancel_rx.recv(), if cancel_rx_open => {
                 match cancelled {
@@ -645,7 +866,7 @@ async fn driver_loop<S>(
                 }
             }
 
-            result = stream.read_buf(&mut read_buf) => {
+            result = reader.read_buf(&mut read_buf), if !terminating => {
                 match result {
                     Ok(0) => {
                         let error = DriverError::Io("connection closed".into());
@@ -663,6 +884,8 @@ async fn driver_loop<S>(
                         });
 
                         if !outbound_frames.is_empty() {
+                            let buffered_data = outbound_frames.iter().any(|frame| matches!(frame, H2Frame::Data(_)));
+                            stream.admitting_buffered_batch = buffered_data;
                             if let Err(e) = encode_and_write_frames(
                                 &mut stream, &engine, &*write_policy, outbound_frames,
                             ).await {
@@ -672,11 +895,37 @@ async fn driver_loop<S>(
                                 notify_waiting_error(&mut waiting, error);
                                 break;
                             }
+                            stream.admitting_buffered_batch = false;
+                            if buffered_data {
+                                stream.control_limit = stream.buffered_bytes.saturating_add(PendingWrites::LIMIT);
+                            }
                         }
 
                         let mut resets = Vec::new();
+                        let mut completed_uploads = Vec::new();
                         for event in events.drain(..) {
+                            let ended_upload = match &event {
+                                H2Event::ResponseHeaders { stream_id, end_stream: true, .. }
+                                | H2Event::ResponseData { stream_id, end_stream: true, .. }
+                                    if pending.get(stream_id).is_some_and(|response| response.upload.is_some()) => Some(*stream_id),
+                                _ => None,
+                            };
                             handle_event_inner(event, &mut pending, &mut resets);
+                            if let Some(stream_id) = ended_upload {
+                                if !pending.contains_key(&stream_id) && !resets.contains(&stream_id) {
+                                    completed_uploads.push(stream_id);
+                                }
+                            }
+                        }
+
+                        let mut output = BytesMut::new();
+                        for stream_id in completed_uploads {
+                            engine.send_rst_stream(stream_id, 0, &mut output);
+                        }
+                        if let Err(error) = write_encoded_buffer(&mut stream, &mut output).await {
+                            notify_all_error(&mut pending, error.clone());
+                            notify_waiting_error(&mut waiting, error);
+                            break;
                         }
 
                         // RFC 9113 §8.1.1: a malformed response is a stream
@@ -698,8 +947,9 @@ async fn driver_loop<S>(
                             tracing::error!(error = %error, "h2.native.connection_error");
                             notify_all_error(&mut pending, error.clone());
                             notify_waiting_error(&mut waiting, error);
-                            let _ = stream.shutdown().await;
-                            break;
+                            terminating = true;
+                            shutdown = true;
+                            shutdown_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
                         }
                     }
                     Err(e) => {
@@ -711,52 +961,41 @@ async fn driver_loop<S>(
                 }
             }
 
-            cmd = cmd_rx.recv(), if !shutdown => {
+            cmd = cmd_rx.recv(), if !shutdown && allow_upload_data => {
                 match cmd {
-                    Some(DriverCommand::SendRequest {
-                        request_id,
-                        request,
-                        headers_tx,
-                        body_tx,
-                        pending_permit,
-                    }) => {
-                        let request = QueuedRequest::Request {
-                            request_id,
-                            request,
-                            headers_tx,
-                            body_tx,
-                            pending_permit,
-                        };
-                        if !request.is_canceled() {
-                            waiting.push_back(request);
+                    Some(command) => {
+                        shutdown = queue_driver_command(command, &mut waiting);
+                        if !shutdown && max_ready_commands_per_turn > 1 {
+                            if !pending.is_empty() {
+                                tokio::task::yield_now().await;
+                            }
+                            for _ in 1..max_ready_commands_per_turn {
+                                match cmd_rx.try_recv() {
+                                    Ok(command) => {
+                                        if queue_driver_command(command, &mut waiting) {
+                                            shutdown = true;
+                                            break;
+                                        }
+                                    }
+                                    Err(mpsc::error::TryRecvError::Empty) => break,
+                                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                                        shutdown = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
-                    Some(DriverCommand::SendNativeRequest {
-                        request_id,
-                        request,
-                        headers_tx,
-                        body_tx,
-                        pending_permit,
-                    }) => {
-                        let request = QueuedRequest::NativeRequest {
-                            request_id,
-                            request,
-                            headers_tx,
-                            body_tx,
-                            pending_permit,
-                        };
-                        if !request.is_canceled() {
-                            waiting.push_back(request);
-                        }
-                    }
-                    Some(DriverCommand::Shutdown) | None => {
+                    None => {
                         shutdown = true;
-                        if pending.is_empty() && waiting.is_empty() {
-                            break;
-                        }
-                        if shutdown_deadline.is_none() {
-                            shutdown_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                        }
+                    }
+                }
+                if shutdown {
+                    if pending.is_empty() && waiting.is_empty() {
+                        break;
+                    }
+                    if shutdown_deadline.is_none() {
+                        shutdown_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                     }
                 }
             }
@@ -767,6 +1006,47 @@ async fn driver_loop<S>(
                 notify_waiting_error(&mut waiting, DriverError::Shutdown);
                 break;
             }
+
+            (stream_id, action) = std::future::poll_fn(|context| poll_uploads(&mut pending, &engine, context, allow_upload_data)) => {
+                let mut output = BytesMut::new();
+                match action {
+                    UploadAction::Data(data) => engine.send_data(stream_id, data, false, &mut output),
+                    UploadAction::End => {
+                        if let Some(response) = pending.get_mut(&stream_id) { response.upload = None; }
+                        engine.send_data(stream_id, Bytes::new(), true, &mut output);
+                    }
+                    UploadAction::Failed(error) => {
+                        if let Some(response) = pending.remove(&stream_id) {
+                            if let Some(headers) = response.headers_tx { let _ = headers.send(Err(error.clone())); }
+                            let _ = response.body_tx.send(Err(error));
+                        }
+                        engine.send_rst_stream(stream_id, 2, &mut output);
+                    }
+                    UploadAction::Cancel => {
+                        pending.remove(&stream_id);
+                        engine.send_rst_stream(stream_id, 8, &mut output);
+                    }
+                }
+                if let Err(error) = write_encoded_buffer(&mut stream, &mut output).await {
+                    notify_all_error(&mut pending, error.clone());
+                    notify_waiting_error(&mut waiting, error);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            result = std::future::poll_fn(|context| stream.poll_drain(&mut writer, context)), if !allow_upload_data => {
+                if let Err(error) = result {
+                    let error = DriverError::Io(error.to_string());
+                    notify_all_error(&mut pending, error.clone());
+                    notify_waiting_error(&mut waiting, error);
+                    break;
+                }
+            }
+        }
+
+        if !stream.is_empty() {
+            continue;
         }
 
         if let Err(error) = dispatch_waiting_requests(
@@ -775,6 +1055,8 @@ async fn driver_loop<S>(
             &*write_policy,
             &mut pending,
             &mut waiting,
+            max_requests_per_write,
+            max_write_batch_bytes,
         )
         .await
         {
@@ -782,6 +1064,51 @@ async fn driver_loop<S>(
             notify_all_error(&mut pending, error.clone());
             notify_waiting_error(&mut waiting, error);
             break;
+        }
+
+        if !shutdown && max_ready_commands_per_turn > 1 && stream.is_empty() {
+            let mut received_request = false;
+            for _ in 0..max_ready_commands_per_turn {
+                match cmd_rx.try_recv() {
+                    Ok(command) => {
+                        let waiting_before = waiting.len();
+                        if queue_driver_command(command, &mut waiting) {
+                            shutdown = true;
+                            break;
+                        }
+                        received_request |= waiting.len() > waiting_before;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        shutdown = true;
+                        break;
+                    }
+                }
+            }
+
+            if received_request {
+                if let Err(error) = dispatch_waiting_requests(
+                    &mut stream,
+                    &mut engine,
+                    &*write_policy,
+                    &mut pending,
+                    &mut waiting,
+                    max_requests_per_write,
+                    max_write_batch_bytes,
+                )
+                .await
+                {
+                    tracing::error!(error = %error, "h2.native.write_error");
+                    notify_all_error(&mut pending, error.clone());
+                    notify_waiting_error(&mut waiting, error);
+                    break;
+                }
+            }
+
+            if shutdown && shutdown_deadline.is_none() {
+                shutdown_deadline =
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+            }
         }
 
         if shutdown && pending.is_empty() && waiting.is_empty() {
@@ -792,16 +1119,52 @@ async fn driver_loop<S>(
     tracing::debug!("h2.native.driver_exited");
 }
 
-async fn dispatch_waiting_requests<S>(
-    stream: &mut S,
+fn queue_driver_command(command: DriverCommand, waiting: &mut VecDeque<QueuedRequest>) -> bool {
+    let request = match command {
+        DriverCommand::SendRequest {
+            request_id,
+            request,
+            headers_tx,
+            body_tx,
+            pending_permit,
+        } => QueuedRequest::Request {
+            request_id,
+            request,
+            headers_tx,
+            body_tx,
+            pending_permit,
+        },
+        DriverCommand::SendNativeRequest {
+            request_id,
+            request,
+            headers_tx,
+            body_tx,
+            pending_permit,
+        } => QueuedRequest::NativeRequest {
+            request_id,
+            request,
+            headers_tx,
+            body_tx,
+            pending_permit,
+        },
+        DriverCommand::Shutdown => return true,
+    };
+
+    if !request.is_canceled() {
+        waiting.push_back(request);
+    }
+    false
+}
+
+async fn dispatch_waiting_requests(
+    stream: &mut PendingWrites,
     engine: &mut H2Engine,
     write_policy: &dyn FrameWritePolicy,
     pending: &mut HashMap<u32, PendingStream>,
     waiting: &mut VecDeque<QueuedRequest>,
-) -> Result<(), DriverError>
-where
-    S: AsyncWrite + Unpin,
-{
+    max_requests_per_write: usize,
+    max_write_batch_bytes: usize,
+) -> Result<(), DriverError> {
     if engine.is_goaway() {
         notify_waiting_error(
             waiting,
@@ -810,7 +1173,12 @@ where
         return Ok(());
     }
 
-    while engine.can_open_stream() {
+    let mut batched_output = BytesMut::new();
+    stream.admitting_buffered_batch = true;
+    let mut batched_requests = 0usize;
+    let mut dispatched_requests = 0usize;
+
+    while engine.can_open_stream() && dispatched_requests < max_requests_per_write {
         let Some(request) = waiting.pop_front() else {
             break;
         };
@@ -819,6 +1187,8 @@ where
         }
 
         let stream_id = engine.open_stream();
+        dispatched_requests += 1;
+        let mut upload = None;
         let (frames, headers_tx, body_tx, pending_permit, method) = match request {
             QueuedRequest::Request {
                 request,
@@ -837,13 +1207,14 @@ where
                 )
             }
             QueuedRequest::NativeRequest {
-                request,
+                mut request,
                 headers_tx,
                 body_tx,
                 pending_permit,
                 ..
             } => {
                 let method = request.method.clone();
+                upload = request.upload.take();
                 (
                     engine.build_native_request(stream_id, *request),
                     headers_tx,
@@ -855,20 +1226,65 @@ where
         };
         drop(pending_permit);
 
-        pending.insert(stream_id, PendingStream::new(method, headers_tx, body_tx));
+        let mut response = PendingStream::new(method, headers_tx, body_tx);
+        if upload.is_some() {
+            let body_tx = response.body_tx.clone();
+            response.cancelled = Some(Box::pin(async move { body_tx.closed().await }));
+        }
+        response.upload = upload;
+        pending.insert(stream_id, response);
 
-        if let Err(error) = encode_and_write_frames(stream, engine, write_policy, frames).await {
-            let error = DriverError::Io(error.to_string());
-            if let Some(pending_stream) = pending.remove(&stream_id) {
-                if let Some(headers_tx) = pending_stream.headers_tx {
-                    let _ = headers_tx.send(Err(error.clone()));
+        if max_requests_per_write == 1 {
+            if let Err(error) = encode_and_write_frames(stream, engine, write_policy, frames).await
+            {
+                let error = DriverError::Io(error.to_string());
+                if let Some(pending_stream) = pending.remove(&stream_id) {
+                    if let Some(headers_tx) = pending_stream.headers_tx {
+                        let _ = headers_tx.send(Err(error.clone()));
+                    }
+                    let _ = pending_stream.body_tx.send(Err(error.clone()));
                 }
-                let _ = pending_stream.body_tx.send(Err(error.clone()));
+                return Err(error);
             }
-            return Err(error);
+            continue;
+        }
+
+        for group in write_policy.group_frames(frames) {
+            engine.encode_frames(&group, &mut batched_output);
+        }
+        batched_requests += 1;
+        if batched_requests >= max_requests_per_write
+            || batched_output.len() >= max_write_batch_bytes
+        {
+            write_encoded_buffer(stream, &mut batched_output).await?;
+            batched_requests = 0;
         }
     }
 
+    write_encoded_buffer(stream, &mut batched_output).await?;
+
+    stream.admitting_buffered_batch = false;
+    stream.control_limit = stream.buffered_bytes.saturating_add(PendingWrites::LIMIT);
+
+    Ok(())
+}
+
+async fn write_encoded_buffer<S>(stream: &mut S, output: &mut BytesMut) -> Result<(), DriverError>
+where
+    S: AsyncWrite + Unpin,
+{
+    if output.is_empty() {
+        return Ok(());
+    }
+    stream
+        .write_all(output)
+        .await
+        .map_err(|error| DriverError::Io(error.to_string()))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| DriverError::Io(error.to_string()))?;
+    output.clear();
     Ok(())
 }
 
@@ -911,28 +1327,18 @@ where
 {
     let stream_id = engine.open_stream();
     let (parts, body) = first_req.request.into_parts();
+    let method = parts.method.clone();
     let priority = parts
         .extensions
         .get::<crate::profile::RequestPriority>()
         .copied();
-    let method = parts.method.clone();
-    let native_req = crate::adapter::NativeH2Request {
-        method: parts.method,
-        uri: parts.uri,
-        ordered_headers: parts
-            .headers
-            .iter()
-            .filter(|(name, _)| !name.as_str().starts_with(':'))
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
-            })
-            .collect(),
+    let native_req = crate::adapter::NativeH2Request::new(
+        parts.method,
+        parts.uri,
+        parts.headers,
         body,
         priority,
-    };
+    );
     let frames = engine.build_native_request(stream_id, native_req);
 
     pending.insert(
@@ -1103,10 +1509,13 @@ fn handle_event_inner(
 
             // RFC 9113 §8.2.1/§8.2.2 apply to every received field section,
             // response and trailer sections alike.
-            if let Err(reason) = crate::adapter::validate_response_fields(&headers) {
-                fail_malformed(pending, stream_id, reason, resets);
-                return;
-            }
+            let parsed_headers = match crate::adapter::parse_response_fields(&headers) {
+                Ok(headers) => headers,
+                Err(reason) => {
+                    fail_malformed(pending, stream_id, reason, resets);
+                    return;
+                }
+            };
 
             if is_trailers {
                 if end_stream {
@@ -1203,7 +1612,10 @@ fn handle_event_inner(
                 return;
             };
             if let Some(tx) = ps.headers_tx.take() {
-                let _ = tx.send(Ok(NativeResponseHeaders { status, headers }));
+                let _ = tx.send(Ok(NativeResponseHeaders {
+                    status,
+                    headers: parsed_headers,
+                }));
             }
             if end_stream {
                 // No body — drop body_tx to signal EOF.
@@ -1334,6 +1746,75 @@ fn notify_all_error(pending: &mut HashMap<u32, PendingStream>, err: DriverError)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct WriteTrace(Vec<Option<Vec<u8>>>);
+
+    impl AsyncWrite for WriteTrace {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.push(Some(data.to_vec()));
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.0.push(None);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_buffered_writes_preserve_direct_bytes_and_flush_boundaries() {
+        for profile in [
+            crate::profile::chrome_146_h2(),
+            crate::profile::safari_26_h2(),
+        ] {
+            let behavior = profile.behavior();
+            let (mut engine, _) = H2Engine::client(&profile);
+            let stream_id = engine.open_stream();
+            let frames = engine.build_request(
+                stream_id,
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.test/upload")
+                    .body(Some(Bytes::from(vec![7; 32768])))
+                    .unwrap(),
+            );
+            let mut direct = WriteTrace::default();
+            encode_and_write_frames(
+                &mut direct,
+                &engine,
+                &*behavior.write_policy,
+                frames.clone(),
+            )
+            .await
+            .unwrap();
+            let mut queued = PendingWrites::default();
+            encode_and_write_frames(&mut queued, &engine, &*behavior.write_policy, frames)
+                .await
+                .unwrap();
+            let mut actual = WriteTrace::default();
+            while !queued.is_empty() {
+                std::future::poll_fn(|context| queued.poll_drain(&mut actual, context))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(actual.0, direct.0);
+        }
+    }
     use std::time::Duration;
 
     fn test_sender(
@@ -1462,6 +1943,9 @@ mod tests {
     #[test]
     fn driver_config_defaults_to_unbounded_pending_requests() {
         assert_eq!(H2DriverConfig::default().max_pending_requests, None);
+        assert_eq!(H2DriverConfig::default().max_ready_commands_per_turn, 1);
+        assert_eq!(H2DriverConfig::default().max_requests_per_write, 1);
+        assert_eq!(H2DriverConfig::default().max_write_batch_bytes, 64 * 1024);
     }
 
     #[tokio::test]
@@ -1472,6 +1956,52 @@ mod tests {
             &crate::profile::chrome_146_h2(),
             H2DriverConfig {
                 max_pending_requests: Some(0),
+                ..H2DriverConfig::default()
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DriverError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn zero_ready_command_batch_is_rejected() {
+        let (client_io, _server_io) = tokio::io::duplex(1024);
+        let result = spawn_driver_with_config(
+            client_io,
+            &crate::profile::chrome_146_h2(),
+            H2DriverConfig {
+                max_ready_commands_per_turn: 0,
+                ..H2DriverConfig::default()
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DriverError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn zero_requests_per_write_is_rejected() {
+        let (client_io, _server_io) = tokio::io::duplex(1024);
+        let result = spawn_driver_with_config(
+            client_io,
+            &crate::profile::chrome_146_h2(),
+            H2DriverConfig {
+                max_requests_per_write: 0,
+                ..H2DriverConfig::default()
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DriverError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn zero_write_batch_bytes_is_rejected() {
+        let (client_io, _server_io) = tokio::io::duplex(1024);
+        let result = spawn_driver_with_config(
+            client_io,
+            &crate::profile::chrome_146_h2(),
+            H2DriverConfig {
+                max_write_batch_bytes: 0,
+                ..H2DriverConfig::default()
             },
         )
         .await;
@@ -1551,6 +2081,7 @@ mod tests {
             &profile,
             H2DriverConfig {
                 max_pending_requests: Some(1),
+                ..H2DriverConfig::default()
             },
         )
         .await

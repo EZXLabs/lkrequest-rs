@@ -12,6 +12,9 @@
 //! - **Automatic cooldown recovery**: background task cleans up expired cooldowns.
 //! - **Permanent removal**: proxies that enter cooldown too many times are removed.
 //! - **Health checking**: optional active TCP probes for static proxy lists.
+//!   MASQUE proxies are skipped unless `HealthCheckConfig::tunnel_probe` asks
+//!   for a real CONNECT-UDP probe *and* `masque_outer_config` says how to build
+//!   its outer connection (both require the `masque` feature).
 //!
 //! ## Use Cases
 //!
@@ -395,6 +398,15 @@ async fn run_health_checks(inner: &Arc<ProxyPoolInner>, config: &HealthCheckConf
     let resolver = crate::dns::SystemDns;
     for proxy in &proxies {
         let identity = proxy.identity();
+
+        // MASQUE proxies never take the TCP path: a reachable port says nothing
+        // about whether CONNECT-UDP works, so judging them by `proxy.connect()`
+        // would be a false positive.  See `masque_health_check`.
+        if proxy.scheme.is_masque() {
+            masque_health_check(inner, proxy, &identity, config, &resolver).await;
+            continue;
+        }
+
         let result = tokio::time::timeout(
             config.timeout,
             proxy.connect(&config.target_host, config.target_port, None, &resolver),
@@ -402,46 +414,178 @@ async fn run_health_checks(inner: &Arc<ProxyPoolInner>, config: &HealthCheckConf
         .await;
 
         match result {
-            Ok(Ok(_stream)) => {
-                let was_in_cooldown = {
-                    let mut cooldown = inner.cooldown.lock().await;
-                    cooldown.remove(&identity).is_some()
-                };
-                if was_in_cooldown {
-                    tracing::info!(
-                        proxy = %identity,
-                        "proxy_pool.health_check_recovered_proxy",
-                    );
-                } else {
-                    tracing::trace!(proxy = %identity, "proxy_pool.health_check_ok");
-                }
-            }
+            Ok(Ok(_stream)) => record_health_check_success(inner, &identity).await,
             Ok(Err(e)) => {
                 tracing::debug!(
                     proxy = %identity,
                     error = %e,
                     "proxy_pool.health_check_failed",
                 );
-                let bp = &inner.bad_proxy_config;
-                let now = Instant::now();
-                let window_start = now - bp.window;
-                let mut failures = inner.failures.lock().await;
-                let entries = failures.entry(identity).or_default();
-                entries.retain(|t| *t > window_start);
-                entries.push_back(now);
+                record_health_check_failure(inner, identity).await;
             }
             Err(_timeout) => {
                 tracing::debug!(proxy = %identity, "proxy_pool.health_check_timeout");
-                let bp = &inner.bad_proxy_config;
-                let now = Instant::now();
-                let window_start = now - bp.window;
-                let mut failures = inner.failures.lock().await;
-                let entries = failures.entry(identity).or_default();
-                entries.retain(|t| *t > window_start);
-                entries.push_back(now);
+                record_health_check_failure(inner, identity).await;
             }
         }
     }
+}
+
+/// A proxy answered the probe: drop it out of cooldown if it was in one.
+async fn record_health_check_success(inner: &Arc<ProxyPoolInner>, identity: &str) {
+    let was_in_cooldown = {
+        let mut cooldown = inner.cooldown.lock().await;
+        cooldown.remove(identity).is_some()
+    };
+    if was_in_cooldown {
+        tracing::info!(
+            proxy = %identity,
+            "proxy_pool.health_check_recovered_proxy",
+        );
+    } else {
+        tracing::trace!(proxy = %identity, "proxy_pool.health_check_ok");
+    }
+}
+
+/// A probe failed or timed out: feed the sliding-window failure counter.
+async fn record_health_check_failure(inner: &Arc<ProxyPoolInner>, identity: String) {
+    let bp = &inner.bad_proxy_config;
+    let now = Instant::now();
+    let window_start = now - bp.window;
+    let mut failures = inner.failures.lock().await;
+    let entries = failures.entry(identity).or_default();
+    entries.retain(|t| *t > window_start);
+    entries.push_back(now);
+}
+
+/// Health-check one MASQUE proxy.
+///
+/// With [`HealthCheckConfig::tunnel_probe`] off (the default) this is a no-op:
+/// the proxy is neither credited nor blamed, keeps whatever cooldown it has and
+/// is never blacklisted by the active checker.  With it on *and* an outer
+/// config supplied, a real CONNECT-UDP handshake decides.
+///
+/// The flag on with no
+/// [`masque_outer_config`](HealthCheckConfig::masque_outer_config) is the third
+/// case, and it skips too: probing against whatever trust anchors happened to
+/// be lying around would fail every privately-fronted proxy and feed the
+/// blacklist with false negatives.  Saying nothing is always recoverable;
+/// blacklisting a healthy proxy is not.
+#[cfg(feature = "masque")]
+async fn masque_health_check(
+    inner: &Arc<ProxyPoolInner>,
+    proxy: &ProxyConfig,
+    identity: &str,
+    config: &HealthCheckConfig,
+    resolver: &crate::dns::SystemDns,
+) {
+    if !config.tunnel_probe {
+        tracing::trace!(proxy = %identity, "proxy_pool.health_check_skipped_masque");
+        return;
+    }
+
+    let Some(outer) = config.masque_outer_config.as_ref() else {
+        tracing::warn!(
+            proxy = %identity,
+            reason = "`HealthCheckConfig::tunnel_probe` is on but `masque_outer_config` is \
+                      unset, so the probe has no trust anchors to verify this proxy against. \
+                      Probing with a guessed default would fail every proxy fronted by a \
+                      private CA and blacklist it. Set `masque_outer_config` (e.g. from \
+                      `Client::masque_config()`) to enable the probe.",
+            "proxy_pool.health_check_skipped_masque_no_outer_config",
+        );
+        return;
+    };
+
+    match tokio::time::timeout(
+        config.timeout,
+        masque_tunnel_probe(proxy, config, outer, resolver),
+    )
+    .await
+    {
+        Ok(Ok(())) => record_health_check_success(inner, identity).await,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                proxy = %identity,
+                error = %e,
+                "proxy_pool.health_check_failed",
+            );
+            record_health_check_failure(inner, identity.to_string()).await;
+        }
+        Err(_timeout) => {
+            tracing::debug!(proxy = %identity, "proxy_pool.health_check_timeout");
+            record_health_check_failure(inner, identity.to_string()).await;
+        }
+    }
+}
+
+/// Without the `masque` feature there is no CONNECT-UDP client to probe with,
+/// so a MASQUE proxy is always skipped — the same conclusion `tunnel_probe =
+/// false` reaches.  A missing feature must not abort the round: health checking
+/// is a background loop, and every other proxy in the list still needs checking.
+#[cfg(not(feature = "masque"))]
+async fn masque_health_check(
+    _inner: &Arc<ProxyPoolInner>,
+    _proxy: &ProxyConfig,
+    identity: &str,
+    _config: &HealthCheckConfig,
+    _resolver: &crate::dns::SystemDns,
+) {
+    tracing::trace!(proxy = %identity, "proxy_pool.health_check_skipped_masque");
+}
+
+/// One CONNECT-UDP handshake against `proxy`, torn down immediately.
+///
+/// Establishes the outer HTTP/3 connection, opens a tunnel to the configured
+/// health-check target — which is where the proxy's response is validated
+/// ([`MasqueConnection::open_tunnel`](crate::proxy::masque::MasqueConnection::open_tunnel))
+/// — then closes both.  Nothing is sent through the tunnel: reaching `Ready`
+/// is the liveness signal.
+///
+/// The proxy host is resolved here because
+/// [`MasqueConnection::connect`](crate::proxy::masque::MasqueConnection::connect)
+/// takes an already-resolved address.
+///
+/// The outer connection is built from `outer`, which the caller supplied
+/// through [`HealthCheckConfig::masque_outer_config`] — never from a default,
+/// so the probe verifies the proxy against exactly the trust anchors the real
+/// requests would use.
+#[cfg(feature = "masque")]
+async fn masque_tunnel_probe(
+    proxy: &ProxyConfig,
+    config: &HealthCheckConfig,
+    outer: &crate::proxy::MasqueOuterConfig,
+    resolver: &crate::dns::SystemDns,
+) -> crate::error::Result<()> {
+    use crate::dns::DnsResolver;
+    use crate::error::{Error, ProxyErrorKind};
+    use crate::proxy::masque::MasqueConnection;
+
+    let (proxy_host, proxy_port) = proxy.host_port();
+    let addresses = resolver
+        .resolve(proxy_host, proxy_port)
+        .await
+        .map_err(|error| {
+            Error::proxy(
+                ProxyErrorKind::IoError,
+                format!("MASQUE health check could not resolve {proxy_host}: {error}"),
+                Some(Box::new(error)),
+            )
+        })?;
+    let proxy_addr = addresses.into_iter().next().ok_or_else(|| {
+        Error::proxy(
+            ProxyErrorKind::IoError,
+            format!("MASQUE health check: {proxy_host} resolved to no addresses"),
+            None,
+        )
+    })?;
+
+    let connection = MasqueConnection::connect(proxy, proxy_addr, outer).await?;
+    let tunnel = connection
+        .open_tunnel(&config.target_host, config.target_port)
+        .await?;
+    tunnel.close();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -487,16 +631,105 @@ impl Default for BadProxyConfig {
 /// Health checks only apply to **static** providers (fixed proxy lists).
 /// Dynamic providers (closures) skip health checks since their identities
 /// are ephemeral.
+///
+/// MASQUE proxies are the exception to the TCP probe — see the `tunnel_probe`
+/// and `masque_outer_config` fields, which exist only with the `masque`
+/// feature.
+///
+/// # Construction
+///
+/// `#[non_exhaustive]`: build one from [`Default`] and assign the fields you
+/// care about, rather than with a struct literal. The MASQUE fields only exist
+/// with the `masque` feature, so a literal would otherwise name a different set
+/// of fields depending on which features the final binary happens to turn on —
+/// and a downstream crate cannot control that.
+///
+/// ```rust
+/// use lkrequest::proxy_pool::HealthCheckConfig;
+/// use std::time::Duration;
+///
+/// let mut health = HealthCheckConfig::default();
+/// health.interval = Duration::from_secs(30);
+/// health.target_host = "www.example.com".into();
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HealthCheckConfig {
     /// How often to run health checks (default: 60s).
     pub interval: Duration,
     /// Timeout for a single health check probe (default: 5s).
+    ///
+    /// Also bounds a MASQUE `tunnel_probe` end to end: DNS, outer QUIC/HTTP-3
+    /// handshake and the CONNECT-UDP exchange together.
     pub timeout: Duration,
     /// Target host for health check TCP connection.
+    ///
+    /// With a MASQUE `tunnel_probe` on, this is also the target a MASQUE proxy
+    /// is asked to open a CONNECT-UDP tunnel to.
     pub target_host: String,
     /// Target port for health check (typically 443 or 80).
     pub target_port: u16,
+    /// Actively probe `masque://` proxies with a real CONNECT-UDP handshake
+    /// (default: `false`).
+    ///
+    /// The ordinary health check establishes a TCP connection through the proxy
+    /// and calls that alive.  For a MASQUE proxy that conclusion is **false**:
+    /// CONNECT-UDP (RFC 9298) rides on an outer HTTP/3 connection, so a
+    /// reachable TCP port proves nothing about whether the proxy supports HTTP
+    /// Datagrams, accepts `connect-udp`, or likes the credentials.
+    ///
+    /// Therefore:
+    ///
+    /// - **`false` (default)** — MASQUE proxies are skipped by the active
+    ///   checker entirely.  They are neither marked healthy (a skipped proxy
+    ///   stays in cooldown until it expires normally) nor marked failing, and
+    ///   are never blacklisted by health checking.  Bad MASQUE proxies are
+    ///   caught the passive way instead, through
+    ///   [`ProxyPool::mark_bad_proxy`] on real request failures.
+    /// - **`true`** — each MASQUE proxy gets a genuine probe: connect the outer
+    ///   HTTP/3 connection, open a CONNECT-UDP tunnel to
+    ///   `target_host:target_port`, verify it becomes ready after a valid 2xx
+    ///   response, then close it immediately. Success recovers
+    ///   the proxy from cooldown; failure or timeout feeds the bad-proxy
+    ///   counter like any other failed check.
+    ///
+    /// The probe costs a full QUIC handshake per proxy per round, which is one
+    /// reason this is opt-in. The other is that it needs to be told how to
+    /// build that outer connection: turning this on **without** also setting
+    /// [`masque_outer_config`](Self::masque_outer_config) leaves MASQUE proxies
+    /// skipped, with a warning. See that field for why.
+    ///
+    /// Turning this on requires the `masque` feature; without it there is no
+    /// CONNECT-UDP client at all, so the field does not exist and MASQUE
+    /// proxies are skipped unconditionally (and never blamed for it).
+    ///
+    /// Non-MASQUE proxies are unaffected by this setting.
+    #[cfg(feature = "masque")]
+    pub tunnel_probe: bool,
+    /// How the probe's **outer** HTTP/3 connection to a MASQUE proxy is built
+    /// (default: `None`).
+    ///
+    /// [`tunnel_probe`](Self::tunnel_probe) alone is not enough, because trust
+    /// anchors are not a detail the pool may guess at. A MASQUE proxy fronted
+    /// by a private CA — the normal case for a self-hosted or vendor-issued
+    /// deployment — is perfectly healthy, and probing it against the operating
+    /// system's certificate store would fail the handshake and feed the
+    /// bad-proxy counter. That is a false *negative*: the health checker would
+    /// actively blacklist working proxies, which is strictly worse than not
+    /// checking them at all.
+    ///
+    /// So there is no default: with `tunnel_probe` on and this left `None` the
+    /// probe is skipped exactly as if `tunnel_probe` were `false`, and a
+    /// `warn!` says why. Supplying a config — typically the one the requests
+    /// themselves will use, [`Client::masque_config`](crate::Client::masque_config)
+    /// — is what turns the probe on for real.
+    ///
+    /// `bind_addr`, `server_name`, `alpn` and the trust anchors are the parts
+    /// that matter here. The tunnel lifecycle knobs (`tunnel_idle_timeout`,
+    /// `max_idle_tunnels`) are irrelevant to a probe that closes its one tunnel
+    /// immediately, and are ignored.
+    #[cfg(feature = "masque")]
+    pub masque_outer_config: Option<crate::proxy::MasqueOuterConfig>,
 }
 
 impl Default for HealthCheckConfig {
@@ -506,6 +739,10 @@ impl Default for HealthCheckConfig {
             timeout: Duration::from_secs(5),
             target_host: "www.google.com".into(),
             target_port: 443,
+            #[cfg(feature = "masque")]
+            tunnel_probe: false,
+            #[cfg(feature = "masque")]
+            masque_outer_config: None,
         }
     }
 }
@@ -569,6 +806,12 @@ impl ProxyPoolBuilder {
     }
 
     /// Enable active proxy health checking.
+    ///
+    /// `masque://` proxies are skipped by the TCP probe. Probing them for real
+    /// needs both `HealthCheckConfig::tunnel_probe` and
+    /// `HealthCheckConfig::masque_outer_config` (the `masque` feature); the
+    /// outer config is normally the one the requests themselves use, from
+    /// `Client::masque_config()`.
     pub fn health_check(mut self, config: HealthCheckConfig) -> Self {
         self.health_check = Some(config);
         self
@@ -679,6 +922,279 @@ mod tests {
         assert_eq!(c.timeout, Duration::from_secs(5));
         assert_eq!(c.target_host, "www.google.com");
         assert_eq!(c.target_port, 443);
+        #[cfg(feature = "masque")]
+        {
+            assert!(
+                !c.tunnel_probe,
+                "a CONNECT-UDP probe costs a QUIC handshake per proxy per round; \
+                 MASQUE proxies are skipped until it is asked for"
+            );
+            assert!(
+                c.masque_outer_config.is_none(),
+                "there is no safe default outer config: guessing one would blacklist \
+                 every proxy fronted by a private CA"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Health checks
+    // -----------------------------------------------------------------------
+
+    /// A health check aimed at a loopback port nothing listens on: Tier-0, and
+    /// a TCP proxy probed against it fails immediately with a refusal.
+    ///
+    /// MASQUE proxies are skipped by this one — no `tunnel_probe`.
+    fn health_check_config() -> HealthCheckConfig {
+        HealthCheckConfig {
+            interval: Duration::from_secs(3600),
+            timeout: Duration::from_millis(500),
+            target_host: "127.0.0.1".into(),
+            target_port: 1,
+            #[cfg(feature = "masque")]
+            tunnel_probe: false,
+            #[cfg(feature = "masque")]
+            masque_outer_config: None,
+        }
+    }
+
+    /// The same, with the CONNECT-UDP probe armed: flag on *and* an outer
+    /// config supplied, which is what it takes to actually probe.
+    #[cfg(feature = "masque")]
+    fn health_check_config_with_tunnel_probe() -> HealthCheckConfig {
+        HealthCheckConfig {
+            tunnel_probe: true,
+            masque_outer_config: Some(crate::proxy::MasqueOuterConfig::default()),
+            ..health_check_config()
+        }
+    }
+
+    /// `tunnel_probe` asked for, but nothing said how to build the outer
+    /// connection: the probe has no trust anchors it may assume, so it must
+    /// skip rather than guess.
+    #[cfg(feature = "masque")]
+    fn health_check_config_tunnel_probe_without_outer_config() -> HealthCheckConfig {
+        HealthCheckConfig {
+            tunnel_probe: true,
+            ..health_check_config()
+        }
+    }
+
+    /// Health-check failures land in the sliding window and nowhere else, so
+    /// this is what "the checker blamed this proxy" looks like from inside.
+    async fn recorded_failures(pool: &ProxyPool, identity: &str) -> usize {
+        pool.inner
+            .failures
+            .lock()
+            .await
+            .get(identity)
+            .map_or(0, |entries| entries.len())
+    }
+
+    /// A MASQUE proxy address nothing is listening on, in either protocol.
+    #[cfg(feature = "masque")]
+    fn dead_masque() -> ProxyConfig {
+        proxy("masque://127.0.0.1:1")
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "masque")]
+    async fn health_check_skips_masque_proxies_by_default() {
+        // The MASQUE proxy does not exist at all. A TCP probe would still have
+        // something to say about it, and whatever it said would be worthless —
+        // so nothing may be said. The HTTP proxy next to it is the control: it
+        // is equally dead and must still be blamed, unchanged.
+        let masque = dead_masque();
+        let http = proxy("http://127.0.0.1:1");
+        let (masque_id, http_id) = (masque.identity(), http.identity());
+        let pool = ProxyPool::builder().proxies(vec![masque, http]).build();
+
+        run_health_checks(&pool.inner, &health_check_config()).await;
+
+        assert_eq!(
+            recorded_failures(&pool, &masque_id).await,
+            0,
+            "a skipped MASQUE proxy must not be blamed by the active checker"
+        );
+        assert_eq!(
+            recorded_failures(&pool, &http_id).await,
+            1,
+            "the non-MASQUE path must keep recording failures exactly as before"
+        );
+        assert!(
+            pool.inner.permanently_removed.lock().await.is_empty(),
+            "a single health check never removes anything"
+        );
+        assert!(pool.inner.cooldown.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "masque")]
+    async fn skipped_masque_proxy_keeps_its_cooldown() {
+        // Skipping means "no opinion": a skipped proxy must not be credited out
+        // of cooldown either, or an unreachable MASQUE proxy would be released
+        // every round.
+        let masque = dead_masque();
+        let id = masque.identity();
+        let pool = ProxyPool::builder().proxies(vec![masque]).build();
+        let expires = Instant::now() + Duration::from_secs(300);
+        pool.inner.cooldown.lock().await.insert(id.clone(), expires);
+
+        run_health_checks(&pool.inner, &health_check_config()).await;
+
+        assert_eq!(
+            pool.inner.cooldown.lock().await.get(&id).copied(),
+            Some(expires),
+            "a skipped MASQUE proxy must stay in cooldown"
+        );
+        assert_eq!(recorded_failures(&pool, &id).await, 0);
+    }
+
+    /// A one-shot HTTP CONNECT proxy that answers `200` and nothing else.
+    async fn spawn_connect_stub() -> (ProxyConfig, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte).await {
+                    Ok(1) => request.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await;
+            // Leave the tunnel open until the probe drops its end.
+            let _ = stream.read(&mut byte).await;
+        });
+        (proxy(&format!("http://{addr}")), task)
+    }
+
+    #[tokio::test]
+    async fn health_check_still_recovers_a_reachable_tcp_proxy_from_cooldown() {
+        // Non-MASQUE control for the success path: a proxy that completes the
+        // CONNECT exchange is healthy, and a healthy proxy is lifted out of
+        // cooldown — behaviour the MASQUE branch must not have disturbed.
+        let (p, stub) = spawn_connect_stub().await;
+        let id = p.identity();
+        let pool = ProxyPool::builder().proxies(vec![p]).build();
+        pool.inner
+            .cooldown
+            .lock()
+            .await
+            .insert(id.clone(), Instant::now() + Duration::from_secs(300));
+
+        run_health_checks(&pool.inner, &health_check_config()).await;
+
+        assert_eq!(recorded_failures(&pool, &id).await, 0);
+        assert!(
+            !pool.inner.cooldown.lock().await.contains_key(&id),
+            "a healthy TCP proxy is recovered from cooldown"
+        );
+        stub.abort();
+    }
+
+    #[cfg(feature = "masque")]
+    #[tokio::test]
+    async fn tunnel_probe_does_not_disturb_a_reachable_tcp_proxy() {
+        // The same control with the flag on: `tunnel_probe` is a MASQUE-only
+        // switch and must not reach the TCP path at all.
+        let (p, stub) = spawn_connect_stub().await;
+        let id = p.identity();
+        let pool = ProxyPool::builder().proxies(vec![p]).build();
+        pool.inner
+            .cooldown
+            .lock()
+            .await
+            .insert(id.clone(), Instant::now() + Duration::from_secs(300));
+
+        run_health_checks(&pool.inner, &health_check_config_with_tunnel_probe()).await;
+
+        assert_eq!(recorded_failures(&pool, &id).await, 0);
+        assert!(!pool.inner.cooldown.lock().await.contains_key(&id));
+        stub.abort();
+    }
+
+    #[cfg(feature = "masque")]
+    #[tokio::test]
+    async fn tunnel_probe_blames_an_unreachable_masque_proxy_within_the_timeout() {
+        // With the probe on, the same nonexistent proxy is now judged — and the
+        // verdict must arrive inside `HealthCheckConfig::timeout`, which wraps
+        // DNS, the outer QUIC handshake and the CONNECT-UDP exchange together.
+        let masque = dead_masque();
+        let http = proxy("http://127.0.0.1:1");
+        let (masque_id, http_id) = (masque.identity(), http.identity());
+        let pool = ProxyPool::builder().proxies(vec![masque, http]).build();
+
+        let started = Instant::now();
+        run_health_checks(&pool.inner, &health_check_config_with_tunnel_probe()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            recorded_failures(&pool, &masque_id).await,
+            1,
+            "an unreachable MASQUE proxy must fail its CONNECT-UDP probe"
+        );
+        assert_eq!(
+            recorded_failures(&pool, &http_id).await,
+            1,
+            "turning the tunnel probe on must not change the non-MASQUE path"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the probe must be bounded by config.timeout, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(feature = "masque")]
+    #[tokio::test]
+    async fn tunnel_probe_without_an_outer_config_skips_instead_of_blaming() {
+        // `tunnel_probe` on, `masque_outer_config` unset. The proxy here is
+        // unreachable, so a probe *would* have blamed it — which is exactly
+        // what makes this a statement about the missing config rather than
+        // about the proxy. Without trust anchors the probe cannot distinguish
+        // "dead" from "fronted by a CA I was never told about", so it must say
+        // nothing at all. The HTTP proxy is the control: the missing MASQUE
+        // config must not disarm the TCP path.
+        let masque = dead_masque();
+        let http = proxy("http://127.0.0.1:1");
+        let (masque_id, http_id) = (masque.identity(), http.identity());
+        let pool = ProxyPool::builder().proxies(vec![masque, http]).build();
+        let expires = Instant::now() + Duration::from_secs(300);
+        pool.inner
+            .cooldown
+            .lock()
+            .await
+            .insert(masque_id.clone(), expires);
+
+        run_health_checks(
+            &pool.inner,
+            &health_check_config_tunnel_probe_without_outer_config(),
+        )
+        .await;
+
+        assert_eq!(
+            recorded_failures(&pool, &masque_id).await,
+            0,
+            "a probe with no trust anchors must not blame the proxy it could not verify"
+        );
+        assert_eq!(
+            pool.inner.cooldown.lock().await.get(&masque_id).copied(),
+            Some(expires),
+            "skipping means no opinion: the proxy is not credited out of cooldown either"
+        );
+        assert_eq!(
+            recorded_failures(&pool, &http_id).await,
+            1,
+            "the non-MASQUE path is unaffected by the missing outer config"
+        );
     }
 
     #[tokio::test]

@@ -41,11 +41,12 @@ fn smoke_profiles_load() {
         presets::chrome_144(),
         presets::firefox_133(),
         presets::firefox_147(),
+        presets::firefox_156(),
         presets::safari_18(),
         presets::safari_26(),
     ];
 
-    assert_eq!(profiles.len(), 6);
+    assert_eq!(profiles.len(), 7);
     assert!(
         profiles.iter().all(|profile| !profile.name.is_empty()),
         "all presets should have a non-empty name"
@@ -121,6 +122,7 @@ fn smoke_json_profile_loading() {
         "profiles/chrome_144.json",
         "profiles/firefox_133.json",
         "profiles/firefox_147.json",
+        "profiles/firefox_156.json",
         "profiles/safari_18.json",
         "profiles/safari_26.json",
     ];

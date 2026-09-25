@@ -490,6 +490,17 @@ impl Session {
         self.inner.get_cookies(url)
     }
 
+    /// Like [`get_cookies`](Self::get_cookies), but each cookie keeps the
+    /// attributes that decide when it is sent.
+    pub fn get_cookies_with_attrs(&self, url: &str) -> Vec<crate::session::CookieInfo> {
+        self.inner.get_cookies_with_attrs(url)
+    }
+
+    /// Every unexpired cookie in the jar, across all domains.
+    pub fn get_all_cookies(&self) -> Vec<crate::session::CookieInfo> {
+        self.inner.get_all_cookies()
+    }
+
     /// Get the value of a specific cookie by name for the given URL.
     pub fn get_cookie(&self, url: &str, name: &str) -> Option<String> {
         self.inner.get_cookie(url, name)
@@ -808,6 +819,45 @@ impl RequestBuilder {
     pub fn body(self, body: impl Into<bytes::Bytes>) -> Self {
         Self {
             inner: self.inner.body(body),
+        }
+    }
+
+    /// Upload incrementally from a synchronous reader, with optional exact length.
+    ///
+    /// Reads run on Tokio's blocking pool, one bounded chunk at a time. A read
+    /// already executing cannot be interrupted by a request timeout; readers
+    /// that can block indefinitely should configure their own read timeout.
+    ///
+    /// This is the synchronous counterpart of
+    /// [`crate::session::RequestBuilder::body_reader`], accepting `std::io::Read`
+    /// rather than `tokio::io::AsyncRead`. Pass an owned reader. `Some(length)`
+    /// must match the complete source through EOF; `None` leaves framing to the
+    /// transport. The source cannot be replayed after the transport claims it.
+    /// Both [`send`](Self::send) and [`send_streaming`](Self::send_streaming) work.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # fn upload(session: &lkrequest::blocking::Session) -> Result<(), Box<dyn std::error::Error>> {
+    /// let file = std::fs::File::open("archive.zip")?;
+    /// let length = file.metadata()?.len();
+    /// let response = session.post("https://example.com/upload")
+    ///     .body_reader(file, Some(length))
+    ///     .send()?;
+    /// assert!(response.status().is_success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn body_reader(
+        self,
+        reader: impl std::io::Read + Send + 'static,
+        length: Option<u64>,
+    ) -> Self {
+        Self {
+            inner: self.inner.body_stream(
+                crate::body::BlockingReaderStream::new(Box::new(reader)),
+                length,
+            ),
         }
     }
 

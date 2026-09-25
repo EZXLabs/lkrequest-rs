@@ -5,11 +5,13 @@ members = [
     "lktls-quic",
     "lkh2",
     "lkh3",
+    "lkmasque",
     "lkrequest",
     "lkprofile",
     "tools/pcap_diff",
     "tools/profile_collector",
     "tools/fpverify",
+    "tools/http-client-bench",
     "lkrequest-ffi",
     "lkquic",
 ]
@@ -22,6 +24,11 @@ exclude = [
     "deps/quinn/quinn-udp",
     "tools/cleaner",
 ]
+
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/EZXLabs/lkrequest-rs"
+homepage = "https://github.com/EZXLabs/lkrequest-rs"
 
 [workspace.dependencies]
 quinn = { path = "deps/quinn/quinn", default-features = false }

@@ -1,0 +1,26 @@
+[book]
+title = "lkrequest 文档"
+description = "lkrequest 用户指南、协议说明、API 导航与开发者文档"
+language = "zh-CN"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[rust]
+edition = "2021"
+
+[output.html]
+git-repository-url = "https://github.com/EZXLabs/lkrequest-rs"
+edit-url-template = "https://github.com/EZXLabs/lkrequest-rs/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30

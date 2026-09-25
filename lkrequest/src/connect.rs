@@ -400,7 +400,11 @@ impl ConnectConfig {
 /// Establish a TCP connection, direct or through a proxy.
 ///
 /// This is the shared implementation for all call sites. The proxy→direct
-/// fallback is controlled by `config.proxy_to_direct_fallback`.
+/// fallback is controlled by `config.proxy_to_direct_fallback`, except on
+/// routes where [`ProxyConfig::forbids_direct_fallback`] holds (MASQUE): those
+/// never fall back, because a silent direct connection would leak the source
+/// address the tunnel exists to hide. This is the authoritative check — every
+/// proxied TCP connect in the crate funnels through here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_tcp(
     host: &str,
@@ -413,7 +417,9 @@ pub(crate) async fn connect_tcp(
     config: &ConnectConfig,
 ) -> Result<TcpStream> {
     if let Some(proxy_cfg) = proxy {
-        let proxy_timeout = if config.proxy_to_direct_fallback {
+        let direct_fallback =
+            config.proxy_to_direct_fallback && !proxy_cfg.forbids_direct_fallback();
+        let proxy_timeout = if direct_fallback {
             if let Some((start, total)) = config.fallback_time_budget {
                 let remaining = total.saturating_sub(start.elapsed());
                 tcp_timeout.min(remaining / 2)
@@ -454,7 +460,7 @@ pub(crate) async fn connect_tcp(
 
         match proxy_result {
             Ok(tcp) => Ok(tcp),
-            Err(e) if config.proxy_to_direct_fallback => {
+            Err(e) if direct_fallback && !e.is_address_family_mismatch() => {
                 tracing::warn!(
                     error = %e,
                     fallback = "proxy_to_direct",
@@ -470,7 +476,18 @@ pub(crate) async fn connect_tcp(
                 )
                 .await
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if config.proxy_to_direct_fallback {
+                    // Fallback was requested but this route forbids it. Say so
+                    // once, so the error is not read as the switch not working.
+                    tracing::debug!(
+                        proxy = %proxy_cfg,
+                        error = %e,
+                        "http.proxy_failed_direct_fallback_forbidden",
+                    );
+                }
+                Err(e)
+            }
         }
     } else {
         connect_tcp_direct(

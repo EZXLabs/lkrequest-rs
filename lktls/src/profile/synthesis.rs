@@ -45,7 +45,7 @@ const NEGOTIABLE_SIG_ALGS: [u16; 3] = [
     0x0403, // ecdsa_secp256r1_sha256 — ECDSA P-256 certs
 ];
 
-/// The signature-algorithm negotiability floor (see [`NEGOTIABLE_SIG_ALGS`]).
+/// The signature-algorithm negotiability floor (see `NEGOTIABLE_SIG_ALGS`).
 /// Exposed so `validate`/tests share one source of truth.
 pub fn negotiable_sig_algs() -> &'static [u16] {
     &NEGOTIABLE_SIG_ALGS
@@ -59,7 +59,7 @@ pub fn negotiable_sig_algs() -> &'static [u16] {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum NegotiabilityFloor {
     /// Recombine sig algs freely, then guarantee the universal-accept core
-    /// ([`NEGOTIABLE_SIG_ALGS`]). Maximum diversity, connects to any server — but
+    /// (`NEGOTIABLE_SIG_ALGS`). Maximum diversity, connects to any server — but
     /// the resulting sig-alg list matches no single real browser, so a detector
     /// that models sig-alg *shape* could flag it. The safe default.
     #[default]
@@ -271,8 +271,11 @@ impl Constraints {
             presets::chrome_150(),
             presets::chrome_151(),
             presets::chrome_152(),
+            presets::chrome_153(),
+            presets::chrome_154(),
             presets::firefox_133(),
             presets::firefox_147(),
+            presets::firefox_156(),
             presets::safari_18(),
             presets::safari_26(),
         ];
@@ -437,8 +440,13 @@ mod tests {
             ("chrome_151_quic", presets::chrome_151_quic()),
             ("chrome_152", presets::chrome_152()),
             ("chrome_152_quic", presets::chrome_152_quic()),
+            ("chrome_153", presets::chrome_153()),
+            ("chrome_153_quic", presets::chrome_153_quic()),
+            ("chrome_154", presets::chrome_154()),
+            ("chrome_154_quic", presets::chrome_154_quic()),
             ("firefox_133", presets::firefox_133()),
             ("firefox_147", presets::firefox_147()),
+            ("firefox_156", presets::firefox_156()),
             ("safari_18", presets::safari_18()),
             ("safari_26", presets::safari_26()),
         ];

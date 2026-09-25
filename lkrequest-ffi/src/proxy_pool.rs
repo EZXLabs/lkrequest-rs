@@ -34,7 +34,12 @@ fn make_proxy_guard_handle(guard: lkrequest::ProxyGuard) -> ProxyGuardHandle {
     ProxyGuardHandle { guard, url }
 }
 
-fn build_proxy_pool(builder: &mut ProxyPoolBuilderHandle) -> lkrequest::ProxyPool {
+fn build_proxy_pool(
+    builder: &mut ProxyPoolBuilderHandle,
+) -> Result<lkrequest::ProxyPool, FfiError> {
+    #[cfg(feature = "masque")]
+    crate::handles::apply_masque_probe(&mut builder.state)?;
+
     let mut pool_builder = lkrequest::ProxyPool::builder()
         .max_proxies(builder.max_proxies)
         .rotation(builder.state.rotation)
@@ -52,7 +57,7 @@ fn build_proxy_pool(builder: &mut ProxyPoolBuilderHandle) -> lkrequest::ProxyPoo
     if let Some(capacity) = builder.state.proxy_buffer {
         pool_builder = pool_builder.proxy_buffer(capacity);
     }
-    pool_builder.build()
+    Ok(pool_builder.build())
 }
 
 #[no_mangle]
@@ -103,6 +108,23 @@ pub extern "C" fn lk_proxy_pool_builder_add_proxies(
             let url = read_string_parts(*ptr, *len, &format!("proxy URL [{i}]"))?;
             builder.state.proxies.push(parse_proxy(&url)?);
         }
+        Ok(())
+    })
+}
+
+/// Add a proxy built with the `lk_proxy_config_*` entry points.
+///
+/// The configuration is copied; the caller keeps ownership of `config`.
+#[no_mangle]
+pub extern "C" fn lk_proxy_pool_builder_add_proxy_config(
+    builder: *mut lk_proxy_pool_builder_t,
+    config: *const crate::handles::lk_proxy_config_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let proxy = crate::proxy_config::proxy_config_ref(config)?.clone();
+        let builder =
+            require_handle_mut::<ProxyPoolBuilderHandle, lk_proxy_pool_builder_t>(builder)?;
+        builder.state.proxies.push(proxy);
         Ok(())
     })
 }
@@ -167,13 +189,71 @@ pub extern "C" fn lk_proxy_pool_builder_set_health_check(
         let builder =
             require_handle_mut::<ProxyPoolBuilderHandle, lk_proxy_pool_builder_t>(builder)?;
         let host = read_string_parts(host_ptr, host_len, "health check host")?;
-        builder.state.health_check = Some(lkrequest::session_pool::HealthCheckConfig {
-            target_host: host,
-            target_port: port,
-            interval: Duration::from_millis(interval_ms),
-            timeout: Duration::from_millis(timeout_ms),
-        });
+        // `HealthCheckConfig` is `#[non_exhaustive]` — its MASQUE fields exist
+        // only with the `masque` feature — so it is built from `Default` and
+        // adjusted rather than with a struct literal. The MASQUE probe fields
+        // keep their (skipping) defaults here and are folded in at build time
+        // from `state.masque_probe`, so the two setters can be called in
+        // either order.
+        let mut config = lkrequest::session_pool::HealthCheckConfig::default();
+        config.target_host = host;
+        config.target_port = port;
+        config.interval = Duration::from_millis(interval_ms);
+        config.timeout = Duration::from_millis(timeout_ms);
+        builder.state.health_check = Some(config);
         Ok(())
+    })
+}
+
+/// Probe `masque://` proxies in this pool with a real CONNECT-UDP handshake
+/// instead of skipping them, verifying the outer connection against `config`.
+///
+/// This is the fix for a specific false negative. The ordinary health check
+/// opens a TCP connection and calls the proxy alive, which proves nothing about
+/// a MASQUE proxy: CONNECT-UDP rides on an outer HTTP/3 connection, so the
+/// default is to skip `masque://` proxies rather than guess. Turning the probe
+/// on needs trust anchors, and they are not something the pool may guess at
+/// either — a privately-fronted proxy probed against the operating system's
+/// store fails its handshake, and the pool would then blacklist a **healthy**
+/// proxy. So the probe and the anchors arrive together, here.
+///
+/// Pass the same `lk_masque_config_t` the client uses, so the probe judges the
+/// proxy the way the requests will. The settings are copied; free `config`
+/// whenever you like afterwards.
+///
+/// Order does not matter relative to `lk_proxy_pool_builder_set_health_check`, but health
+/// checking must be configured by the time the pool is built: a probe with no
+/// health check would never run, so `lk_proxy_pool_builder_build` then fails with
+/// `LK_ERR_INVALID_CONFIG` rather than silently doing nothing.
+///
+/// Non-MASQUE proxies in the same pool are unaffected and keep their TCP probe.
+///
+/// Returns `LK_ERR` without the `masque` feature, where there is no
+/// CONNECT-UDP client to probe with.
+#[no_mangle]
+// Without `masque` the body never dereferences anything.
+#[cfg_attr(not(feature = "masque"), allow(unused_unsafe))]
+pub extern "C" fn lk_proxy_pool_builder_set_masque_tunnel_probe(
+    builder: *mut lk_proxy_pool_builder_t,
+    config: *const crate::handles::lk_masque_config_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        #[cfg(feature = "masque")]
+        {
+            let masque = crate::masque_config::masque_config_ref(config)?.clone();
+            let builder =
+                require_handle_mut::<ProxyPoolBuilderHandle, lk_proxy_pool_builder_t>(builder)?;
+            builder.state.masque_probe = Some(masque);
+            Ok(())
+        }
+
+        #[cfg(not(feature = "masque"))]
+        {
+            let _ = (builder, config);
+            Err(FfiError::invalid_config(
+                "MASQUE support is not compiled in; rebuild lkrequest-ffi with the `masque` feature",
+            ))
+        }
     })
 }
 
@@ -218,7 +298,7 @@ pub extern "C" fn lk_proxy_pool_builder_build(
         *out_pool = ptr::null_mut();
         let builder =
             require_handle_mut::<ProxyPoolBuilderHandle, lk_proxy_pool_builder_t>(builder)?;
-        let pool = runtime().block_on(async { build_proxy_pool(builder) });
+        let pool = runtime().block_on(async { build_proxy_pool(builder) })?;
         *out_pool = box_into_handle::<ProxyPoolHandle, lk_proxy_pool_t>(ProxyPoolHandle { pool });
         Ok(())
     })

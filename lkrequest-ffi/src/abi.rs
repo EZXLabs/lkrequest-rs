@@ -91,6 +91,16 @@ pub enum lk_rotation_strategy_t {
     LK_ROTATION_RANDOM = 1,
 }
 
+/// Which request header carries HTTP-based proxy credentials.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum lk_proxy_auth_header_t {
+    /// `Proxy-Authorization` (default).
+    LK_PROXY_AUTH_HEADER_PROXY_AUTHORIZATION = 0,
+    /// `Authorization` (masque-go / RFC 9484 §11 style deployments).
+    LK_PROXY_AUTH_HEADER_AUTHORIZATION = 1,
+}
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum lk_dns_config_t {

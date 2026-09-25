@@ -46,6 +46,8 @@ Current exported opaque handles:
 - `lk_session_pool_builder_t`
 - `lk_session_pool_guard_t`
 - `lk_multipart_t`
+- `lk_masque_config_t` (MASQUE outer-connection settings; needs the `masque`
+  feature to be creatable, but the type exists in every build)
 
 ## Current Coverage
 
@@ -55,16 +57,156 @@ Implemented ABI surface includes:
 - Streaming reads and chunk ops
 - Response text / cookies / redirect history / diagnostics
 - Streaming diagnostics and header-by-name lookup
-- Session cookie CRUD
+- Session cookie CRUD (setting and removal; the Rust-side attribute readers
+  `get_cookies_with_attrs` / `get_all_cookies` are not exported yet)
 - Session preconnect sync/async
 - Session connection-pool stats / clear
 - Request `cookie_override`
 - Multipart/form-data handles and request integration
 - ProxyPool builder / acquire / acquire_async / acquire_fresh / mark_bad
+- Proxy configuration handles (`lk_proxy_config_*`): URL parsing including
+  `masque://` (RFC 9298 CONNECT-UDP), username/password credentials, static HTTP
+  credentials (`Preshared` / `PrivateToken` / `Bearer` …) and the choice of
+  `Proxy-Authorization` vs `Authorization`. The Rust-side
+  `ProxyCredential::Custom` authenticator is **Rust-only** — it is a trait
+  object and cannot cross the C ABI.
+- MASQUE outer-connection configuration (`lk_masque_config_*`): trust anchors
+  (PEM bundle and DER), `use_native_certs`, `verify`, `server_name`, and the two
+  tunnel-reclaim knobs — attachable to a client builder or to a proxy/session
+  pool's CONNECT-UDP health-check probe. See **MASQUE outer configuration**
+  below.
 - SessionPool builder / acquire / acquire_async / acquire_fresh / mark_bad
 - DNS preset / custom socket address / native cert toggle
 - File logging and callback logging
 - Fingerprint randomization policy (`lk_client_builder_set_randomize`)
+
+## MASQUE outer configuration
+
+MASQUE support is experimental and requires the opt-in `masque` feature. Its
+dedicated configuration and proxy interoperability may change while independent
+proxy testing is still pending. The feature does not change which C ABI symbols
+are present; builds without it report an error when those symbols are used.
+
+A `masque://` proxy URL says *where* the proxy is. It cannot say what the hop
+*to* the proxy should trust — and that hop is an ordinary HTTP/3 connection with
+ordinary TLS. A self-hosted or vendor-issued MASQUE proxy is normally fronted by
+a private CA, so `lk_masque_config_t` is how a C caller names it.
+
+This matters most for the proxy pool. The ordinary health check opens a TCP
+connection and calls the proxy alive, which proves nothing about a MASQUE proxy,
+so `masque://` proxies are skipped by default. Turning on the real CONNECT-UDP
+probe without trust anchors would be worse than skipping: a privately-fronted
+proxy would fail its handshake and be **blacklisted while healthy**. So the
+probe and the anchors arrive together, through this handle.
+
+| Entry point | Effect |
+|---|---|
+| `lk_masque_config_new(&out)` | settings at their defaults (OS trust store, name from the proxy URL, 120s idle timeout, 256 tunnels) |
+| `lk_masque_config_add_ca_certs_pem(cfg, pem, len, &added)` | append every certificate in a PEM **bundle**; `added` is optional. A malformed bundle, or one holding no certificate, returns `LK_ERR` and appends nothing |
+| `lk_masque_config_add_ca_cert_der(cfg, der, len)` | append one DER trust anchor; bad DER surfaces when the outer connection is built |
+| `lk_masque_config_set_use_native_certs(cfg, enabled)` | trust the OS store (default on); turn it off for a private CA |
+| `lk_masque_config_set_verify(cfg, enabled)` | verify the proxy's certificate (default on). `false` skips it on this hop only — **development only**, and a last resort: the anchors above are the fix for a private CA |
+| `lk_masque_config_set_server_name(cfg, name, len)` | override SNI and the verified certificate name; `NULL` restores the proxy URL's host |
+| `lk_masque_config_set_tunnel_idle_timeout(cfg, ms)` | retire an idle tunnel after `ms`; `0` never retires on idleness |
+| `lk_masque_config_set_max_idle_tunnels(cfg, n)` | cap tunnels per outer connection, least recently active shed first; `0` removes the cap |
+| `lk_masque_config_free(cfg)` | release it; `NULL` is a no-op |
+| `lk_client_builder_set_masque_config(builder, cfg)` | use these settings on the request path |
+| `lk_proxy_pool_builder_set_masque_tunnel_probe(builder, cfg)` | probe `masque://` proxies in this pool with a real CONNECT-UDP handshake, verified against `cfg` |
+| `lk_session_pool_builder_set_masque_tunnel_probe(builder, cfg)` | the same, for a `SessionPool` |
+
+Both consumers **copy** the settings, so one handle can feed both — which is
+the usual arrangement, since the probe should judge a proxy the way the requests
+will — and is freed exactly once.
+
+```c
+lk_masque_config_t *outer = NULL;
+if (lk_masque_config_new(&outer) != LK_OK) { /* built without `masque` */ }
+
+/* A privately-fronted proxy needs nothing from the OS store. */
+lk_masque_config_set_use_native_certs(outer, false);
+size_t added = 0;
+if (lk_masque_config_add_ca_certs_pem(outer, pem_bytes, pem_len, &added) != LK_OK) {
+    /* malformed bundle, or no certificate in it -- nothing was appended */
+}
+/* Only if the proxy is addressed by a name its certificate does not cover. */
+lk_masque_config_set_server_name(outer, "proxy.internal", 14);
+
+/* Requests through the proxy... */
+lk_client_builder_set_masque_config(client_builder, outer);
+
+/* ...and the health check, so a working proxy is not probed as dead. */
+lk_proxy_pool_builder_set_health_check(pool_builder, "www.example.com", 15, 443,
+                                      60000, 5000);
+lk_proxy_pool_builder_set_masque_tunnel_probe(pool_builder, outer);
+
+lk_masque_config_free(outer);
+```
+
+The probe setter and `lk_*_pool_builder_set_health_check` can be called in
+either order; they are merged when the pool is built. Setting the probe with no
+health check configured at all makes `lk_*_pool_builder_build` fail with
+`LK_ERR_INVALID_CONFIG`, because a probe that can never run is a
+misconfiguration rather than a default.
+
+### `verify` is the last resort, not the private-CA answer
+
+`lk_masque_config_set_verify(cfg, false)` skips **all** certificate
+verification on the hop to the proxy. Reach for the anchors above first: the
+private-CA deployment this switch is most often grabbed for is fully
+expressible with them — add the CA, drop the OS store, override the certificate
+name if needed — and that keeps the hop authenticated. What turning verification
+off adds beyond that is only the ability to talk to a proxy you cannot identify
+at all.
+
+It is exposed because the false negative it rescues is not language-specific. A
+certificate that cannot be made to verify — one naming a host that does not
+resolve in this environment, say — leaves a C caller with the
+blacklisted-healthy-proxy outcome and no way out of it, while a Rust caller has
+`masque_verify(false)`. Withholding it here would not make anyone safer; it
+would just make the C surface the one that cannot be unblocked.
+
+Note what makes this hard to debug, and budget for it: an outer connection
+terminated by a man in the middle looks exactly like a working one from every
+side, and the C caller that flipped the switch, the binding that wrapped it and
+the library that honoured it are three different codebases. The library logs
+`masque.outer_certificate_verification_disabled` once per outer configuration so
+the decision is at least visible in a trace. It is independent of
+`lk_client_builder_set_verify`, which governs the hop to the origin — neither
+implies the other.
+
+`bind_addr`, `alpn` and `inbox_depth` are unexposed, for a different and much
+weaker reason — no caller has asked. They can be added later without disturbing
+anything.
+
+### Without the `masque` feature
+
+Every `lk_masque_config_*` symbol still exists, so the generated header and the
+ABI do not change shape with a Cargo feature. `lk_masque_config_new` returns
+`LK_ERR` and leaves the out-parameter `NULL`; since no handle can exist, the
+setters and both consumers refuse too. A caller therefore learns the build
+cannot do MASQUE at its first call, rather than after wiring up a configuration
+that would be silently ignored. This is the same stance
+`lk_proxy_config_parse` takes on a `masque://` URL.
+
+## Browser Presets
+
+Pass a canonical preset name to `lk_client_builder_set_preset`:
+
+| Family | Names | TLS/H2 | QUIC/H3 |
+|---|---|---|---|
+| Chrome | `chrome_131`, `chrome_144` through `chrome_154` | Yes | Requires `quic-h3` |
+| Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Yes | Not provided |
+| Safari | `safari_18`, `safari_26` | Yes | Not provided |
+
+Use `lk_preset_list_json` to discover names in the loaded library and
+`lk_preset_get_detail_json` to inspect a canonical name. The builder also accepts
+`default` as an alias for `chrome_144` and `safari_26_2` for `safari_26`; the list
+and detail APIs use canonical names.
+
+Chrome 154's H3 SETTINGS inherit the Chrome 153 baseline. Firefox 156's TLS/H2
+fields were captured directly; its preset has no QUIC/H3 configuration even when
+the library is built with `quic-h3`. See the
+[support and verification matrix](../docs/reference/presets.md).
 
 ## Fingerprint Randomization
 
@@ -90,7 +232,7 @@ fingerprints that match **no** real browser — use only against negative-model
 
 ```c
 lk_client_builder_t *b = lk_client_builder_new();
-lk_client_builder_set_preset(b, "chrome_146");
+lk_client_builder_set_preset(b, "chrome_154");
 
 /* Tier 1 — real-browser per-connection jitter (always available): */
 lk_client_builder_set_randomize(b, LK_RANDOMIZE_EXTENSION_ORDER, 0);

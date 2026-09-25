@@ -85,6 +85,65 @@ fn check_tls(browser: &str, profile: TlsProfile) {
     gate_value(&format!("{browser}_tls_fresh"), value);
 }
 
+#[test]
+fn firefox_156_matches_public_capture_hashes() {
+    let profile = lktls::profile::presets::firefox_156();
+    let out = ClientHelloBuilder::new(&profile, "www.cloudflare.com")
+        .build()
+        .expect("Firefox 156 ClientHello build should succeed");
+    let parsed = parse_client_hello(&out.message).expect("parse Firefox 156 ClientHello");
+    let fingerprint = lkprofile::collect_tls_fingerprint(&parsed);
+    assert_eq!(fingerprint.ja3_hash, "9d42e90b0225e779f03141ddcd699df2");
+    assert_eq!(fingerprint.ja4_prefix, "t13d1517h2");
+}
+
+#[cfg(feature = "quic-h3")]
+#[test]
+fn chrome_153_quic_tls() {
+    let profile = lktls::profile::presets::chrome_153_quic();
+    let message = lktls_quic::LktlsQuicClientConfig::new(profile.clone())
+        .alps_payload(lkh3::encode_alps_h3_settings(&lkh3::chrome_153_h3()))
+        .emit_initial_client_hello("example.com", Vec::new())
+        .expect("emit QUIC ClientHello");
+    let parsed = parse_client_hello(&message).expect("parse QUIC ClientHello");
+    // Chrome 153 QUIC drops the TCP-only TLS GREASE cipher-suite slot.
+    assert!(
+        !parsed
+            .cipher_suites
+            .iter()
+            .any(|&suite| suite & 0x0f0f == 0x0a0a && suite >> 8 == suite & 0xff),
+        "Chrome 153 QUIC ClientHello must not carry a GREASE cipher suite"
+    );
+    let canonical = CanonicalTlsFingerprint::from_parsed(&parsed);
+    gate_value(
+        "chrome_153_quic_tls_fresh",
+        serde_json::to_value(canonicalize_tls(&canonical, &tls_shape(&profile))).unwrap(),
+    );
+}
+
+#[cfg(feature = "quic-h3")]
+#[test]
+fn chrome_154_quic_tls() {
+    let profile = lktls::profile::presets::chrome_154_quic();
+    let message = lktls_quic::LktlsQuicClientConfig::new(profile.clone())
+        .alps_payload(lkh3::encode_alps_h3_settings(&lkh3::chrome_154_h3()))
+        .emit_initial_client_hello("example.com", Vec::new())
+        .expect("emit QUIC ClientHello");
+    let parsed = parse_client_hello(&message).expect("parse QUIC ClientHello");
+    assert!(
+        !parsed
+            .cipher_suites
+            .iter()
+            .any(|&suite| suite & 0x0f0f == 0x0a0a && suite >> 8 == suite & 0xff),
+        "Chrome 154 QUIC ClientHello must not carry a GREASE cipher suite"
+    );
+    let canonical = CanonicalTlsFingerprint::from_parsed(&parsed);
+    gate_value(
+        "chrome_154_quic_tls_fresh",
+        serde_json::to_value(canonicalize_tls(&canonical, &tls_shape(&profile))).unwrap(),
+    );
+}
+
 // ── HTTP/2 ─────────────────────────────────────────────────────────────────
 
 /// Emit the H2 connection preface (SETTINGS + WINDOW_UPDATE + PRIORITY) for the
@@ -134,30 +193,34 @@ fn quic_packetization(
         disable_mtu_discovery: p.disable_mtu_discovery,
         enable_segmentation_offload: p.enable_segmentation_offload,
         enable_ecn: p.enable_ecn,
-        initial_frame_layout: p.initial_frame_layout.as_ref().map(|layout| {
-            layout
-                .packets
-                .iter()
-                .map(|packet| {
-                    let frames = packet
-                        .frames
-                        .iter()
-                        .map(|frame| match frame {
-                            lkh3::InitialFrameElement::Crypto { offset, length } => {
-                                format!("crypto@{offset}+{length}")
-                            }
-                            lkh3::InitialFrameElement::Padding { length } => {
-                                format!("padding+{length}")
-                            }
-                            lkh3::InitialFrameElement::Ping => "ping".to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    format!("pn{}[{frames}]", packet.packet_number)
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        }),
+        initial_frame_layout: if p.initial_packet_chaos {
+            Some("chromium_chaos".into())
+        } else {
+            p.initial_frame_layout.as_ref().map(|layout| {
+                layout
+                    .packets
+                    .iter()
+                    .map(|packet| {
+                        let frames = packet
+                            .frames
+                            .iter()
+                            .map(|frame| match frame {
+                                lkh3::InitialFrameElement::Crypto { offset, length } => {
+                                    format!("crypto@{offset}+{length}")
+                                }
+                                lkh3::InitialFrameElement::Padding { length } => {
+                                    format!("padding+{length}")
+                                }
+                                lkh3::InitialFrameElement::Ping => "ping".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("pn{}[{frames}]", packet.packet_number)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+        },
     }
 }
 
@@ -248,6 +311,15 @@ fn quic_fingerprint_value(profile: &lkh3::QuicProfile) -> serde_json::Value {
             "send_control_grease_frame".into(),
             serde_json::json!(profile.h3.send_control_grease_frame),
         );
+        if tp.randomize_grease_shape {
+            obj.insert("randomize_grease_shape".into(), serde_json::json!(true));
+        }
+        if profile.h3.chromium_grease {
+            obj.insert("chromium_grease".into(), serde_json::json!(true));
+        }
+        if profile.packetization.initial_packet_chaos {
+            obj.insert("initial_packet_chaos".into(), serde_json::json!(true));
+        }
     }
     value
 }
@@ -362,6 +434,10 @@ fn chrome_146_quic_tls_resumed() {
 
 // ── Test registry ────────────────────────────────────────────────────────────
 
+// Chrome 153 and 154 TLS (TCP and QUIC) and H2 goldens come from Wireshark
+// captures against public Cloudflare. QUIC profile goldens additionally gate
+// modeled runtime configuration, not packet layout.
+
 macro_rules! tls_gate {
     ($($name:ident => $preset:expr),+ $(,)?) => {
         $(
@@ -407,8 +483,11 @@ tls_gate! {
     chrome_150 => lktls::profile::presets::chrome_150(),
     chrome_151 => lktls::profile::presets::chrome_151(),
     chrome_152 => lktls::profile::presets::chrome_152(),
+    chrome_153 => lktls::profile::presets::chrome_153(),
+    chrome_154 => lktls::profile::presets::chrome_154(),
     firefox_133 => lktls::profile::presets::firefox_133(),
     firefox_147 => lktls::profile::presets::firefox_147(),
+    firefox_156 => lktls::profile::presets::firefox_156(),
     safari_18 => lktls::profile::presets::safari_18(),
     safari_26 => lktls::profile::presets::safari_26(),
 }
@@ -424,8 +503,11 @@ h2_gate! {
     chrome_150_h2 => "chrome_150" => lkh2::profile::chrome_150_h2(),
     chrome_151_h2 => "chrome_151" => lkh2::profile::chrome_151_h2(),
     chrome_152_h2 => "chrome_152" => lkh2::profile::chrome_152_h2(),
+    chrome_153_h2 => "chrome_153" => lkh2::profile::chrome_153_h2(),
+    chrome_154_h2 => "chrome_154" => lkh2::profile::chrome_154_h2(),
     firefox_133_h2 => "firefox_133" => lkh2::profile::firefox_133_h2(),
     firefox_147_h2 => "firefox_147" => lkh2::profile::firefox_147_h2(),
+    firefox_156_h2 => "firefox_156" => lkh2::profile::firefox_156_h2(),
     safari_18_h2 => "safari_18" => lkh2::profile::safari_18_h2(),
     safari_26_h2 => "safari_26" => lkh2::profile::safari_26_h2(),
 }
@@ -436,5 +518,7 @@ quic_gate! {
     chrome_150_quic => "chrome_150_quic" => lkh3::chrome_150_quic(),
     chrome_151_quic => "chrome_151_quic" => lkh3::chrome_151_quic(),
     chrome_152_quic => "chrome_152_quic" => lkh3::chrome_152_quic(),
+    chrome_153_quic => "chrome_153_quic" => lkh3::chrome_153_quic(),
+    chrome_154_quic => "chrome_154_quic" => lkh3::chrome_154_quic(),
     chrome_generic_quic => "chrome_generic_quic" => lkh3::chrome_quic(),
 }

@@ -4,7 +4,7 @@
 //! fingerprint machinery: canonical (normalized) fingerprint types, the
 //! GREASE/shape normalizer, the per-profile shape spec, the shape-aware
 //! comparator, heuristic shape discovery, and capture decoding.
-//! See `docs/fingerprint-regression-design.md`.
+//! See `design/fingerprint-regression-design.md`.
 //!
 //! ## Client-agnostic invariant (keep it extractable)
 //!

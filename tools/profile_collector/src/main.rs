@@ -317,6 +317,10 @@ enum ChromePresetVersion {
     Chrome151,
     #[value(name = "chrome_152")]
     Chrome152,
+    #[value(name = "chrome_153")]
+    Chrome153,
+    #[value(name = "chrome_154")]
+    Chrome154,
 }
 
 struct CaptureChromeOptions {
@@ -524,7 +528,16 @@ struct QuicFingerprint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     initial_destination_connection_id_length: Option<usize>,
     grease_transport_params: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modeled_wire_policy: Option<ModeledQuicWirePolicy>,
     h3: H3Fingerprint,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModeledQuicWirePolicy {
+    chromium_h3_grease: bool,
+    randomize_transport_grease_shape: bool,
+    initial_packet_chaos: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1451,30 +1464,34 @@ fn quic_packetization_fingerprint(
         disable_mtu_discovery: packetization.disable_mtu_discovery,
         enable_segmentation_offload: packetization.enable_segmentation_offload,
         enable_ecn: packetization.enable_ecn,
-        initial_frame_layout: packetization.initial_frame_layout.as_ref().map(|layout| {
-            layout
-                .packets
-                .iter()
-                .map(|packet| {
-                    let frames = packet
-                        .frames
-                        .iter()
-                        .map(|frame| match frame {
-                            lkh3::InitialFrameElement::Crypto { offset, length } => {
-                                format!("crypto@{offset}+{length}")
-                            }
-                            lkh3::InitialFrameElement::Padding { length } => {
-                                format!("padding+{length}")
-                            }
-                            lkh3::InitialFrameElement::Ping => "ping".to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    format!("pn{}[{frames}]", packet.packet_number)
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        }),
+        initial_frame_layout: if packetization.initial_packet_chaos {
+            Some("chromium_chaos".into())
+        } else {
+            packetization.initial_frame_layout.as_ref().map(|layout| {
+                layout
+                    .packets
+                    .iter()
+                    .map(|packet| {
+                        let frames = packet
+                            .frames
+                            .iter()
+                            .map(|frame| match frame {
+                                lkh3::InitialFrameElement::Crypto { offset, length } => {
+                                    format!("crypto@{offset}+{length}")
+                                }
+                                lkh3::InitialFrameElement::Padding { length } => {
+                                    format!("padding+{length}")
+                                }
+                                lkh3::InitialFrameElement::Ping => "ping".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("pn{}[{frames}]", packet.packet_number)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+        },
     }
 }
 
@@ -1553,6 +1570,11 @@ fn quic_fingerprint_from_profile(profile: &lkh3::QuicProfile) -> QuicFingerprint
         packetization: quic_packetization_fingerprint(&profile.packetization),
     };
     let mut fingerprint = convert_quic_fingerprint(collect_quic_fingerprint(&quic_input));
+    fingerprint.modeled_wire_policy = Some(ModeledQuicWirePolicy {
+        chromium_h3_grease: profile.h3.chromium_grease,
+        randomize_transport_grease_shape: profile.transport_params.randomize_grease_shape,
+        initial_packet_chaos: profile.packetization.initial_packet_chaos,
+    });
     fingerprint.h3.priority_updates = profile
         .h3
         .priority_updates
@@ -2267,6 +2289,8 @@ fn chrome_base_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome150 => lktls::profile::presets::chrome_150(),
         ChromePresetVersion::Chrome151 => lktls::profile::presets::chrome_151(),
         ChromePresetVersion::Chrome152 => lktls::profile::presets::chrome_152(),
+        ChromePresetVersion::Chrome153 => lktls::profile::presets::chrome_153(),
+        ChromePresetVersion::Chrome154 => lktls::profile::presets::chrome_154(),
     }
 }
 
@@ -2278,6 +2302,8 @@ fn chrome_quic_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome150 => return lktls::profile::presets::chrome_150_quic(),
         ChromePresetVersion::Chrome151 => return lktls::profile::presets::chrome_151_quic(),
         ChromePresetVersion::Chrome152 => return lktls::profile::presets::chrome_152_quic(),
+        ChromePresetVersion::Chrome153 => return lktls::profile::presets::chrome_153_quic(),
+        ChromePresetVersion::Chrome154 => return lktls::profile::presets::chrome_154_quic(),
         _ => {}
     }
 
@@ -2356,6 +2382,8 @@ fn chrome_h2_profile(version: ChromePresetVersion) -> lkh2::profile::H2Profile {
         ChromePresetVersion::Chrome150 => lkh2::profile::chrome_150_h2(),
         ChromePresetVersion::Chrome151 => lkh2::profile::chrome_151_h2(),
         ChromePresetVersion::Chrome152 => lkh2::profile::chrome_152_h2(),
+        ChromePresetVersion::Chrome153 => lkh2::profile::chrome_153_h2(),
+        ChromePresetVersion::Chrome154 => lkh2::profile::chrome_154_h2(),
     }
 }
 
@@ -2365,6 +2393,8 @@ fn chrome_quic_profile(version: ChromePresetVersion) -> lkh3::QuicProfile {
         ChromePresetVersion::Chrome150 => lkh3::chrome_150_quic(),
         ChromePresetVersion::Chrome151 => lkh3::chrome_151_quic(),
         ChromePresetVersion::Chrome152 => lkh3::chrome_152_quic(),
+        ChromePresetVersion::Chrome153 => lkh3::chrome_153_quic(),
+        ChromePresetVersion::Chrome154 => lkh3::chrome_154_quic(),
         _ => lkh3::chrome_quic(),
     }
 }
@@ -2942,6 +2972,7 @@ fn convert_quic_fingerprint(fp: QuicFingerprintCollection) -> QuicFingerprint {
         connection_id_length: fp.connection_id_length,
         initial_destination_connection_id_length: fp.initial_destination_connection_id_length,
         grease_transport_params: fp.grease_transport_params,
+        modeled_wire_policy: None,
         h3: H3Fingerprint {
             settings: fp
                 .h3_settings

@@ -415,3 +415,122 @@ async fn test_session_pool_stats() {
     assert_eq!(stats.idle_sessions, 0);
     assert_eq!(stats.max_sessions, 5);
 }
+
+// ---------------------------------------------------------------------------
+// proxy_fallback_direct — and the MASQUE exception to it
+// ---------------------------------------------------------------------------
+
+/// Client that trusts the local self-signed cert and fails the proxy fast.
+fn fallback_client(fallback_direct: bool) -> Client {
+    Client::builder()
+        .fingerprint(presets::chrome_144())
+        .h2_profile(chrome_144_h2())
+        .verify(false)
+        .connect_timeout(std::time::Duration::from_millis(500))
+        .proxy_fallback_direct(fallback_direct)
+        .build()
+}
+
+/// Port 1 is reliably refused, which is the cheapest "proxy is down" we can get
+/// without a listener that has to be torn down.
+const DEAD_PROXY_PORT: u16 = 1;
+
+/// MASQUE + `proxy_fallback_direct(true)` must NOT fall back to a direct
+/// connection.
+///
+/// A MASQUE tunnel is configured to keep the client's source address away from
+/// the target (RFC 9298 CONNECT-UDP), so bypassing it silently would hand the
+/// target the real IP — see `design/masque-connect-udp-design.md`, "失败语义与隔离".
+/// The origin's TCP accept counter is the direct evidence: it must stay at zero.
+#[tokio::test]
+#[cfg(feature = "masque")]
+async fn test_masque_proxy_never_falls_back_to_direct() {
+    let srv = start_local_https_server().await;
+    let client = fallback_client(true);
+    let session = client
+        .session()
+        .proxy(&format!("masque://127.0.0.1:{DEAD_PROXY_PORT}"))
+        .build();
+
+    let result = session.get(&url_join(&srv.base_url, "/get")).send().await;
+
+    let err = result.expect_err("MASQUE must not fall back to a direct connection");
+    assert!(
+        err.to_string().contains("relays UDP only"),
+        "expected the MASQUE-cannot-carry-TCP error, got: {err}"
+    );
+    assert_eq!(
+        srv.tcp_accept_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the origin must see no direct connection attempt"
+    );
+}
+
+/// Control: HTTP CONNECT keeps the pre-existing fallback semantics — a dead
+/// proxy plus `proxy_fallback_direct(true)` still reaches the origin directly.
+#[tokio::test]
+async fn test_http_connect_proxy_still_falls_back_to_direct() {
+    let srv = start_local_https_server().await;
+    let client = fallback_client(true);
+    let session = client
+        .session()
+        .proxy(&format!("http://127.0.0.1:{DEAD_PROXY_PORT}"))
+        .build();
+
+    let resp = session
+        .get(&url_join(&srv.base_url, "/get"))
+        .send()
+        .await
+        .expect("HTTP CONNECT failure should still fall back to a direct connection");
+
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+/// Control: SOCKS5 keeps the pre-existing fallback semantics too.
+#[tokio::test]
+async fn test_socks5_proxy_still_falls_back_to_direct() {
+    let srv = start_local_https_server().await;
+    let client = fallback_client(true);
+    let session = client
+        .session()
+        .proxy(&format!("socks5://127.0.0.1:{DEAD_PROXY_PORT}"))
+        .build();
+
+    let resp = session
+        .get(&url_join(&srv.base_url, "/get"))
+        .send()
+        .await
+        .expect("SOCKS5 failure should still fall back to a direct connection");
+
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+/// Control: the flag is still what drives the HTTP/SOCKS5 fallback — with it
+/// off (the default) a dead proxy is a hard failure and the origin is never
+/// contacted. Pins that the MASQUE change did not turn the fallback on or off
+/// for everybody else.
+#[tokio::test]
+async fn test_proxy_fallback_direct_off_keeps_failing_for_tcp_proxies() {
+    for scheme in ["http", "socks5"] {
+        let srv = start_local_https_server().await;
+        let client = fallback_client(false);
+        let session = client
+            .session()
+            .proxy(&format!("{scheme}://127.0.0.1:{DEAD_PROXY_PORT}"))
+            .build();
+
+        let result = session.get(&url_join(&srv.base_url, "/get")).send().await;
+
+        assert!(
+            result.is_err(),
+            "{scheme}: a dead proxy must fail without proxy_fallback_direct"
+        );
+        assert_eq!(
+            srv.tcp_accept_counter
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{scheme}: the origin must see no direct connection attempt"
+        );
+    }
+}

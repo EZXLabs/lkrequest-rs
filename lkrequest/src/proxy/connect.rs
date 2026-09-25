@@ -9,6 +9,13 @@ use crate::error::{Error, ProxyErrorKind, Result};
 use super::config::{ProxyAuth, ProxyConfig, ProxyScheme};
 use super::socks5_udp::SocksTarget;
 
+fn connect_authority(host: &str, port: u16) -> String {
+    match crate::dns::literal_ip(host) {
+        Some(ip) => SocketAddr::new(ip, port).to_string(),
+        None => format!("{host}:{port}"),
+    }
+}
+
 impl ProxyConfig {
     /// Establish a TCP connection through this proxy to the given target.
     ///
@@ -46,6 +53,7 @@ impl ProxyConfig {
         connect_timeout: std::time::Duration,
         connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     ) -> Result<TcpStream> {
+        self.validate()?;
         if !self.chain.is_empty() {
             return self
                 .connect_chain(
@@ -90,6 +98,8 @@ impl ProxyConfig {
                 )
                 .await
             }
+            #[cfg(feature = "masque")]
+            ProxyScheme::Masque { host, port } => Err(masque_cannot_carry_tcp(host, *port)),
         }
     }
     /// Establish a TCP tunnel through a multi-hop **proxychain** to the target.
@@ -218,7 +228,7 @@ impl ProxyConfig {
                 None,
             ));
         }
-        socks5_handshake(stream, self.auth.as_ref()).await?;
+        socks5_handshake(stream, self.socks5_user_pass().as_ref()).await?;
         socks5_send_connect_address(stream, target).await?;
         socks5_read_response(stream, "connect").await?;
         Ok(())
@@ -232,9 +242,9 @@ impl ProxyConfig {
     ) -> Result<()> {
         match &self.scheme {
             ProxyScheme::Http { .. } => {
-                let target = format!("{host}:{port}");
+                let target = connect_authority(host, port);
                 let (status_code, response_bytes) =
-                    send_connect_request(stream, &target, self.auth.as_ref()).await?;
+                    send_connect_request(stream, &target, self.http_auth_header()).await?;
                 if connect_tunnel_established(status_code) {
                     Ok(())
                 } else if status_code == 407 {
@@ -254,11 +264,16 @@ impl ProxyConfig {
                 }
             }
             ProxyScheme::Socks5 { remote_dns, .. } => {
-                socks5_handshake(stream, self.auth.as_ref()).await?;
+                socks5_handshake(stream, self.socks5_user_pass().as_ref()).await?;
                 socks5_send_connect(stream, host, port, *remote_dns, resolver).await?;
                 socks5_read_response(stream, "connect").await?;
                 Ok(())
             }
+            #[cfg(feature = "masque")]
+            ProxyScheme::Masque {
+                host: proxy_host,
+                port: proxy_port,
+            } => Err(masque_cannot_carry_tcp(proxy_host, *proxy_port)),
         }
     }
 
@@ -297,7 +312,7 @@ impl ProxyConfig {
 
         async {
             let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-            let target = format!("{}:{}", target_host, target_port);
+            let target = connect_authority(target_host, target_port);
 
             let mut stream = connect_tcp_to_proxy_with_budget(
                 proxy_host,
@@ -312,7 +327,7 @@ impl ProxyConfig {
             tracing::debug!("proxy.tcp_connected");
 
             let (status_code, response_bytes) =
-                send_connect_request(&mut stream, &target, self.auth.as_ref()).await?;
+                send_connect_request(&mut stream, &target, self.http_auth_header()).await?;
 
             if connect_tunnel_established(status_code) {
                 tracing::debug!(status = status_code, "proxy.tunnel_established");
@@ -326,7 +341,7 @@ impl ProxyConfig {
                     lower.starts_with("proxy-authenticate:") && lower.contains("basic")
                 });
 
-                if self.auth.is_some() && supports_basic {
+                if self.http_auth_header().is_some() && supports_basic {
                     tracing::warn!(
                         status = 407,
                         "proxy.407_retrying_with_auth — reconnecting with credentials"
@@ -351,7 +366,8 @@ impl ProxyConfig {
                     })?;
 
                     let (retry_code, _) =
-                        send_connect_request(&mut stream2, &target, self.auth.as_ref()).await?;
+                        send_connect_request(&mut stream2, &target, self.http_auth_header())
+                            .await?;
 
                     if connect_tunnel_established(retry_code) {
                         tracing::debug!(
@@ -454,7 +470,7 @@ impl ProxyConfig {
                 connection_budget,
             )
             .await?;
-            socks5_handshake(&mut stream, self.auth.as_ref()).await?;
+            socks5_handshake(&mut stream, self.socks5_user_pass().as_ref()).await?;
             socks5_send_connect(&mut stream, target_host, target_port, true, resolver).await?;
             socks5_read_response(&mut stream, "connect").await?;
             return Ok(stream);
@@ -491,7 +507,7 @@ impl ProxyConfig {
                 connection_budget.clone(),
             )
             .await?;
-            socks5_handshake(&mut stream, self.auth.as_ref()).await?;
+            socks5_handshake(&mut stream, self.socks5_user_pass().as_ref()).await?;
             socks5_send_connect_address(&mut stream, target).await?;
             match socks5_read_response(&mut stream, "connect").await {
                 Ok(_) => return Ok(stream),
@@ -526,8 +542,16 @@ impl ProxyConfig {
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
     ) -> Result<UdpAssociation> {
+        self.validate()?;
         if !self.chain.is_empty() {
             return self.udp_associate_chain(tcp_fingerprint, resolver).await;
+        }
+        if !matches!(self.scheme, ProxyScheme::Socks5 { .. }) {
+            return Err(Error::proxy(
+                ProxyErrorKind::ProtocolError,
+                format!("UDP ASSOCIATE is SOCKS5-only; proxy {self} is not SOCKS5"),
+                None,
+            ));
         }
 
         let (proxy_host, proxy_port) = self.host_port();
@@ -554,7 +578,7 @@ impl ProxyConfig {
 
             tracing::debug!("proxy.tcp_connected");
 
-            socks5_handshake(&mut stream, self.auth.as_ref()).await?;
+            socks5_handshake(&mut stream, self.socks5_user_pass().as_ref()).await?;
 
             let raw_relay = send_udp_associate(&mut stream).await?;
             let first_relay = resolve_first_relay(raw_relay, &stream)?;
@@ -638,7 +662,7 @@ impl ProxyConfig {
                 }
 
                 // At hop i: SOCKS5 handshake + UDP ASSOCIATE over the tunnel.
-                socks5_handshake(&mut stream, hops[i].auth.as_ref()).await?;
+                socks5_handshake(&mut stream, hops[i].socks5_user_pass().as_ref()).await?;
                 let raw_relay = send_udp_associate(&mut stream).await?;
 
                 if i == 0 {
@@ -835,6 +859,9 @@ async fn socks5_send_connect(
     remote_dns: bool,
     resolver: &dyn crate::dns::DnsResolver,
 ) -> Result<()> {
+    if let Some(ip) = crate::dns::literal_ip(target_host) {
+        return socks5_send_connect_address(stream, SocketAddr::new(ip, target_port)).await;
+    }
     let mut req = Vec::new();
     req.push(0x05); // VER
     req.push(0x01); // CMD: CONNECT
@@ -1137,6 +1164,31 @@ async fn connect_tcp_to_proxy_with_budget(
         )
     })
 }
+/// The error for asking a MASQUE proxy to carry a TCP stream.
+///
+/// RFC 9298 defines CONNECT-UDP, which relays UDP datagrams only. Falling back
+/// to a direct connection here would leak the real source address — the reason
+/// the proxy was configured in the first place — so this is a hard failure.
+///
+/// Only reachable with the `masque` feature: without it `ProxyScheme::Masque`
+/// does not exist, a `masque://` URL never gets past
+/// [`ProxyConfig::parse`](crate::proxy::ProxyConfig::parse), and there is no
+/// config that could reach the TCP path with one. Hence the `cfg` — otherwise
+/// this would be dead code under `-D warnings`. The message therefore never
+/// has to name the feature: by the time it can be produced, the feature is on.
+#[cfg(feature = "masque")]
+fn masque_cannot_carry_tcp(host: &str, port: u16) -> Error {
+    Error::proxy(
+        ProxyErrorKind::ProtocolError,
+        format!(
+            "MASQUE proxy masque://{host}:{port} relays UDP only (RFC 9298 CONNECT-UDP) and \
+             cannot carry a TCP stream; HTTP/1.1 and HTTP/2 require an HTTP CONNECT or SOCKS5 \
+             proxy"
+        ),
+        None,
+    )
+}
+
 /// Whether a CONNECT response status establishes the tunnel.
 ///
 /// RFC 9110 §9.3.6: "Any 2xx (Successful) response indicates that the sender
@@ -1154,19 +1206,14 @@ fn connect_tunnel_established(status_code: u16) -> bool {
 async fn send_connect_request(
     stream: &mut TcpStream,
     target: &str,
-    auth: Option<&super::config::ProxyAuth>,
+    auth_header: Option<(&'static str, String)>,
 ) -> Result<(u16, Vec<u8>)> {
     let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
 
-    if let Some(auth) = auth {
+    if let Some((name, value)) = auth_header {
         use std::fmt::Write;
-        let credentials = format!("{}:{}", auth.username, auth.password);
-        let encoded = {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
-        };
-        let _ = write!(request, "Proxy-Authorization: Basic {encoded}\r\n");
-        tracing::trace!("proxy.auth_header_added");
+        let _ = write!(request, "{name}: {value}\r\n");
+        tracing::trace!(header = name, "proxy.auth_header_added");
     }
 
     request.push_str("\r\n");

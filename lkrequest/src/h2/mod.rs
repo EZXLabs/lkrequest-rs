@@ -38,7 +38,7 @@ pub async fn connect_h2<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    connect_h2_with_config(tls_stream, h2_profile, first_request, None).await
+    connect_h2_with_config(tls_stream, h2_profile, first_request, None, 1).await
 }
 
 pub(crate) async fn connect_h2_with_config<S>(
@@ -46,6 +46,7 @@ pub(crate) async fn connect_h2_with_config<S>(
     h2_profile: &H2Profile,
     first_request: Option<http::Request<Option<bytes::Bytes>>>,
     max_pending_h2_requests: Option<usize>,
+    h2_dispatch_batch_size: usize,
 ) -> Result<UnifiedH2Connection>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -56,6 +57,9 @@ where
         first_request,
         H2DriverConfig {
             max_pending_requests: max_pending_h2_requests,
+            max_ready_commands_per_turn: h2_dispatch_batch_size,
+            max_requests_per_write: h2_dispatch_batch_size,
+            ..H2DriverConfig::default()
         },
     )
     .await

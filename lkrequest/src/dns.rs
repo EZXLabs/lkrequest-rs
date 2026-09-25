@@ -19,13 +19,110 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_resolver::config::ConnectionConfig;
 use serde::{Deserialize, Serialize};
+
+/// Address families allowed for locally selected TCP and QUIC endpoints.
+///
+/// This filters connection candidates, not the DNS resolver's own transport or
+/// addresses selected internally by a remote-DNS proxy.
+/// For example, `Ipv4` can connect to an HTTP proxy over IPv4 while that proxy
+/// resolves the forwarded target name and connects to it over IPv6.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpFamily {
+    /// Preserve the resolver's address families and order.
+    #[default]
+    Any,
+    /// Allow only IPv4 endpoints selected locally (including proxy ingress).
+    Ipv4,
+    /// Allow only IPv6 endpoints selected locally; exclude IPv4-mapped addresses.
+    Ipv6,
+}
+
+impl std::fmt::Display for IpFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Any => "any",
+            Self::Ipv4 => "IPv4",
+            Self::Ipv6 => "IPv6",
+        })
+    }
+}
+
+impl IpFamily {
+    pub(crate) fn allows(self, ip: IpAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Ipv4 => ip.is_ipv4(),
+            Self::Ipv6 => matches!(ip, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_none()),
+        }
+    }
+
+    pub(crate) fn check(self, ip: IpAddr) -> io::Result<()> {
+        if self.allows(ip) {
+            Ok(())
+        } else {
+            Err(self.no_address(&ip.to_string()))
+        }
+    }
+
+    fn no_address(self, host: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            AddressFamilyMismatch {
+                family: self,
+                host: host.to_owned(),
+            },
+        )
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("no address permitted by {family} policy for {host}")]
+pub(crate) struct AddressFamilyMismatch {
+    family: IpFamily,
+    host: String,
+}
+
+pub(crate) fn literal_ip(host: &str) -> Option<IpAddr> {
+    match url::Host::parse(host) {
+        Ok(url::Host::Ipv4(ip)) => Some(ip.into()),
+        Ok(url::Host::Ipv6(ip)) => Some(ip.into()),
+        _ => host.parse().ok(),
+    }
+}
+
+/// Installed after all builder resolver settings so call order cannot undo it.
+pub(crate) struct FamilyResolver {
+    pub inner: Arc<dyn DnsResolver>,
+    pub family: IpFamily,
+}
+
+#[async_trait]
+impl DnsResolver for FamilyResolver {
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        if let Some(ip) = literal_ip(host) {
+            self.family.check(ip)?;
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        let mut addresses = self.inner.resolve(host, port).await?;
+        addresses.retain(|addr| self.family.allows(addr.ip()));
+        if addresses.is_empty() && self.family != IpFamily::Any {
+            return Err(self.family.no_address(host));
+        }
+        Ok(addresses)
+    }
+
+    async fn lookup_https(&self, host: &str) -> io::Result<Option<HttpsRecord>> {
+        self.inner.lookup_https(host).await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DnsResolver trait

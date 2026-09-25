@@ -1,0 +1,94 @@
+schema_version = 1
+reviewed_at = "2026-09-06"
+
+[[dataset]]
+id = "2026-09-05-linux-native-fastpath-ab"
+title = "Linux HTTP/2 native request/response fast-path A/B"
+date = "2026-09-05"
+source = "tools/http-client-bench/AB-NATIVE-HEADERS-2026-09-05.md"
+source_commit = "bdd70a1cdac6e0c879d4685ac34ec6db0c530fe3"
+status = "current-engineering-baseline"
+publishable = false
+current = true
+raw_results_in_public_tree = false
+reason = "Latest direct measurement of the implemented final H2 path, including the self-hosted HPACK decoder and native request/response fast path. The referenced raw archive is not present in the public tree and this is not a complete cross-client matrix."
+[dataset.environment]
+os = "Ubuntu 24.04 KVM"
+kernel = "6.8.0-117-generic"
+profile = "release"
+[dataset.workload]
+protocol = "h2c prior knowledge"
+response_body_bytes = 1024
+requests_per_round = 200000
+concurrency = 32
+sessions = 1
+connections = 1
+client_workers = 1
+server_workers = 2
+rounds = 7
+round_order = "alternating"
+aggregation = "median of round-level results"
+
+[[dataset]]
+id = "2026-09-05-linux-self-hpack-ab"
+title = "Linux self-hosted HPACK decoder A/B"
+date = "2026-09-05"
+source = "tools/http-client-bench/FLAMEGRAPH-HPACK-SELF-2026-09-05.md"
+source_commit = "bdd70a1cdac6e0c879d4685ac34ec6db0c530fe3"
+status = "superseded-engineering-ab"
+publishable = false
+current = false
+raw_results_in_public_tree = false
+reason = "Proves the HPACK decoder improvement, but predates the native request/response fast path and is not a final-state cross-client comparison."
+
+[[dataset]]
+id = "2026-09-05-linux-h2c"
+title = "Linux HTTP/2 corrected comparison"
+date = "2026-09-05"
+source = "tools/http-client-bench/LINUX-RESULTS-2026-09-05.md"
+source_commit = "bdd70a1cdac6e0c879d4685ac34ec6db0c530fe3"
+status = "historical-cross-client-baseline"
+publishable = false
+current = false
+raw_results_in_public_tree = false
+reason = "The reviewed report and methodology are tracked, but the raw JSON result archive is not present in the public source tree. Results are engineering evidence, not a release headline."
+[dataset.environment]
+os = "Ubuntu 24.04.4 LTS"
+kernel = "6.8.0-117-generic"
+machine = "KVM virtual machine"
+logical_cpus = 28
+rust = "1.89.0-nightly (f3db63916 2025-06-17)"
+profile = "release"
+[dataset.workload]
+protocol = "h2c prior knowledge"
+tls = false
+dns = false
+proxy = false
+compression = false
+redirects = false
+warmup_requests_per_session = 200
+rounds = 5
+round_order = "alternating; even rounds reversed"
+aggregation = "median of round-level results"
+
+[[dataset]]
+id = "2026-09-05-windows-h2c-superseded"
+title = "Windows HTTP/2 diagnostic baseline"
+date = "2026-09-05"
+source = "tools/http-client-bench/RESULTS-2026-09-05.md"
+status = "superseded"
+publishable = false
+current = false
+raw_results_in_public_tree = false
+reason = "Collected before the server/client TCP_NODELAY correction; retained only as diagnostic history."
+
+[[dataset]]
+id = "2026-09-05-write-batching-ab"
+title = "HTTP/2 dispatch batching A/B"
+date = "2026-09-05"
+source = "tools/http-client-bench/AB-BATCHING-2026-09-05.md"
+status = "engineering-ab"
+publishable = false
+current = false
+raw_results_in_public_tree = false
+reason = "Demonstrates an opt-in implementation trade-off; it does not establish browser wire-fingerprint parity."

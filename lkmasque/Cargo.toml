@@ -1,0 +1,15 @@
+[package]
+name = "lkmasque"
+version = "0.2.3"
+edition = "2021"
+description = "MASQUE CONNECT-UDP (RFC 9298) wire codec and tunnel layer for lkrequest"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/lkmasque"
+keywords = ["masque", "connect-udp", "quic", "proxy", "http3"]
+categories = ["network-programming", "web-programming::http-client"]
+
+[dependencies]
+thiserror = { workspace = true }

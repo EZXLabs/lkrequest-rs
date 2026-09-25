@@ -1,34 +1,54 @@
 [package]
 name = "lkrequest"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "HTTP client with fine-grained TLS fingerprint control"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/lkrequest"
+keywords = ["http", "client", "tls", "fingerprint", "http3"]
+categories = ["network-programming", "web-programming::http-client"]
 
 [features]
 default = ["h2-native"]
 
 doh = ["hickory-resolver/https-aws-lc-rs"]
-# Backward-compatible alias. HTTP/2 always uses lkh2 and no longer has an
-# alternate backend.
+# Deprecated backward-compatible alias. HTTP/2 always uses lkh2 and no longer
+# has an alternate backend. Remove this feature completely in 0.3.0.
 h2-native = ["lkh2/h2-native"]
-quic-h3 = ["dep:lktls-quic", "dep:lkh3", "dep:lkquic", "dep:quinn"]
+quic-h3 = ["dep:lktls-quic", "dep:lkh3", "dep:lkquic", "dep:quinn", "dep:h3", "dep:h3-quinn"]
+# MASQUE (RFC 9298 CONNECT-UDP) proxy support. Off by default: it pulls in the
+# tunnel layer and only helps deployments that actually have a MASQUE proxy.
+# Implies `quic-h3` — the outer hop is HTTP/3 and the inner one is QUIC, so
+# without it there is nothing for a tunnel to ride on or to carry.
+masque = ["quic-h3", "dep:lkmasque"]
 # Tier-2 integration tests that hit the public internet (not enabled in CI).
 network-e2e = []
 # Operational telemetry (bandwidth / connection / request counters). Off by
 # default so non-observed deployments carry zero transport instrumentation.
 telemetry = []
+bench-internals = []
 # Synthetic (Tier 3a/3b) fingerprint randomization — produces fingerprints that
 # match no real browser. Escape hatch for negative-model blocklists; off by
 # default so it can't be enabled by accident against allowlist targets.
 synthetic-fp = ["dep:rand_chacha", "dep:rand_core"]
 
 [dependencies]
-lktls = { path = "../lktls" }
-lktls-quic = { path = "../lktls-quic", optional = true }
-lkh2 = { path = "../lkh2", default-features = false }
-lkh3 = { path = "../lkh3", optional = true }
-lkquic = { path = "../lkquic", optional = true }
+lktls = { path = "../lktls", version = "0.2.3" }
+lktls-quic = { path = "../lktls-quic", version = "0.2.3", optional = true }
+lkh2 = { path = "../lkh2", version = "0.2.3", default-features = false }
+lkh3 = { path = "../lkh3", version = "0.2.3", optional = true }
+lkquic = { path = "../lkquic", version = "0.2.3", optional = true }
+lkmasque = { path = "../lkmasque", version = "0.2.3", optional = true }
 quinn = { workspace = true, optional = true, features = ["runtime-tokio", "ring", "rustls"] }
+# The MASQUE bridge speaks the outer HTTP/3 connection directly: it must issue
+# an extended CONNECT with `:protocol = connect-udp` and read datagrams off the
+# raw quinn connection, neither of which `lkh3`'s profile-driven sender exposes.
+# Both are the workspace's patched forks, same as `lkh3` uses.
+h3 = { path = "../deps/h3/h3", optional = true }
+h3-quinn = { path = "../deps/h3/h3-quinn", optional = true }
 arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 aws-lc-rs = { workspace = true }
@@ -42,6 +62,8 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+http-body = "1"
+futures-core = "0.3"
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -131,9 +153,33 @@ name = "quic_local_e2e"
 required-features = ["quic-h3"]
 
 [[test]]
+name = "e2e_quic_fallback_budget"
+required-features = ["quic-h3"]
+
+[[test]]
 name = "quic_profile_fingerprint"
 required-features = ["quic-h3"]
 
 [[test]]
 name = "quic_network_e2e"
 required-features = ["quic-h3", "network-e2e"]
+
+[[test]]
+name = "streaming_upload_h3"
+required-features = ["quic-h3"]
+
+[[test]]
+name = "masque_local_e2e"
+required-features = ["quic-h3"]
+
+[[test]]
+name = "masque_tunnel_e2e"
+required-features = ["masque"]
+
+[[test]]
+name = "masque_session_e2e"
+required-features = ["masque"]
+
+[[test]]
+name = "masque_health_check_e2e"
+required-features = ["masque"]

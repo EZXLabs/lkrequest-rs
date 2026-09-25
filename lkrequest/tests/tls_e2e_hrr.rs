@@ -51,6 +51,7 @@ async fn test_all_profiles_handshake() {
     let profiles = vec![
         ("Chrome 144", presets::chrome_144()),
         ("Firefox 147", presets::firefox_147()),
+        ("Firefox 156", presets::firefox_156()),
         ("Safari 26", presets::safari_26()),
     ];
     let host = "www.cloudflare.com";

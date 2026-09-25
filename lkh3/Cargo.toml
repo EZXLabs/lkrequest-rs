@@ -1,10 +1,19 @@
 [package]
 name = "lkh3"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
+description = "HTTP/3 and QUIC fingerprint profiles for lkrequest"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/lkh3"
+keywords = ["http3", "quic", "fingerprint", "qpack", "browser"]
+categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
 bytes = { workspace = true }
+futures-core = "0.3"
 h3 = { path = "../deps/h3/h3" }
 h3-quinn = { path = "../deps/h3/h3-quinn" }
 http = { workspace = true }

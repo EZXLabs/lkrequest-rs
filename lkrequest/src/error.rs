@@ -389,6 +389,34 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether a connection was rejected by the client's address-family policy.
+    pub fn is_address_family_mismatch(&self) -> bool {
+        fn contains(error: &(dyn std::error::Error + 'static)) -> bool {
+            if error.is::<crate::dns::AddressFamilyMismatch>() {
+                return true;
+            }
+            if let Some(error) = error.downcast_ref::<Error>() {
+                return error.is_address_family_mismatch();
+            }
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                return error.get_ref().is_some_and(|inner| contains(inner));
+            }
+            error.source().is_some_and(contains)
+        }
+        match self {
+            Self::Io(error) => contains(error),
+            Self::Proxy(error) => error
+                .source
+                .as_deref()
+                .is_some_and(|source| contains(source)),
+            Self::Connection(error) => error
+                .source
+                .as_deref()
+                .is_some_and(|source| contains(source)),
+            _ => false,
+        }
+    }
+
     /// Whether this error is potentially transient and the request could succeed on retry.
     ///
     /// Returns `true` for:
@@ -401,6 +429,7 @@ impl Error {
     /// - `Status` with 5xx — server errors are often transient
     ///
     /// Returns `false` for:
+    /// - Address-family policy rejections, including wrapped I/O or proxy errors
     /// - `InvalidConfig` — configuration error, won't fix itself
     /// - `UrlParse` — malformed URL
     /// - `TooManyRedirects` — logic error
@@ -410,6 +439,9 @@ impl Error {
     /// - `Status` with 4xx — client errors won't fix themselves
     /// - `ResourceLimitExceeded` — won't change on retry
     pub fn is_retryable(&self) -> bool {
+        if self.is_address_family_mismatch() {
+            return false;
+        }
         matches!(
             self,
             Error::Timeout { .. }
@@ -464,6 +496,9 @@ impl Error {
     /// if an H3 request fails after the QUIC handshake succeeded, the path
     /// is fine and fallback would just mask a request-level bug.
     pub fn is_quic_handshake_failure(&self) -> bool {
+        if self.is_address_family_mismatch() {
+            return false;
+        }
         match self {
             Error::QuicHandshake(_) => true,
             Error::QuicTransport(err) => err.phase == QuicPhase::Handshake,

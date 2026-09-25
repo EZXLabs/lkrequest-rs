@@ -23,6 +23,16 @@ available.
 | `chrome_150` | yes | yes | yes | dedicated captured QUIC/H3 |
 | `chrome_151` | yes | yes | yes | public-site captured QUIC/H3 |
 | `chrome_152` | yes | yes | yes | public Cloudflare TLS/H2/QUIC capture; H3 baseline retained |
+| `chrome_153` | yes | yes | yes | public Cloudflare TLS/H2/QUIC/H3 capture |
+| `chrome_154` | yes | yes | yes | public Cloudflare TLS/H2/QUIC capture; H3 baseline inherited |
+
+Chrome 153.0.8010.37 was captured against public Cloudflare targets on
+2026-09-15, including decrypted H3 SETTINGS.
+
+Chrome 154.0.8037.58 was captured against public Cloudflare targets on
+2026-09-24. TLS, H2, QUIC TLS, transport parameters, and Initial packetization
+match Chrome 153; the public path did not complete H3, so H3 settings inherit
+the Chrome 153 baseline.
 
 Chrome's TCP `signature_algorithms` evolution is version-specific and must be
 compared as an ordered raw sequence: Chrome 149 starts with
@@ -92,9 +102,8 @@ cargo run -p profile-collector -- export-chrome-preset \
   -o target/captures/lkrequest_chrome_146_h3.json
 ```
 
-For H3, `chrome_146` exports the captured QUIC/H3 profile. Other Chrome versions
-export the generic Chromium QUIC/H3 profile until version-specific captures are
-added.
+H3 export uses the version-specific QUIC/H3 profile where listed in the matrix
+above, and the generic Chromium profile for the remaining versions.
 
 ## Field-Level Diff
 

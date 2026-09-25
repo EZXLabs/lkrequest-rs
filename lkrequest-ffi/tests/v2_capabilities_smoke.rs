@@ -1,3 +1,6 @@
+#[path = "support/server_regressions.rs"]
+mod server_regressions;
+
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -17,8 +20,11 @@ use lkrequest_ffi::{
     lk_log_init_callback, lk_multipart_add_file, lk_multipart_add_text, lk_multipart_new,
     lk_op_free, lk_op_state_t, lk_op_take_proxy_guard, lk_op_take_session_pool_guard,
     lk_op_take_socks5_udp_probe_report, lk_op_wait, lk_preset_get_detail_json, lk_preset_list_json,
-    lk_proxy_guard_free, lk_proxy_guard_mark_bad, lk_proxy_guard_t, lk_proxy_guard_url,
-    lk_proxy_pool_acquire, lk_proxy_pool_acquire_async, lk_proxy_pool_builder_add_proxy,
+    lk_proxy_auth_header_t, lk_proxy_config_free, lk_proxy_config_identity, lk_proxy_config_parse,
+    lk_proxy_config_set_auth_header, lk_proxy_config_set_http_auth, lk_proxy_config_set_user_pass,
+    lk_proxy_config_t, lk_proxy_config_url, lk_proxy_guard_free, lk_proxy_guard_mark_bad,
+    lk_proxy_guard_t, lk_proxy_guard_url, lk_proxy_pool_acquire, lk_proxy_pool_acquire_async,
+    lk_proxy_pool_builder_add_proxy, lk_proxy_pool_builder_add_proxy_config,
     lk_proxy_pool_builder_build, lk_proxy_pool_builder_free, lk_proxy_pool_builder_new,
     lk_proxy_pool_builder_set_provider, lk_proxy_pool_builder_set_proxy_buffer,
     lk_proxy_pool_builder_set_rotation, lk_proxy_pool_free, lk_proxy_pool_mark_bad,
@@ -28,21 +34,22 @@ use lkrequest_ffi::{
     lk_response_cookie_value_at, lk_response_error_for_status, lk_response_free,
     lk_response_redirect_count, lk_response_redirect_status_at, lk_response_redirect_url_at,
     lk_response_t, lk_response_text, lk_response_was_redirected, lk_rotation_strategy_t,
-    lk_session_clear_cookies, lk_session_connection_pool_clear, lk_session_connection_pool_stats,
-    lk_session_free, lk_session_get_cookie, lk_session_get_cookies_json, lk_session_new,
-    lk_session_pool_acquire, lk_session_pool_acquire_async, lk_session_pool_builder_build,
-    lk_session_pool_builder_free, lk_session_pool_builder_new,
-    lk_session_pool_builder_set_idle_timeout, lk_session_pool_builder_set_max_sessions,
-    lk_session_pool_builder_set_proxy_buffer, lk_session_pool_builder_set_rotation,
-    lk_session_pool_free, lk_session_pool_guard_free, lk_session_pool_guard_request_new,
-    lk_session_pool_guard_t, lk_session_pool_mark_bad, lk_session_pool_stats, lk_session_pool_t,
-    lk_session_preconnect, lk_session_preconnect_async, lk_session_set_cookie, lk_session_t,
-    lk_socks5_udp_probe, lk_socks5_udp_probe_async, lk_socks5_udp_probe_config_t,
-    lk_socks5_udp_probe_mode_t, lk_socks5_udp_probe_report_error, lk_socks5_udp_probe_report_free,
-    lk_socks5_udp_probe_report_json, lk_socks5_udp_probe_report_phase,
-    lk_socks5_udp_probe_report_proxy, lk_socks5_udp_probe_report_support,
-    lk_socks5_udp_probe_report_t, lk_socks5_udp_probe_support_t, lk_status_t, lk_stream_close,
-    lk_stream_read, lk_streaming_response_free, lk_streaming_response_get_diagnostics_json,
+    lk_session_builder_set_proxy_config, lk_session_clear_cookies,
+    lk_session_connection_pool_clear, lk_session_connection_pool_stats, lk_session_free,
+    lk_session_get_cookie, lk_session_get_cookies_json, lk_session_new, lk_session_pool_acquire,
+    lk_session_pool_acquire_async, lk_session_pool_builder_build, lk_session_pool_builder_free,
+    lk_session_pool_builder_new, lk_session_pool_builder_set_idle_timeout,
+    lk_session_pool_builder_set_max_sessions, lk_session_pool_builder_set_proxy_buffer,
+    lk_session_pool_builder_set_rotation, lk_session_pool_free, lk_session_pool_guard_free,
+    lk_session_pool_guard_request_new, lk_session_pool_guard_t, lk_session_pool_mark_bad,
+    lk_session_pool_stats, lk_session_pool_t, lk_session_preconnect, lk_session_preconnect_async,
+    lk_session_set_cookie, lk_session_t, lk_socks5_udp_probe, lk_socks5_udp_probe_async,
+    lk_socks5_udp_probe_config_t, lk_socks5_udp_probe_mode_t, lk_socks5_udp_probe_report_error,
+    lk_socks5_udp_probe_report_free, lk_socks5_udp_probe_report_json,
+    lk_socks5_udp_probe_report_phase, lk_socks5_udp_probe_report_proxy,
+    lk_socks5_udp_probe_report_support, lk_socks5_udp_probe_report_t,
+    lk_socks5_udp_probe_support_t, lk_status_t, lk_stream_close, lk_stream_read,
+    lk_streaming_response_free, lk_streaming_response_get_diagnostics_json,
     lk_streaming_response_get_header_by_name, lk_streaming_response_t,
 };
 
@@ -63,7 +70,14 @@ impl TestServer {
         let thread = thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_connection(stream),
+                    Ok((stream, _)) => {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // Accepted Windows sockets may inherit nonblocking mode.
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        handle_connection(stream);
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -89,7 +103,12 @@ impl Drop for TestServer {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
-            thread.join().expect("join server");
+            if let Err(failure) = thread.join() {
+                // Report server assertions, but never panic twice during cleanup.
+                if !thread::panicking() {
+                    std::panic::resume_unwind(failure);
+                }
+            }
         }
     }
 }
@@ -1086,7 +1105,7 @@ fn socks5_udp_probe_ffi_extensions_work() -> usize {
         );
         assert_eq!(
             str::from_utf8(slice::from_raw_parts(out_ptr.cast::<u8>(), out_len)).unwrap(),
-            "127.0.0.1:8080"
+            r#"[["http","127.0.0.1",8080,null]]"#
         );
 
         assert_eq!(
@@ -1137,10 +1156,11 @@ fn socks5_udp_probe_ffi_extensions_work() -> usize {
     2
 }
 
-fn chrome_preset_ffi_extensions_work(
+fn browser_preset_ffi_extensions_work(
     preset_name: &str,
     tls_profile_name: &str,
     expect_trust_anchor_ids: bool,
+    expected_h2_window_update: u64,
 ) -> usize {
     unsafe {
         let mut list_ptr = ptr::null();
@@ -1171,7 +1191,10 @@ fn chrome_preset_ffi_extensions_work(
             .iter()
             .any(|extension| extension["extension_type"] == 0xca34);
         assert_eq!(has_trust_anchor_ids, expect_trust_anchor_ids);
-        assert_eq!(detail["h2_profile"]["window_update"], 15_663_105);
+        assert_eq!(
+            detail["h2_profile"]["window_update"],
+            expected_h2_window_update
+        );
         assert_eq!(
             detail["h2_profile"]["settings"].as_array().unwrap().len(),
             4
@@ -1215,10 +1238,37 @@ fn socks5_udp_probe_ffi_apis_return_structured_reports() {
 }
 
 #[test]
+fn chrome_153_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("chrome_153", "Chrome 153", true, 15_663_105),
+        3
+    );
+}
+
+#[test]
+fn chrome_154_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("chrome_154", "Chrome 154", true, 15_663_105),
+        3
+    );
+}
+
+#[test]
+fn firefox_156_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("firefox_156", "Firefox 156", false, 12_517_377),
+        3
+    );
+}
+
+#[test]
 fn chrome_152_preset_is_exposed_through_ffi() {
     let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     assert_eq!(
-        chrome_preset_ffi_extensions_work("chrome_152", "Chrome 152", true),
+        browser_preset_ffi_extensions_work("chrome_152", "Chrome 152", true, 15_663_105),
         3
     );
 }
@@ -1227,7 +1277,7 @@ fn chrome_152_preset_is_exposed_through_ffi() {
 fn chrome_151_preset_remains_exposed_through_ffi() {
     let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     assert_eq!(
-        chrome_preset_ffi_extensions_work("chrome_151", "Chrome 151", false),
+        browser_preset_ffi_extensions_work("chrome_151", "Chrome 151", false, 15_663_105),
         3
     );
 }
@@ -1243,4 +1293,266 @@ fn metrics_snapshot_ffi_is_callable_and_rejects_null() {
     // A null out-pointer is rejected rather than dereferenced.
     let null_status = lkrequest_ffi::lk_metrics_snapshot(ptr::null_mut());
     assert_ne!(null_status as i32, lkrequest_ffi::lk_status_t::LK_OK as i32);
+}
+
+// -- Proxy configuration handles (MASQUE + non-Basic credentials) ------------
+
+unsafe fn parse_proxy_config(url: &str) -> *mut lk_proxy_config_t {
+    let owned = cstring(url);
+    let mut config = ptr::null_mut::<lk_proxy_config_t>();
+    assert_eq!(
+        lk_proxy_config_parse(owned.as_ptr(), url.len(), &mut config),
+        lk_status_t::LK_OK,
+        "parsing {url}"
+    );
+    assert!(!config.is_null());
+    config
+}
+
+unsafe fn proxy_config_url(config: *const lk_proxy_config_t) -> String {
+    let mut ptr_out = ptr::null();
+    let mut len_out = 0usize;
+    assert_eq!(
+        lk_proxy_config_url(config, &mut ptr_out, &mut len_out),
+        lk_status_t::LK_OK
+    );
+    view_string(ptr_out, len_out)
+}
+
+unsafe fn proxy_config_identity(config: *const lk_proxy_config_t) -> String {
+    let mut ptr_out = ptr::null();
+    let mut len_out = 0usize;
+    assert_eq!(
+        lk_proxy_config_identity(config, &mut ptr_out, &mut len_out),
+        lk_status_t::LK_OK
+    );
+    view_string(ptr_out, len_out)
+}
+
+unsafe fn set_http_auth(
+    config: *mut lk_proxy_config_t,
+    scheme: &str,
+    credentials: &str,
+) -> lk_status_t {
+    let scheme_c = cstring(scheme);
+    let credentials_c = cstring(credentials);
+    lk_proxy_config_set_http_auth(
+        config,
+        scheme_c.as_ptr(),
+        scheme.len(),
+        credentials_c.as_ptr(),
+        credentials.len(),
+    )
+}
+
+/// The scheme this exercise is built on.
+///
+/// MASQUE is why header credentials exist on this handle at all, so it is the
+/// scheme to test them with wherever it exists. `ProxyScheme::Masque` is gated
+/// behind the `masque` feature, though, and without it `masque://` no longer
+/// parses — the handle surface itself is scheme independent, so the same
+/// exercise then runs over an HTTP CONNECT proxy instead of being skipped.
+#[cfg(feature = "masque")]
+const HANDLE_SCHEME: &str = "masque";
+#[cfg(feature = "masque")]
+const HANDLE_DEFAULT_PORT: u16 = 443;
+#[cfg(not(feature = "masque"))]
+const HANDLE_SCHEME: &str = "http";
+#[cfg(not(feature = "masque"))]
+const HANDLE_DEFAULT_PORT: u16 = 80;
+
+/// Without the `masque` feature the scheme is refused where it is configured,
+/// so a caller learns the build cannot do MASQUE before any request depends on
+/// it.
+#[test]
+#[cfg(not(feature = "masque"))]
+fn proxy_config_parse_rejects_masque_without_the_feature() {
+    let url = "masque://proxy.example.com:443";
+    let owned = cstring(url);
+    let mut config = ptr::null_mut::<lk_proxy_config_t>();
+    assert_ne!(
+        lk_proxy_config_parse(owned.as_ptr(), url.len(), &mut config),
+        lk_status_t::LK_OK
+    );
+    assert!(config.is_null());
+}
+
+/// The MASQUE outer-connection surface without the `masque` feature.
+///
+/// The `lk_masque_config_*` symbols exist in every build, so the generated
+/// header and the ABI do not change shape with a Cargo feature — a C caller
+/// links the same library either way. What changes is the answer: no handle can
+/// be created, so a caller learns the build cannot do MASQUE at the first call
+/// rather than after wiring up a configuration that would be silently ignored.
+///
+/// The surface's real behaviour lives in `masque_config_ffi.rs`, which needs
+/// the feature.
+#[test]
+#[cfg(not(feature = "masque"))]
+fn masque_config_entry_points_report_the_missing_feature() {
+    let mut config = ptr::null_mut::<lkrequest_ffi::lk_masque_config_t>();
+    assert_eq!(
+        lkrequest_ffi::lk_masque_config_new(&mut config),
+        lk_status_t::LK_ERR
+    );
+    assert!(config.is_null(), "no handle may be produced");
+
+    // The consumers refuse too, so `masque` cannot be half-configured.
+    let builder = lk_client_builder_new();
+    assert_ne!(
+        lkrequest_ffi::lk_client_builder_set_masque_config(builder, ptr::null()),
+        lk_status_t::LK_OK
+    );
+    lk_client_builder_free(builder);
+
+    let pool_builder = lk_proxy_pool_builder_new();
+    assert_ne!(
+        lkrequest_ffi::lk_proxy_pool_builder_set_masque_tunnel_probe(pool_builder, ptr::null()),
+        lk_status_t::LK_OK
+    );
+    lkrequest_ffi::lk_proxy_pool_builder_free(pool_builder);
+
+    // And freeing the null handle the failed create left behind is a no-op.
+    lkrequest_ffi::lk_masque_config_free(config);
+}
+
+/// With the feature on, the same handle is creatable — the counterpart of the
+/// test above, so the two together say the gate is the feature and nothing
+/// else. Everything the handle *does* is covered in `masque_config_ffi.rs`.
+#[test]
+#[cfg(feature = "masque")]
+fn masque_config_handles_are_available_with_the_feature() {
+    let mut config = ptr::null_mut::<lkrequest_ffi::lk_masque_config_t>();
+    assert_eq!(
+        lkrequest_ffi::lk_masque_config_new(&mut config),
+        lk_status_t::LK_OK
+    );
+    assert!(!config.is_null());
+    lkrequest_ffi::lk_masque_config_free(config);
+}
+
+#[test]
+fn proxy_config_handles_round_trip_masque_urls_and_header_credentials() {
+    unsafe {
+        // The URL parses, fills in the default port, and echoes back.
+        let masque = parse_proxy_config(&format!("{HANDLE_SCHEME}://proxy.example.com"));
+        assert_eq!(
+            proxy_config_url(masque),
+            format!("{HANDLE_SCHEME}://proxy.example.com:{HANDLE_DEFAULT_PORT}")
+        );
+        lk_proxy_config_free(masque);
+
+        let masque = parse_proxy_config(&format!(
+            "{HANDLE_SCHEME}://user:pass@proxy.example.com:10001"
+        ));
+        assert_eq!(
+            proxy_config_url(masque),
+            format!("{HANDLE_SCHEME}://user:pass@proxy.example.com:10001")
+        );
+
+        // Username/password can also be set through the handle.
+        let user = cstring("other");
+        let password = cstring("secret");
+        assert_eq!(
+            lk_proxy_config_set_user_pass(
+                masque,
+                user.as_ptr(),
+                "other".len(),
+                password.as_ptr(),
+                "secret".len(),
+            ),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            proxy_config_url(masque),
+            format!("{HANDLE_SCHEME}://other:secret@proxy.example.com:10001")
+        );
+
+        // A header credential has no URL form, so the echoed URL is anonymous,
+        // but the identity still distinguishes it.
+        let anonymous_identity = {
+            let plain = parse_proxy_config(&format!("{HANDLE_SCHEME}://proxy.example.com:10001"));
+            let identity = proxy_config_identity(plain);
+            lk_proxy_config_free(plain);
+            identity
+        };
+        assert_eq!(
+            set_http_auth(masque, "Preshared", "psk-a"),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            proxy_config_url(masque),
+            format!("{HANDLE_SCHEME}://proxy.example.com:10001")
+        );
+        let psk_a_identity = proxy_config_identity(masque);
+        assert_ne!(psk_a_identity, anonymous_identity);
+        assert!(!psk_a_identity.contains("psk-a"), "{psk_a_identity}");
+
+        // Same address, different credentials → different cooldown key.
+        assert_eq!(
+            set_http_auth(masque, "Preshared", "psk-b"),
+            lk_status_t::LK_OK
+        );
+        assert_ne!(proxy_config_identity(masque), psk_a_identity);
+
+        // The authorization header is selectable.
+        assert_eq!(
+            lk_proxy_config_set_auth_header(
+                masque,
+                lk_proxy_auth_header_t::LK_PROXY_AUTH_HEADER_AUTHORIZATION,
+            ),
+            lk_status_t::LK_OK
+        );
+
+        // A header credential on SOCKS5 is refused, not silently ignored.
+        let socks = parse_proxy_config("socks5://proxy.example.com:1080");
+        assert_ne!(set_http_auth(socks, "Preshared", "psk"), lk_status_t::LK_OK);
+        lk_proxy_config_free(socks);
+
+        // The handle can be handed to a Session builder and a ProxyPool builder.
+        let (client, session) = new_client_and_session();
+        let session_builder = lkrequest_ffi::lk_session_builder_new(client);
+        assert!(!session_builder.is_null());
+        assert_eq!(
+            lk_session_builder_set_proxy_config(session_builder, masque),
+            lk_status_t::LK_OK
+        );
+        let mut built = ptr::null_mut();
+        let mut err = ptr::null_mut::<lk_error_t>();
+        assert_eq!(
+            lkrequest_ffi::lk_session_builder_build(session_builder, &mut built, &mut err),
+            lk_status_t::LK_OK
+        );
+        assert!(err.is_null());
+        lkrequest_ffi::lk_session_builder_free(session_builder);
+        lk_session_free(built);
+        lk_session_free(session);
+        lk_client_free(client);
+
+        let pool_builder = lk_proxy_pool_builder_new();
+        assert_eq!(
+            lk_proxy_pool_builder_add_proxy_config(pool_builder, masque),
+            lk_status_t::LK_OK
+        );
+        lkrequest_ffi::lk_proxy_pool_builder_free(pool_builder);
+
+        // Null handles are rejected rather than dereferenced.
+        assert_ne!(
+            lk_proxy_config_url(ptr::null(), ptr::null_mut(), ptr::null_mut()),
+            lk_status_t::LK_OK
+        );
+        assert_ne!(
+            set_http_auth(ptr::null_mut(), "Preshared", "psk"),
+            lk_status_t::LK_OK
+        );
+        let bogus = cstring("ftp://proxy.example.com:21");
+        let mut out = ptr::null_mut::<lk_proxy_config_t>();
+        assert_ne!(
+            lk_proxy_config_parse(bogus.as_ptr(), "ftp://proxy.example.com:21".len(), &mut out),
+            lk_status_t::LK_OK
+        );
+        assert!(out.is_null());
+
+        lk_proxy_config_free(masque);
+    }
 }

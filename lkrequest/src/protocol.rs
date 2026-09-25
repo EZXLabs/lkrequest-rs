@@ -322,6 +322,14 @@ pub enum ProxyRouteKind {
     HttpConnect,
     /// SOCKS5 proxy.
     Socks5,
+    /// MASQUE proxy (RFC 9298 CONNECT-UDP); relays UDP/QUIC only.
+    ///
+    /// Requires the `masque` feature, for the same reason
+    /// [`ProxyScheme::Masque`](crate::proxy::ProxyScheme) does: without it no
+    /// MASQUE route can be configured at all, so no route key could ever carry
+    /// this kind.
+    #[cfg(feature = "masque")]
+    Masque,
 }
 
 /// Where target DNS resolution happens for a route.
@@ -373,6 +381,15 @@ impl RouteKey {
                         DnsResolutionMode::Local
                     },
                 },
+                // RFC 9298 §3.1: the target is encoded in the request path and
+                // the proxy MUST resolve it before answering, so this route
+                // resolves remotely just like `socks5h`.
+                #[cfg(feature = "masque")]
+                ProxyScheme::Masque { .. } => Self {
+                    proxy_kind: ProxyRouteKind::Masque,
+                    proxy_identity: Some(proxy.identity()),
+                    dns_mode: DnsResolutionMode::Remote,
+                },
             },
         }
     }
@@ -394,6 +411,8 @@ impl fmt::Display for RouteKey {
             ProxyRouteKind::Direct => "direct",
             ProxyRouteKind::HttpConnect => "http_connect",
             ProxyRouteKind::Socks5 => "socks5",
+            #[cfg(feature = "masque")]
+            ProxyRouteKind::Masque => "masque",
         };
         let dns = match self.dns_mode {
             DnsResolutionMode::Local => "local_dns",

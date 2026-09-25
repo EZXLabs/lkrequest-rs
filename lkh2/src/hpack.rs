@@ -1,10 +1,10 @@
 //! HPACK header compression (RFC 7541).
 //!
-//! Decoder wraps the `hpack` crate; encoder uses our own `hpack_enc`
-//! module with Huffman support and policy-driven encoding.
+//! Both decoder and encoder are implemented by `lkh2`. The encoder preserves
+//! policy-driven browser wire behavior; the decoder uses a process-wide,
+//! immutable Huffman trie instead of rebuilding lookup maps for every string.
 
 use crate::hpack_enc;
-use fluke_hpack::Decoder as HpackDecoder;
 
 /// Convert `Vec<u8>` to `String`, reusing the allocation when valid UTF-8
 /// (the common case for HTTP/2 headers). Falls back to lossy replacement only
@@ -19,7 +19,7 @@ fn vec_to_string_lossy(bytes: Vec<u8>) -> String {
 // ─── Decoder ─────────────────────────────────────────────────────────────────
 
 pub struct HeaderDecoder {
-    decoder: HpackDecoder<'static>,
+    decoder: hpack_enc::decoder::Decoder,
 }
 
 impl std::fmt::Debug for HeaderDecoder {
@@ -30,11 +30,9 @@ impl std::fmt::Debug for HeaderDecoder {
 
 impl HeaderDecoder {
     pub fn new(table_size: usize) -> Self {
-        let mut decoder = HpackDecoder::new();
-        if table_size != 4096 {
-            decoder.set_max_table_size(table_size);
+        Self {
+            decoder: hpack_enc::decoder::Decoder::new(table_size),
         }
-        Self { decoder }
     }
 
     pub fn with_default_size() -> Self {
@@ -50,7 +48,7 @@ impl HeaderDecoder {
                     .map(|(name, value)| (vec_to_string_lossy(name), vec_to_string_lossy(value)))
                     .collect()
             })
-            .map_err(|e| HpackError::DecodingError(format!("{e:?}")))
+            .map_err(|error| HpackError::DecodingError(format!("{error:?}")))
     }
 
     pub fn set_max_table_size(&mut self, size: usize) {

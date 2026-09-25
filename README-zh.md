@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-4c1.svg">
+  <img alt="Version 0.2.3" src="https://img.shields.io/badge/version-0.2.3-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -34,7 +34,7 @@
 - **TLS ClientHello 控制** — 扩展顺序、GREASE、cipher suites、签名算法、key share、ECH、ALPS、证书压缩和握手行为。
 - **原生 HTTP/2 指纹** — SETTINGS 顺序、WINDOW_UPDATE、PRIORITY、伪头顺序、HPACK 行为和请求优先级。
 - **HTTP/3 与 QUIC** — 可选 H3 协议栈，支持 QUIC Transport Parameters、QPACK、PRIORITY_UPDATE、Alt-Svc、会话恢复和 SOCKS5 UDP。
-- **真实抓包驱动的预设** — Chrome 131、144–152，Firefox 133/147，Safari 18/26。
+- **真实抓包驱动的预设** — Chrome 131、144–153，Firefox 133/147，Safari 18/26。
 - **浏览器式 Session** — 独立 Cookie、可配置的物理连接上限、H2 stream 背压、重定向、重试、解压、流式响应、WebSocket、系统 DNS singleflight 与可选正向缓存，以及 HSTS 策略。
 - **代理编排** — HTTP CONNECT、SOCKS5、多跳代理链、解析地址回退、`ProxyPool` 和 `SessionPool`。
 - **稳定 C ABI** — `lkrequest-ffi` 将 Rust Client/Session/Request 模型暴露给其他语言。
@@ -42,53 +42,52 @@
 
 ## 项目状态
 
-- 当前工作区发布版本：**0.2.2**。
+- 当前工作区发布版本：**0.2.3**。
+- **0.2.3 Rust 升级提示：** 代理配置与 H3/QUIC profile 的构造方式有源码级不兼容变化；从 0.2.2 升级前请阅读[迁移说明](CHANGELOG.md#upgrade-from-022)。
 - API 已可使用，但在 1.0 前仍可能演进。
-- 当前以**源码方式**集成；下面示例使用本地 checkout。
+- 当前通过 Cargo Git 依赖集成；只有贡献者修改 workspace 时才需要手动 clone。
 - HTTP/3、合成指纹、遥测和公网测试均为显式 opt-in。
+- MASQUE CONNECT-UDP 是实验性功能，需显式启用 `masque`；其专用 API 和代理互操作行为仍可能调整。参见 [MASQUE 使用指南](docs/guides/networking.md#masque-connect-udp-代理)。
 - 浏览器指纹会受版本、平台、Finch、GREASE 与请求上下文影响。预设文档会区分已抓包确认的稳定字段和变量行为。
 
 ## 快速开始
 
-### 1. Clone 与构建
+### 1. 添加依赖
 
-`deps/quinn` 和 `deps/h3` 包含工作区所需的传输层补丁，因此 Git submodule 是必需的。
-
-```bash
-git clone --recurse-submodules <repository-url>
-cd lkrequest
-cargo test --workspace
-```
-
-如果已经 clone 但没有初始化子模块：
-
-```bash
-git submodule update --init --recursive
-```
-
-构建要求：
-
-- Rust 工具链与 Cargo。
-- 加密工具链需要时安装 NASM、CMake 和 libclang。
-- 仅在生成或修改 C header 时需要 `cbindgen`。
-
-### 2. 从本地工作区引用
-
-在另一个 Rust 项目中：
+直接从公开仓库添加 lkrequest，普通用户无需手动 checkout：
 
 ```toml
 [dependencies]
-lkrequest = { path = "../lkrequest/lkrequest" }
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs" }
+```
+
+也可以使用 Cargo 命令：
+
+```bash
+cargo add lkrequest --git https://github.com/EZXLabs/lkrequest-rs
+```
+
+以上依赖已经足够使用 `lkrequest::blocking`。Tokio 是 lkrequest 的内部实现依赖，但同步应用不需要直接声明；使用异步 API 时再额外添加：
+
+```toml
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 启用 HTTP/3：
 
 ```toml
-lkrequest = { path = "../lkrequest/lkrequest", features = ["quic-h3"] }
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs", features = ["quic-h3"] }
 ```
 
-### 3. 使用明确的浏览器预设发送请求
+生产项目建议固定经过验证的 commit，保证构建可复现：
+
+```toml
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs", rev = "<tested-commit>" }
+```
+
+构建机需要 Rust/Cargo。加密工具链在部分平台还需要 NASM、CMake 和 libclang；只有生成 C header 时需要 `cbindgen`。
+
+### 2. 使用明确的浏览器预设发送请求
 
 ```rust
 use lkrequest::Client;
@@ -96,7 +95,7 @@ use lkrequest::Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
-        .preset(lkrequest::preset::chrome_151())
+        .preset(lkrequest::preset::chrome_154())
         .build();
 
     // 一个 Session 对应一个虚拟浏览器用户；Cookie 和连接不会与其他
@@ -127,7 +126,7 @@ cargo run -p lkrequest --example basic_get
 use lkrequest::Client;
 
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_154())
     .build();
 
 // 优先使用 H3，QUIC 不可用时回退 H2。
@@ -153,23 +152,40 @@ cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 
 高层预设会打包 TLS、H2、可选 QUIC/H3、协议策略和请求头顺序：
 
-| 浏览器家族 | 预设 |
-|---|---|
-| Chrome | `chrome_131`、`chrome_144`–`chrome_152` |
-| Firefox | `firefox_133`、`firefox_147` |
-| Safari | `safari_18`、`safari_26` |
+| 浏览器家族 | 预设 | TLS / H2 | QUIC / H3 |
+|---|---|---|---|
+| Chrome | `chrome_131`、`chrome_144`–`chrome_154` | 支持 | 需要 `quic-h3` |
+| Firefox | `firefox_133`、`firefox_147`、`firefox_156` | 支持 | 未提供 |
+| Safari | `safari_18`、`safari_26` | 支持 | 未提供 |
+
+这 17 个名称均可通过 Rust 和 C ABI 使用。启用 `quic-h3` 不会为 Firefox 或 Safari
+preset 增加 QUIC/H3 指纹。各协议层的证据见[支持与验证矩阵](docs/reference/presets.md)。
+
+| 新增 preset | 采集浏览器 | 验证边界 |
+|---|---|---|
+| `chrome_154` | Chrome 154.0.8037.58，Windows | TLS/H2 与发出的 QUIC 字段已抓包；H3 SETTINGS 继承 Chrome 153 |
+| `firefox_156` | Firefox 156.0.1，Windows | TLS/H2 已抓包；完整 preset 实测 H2 返回 HTTP 200；未提供 QUIC/H3 preset |
 
 为保证可复现性，建议明确指定版本：
 
 ```rust
 let client = lkrequest::Client::builder()
-    .preset(lkrequest::preset::chrome_152())
+    .preset(lkrequest::preset::chrome_154())
     .build();
 ```
+
+Firefox 使用 `lkrequest::preset::firefox_156()`；C 调用方可将 `"firefox_156"` 传给
+`lk_client_builder_set_preset`。preset 配置请求头顺序，User-Agent 等浏览器头的值需要按请求场景显式设置。
 
 Chrome 152 已在 Windows 上通过 Cloudflare 公网目标和 `example.com` 真实抓包验证。TCP TLS 会在 ML-DSA 条目（`0x0904`–`0x0906`）之前向 `signature_algorithms` 插入一个独立随机的 GREASE code point，并在保留 Chrome 151 其他稳定字段的同时新增顺序随机化的 Chromium `0xCA34` 信任锚标识集合；H2 未变化，QUIC 不再发送 `google_initial_rtt`（`0x3127`）。本次公网 QUIC 流程未完成到可独立重抓 H3 SETTINGS 的阶段，因此预设继续使用最近一次已验证的 Chrome H3 基线。
 
 校验 Chrome 152 时，需要比较原始有序 `signature_algorithms` 序列，或使用 peetprint 这类保留 GREASE 的指纹。JA3/JA3N 不包含该字段，JA4 又会剥离 GREASE，因此这些哈希无法发现 sigalgs 首槽缺失。回归 fixture 会原位归一化随机 GREASE 值，但仍严格要求它位于 index 0。
+
+Chrome 153.0.8010.37 于 2026 年 9 月 15 日在 Windows 上通过 Wireshark 对 Cloudflare 进行抓包。TCP TLS 保留 `signature_algorithms` GREASE，并将顺序随机化的 `0xca34` 信任锚标识集合从 32 个减至 28 个，移除了 `d6790902`、`d6790903`、`d6790909` 和 `d679090e`；H2 保留已验证的 Chrome 152 SETTINGS、连接窗口、伪首部顺序和初始 HEADERS 优先级。QUIC 保留经典的 9 个签名算法、随机化的 ClientHello 扩展和这 28 个信任锚标识，但不发送普通 TLS GREASE 槽位，ECH 与 QUIC GREASE 仍保留。一次完整 H3 导航返回 HTTP 200，观察到 SETTINGS `1=65536`、`6=262144`、`7=100` 和 `51=1`，以及 GREASE 和导航优先级 `u=0, i`。保留传输参数的 payload 长度会在 0 至 15 字节间随机化，GREASE version 位置也按 profile 随机化。H3 现已按 Chromium 方式发送 GREASE：保留 SETTINGS 的 id/value 随机生成，control stream 上发送 0–3 字节的 GREASE 帧，request stream 上不再发送 GREASE。客户端 Initial 会按 Chromium 的 CRYPTO 拆分、PING、PADDING 与打乱算法逐连接生成。Chrome 146 与 150–154 预设启用了这些模式；自定义 profile 除非显式开启，否则保持原有行为。GREASE 随机值与 Initial 布局每次连接都不同，因此库的抓包与浏览器一致的是生成规则和稳定字段，而不是与某一次抓包逐字节相同。
+
+Chrome 154.0.8037.58 于 2026 年 9 月 24 日在 Windows 上对 Cloudflare 公网目标完成抓包。稳定的 TCP TLS、H2、QUIC TLS、QUIC transport 和 Initial 生成规则与 Chrome 153 相同。当前公网采集路径没有收到 QUIC 回包，因此该 preset 的 H3 SETTINGS 和导航优先级继承 Chrome 153 的完整成功基线，不宣称新增了 H3 应用层观测。
+
+Firefox 156.0.1 于 2026 年 9 月 25 日在 Windows 上对 Cloudflare 公网目标完成抓包。相较 Firefox 147，TLS 移除了两个 ECDSA CBC cipher 和 FFDHE group 256/257，并将 ECH GREASE 改为 AES-128-GCM；H2 继续使用 SETTINGS `1=65536, 2=0, 4=131072, 5=16384`、连接窗口 `12517377`、伪首部顺序 `m,p,a,s` 和 priority weight 42。公网抓包已观察到 QUIC Initial，但当前 transport 还不能精确复现全部 Firefox 字段，因此 `firefox_156` 有意保持为 TLS/H2-only。
 
 ## 浏览器网络状态策略
 
@@ -179,7 +195,7 @@ Chrome 152 已在 Windows 上通过 Cloudflare 公网目标和 `example.com` 真
 use lkrequest::{Client, H2DataFramePolicy};
 
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_153())
     .h2_data_frame_policy(H2DataFramePolicy::BrowserDefault)
     .build();
 ```
@@ -193,7 +209,7 @@ use lkrequest::{
 };
 
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_151())
+    .preset(lkrequest::preset::chrome_153())
     .tls_session_resumption_policy(TlsSessionResumptionPolicy::Enabled {
         max_tickets_per_server: 2,
     })
@@ -360,7 +376,7 @@ cargo test -p lkrequest --features quic-h3
 TEST_ALLOW_NETWORK=1 cargo test --workspace -- --include-ignored
 ```
 
-测试分层和环境要求见 [docs/TESTING.md](docs/TESTING.md)。
+测试分层和环境要求见 [docs/development/testing.md](docs/development/testing.md)。
 
 ## C ABI
 
@@ -382,13 +398,14 @@ cbindgen . --config cbindgen.toml > include/lkrequest.h
 
 ## 文档与示例
 
-- [测试指南](docs/TESTING.md)
+- [文档索引](docs/README.md)
+- [HTTP/2 性能修复与 Linux 验证计划](docs/development/http2-performance.md)
+- [HTTP/2 write batching 的性能与指纹边界](docs/development/h2-write-batching.md)
+- [测试指南](docs/development/testing.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全与负责任使用](SECURITY.md)
 - [FFI 指南](lkrequest-ffi/README.md)
 - [Rust 示例](lkrequest/examples)
-- [指纹回归设计](docs/fingerprint-regression-design.md)
-- [QUIC/H3 指纹说明](docs/chrome146-quic-h3-fingerprint.md)
 
 ## 参与贡献
 

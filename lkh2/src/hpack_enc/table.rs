@@ -66,7 +66,7 @@ pub(crate) static STATIC_TABLE: &[(&[u8], &[u8])] = &[
     (b"www-authenticate", b""),             // 61
 ];
 
-const STATIC_TABLE_LEN: usize = 61;
+pub(crate) const STATIC_TABLE_LEN: usize = 61;
 
 /// Search result from table lookup.
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +130,16 @@ impl DynamicTable {
                 self.size -= Self::entry_size(&n, &v);
             }
         }
+    }
+
+    pub fn lookup(&self, index: usize) -> Option<(&[u8], &[u8])> {
+        if index == 0 {
+            return None;
+        }
+        if index <= STATIC_TABLE_LEN {
+            return STATIC_TABLE.get(index - 1).copied();
+        }
+        self.get(index - STATIC_TABLE_LEN - 1)
     }
 }
 

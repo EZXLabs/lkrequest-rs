@@ -32,7 +32,10 @@ fn build_session(state: &SessionBuilderState) -> Arc<SessionShared> {
         .client
         .session()
         .redirect_policy(state.redirect_policy.clone());
-    if let Some(proxy) = &state.proxy {
+    // A handle-built config can express credentials a URL cannot, so it wins.
+    if let Some(proxy_config) = &state.proxy_config {
+        builder = builder.proxy_config(proxy_config.clone());
+    } else if let Some(proxy) = &state.proxy {
         builder = builder.proxy(proxy);
     }
     if let Some(ech_config) = &state.ech_config {
@@ -188,6 +191,23 @@ pub extern "C" fn lk_session_builder_set_proxy(
         let proxy = read_string_parts(proxy_ptr, proxy_len, "proxy")?;
         validate_proxy(&proxy)?;
         builder.state.proxy = Some(proxy);
+        Ok(())
+    })
+}
+
+/// Use a proxy built with the `lk_proxy_config_*` entry points.
+///
+/// Takes precedence over `lk_session_builder_set_proxy`. The configuration is
+/// copied; the caller keeps ownership of `config` and must still free it.
+#[no_mangle]
+pub extern "C" fn lk_session_builder_set_proxy_config(
+    builder: *mut lk_session_builder_t,
+    config: *const crate::handles::lk_proxy_config_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let proxy = crate::proxy_config::proxy_config_ref(config)?.clone();
+        let builder = require_handle_mut::<SessionBuilderHandle, lk_session_builder_t>(builder)?;
+        builder.state.proxy_config = Some(proxy);
         Ok(())
     })
 }

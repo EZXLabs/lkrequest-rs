@@ -44,6 +44,14 @@ mod tests {
     }
 
     #[test]
+    fn load_firefox_156_json_file() {
+        let profile = from_json_file("profiles/firefox_156.json").unwrap();
+        assert_eq!(profile.name, "Firefox 156");
+        assert!(!profile.cipher_suites.is_empty(), "cipher suites must load");
+        assert!(!profile.extensions.is_empty(), "extensions must load");
+    }
+
+    #[test]
     fn load_safari_26_json_file() {
         let profile = from_json_file("profiles/safari_26.json").unwrap();
         assert!(profile.name.contains("Safari"));

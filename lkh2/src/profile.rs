@@ -661,6 +661,24 @@ pub fn chrome_152_h2() -> H2Profile {
     chrome_151_h2()
 }
 
+/// Returns the Chrome 153 H2 fingerprint profile.
+///
+/// Chrome 153.0.8010.37 captured at `www.cloudflare.com/cdn-cgi/trace` on
+/// 2026-09-15 retained Chrome 152's SETTINGS order, connection window update,
+/// pseudo-header order, and initial navigation HEADERS priority fields.
+pub fn chrome_153_h2() -> H2Profile {
+    chrome_152_h2()
+}
+
+/// Returns the Chrome 154 H2 fingerprint profile.
+///
+/// Chrome 154.0.8037.58 captured at public Cloudflare endpoints on 2026-09-24
+/// retained Chrome 153's SETTINGS, connection window, pseudo-header order,
+/// and navigation HEADERS priority fields.
+pub fn chrome_154_h2() -> H2Profile {
+    chrome_153_h2()
+}
+
 /// Returns the Chrome 131 H2 fingerprint profile.
 ///
 /// Same H2 parameters as Chrome 144 (H2 fingerprint hasn't changed).
@@ -784,6 +802,14 @@ pub fn firefox_147_h2() -> H2Profile {
         priority_config: PriorityConfig::firefox(),
         behavior: Some(H2Behavior::firefox()),
     }
+}
+
+/// Returns the Firefox 156 H2 fingerprint profile.
+///
+/// Firefox 156.0.1 captured against public Cloudflare retained Firefox 147's
+/// SETTINGS, connection window, pseudo-header order, and HEADERS priority.
+pub fn firefox_156_h2() -> H2Profile {
+    firefox_147_h2()
 }
 
 /// Returns the Safari 18 H2 fingerprint profile.
@@ -1108,6 +1134,18 @@ pub fn chrome_152_header_order() -> Vec<String> {
     chrome_151_header_order()
 }
 
+/// Returns the Chrome 153 HTTP header sending order (navigation only).
+///
+/// The 2026-09-15 public Cloudflare capture retained Chrome 152's header order.
+pub fn chrome_153_header_order() -> Vec<String> {
+    chrome_152_header_order()
+}
+
+/// Returns the Chrome 154 HTTP header sending order (navigation only).
+pub fn chrome_154_header_order() -> Vec<String> {
+    chrome_153_header_order()
+}
+
 /// Returns the Chrome 131 HTTP header sending order.
 ///
 /// Same as Chrome 144 (header order hasn't changed).
@@ -1137,6 +1175,11 @@ pub fn firefox_147_header_order() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// Returns the Firefox 156 navigation header order.
+pub fn firefox_156_header_order() -> Vec<String> {
+    firefox_147_header_order()
 }
 
 /// Returns the Firefox 133 HTTP header sending order.
@@ -1230,6 +1273,42 @@ mod tests {
     }
 
     #[test]
+    fn test_chrome_153_h2_matches_public_navigation_capture() {
+        let p = chrome_153_h2();
+        let settings: Vec<_> = p
+            .settings
+            .iter()
+            .map(|setting| (setting.id.as_u16(), setting.value))
+            .collect();
+        assert_eq!(settings, [(1, 65536), (2, 0), (4, 6291456), (6, 262144)]);
+        assert_eq!(p.window_update, 15_663_105);
+        assert_eq!(
+            p.pseudo_header_order,
+            [
+                PseudoHeaderId::Method,
+                PseudoHeaderId::Authority,
+                PseudoHeaderId::Scheme,
+                PseudoHeaderId::Path,
+            ]
+        );
+        let priority = p.headers_priority.expect("Chrome navigation priority");
+        assert!(priority.exclusive);
+        assert_eq!(priority.stream_dependency, 0);
+        assert_eq!(priority.weight, 255);
+        assert!(p.priority_frames.is_empty());
+        assert_eq!(chrome_153_header_order(), chrome_152_header_order());
+    }
+
+    #[test]
+    fn test_chrome_154_h2_matches_public_navigation_capture() {
+        assert_eq!(
+            serde_json::to_value(chrome_154_h2()).unwrap(),
+            serde_json::to_value(chrome_153_h2()).unwrap()
+        );
+        assert_eq!(chrome_154_header_order(), chrome_153_header_order());
+    }
+
+    #[test]
     fn test_firefox_147_h2_preset() {
         let p = firefox_147_h2();
         assert_eq!(p.settings.len(), 4);
@@ -1241,6 +1320,15 @@ mod tests {
         assert!(!hp.exclusive);
         assert_eq!(hp.stream_dependency, 0);
         assert_eq!(hp.weight, 42);
+    }
+
+    #[test]
+    fn test_firefox_156_h2_matches_public_navigation_capture() {
+        assert_eq!(
+            serde_json::to_value(firefox_156_h2()).unwrap(),
+            serde_json::to_value(firefox_147_h2()).unwrap()
+        );
+        assert_eq!(firefox_156_header_order(), firefox_147_header_order());
     }
 
     #[test]

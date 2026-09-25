@@ -9,20 +9,50 @@
 //! 6. `recv_stream.flow_control().release_capacity(len)`
 
 use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 use tokio::sync::oneshot;
+
+/// Incremental upload source. The driver retains at most one yielded chunk,
+/// including one lookahead chunk at a zero window so EOF can close the stream.
+/// Producers should yield bounded-size chunks to bound retained source memory.
+pub type UploadStream =
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 // ─── NativeH2Request ─────────────────────────────────────────────────────────
 
 /// Internal request type for the native H2 backend.
 /// Uses Vec instead of HeaderMap for deterministic header ordering.
 #[derive(Debug)]
-pub(crate) struct NativeH2Request {
-    pub method: http::Method,
-    pub uri: http::Uri,
-    pub ordered_headers: Vec<(String, String)>,
-    pub body: Option<Bytes>,
-    pub priority: Option<crate::profile::RequestPriority>,
+pub struct NativeH2Request {
+    pub(crate) method: http::Method,
+    pub(crate) uri: http::Uri,
+    pub(crate) ordered_headers: Vec<(HeaderName, HeaderValue)>,
+    pub(crate) body: Option<Bytes>,
+    pub(crate) priority: Option<crate::profile::RequestPriority>,
+    pub(crate) upload: Option<crate::driver::PendingUpload>,
+    pub(crate) streaming: bool,
+}
+
+impl NativeH2Request {
+    /// Build a native request from an already ordered header map.
+    pub fn new(
+        method: http::Method,
+        uri: http::Uri,
+        headers: HeaderMap,
+        body: Option<Bytes>,
+        priority: Option<crate::profile::RequestPriority>,
+    ) -> Self {
+        Self {
+            method,
+            uri,
+            ordered_headers: ordered_headers_from_map(headers),
+            body,
+            priority,
+            upload: None,
+            streaming: false,
+        }
+    }
 }
 
 // ─── H2 Sender (Clone, pool-compatible) ──────────────────────────────────────
@@ -60,6 +90,26 @@ pub enum H2ReadySender {
 }
 
 impl H2ReadySender {
+    /// Send headers without waiting for the upload and consume it under flow control.
+    /// Sending starts when the returned future's `await_response()` is polled.
+    ///
+    /// The caller owns framing and length validation. The driver retains at most
+    /// one source chunk and splits it against the peer's stream/connection windows.
+    /// EOF emits END_STREAM; a source error resets this stream without closing
+    /// other streams. Cancellation remains active while awaiting or reading the
+    /// response, including after upload EOF. This path does not replay the source.
+    pub fn send_streaming_request(
+        self,
+        request: http::Request<()>,
+        body: UploadStream,
+    ) -> H2ResponseFuture {
+        let (parts, ()) = request.into_parts();
+        let mut request = build_native_request(parts, None);
+        request.streaming = true;
+        request.upload = Some(crate::driver::PendingUpload::new(body));
+        self.send_native_request(request)
+    }
+
     /// Send an HTTP/2 request.
     ///
     /// The actual network send is deferred to
@@ -87,6 +137,17 @@ impl H2ReadySender {
             }
         }
     }
+
+    /// Send an already prepared native request without converting through
+    /// `http::Request` or a body handoff channel.
+    pub fn send_native_request(self, request: NativeH2Request) -> H2ResponseFuture {
+        match self {
+            Self::Native(sender) => H2ResponseFuture::PreparedNative {
+                sender,
+                request: Box::new(request),
+            },
+        }
+    }
 }
 
 // ─── Response Future ─────────────────────────────────────────────────────────
@@ -97,6 +158,10 @@ pub enum H2ResponseFuture {
         request: Box<Option<http::Request<()>>>,
         end_stream: bool,
         body_rx: Option<oneshot::Receiver<Option<Bytes>>>,
+    },
+    PreparedNative {
+        sender: crate::driver::NativeSendRequest,
+        request: Box<NativeH2Request>,
     },
 }
 
@@ -121,8 +186,7 @@ impl H2ResponseFuture {
                     }
                 };
                 let (parts, _) = orig_req.into_parts();
-
-                let http_req = build_native_request(&parts, body);
+                let http_req = build_native_request(parts, body);
                 let (resp_headers, body_rx) = sender
                     .send_native_request(http_req)
                     .await
@@ -130,6 +194,16 @@ impl H2ResponseFuture {
 
                 let recv = H2RecvStream::Native { body_rx };
                 build_native_response(resp_headers, recv)
+            }
+            Self::PreparedNative {
+                mut sender,
+                request,
+            } => {
+                let (resp_headers, body_rx) = sender
+                    .send_native_request(*request)
+                    .await
+                    .map_err(H2SendError::from_native)?;
+                build_native_response(resp_headers, H2RecvStream::Native { body_rx })
             }
         }
     }
@@ -154,35 +228,34 @@ pub async fn await_first_response(
     build_native_response(resp_headers, recv)
 }
 
-fn build_native_request(parts: &http::request::Parts, body: Option<Bytes>) -> NativeH2Request {
-    let ordered_headers: Vec<(String, String)> = parts
-        .headers
-        .iter()
-        .filter(|(name, _)| !name.as_str().starts_with(':'))
-        .filter_map(|(name, value)| match value.to_str() {
-            Ok(v) => Some((name.as_str().to_owned(), v.to_owned())),
-            Err(_) => {
-                tracing::warn!(
-                    header = %name,
-                    "h2.native.non_utf8_header_value_skipped"
-                );
-                None
-            }
-        })
-        .collect();
-
+fn build_native_request(parts: http::request::Parts, body: Option<Bytes>) -> NativeH2Request {
     let priority = parts
         .extensions
         .get::<crate::profile::RequestPriority>()
         .copied();
+    NativeH2Request::new(parts.method, parts.uri, parts.headers, body, priority)
+}
 
-    NativeH2Request {
-        method: parts.method.clone(),
-        uri: parts.uri.clone(),
-        ordered_headers,
-        body,
-        priority,
+fn ordered_headers_from_map(headers: HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    let mut ordered = Vec::with_capacity(headers.len());
+    let mut current_name = None;
+    for (name, value) in headers {
+        if let Some(name) = name {
+            current_name = Some(name);
+        }
+        let Some(name) = current_name.clone() else {
+            continue;
+        };
+        if value.to_str().is_ok() {
+            ordered.push((name, value));
+        } else {
+            tracing::warn!(
+                header = %name,
+                "h2.native.non_utf8_header_value_skipped"
+            );
+        }
     }
+    ordered
 }
 
 fn build_native_response(
@@ -200,32 +273,10 @@ fn build_native_response(
         ))
     })?;
 
-    let mut builder = http::Response::builder().status(status);
-    for (name, value) in &resp_headers.headers {
-        if name.starts_with(':') {
-            continue;
-        }
-        // RFC 9113 §8.2: a field the caller cannot be given verbatim makes the
-        // response malformed. Silently dropping it would hand back a response
-        // missing headers the caller was never told about.
-        validate_response_field(name, value)
-            .map_err(|reason| H2SendError(format!("{MALFORMED_PREFIX}: {reason}")))?;
-        let hn = http::header::HeaderName::try_from(name.as_str()).map_err(|_| {
-            H2SendError(format!(
-                "{MALFORMED_PREFIX}: field name {name:?} is not a valid HTTP field name (RFC 9113 §8.2.1)"
-            ))
-        })?;
-        let hv = http::header::HeaderValue::from_str(value).map_err(|_| {
-            H2SendError(format!(
-                "{MALFORMED_PREFIX}: field {name:?} has a value that is not a valid HTTP field value (RFC 9113 §8.2.1)"
-            ))
-        })?;
-        builder = builder.header(hn, hv);
-    }
-
-    builder
-        .body(recv)
-        .map_err(|e| H2SendError(format!("failed to build response: {e}")))
+    let mut response = http::Response::new(recv);
+    *response.status_mut() = status;
+    *response.headers_mut() = resp_headers.headers;
+    Ok(response)
 }
 
 // ─── Received-response validation (RFC 9113 §8.1.1 / §8.2 / §8.3.2) ─────────
@@ -321,22 +372,23 @@ pub(crate) fn validate_response_pseudo_headers(
     Ok(())
 }
 
-/// Validate every regular field of a received field section.
-///
+/// Validate and parse every regular field of a received field section once.
 /// Pseudo-headers are skipped; they are validated by their own rules.
-pub(crate) fn validate_response_fields(headers: &[(String, String)]) -> Result<(), String> {
+pub(crate) fn parse_response_fields(headers: &[(String, String)]) -> Result<HeaderMap, String> {
+    let mut parsed = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
         if name.starts_with(':') {
             continue;
         }
-        validate_response_field(name, value)?;
+        let (name, value) = parse_response_field(name, value)?;
+        parsed.append(name, value);
     }
-    Ok(())
+    Ok(parsed)
 }
 
 /// Validate one received field per RFC 9113 §8.2.1 (field validity) and
 /// §8.2.2 (connection-specific fields).
-fn validate_response_field(name: &str, value: &str) -> Result<(), String> {
+fn parse_response_field(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), String> {
     if name.is_empty() {
         return Err("field name is empty (RFC 9113 §8.2.1)".to_string());
     }
@@ -352,11 +404,9 @@ fn validate_response_field(name: &str, value: &str) -> Result<(), String> {
             "field name {name:?} contains the forbidden byte {bad:#04x} (RFC 9113 §8.2.1)"
         ));
     }
-    if http::header::HeaderName::try_from(name).is_err() {
-        return Err(format!(
-            "field name {name:?} is not a valid HTTP field name (RFC 9113 §8.2.1)"
-        ));
-    }
+    let parsed_name = HeaderName::try_from(name).map_err(|_| {
+        format!("field name {name:?} is not a valid HTTP field name (RFC 9113 §8.2.1)")
+    })?;
 
     // §8.2.1: a field value must not contain NUL / LF / CR, and must not begin
     // or end with ASCII whitespace.
@@ -370,11 +420,9 @@ fn validate_response_field(name: &str, value: &str) -> Result<(), String> {
             "field {name:?} has a value with leading or trailing whitespace (RFC 9113 §8.2.1)"
         ));
     }
-    if http::header::HeaderValue::from_str(value).is_err() {
-        return Err(format!(
-            "field {name:?} has a value that is not a valid HTTP field value (RFC 9113 §8.2.1)"
-        ));
-    }
+    let parsed_value = HeaderValue::from_str(value).map_err(|_| {
+        format!("field {name:?} has a value that is not a valid HTTP field value (RFC 9113 §8.2.1)")
+    })?;
 
     // §8.2.2: connection-specific fields have no meaning in HTTP/2 and make
     // the message malformed. `TE` is tolerated only as exactly "trailers".
@@ -389,7 +437,7 @@ fn validate_response_field(name: &str, value: &str) -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    Ok((parsed_name, parsed_value))
 }
 
 /// Extract the declared `content-length` of a received response.
@@ -580,10 +628,12 @@ mod tests {
         pairs: &[(&str, &str)],
     ) -> Result<http::Response<H2RecvStream>, H2SendError> {
         let (_body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel();
+        let parsed = parse_response_fields(&headers(pairs))
+            .map_err(|reason| H2SendError(format!("{MALFORMED_PREFIX}: {reason}")))?;
         build_native_response(
             crate::driver::NativeResponseHeaders {
                 status,
-                headers: headers(pairs),
+                headers: parsed,
             },
             H2RecvStream::Native { body_rx },
         )
@@ -649,6 +699,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repeated_fields_are_parsed_once_and_preserved() {
+        let built = response(200, &[("set-cookie", "a=1"), ("set-cookie", "b=2")]).unwrap();
+        let values: Vec<_> = built
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(values, ["a=1", "b=2"]);
+    }
+
     // ── H-03: connection-specific fields ──
 
     #[test]
@@ -676,8 +738,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_response_fields_ignores_pseudo_headers() {
-        let ok = validate_response_fields(&headers(&[(":status", "200"), ("x-a", "1")]));
+    fn parse_response_fields_ignores_pseudo_headers() {
+        let ok = parse_response_fields(&headers(&[(":status", "200"), ("x-a", "1")]));
         assert!(ok.is_ok(), "pseudo-headers are validated elsewhere: {ok:?}");
     }
 

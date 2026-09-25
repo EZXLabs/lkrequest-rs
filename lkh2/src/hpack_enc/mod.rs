@@ -4,6 +4,7 @@
 //! encoding and has a fixed indexing strategy.  The implementation follows
 //! RFC 7541 and is modelled after the `h2` crate's HPACK encoder.
 
+pub(crate) mod decoder;
 mod huffman;
 mod table;
 
@@ -423,7 +424,7 @@ mod tests {
     #[test]
     fn test_roundtrip_with_hpack_decoder() {
         let mut encoder = Encoder::with_default_size();
-        let mut decoder = fluke_hpack::Decoder::new();
+        let mut decoder = decoder::Decoder::new(4096);
 
         let headers = vec![
             (":method".to_string(), "GET".to_string()),
@@ -461,7 +462,7 @@ mod tests {
         let encoded = encoder.encode_with_policy(&headers, &policy);
 
         // Verify with hpack decoder
-        let mut decoder = fluke_hpack::Decoder::new();
+        let mut decoder = decoder::Decoder::new(4096);
         let decoded = decoder.decode(&encoded).unwrap();
         let decoded_strings: Vec<(String, String)> = decoded
             .into_iter()
@@ -517,7 +518,7 @@ mod tests {
         eprintln!("Sum of individual: {} bytes", total);
 
         // Verify roundtrip
-        let mut decoder = fluke_hpack::Decoder::new();
+        let mut decoder = decoder::Decoder::new(4096);
         let decoded = decoder.decode(&encoded).unwrap();
         assert_eq!(decoded.len(), headers.len());
 

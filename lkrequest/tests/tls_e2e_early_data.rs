@@ -242,8 +242,11 @@ fn no_tcp_profile_offers_early_data_while_end_of_early_data_is_unimplemented() {
         ("chrome_150", presets::chrome_150()),
         ("chrome_151", presets::chrome_151()),
         ("chrome_152", presets::chrome_152()),
+        ("chrome_153", presets::chrome_153()),
+        ("chrome_154", presets::chrome_154()),
         ("firefox_133", presets::firefox_133()),
         ("firefox_147", presets::firefox_147()),
+        ("firefox_156", presets::firefox_156()),
         ("safari_18", presets::safari_18()),
         ("safari_26", presets::safari_26()),
     ];
@@ -277,6 +280,8 @@ fn quic_profiles_offer_early_data_and_owe_no_end_of_early_data() {
         ("chrome_150_quic", presets::chrome_150_quic()),
         ("chrome_151_quic", presets::chrome_151_quic()),
         ("chrome_152_quic", presets::chrome_152_quic()),
+        ("chrome_153_quic", presets::chrome_153_quic()),
+        ("chrome_154_quic", presets::chrome_154_quic()),
     ] {
         assert!(
             offers_early_data(&profile),

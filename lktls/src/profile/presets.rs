@@ -12,12 +12,13 @@
 //! | [`chrome_147`] | **Verified (capture)** | `profile-collector` real Chrome 147 capture | none |
 //! | [`chrome_148`] | **Verified (capture)** | `profile-collector` real Chrome 148 capture | none |
 //! | [`firefox_147`] | **Verified** | `tlsleak/firefox147.0.3_tlsleak.json` | `e2e_firefox_fingerprint.rs` |
+//! | [`firefox_156`] | **Verified (capture)** | public Cloudflare Wireshark capture | `fingerprint_regression.rs` |
 //! | [`safari_26`] | **Verified** | `tlsleak/safari26.2_tlsleak.json` | `e2e_safari_fingerprint.rs` |
 //! | [`chrome_131`] | **Unverified** | no reference data | none |
 //! | [`firefox_133`] | **Unverified** | no reference data | none |
 //! | [`safari_18`] | **Unverified** | no reference data | none |
 //!
-//! **For production use, prefer the verified profiles (chrome_144 / chrome_148 / firefox_147 / safari_26).**
+//! **For production use, prefer the verified profiles (chrome_154 / firefox_156 / safari_26).**
 //! Unverified profiles may have subtle deviations in extension order, parameter values, etc.,
 //! which risk detection in adversarial scenarios.
 
@@ -219,6 +220,51 @@ pub fn chrome_152_quic() -> TlsProfile {
     profile
 }
 
+/// Chrome 153.0.8010.37 TCP profile captured against public Cloudflare.
+/// The trust-anchor identifier set contains 28 entries; other stable fields
+/// retain Chrome 152's shape, including signature-algorithm GREASE.
+pub fn chrome_153() -> TlsProfile {
+    let json_str = include_str!("../../profiles/chrome_153.json");
+    serde_json::from_str(json_str).expect("built-in chrome_153 profile should be valid")
+}
+
+/// Chrome 153 QUIC ClientHello captured against Cloudflare and Google.
+/// QUIC retains the classic signature algorithms without TCP's ML-DSA or TLS
+/// GREASE slots, and advertises the same 28 trust-anchor identifiers as TCP.
+pub fn chrome_153_quic() -> TlsProfile {
+    let mut profile = chromium_quic_profile(chrome_153(), "Chrome 153 QUIC");
+    profile.grease = GreaseConfig::default();
+    profile.randomization = Some(RandomizationConfig {
+        shuffle_extensions: true,
+    });
+    profile
+        .signature_algorithms
+        .retain(|algorithm| !matches!(*algorithm, 0x0904..=0x0906));
+    profile
+}
+
+/// Chrome 154.0.8037.58 TCP profile captured against public Cloudflare.
+/// Stable TLS fields and the 28-entry trust-anchor set match Chrome 153.
+pub fn chrome_154() -> TlsProfile {
+    let json_str = include_str!("../../profiles/chrome_154.json");
+    serde_json::from_str(json_str).expect("built-in chrome_154 profile should be valid")
+}
+
+/// Chrome 154 QUIC ClientHello captured against public Cloudflare.
+/// It retains Chrome 153's classic nine signature algorithms, shuffled
+/// extensions, 28 trust anchors, and lack of ordinary TLS GREASE slots.
+pub fn chrome_154_quic() -> TlsProfile {
+    let mut profile = chromium_quic_profile(chrome_154(), "Chrome 154 QUIC");
+    profile.grease = GreaseConfig::default();
+    profile.randomization = Some(RandomizationConfig {
+        shuffle_extensions: true,
+    });
+    profile
+        .signature_algorithms
+        .retain(|algorithm| !matches!(*algorithm, 0x0904..=0x0906));
+    profile
+}
+
 /// Load the built-in Firefox 133 profile.
 ///
 /// **Unverified** — lacks real browser reference data and has not undergone JA3/JA4 consistency testing.
@@ -238,6 +284,16 @@ pub fn firefox_133() -> TlsProfile {
 pub fn firefox_147() -> TlsProfile {
     let json_str = include_str!("../../profiles/firefox_147.json");
     serde_json::from_str(json_str).expect("built-in firefox_147 profile should be valid")
+}
+
+/// Load the built-in Firefox 156 profile.
+///
+/// Captured from Firefox 156.0.1 on Windows against public Cloudflare. It
+/// removes two ECDSA CBC suites and both FFDHE groups from Firefox 147 and uses
+/// AES-128-GCM for its fixed-size ECH GREASE payload.
+pub fn firefox_156() -> TlsProfile {
+    let json_str = include_str!("../../profiles/firefox_156.json");
+    serde_json::from_str(json_str).expect("built-in firefox_156 profile should be valid")
 }
 
 /// Load the built-in Safari 18 profile.
@@ -281,6 +337,7 @@ mod tests {
             chrome_150(),
             chrome_151(),
             chrome_152(),
+            chrome_153(),
         ] {
             assert_eq!(
                 profile.tls_client_hello_style,
@@ -290,7 +347,7 @@ mod tests {
             );
         }
 
-        for profile in [firefox_133(), firefox_147()] {
+        for profile in [firefox_133(), firefox_147(), firefox_156()] {
             assert_eq!(
                 profile.tls_client_hello_style,
                 TlsClientHelloStyle::FirefoxNss,
@@ -398,6 +455,122 @@ mod tests {
         assert!(!chrome_150().grease.signature_algorithms);
         assert!(!chrome_151().grease.signature_algorithms);
         assert!(chrome_152().grease.signature_algorithms);
+    }
+
+    #[test]
+    fn chrome_153_updates_only_capture_verified_trust_anchor_membership() {
+        let previous = chrome_152();
+        let current = chrome_153();
+        let anchors = |profile: &TlsProfile| match &profile
+            .extensions
+            .iter()
+            .find(|ext| ext.extension_type == ext_type::TRUST_ANCHOR_IDS)
+            .unwrap()
+            .source
+        {
+            ExtensionSource::TrustAnchorIds { ids, shuffle } => {
+                assert!(*shuffle);
+                let mut ids = ids.clone();
+                ids.sort();
+                ids
+            }
+            source => panic!("unexpected trust-anchor source: {source:?}"),
+        };
+        let removed = ["d6790902", "d6790903", "d6790909", "d679090e"];
+        let expected: Vec<_> = anchors(&previous)
+            .into_iter()
+            .filter(|id| !removed.contains(&id.as_str()))
+            .collect();
+        assert_eq!(anchors(&current), expected);
+        assert_eq!(anchors(&current).len(), 28);
+        let stable = |mut profile: TlsProfile| {
+            profile.name.clear();
+            profile
+                .extensions
+                .retain(|ext| ext.extension_type != ext_type::TRUST_ANCHOR_IDS);
+            serde_json::to_value(profile).unwrap()
+        };
+        assert_eq!(stable(previous), stable(current));
+    }
+
+    #[test]
+    fn chrome_153_quic_preserves_transport_specific_tls_shape() {
+        let profile = chrome_153_quic();
+        assert_eq!(profile.name, "Chrome 153 QUIC");
+        assert_eq!(profile.session_id_length, 0);
+        assert!(!profile.grease.signature_algorithms);
+        assert!(!profile.grease.cipher_suite);
+        assert!(!profile.grease.extensions);
+        assert!(!profile.grease.supported_groups);
+        assert!(!profile.grease.supported_versions);
+        assert!(!profile.grease.key_share);
+        assert!(profile.randomization.as_ref().unwrap().shuffle_extensions);
+        assert_eq!(profile.alpn_protocols, ["h3"]);
+        assert_eq!(profile.alps_protocols, Some(vec!["h3".into()]));
+        assert_eq!(
+            profile.signature_algorithms,
+            [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201]
+        );
+        let anchors = profile
+            .extensions
+            .iter()
+            .find(|ext| ext.extension_type == ext_type::TRUST_ANCHOR_IDS)
+            .unwrap();
+        assert!(
+            matches!(&anchors.source, ExtensionSource::TrustAnchorIds { ids, shuffle: true } if ids.len() == 28)
+        );
+    }
+
+    #[test]
+    fn chrome_154_matches_capture_verified_chrome_153_tls_shape() {
+        let mut previous = chrome_153();
+        let mut current = chrome_154();
+        assert_eq!(current.name, "Chrome 154");
+        previous.name.clear();
+        current.name.clear();
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(previous).unwrap()
+        );
+
+        let quic = chrome_154_quic();
+        assert_eq!(quic.name, "Chrome 154 QUIC");
+        assert_eq!(
+            quic.signature_algorithms,
+            chrome_153_quic().signature_algorithms
+        );
+        assert!(!quic.grease.signature_algorithms);
+        assert!(!quic.grease.cipher_suite);
+        assert!(!quic.grease.extensions);
+        assert!(!quic.grease.supported_groups);
+        assert!(!quic.grease.supported_versions);
+        assert!(!quic.grease.key_share);
+        assert!(quic.randomization.as_ref().unwrap().shuffle_extensions);
+    }
+
+    #[test]
+    fn firefox_156_matches_public_cloudflare_capture() {
+        let profile = firefox_156();
+        assert_eq!(profile.name, "Firefox 156");
+        assert_eq!(
+            profile.cipher_suites,
+            [
+                4865, 4867, 4866, 49195, 49199, 52393, 52392, 49196, 49200, 49171, 49172, 156, 157,
+                47, 53,
+            ]
+        );
+        assert_eq!(profile.supported_groups, [4588, 29, 23, 24, 25]);
+        assert_eq!(profile.key_share_curves, [4588, 29, 23]);
+        assert_eq!(
+            profile.signature_algorithms,
+            [1027, 1283, 1539, 2052, 2053, 2054, 1025, 1281, 1537, 515, 513]
+        );
+        let EchMode::Grease(ech) = profile.ech.expect("Firefox 156 ECH GREASE config") else {
+            panic!("Firefox 156 should use ECH GREASE");
+        };
+        assert_eq!(ech.aead_id, 1);
+        assert_eq!(ech.payload_length_min, Some(240));
+        assert_eq!(ech.payload_length_max, Some(240));
     }
 
     #[test]

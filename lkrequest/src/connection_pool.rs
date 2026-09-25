@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use crate::body::WireBody;
 use http_body_util::Full;
 
 use crate::protocol::RouteKey;
@@ -152,7 +153,7 @@ pub(crate) enum AcquiredConnection {
     /// An HTTP/1.1 sender — exclusively borrowed from the pool.
     /// The `Arc<JoinHandle>` keeps the connection driver alive.
     H1 {
-        sender: hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
+        sender: hyper::client::conn::http1::SendRequest<WireBody>,
         conn_task: Arc<tokio::task::JoinHandle<()>>,
         permit: ConnectionPermit,
     },
@@ -207,10 +208,15 @@ pub struct H3PoolEntry {
     last_used: Instant,
 }
 
+enum H1Sender {
+    Legacy(hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>),
+    Wire(hyper::client::conn::http1::SendRequest<WireBody>),
+}
+
 /// An HTTP/1.1 pool entry — holds an exclusive sender for keep-alive reuse.
 pub struct H1PoolEntry {
     /// The send half of the HTTP/1.1 connection. NOT Clone — exclusive access.
-    sender: hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
+    sender: H1Sender,
     /// The connection driver task handle.
     /// Kept alive so the connection isn't dropped.
     conn_task: Arc<tokio::task::JoinHandle<()>>,
@@ -456,35 +462,37 @@ impl ConnectionPool {
     ) -> Option<AcquiredConnection> {
         let timeout = self.idle_timeout;
         self.evict_idle(timeout);
-        self.try_acquire_h1(key).map(|h1| AcquiredConnection::H1 {
-            sender: h1.sender,
-            conn_task: h1.conn_task,
-            permit: h1.permit,
+        let entry = self.take_h1(key, true)?;
+        let H1Sender::Wire(sender) = entry.sender else {
+            unreachable!()
+        };
+        Some(AcquiredConnection::H1 {
+            sender,
+            conn_task: entry.conn_task,
+            permit: entry.permit,
         })
     }
 
-    fn convert_legacy_connection(&mut self, connection: AcquiredConnection) -> PooledConnection {
-        match connection {
-            AcquiredConnection::H2(sender) => PooledConnection::H2(sender),
-            #[cfg(feature = "quic-h3")]
-            AcquiredConnection::H3(sender) => PooledConnection::H3(sender),
-            AcquiredConnection::H1 {
-                sender,
-                conn_task,
-                permit,
-            } => {
-                let task_key = Arc::as_ptr(&conn_task) as usize;
-                let previous = self.legacy_h1_permits.insert(
-                    task_key,
-                    LegacyH1Permit {
-                        task: Arc::downgrade(&conn_task),
-                        permit,
-                    },
-                );
-                debug_assert!(previous.is_none());
-                PooledConnection::H1 { sender, conn_task }
-            }
-        }
+    fn acquire_legacy_h1(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
+        let timeout = self.idle_timeout;
+        self.evict_idle(timeout);
+        let entry = self.try_acquire_h1(key)?;
+        let H1Sender::Legacy(sender) = entry.sender else {
+            unreachable!()
+        };
+        let task_key = Arc::as_ptr(&entry.conn_task) as usize;
+        let previous = self.legacy_h1_permits.insert(
+            task_key,
+            LegacyH1Permit {
+                task: Arc::downgrade(&entry.conn_task),
+                permit: entry.permit,
+            },
+        );
+        debug_assert!(previous.is_none());
+        Some(PooledConnection::H1 {
+            sender,
+            conn_task: entry.conn_task,
+        })
     }
 
     #[deprecated(
@@ -492,8 +500,16 @@ impl ConnectionPool {
         note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
     )]
     pub fn try_acquire(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
-        let connection = self.try_acquire_internal(key)?;
-        Some(self.convert_legacy_connection(connection))
+        let timeout = self.idle_timeout;
+        self.evict_idle(timeout);
+        #[cfg(feature = "quic-h3")]
+        if let Some(sender) = self.try_acquire_h3(key) {
+            return Some(PooledConnection::H3(sender));
+        }
+        if let Some(sender) = self.try_acquire_h2(key) {
+            return Some(PooledConnection::H2(sender));
+        }
+        self.acquire_legacy_h1(key)
     }
 
     #[deprecated(
@@ -501,8 +517,17 @@ impl ConnectionPool {
         note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
     )]
     pub fn try_acquire_h3_pooled(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
-        let connection = self.try_acquire_h3_pooled_internal(key)?;
-        Some(self.convert_legacy_connection(connection))
+        let timeout = self.idle_timeout;
+        self.evict_idle(timeout);
+        #[cfg(feature = "quic-h3")]
+        {
+            self.try_acquire_h3(key).map(PooledConnection::H3)
+        }
+        #[cfg(not(feature = "quic-h3"))]
+        {
+            let _ = key;
+            None
+        }
     }
 
     #[deprecated(
@@ -510,8 +535,9 @@ impl ConnectionPool {
         note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
     )]
     pub fn try_acquire_h2_pooled(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
-        let connection = self.try_acquire_h2_pooled_internal(key)?;
-        Some(self.convert_legacy_connection(connection))
+        let timeout = self.idle_timeout;
+        self.evict_idle(timeout);
+        self.try_acquire_h2(key).map(PooledConnection::H2)
     }
 
     #[deprecated(
@@ -519,8 +545,7 @@ impl ConnectionPool {
         note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
     )]
     pub fn try_acquire_h1_pooled(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
-        let connection = self.try_acquire_h1_pooled_internal(key)?;
-        Some(self.convert_legacy_connection(connection))
+        self.acquire_legacy_h1(key)
     }
 
     /// Remove all connections (both H2 and H1.1) for the given key.
@@ -685,8 +710,15 @@ impl ConnectionPool {
     /// Pops the most recently used connection from the stack.
     /// Returns `None` if no idle connections are available.
     pub fn try_acquire_h1(&mut self, key: &ConnectionKey) -> Option<H1PoolEntry> {
+        self.take_h1(key, false)
+    }
+
+    fn take_h1(&mut self, key: &ConnectionKey, wire_body: bool) -> Option<H1PoolEntry> {
         let entries = self.h1_connections.get_mut(key)?;
-        let entry = entries.pop_back();
+        let index = entries
+            .iter()
+            .rposition(|entry| matches!(entry.sender, H1Sender::Wire(_)) == wire_body)?;
+        let entry = entries.remove(index);
         if entries.is_empty() {
             self.h1_connections.remove(key);
         }
@@ -701,35 +733,42 @@ impl ConnectionPool {
     pub(crate) fn return_h1_reserved(
         &mut self,
         key: ConnectionKey,
-        sender: hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
+        sender: hyper::client::conn::http1::SendRequest<WireBody>,
         conn_task: Arc<tokio::task::JoinHandle<()>>,
         permit: ConnectionPermit,
     ) {
+        self.return_h1_entry(
+            key,
+            H1PoolEntry {
+                sender: H1Sender::Wire(sender),
+                conn_task,
+                permit,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    fn return_h1_entry(&mut self, key: ConnectionKey, entry: H1PoolEntry) {
         let entries = self.h1_connections.entry(key).or_default();
         if entries.len() >= self.max_per_key {
             if let Some(entry) = entries.pop_front() {
                 entry.conn_task.abort();
             }
         }
-        entries.push_back(H1PoolEntry {
-            sender,
-            conn_task,
-            permit,
-            last_used: Instant::now(),
-        });
+        entries.push_back(entry);
     }
 
     /// Insert a brand new H1.1 connection into the pool.
     pub(crate) fn insert_h1_reserved(
         &mut self,
         key: ConnectionKey,
-        sender: hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
+        sender: hyper::client::conn::http1::SendRequest<WireBody>,
         conn_task: tokio::task::JoinHandle<()>,
         permit: ConnectionPermit,
     ) {
         let entries = self.h1_connections.entry(key).or_default();
         entries.push_back(H1PoolEntry {
-            sender,
+            sender: H1Sender::Wire(sender),
             conn_task: Arc::new(conn_task),
             permit,
             last_used: Instant::now(),
@@ -752,7 +791,15 @@ impl ConnectionPool {
             .remove(&task_key)
             .map(|tracked| tracked.permit)
             .unwrap_or_else(|| self.adopt_existing_connection());
-        self.return_h1_reserved(key, sender, conn_task, permit);
+        self.return_h1_entry(
+            key,
+            H1PoolEntry {
+                sender: H1Sender::Legacy(sender),
+                conn_task,
+                permit,
+                last_used: Instant::now(),
+            },
+        );
     }
 
     #[deprecated(
@@ -766,7 +813,15 @@ impl ConnectionPool {
         conn_task: tokio::task::JoinHandle<()>,
     ) {
         let permit = self.adopt_existing_connection();
-        self.insert_h1_reserved(key, sender, conn_task, permit);
+        self.h1_connections
+            .entry(key)
+            .or_default()
+            .push_back(H1PoolEntry {
+                sender: H1Sender::Legacy(sender),
+                conn_task: Arc::new(conn_task),
+                permit,
+                last_used: Instant::now(),
+            });
     }
 
     // -----------------------------------------------------------------------
@@ -969,6 +1024,154 @@ impl ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn local_h1<Body>() -> (
+        hyper::client::conn::http1::SendRequest<Body>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        Body: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        Body::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        use http_body_util::BodyExt;
+        let (client, server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let service = hyper::service::service_fn(
+                |request: http::Request<hyper::body::Incoming>| async move {
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(body)))
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(server), service)
+                .await;
+        });
+        let (sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(client))
+                .await
+                .unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        (sender, driver, server_task)
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn legacy_h1_round_trip_preserves_sender_type_and_mixed_pool_accounting() {
+        use http_body_util::BodyExt;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut pool = ConnectionPool::with_max_total(2);
+            let key = test_key("localhost");
+            let (sender, driver, legacy_server) = local_h1::<Full<bytes::Bytes>>().await;
+            pool.insert_h1(key.clone(), sender, driver);
+            let (wire_sender, wire_driver, wire_server) = local_h1::<WireBody>().await;
+            let permit = pool.try_reserve_connection().unwrap();
+            pool.insert_h1_reserved(key.clone(), wire_sender, wire_driver, permit);
+            assert_eq!(pool.stats().total, 2);
+            assert_eq!(pool.stats().h1_connections, 2);
+            assert!(pool.is_at_capacity());
+
+            for payload in ["first", "second"] {
+                let PooledConnection::H1 {
+                    mut sender,
+                    conn_task,
+                } = pool.try_acquire(&key).unwrap()
+                else {
+                    panic!("expected legacy H1 connection");
+                };
+                let _: &hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>> = &sender;
+                assert_eq!(pool.len(), 1);
+                assert_eq!(pool.stats().total, 2);
+                assert!(pool.try_acquire_h1_pooled(&key).is_none());
+                sender.ready().await.unwrap();
+                let response = sender
+                    .send_request(
+                        http::Request::builder()
+                            .uri("http://localhost/")
+                            .body(Full::new(bytes::Bytes::from_static(payload.as_bytes())))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    payload
+                );
+                pool.return_h1(key.clone(), sender, conn_task);
+                assert_eq!(pool.len(), 2);
+                assert_eq!(pool.stats().total, 2);
+            }
+
+            let AcquiredConnection::H1 {
+                sender,
+                conn_task,
+                permit,
+            } = pool.try_acquire_h1_pooled_internal(&key).unwrap()
+            else {
+                panic!("expected WireBody H1 connection");
+            };
+            assert!(pool.try_acquire_h1_pooled_internal(&key).is_none());
+            assert!(pool.has_h1_connection(&key));
+            pool.return_h1_reserved(key, sender, conn_task, permit);
+            pool.clear();
+            assert!(pool.is_empty());
+            assert_eq!(pool.stats().total, 0);
+            legacy_server.await.unwrap();
+            wire_server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn legacy_h1_shares_capacity_idle_and_removal_maintenance() {
+        let mut pool = ConnectionPool::with_max_total(1);
+        let key = test_key("localhost");
+        for maintenance in ["capacity", "idle", "remove", "closed"] {
+            let (sender, driver, server) = local_h1::<Full<bytes::Bytes>>().await;
+            pool.insert_h1(key.clone(), sender, driver);
+            assert_eq!(pool.stats().total, 1);
+            match maintenance {
+                "capacity" => {
+                    let permit = pool
+                        .try_reserve_connection()
+                        .expect("idle legacy entry must be evictable");
+                    assert!(pool.is_empty());
+                    assert_eq!(pool.stats().total, 1);
+                    drop(permit);
+                }
+                "idle" => assert_eq!(pool.evict_idle(Duration::ZERO), 1),
+                "remove" => pool.remove(&key),
+                "closed" => {
+                    let PooledConnection::H1 { sender, conn_task } =
+                        pool.try_acquire_h1_pooled(&key).unwrap()
+                    else {
+                        panic!("expected legacy H1 connection");
+                    };
+                    conn_task.abort();
+                    drop(sender);
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !conn_task.is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    pool.evict_closed();
+                }
+                _ => unreachable!(),
+            }
+            assert!(pool.is_empty());
+            assert_eq!(pool.stats().total, 0);
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     fn test_key(host: &str) -> ConnectionKey {
         ConnectionKey {

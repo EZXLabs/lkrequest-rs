@@ -1,9 +1,15 @@
 [package]
 name = "lkprofile"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Parse TLS ClientHello and HTTP/2 frames into fingerprint profiles"
 publish = false
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tls", "http2", "fingerprint", "parser", "browser"]
+categories = ["network-programming", "development-tools"]
 
 [dependencies]
 lktls = { path = "../lktls" }

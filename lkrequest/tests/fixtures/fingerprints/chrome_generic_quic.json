@@ -1,4 +1,5 @@
 {
+  "chromium_grease": true,
   "connection_id_length": 0,
   "extra_transport_parameters": [],
   "grease_settings": true,

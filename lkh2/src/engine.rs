@@ -835,6 +835,17 @@ impl H2Engine {
         self.state.send_window()
     }
 
+    pub(crate) fn upload_capacity(&self, stream_id: u32) -> usize {
+        let stream_window = self
+            .state
+            .get_stream(stream_id)
+            .map_or(0, |stream| stream.send_window_available());
+        self.state
+            .send_window_available()
+            .min(stream_window)
+            .min(16384) as usize
+    }
+
     // ── Internal frame handling ──────────────────────────────────────────
 
     fn handle_frame(
@@ -1393,10 +1404,12 @@ impl H2Engine {
         }
 
         for (name, value) in &request.ordered_headers {
-            ordered.push((name.as_str(), value.as_str()));
+            if let Ok(value) = value.to_str() {
+                ordered.push((name.as_str(), value));
+            }
         }
 
-        let has_body = request.body.as_ref().is_some_and(|b| !b.is_empty());
+        let has_body = request.streaming || request.body.as_ref().is_some_and(|b| !b.is_empty());
         let headers_end_stream = !has_body;
 
         let mut frames =
@@ -2259,18 +2272,18 @@ mod tests {
         let (mut engine, _) = H2Engine::client(&chrome_144_h2());
         let sid = engine.open_stream();
 
-        let native_req = crate::adapter::NativeH2Request {
-            method: http::Method::GET,
-            uri: "https://example.com/foo".parse().unwrap(),
-            ordered_headers: vec![
-                ("user-agent".to_string(), "test/1.0".to_string()),
-                ("accept".to_string(), "text/html".to_string()),
-                ("cookie".to_string(), "a=1".to_string()),
-                ("cookie".to_string(), "b=2".to_string()),
-            ],
-            body: None,
-            priority: None,
-        };
+        let mut headers = http::HeaderMap::new();
+        headers.append("user-agent", http::HeaderValue::from_static("test/1.0"));
+        headers.append("accept", http::HeaderValue::from_static("text/html"));
+        headers.append("cookie", http::HeaderValue::from_static("a=1"));
+        headers.append("cookie", http::HeaderValue::from_static("b=2"));
+        let native_req = crate::adapter::NativeH2Request::new(
+            http::Method::GET,
+            "https://example.com/foo".parse().unwrap(),
+            headers,
+            None,
+            None,
+        );
 
         let frames = engine.build_native_request(sid, native_req);
         assert!(matches!(frames[0], H2Frame::Headers(_)));
@@ -2297,13 +2310,15 @@ mod tests {
         let (mut engine, _) = H2Engine::client(&chrome_144_h2());
         let sid = engine.open_stream();
 
-        let native_req = crate::adapter::NativeH2Request {
-            method: http::Method::GET,
-            uri: "https://example.com/".parse().unwrap(),
-            ordered_headers: vec![("accept".to_string(), "text/html".to_string())],
-            body: None,
-            priority: None,
-        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("accept", http::HeaderValue::from_static("text/html"));
+        let native_req = crate::adapter::NativeH2Request::new(
+            http::Method::GET,
+            "https://example.com/".parse().unwrap(),
+            headers,
+            None,
+            None,
+        );
 
         let frames = engine.build_native_request(sid, native_req);
 
@@ -2313,6 +2328,49 @@ mod tests {
             let count = headers.iter().filter(|(name, _)| name == pseudo).count();
             assert_eq!(count, 1, "pseudo-header {pseudo} must appear exactly once");
         }
+    }
+
+    #[test]
+    fn native_request_matches_legacy_request_wire_bytes() {
+        let profile = chrome_144_h2();
+        let (mut legacy_engine, _) = H2Engine::client(&profile);
+        let (mut native_engine, _) = H2Engine::client(&profile);
+        let legacy_stream = legacy_engine.open_stream();
+        let native_stream = native_engine.open_stream();
+
+        let mut legacy = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/upload?q=1")
+            .body(Some(Bytes::from_static(b"payload")))
+            .unwrap();
+        legacy
+            .headers_mut()
+            .append("user-agent", http::HeaderValue::from_static("test/1.0"));
+        legacy
+            .headers_mut()
+            .append("cookie", http::HeaderValue::from_static("a=1"));
+        legacy
+            .headers_mut()
+            .append("cookie", http::HeaderValue::from_static("b=2"));
+        let native_headers = legacy.headers().clone();
+
+        let legacy_frames = legacy_engine.build_request(legacy_stream, legacy);
+        let native_frames = native_engine.build_native_request(
+            native_stream,
+            crate::adapter::NativeH2Request::new(
+                http::Method::POST,
+                "https://example.com/upload?q=1".parse().unwrap(),
+                native_headers,
+                Some(Bytes::from_static(b"payload")),
+                None,
+            ),
+        );
+
+        let mut legacy_wire = BytesMut::new();
+        let mut native_wire = BytesMut::new();
+        legacy_engine.encode_frames(&legacy_frames, &mut legacy_wire);
+        native_engine.encode_frames(&native_frames, &mut native_wire);
+        assert_eq!(native_wire, legacy_wire);
     }
 
     // ── Priority resolution tests ─────────────────────────────────────

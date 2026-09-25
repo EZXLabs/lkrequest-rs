@@ -2,6 +2,8 @@
 //!
 //! Encode table extracted from the `h2` crate (Apache-2.0 / MIT).
 
+use std::sync::OnceLock;
+
 /// (num_bits, code) for each byte value 0..=255, plus EOS at index 256.
 pub(crate) static ENCODE_TABLE: [(u8, u32); 257] = [
     (13, 0x1ff8),
@@ -297,6 +299,100 @@ pub(crate) fn encode(src: &[u8], dst: &mut Vec<u8>) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DecodeNode {
+    children: [u16; 2],
+    symbol: i16,
+}
+
+impl DecodeNode {
+    const NONE: u16 = u16::MAX;
+
+    const fn new() -> Self {
+        Self {
+            children: [Self::NONE; 2],
+            symbol: -1,
+        }
+    }
+}
+
+fn decode_nodes() -> &'static [DecodeNode] {
+    static NODES: OnceLock<Vec<DecodeNode>> = OnceLock::new();
+    NODES.get_or_init(|| {
+        let mut nodes = vec![DecodeNode::new()];
+        for (symbol, &(bit_count, code)) in ENCODE_TABLE.iter().enumerate() {
+            let mut node_index = 0usize;
+            for shift in (0..bit_count).rev() {
+                let bit = ((code >> shift) & 1) as usize;
+                let child = nodes[node_index].children[bit];
+                node_index = if child == DecodeNode::NONE {
+                    let next = u16::try_from(nodes.len()).expect("HPACK Huffman trie too large");
+                    nodes.push(DecodeNode::new());
+                    nodes[node_index].children[bit] = next;
+                    next as usize
+                } else {
+                    child as usize
+                };
+            }
+            debug_assert_eq!(nodes[node_index].symbol, -1);
+            nodes[node_index].symbol = symbol as i16;
+        }
+        nodes
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeError {
+    InvalidCode,
+    UnexpectedEos,
+    InvalidPadding,
+}
+
+/// Decode an RFC 7541 Huffman string.
+///
+/// The immutable decoding trie is constructed once per process and reused by
+/// every connection. The hot path performs only compact array lookups; it does
+/// not allocate lookup tables or hash individual bits.
+pub(crate) fn decode(src: &[u8], dst: &mut Vec<u8>) -> Result<(), DecodeError> {
+    let nodes = decode_nodes();
+    let mut node_index = 0usize;
+    let mut trailing_bits = 0u8;
+    let mut trailing_len = 0u8;
+
+    for &byte in src {
+        for shift in (0..8).rev() {
+            let bit = ((byte >> shift) & 1) as usize;
+            trailing_bits = (trailing_bits << 1) | bit as u8;
+            trailing_len += 1;
+
+            let child = nodes[node_index].children[bit];
+            if child == DecodeNode::NONE {
+                return Err(DecodeError::InvalidCode);
+            }
+            node_index = child as usize;
+
+            let symbol = nodes[node_index].symbol;
+            if symbol >= 0 {
+                if symbol == 256 {
+                    return Err(DecodeError::UnexpectedEos);
+                }
+                dst.push(symbol as u8);
+                node_index = 0;
+                trailing_bits = 0;
+                trailing_len = 0;
+            }
+        }
+    }
+
+    if node_index == 0 {
+        return Ok(());
+    }
+    if trailing_len > 7 || trailing_bits != ((1u16 << trailing_len) - 1) as u8 {
+        return Err(DecodeError::InvalidPadding);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +422,65 @@ mod tests {
         let mut dst = Vec::new();
         encode(b"www.example.com", &mut dst);
         assert_eq!(dst.len(), 12);
+    }
+
+    #[test]
+    fn test_decode_roundtrip() {
+        let inputs: &[&[u8]] = &[
+            b"hello",
+            b"www.example.com",
+            b"Mon, 21 Oct 2013 20:13:21 GMT",
+            b"custom-value",
+        ];
+        for input in inputs {
+            let mut encoded = Vec::new();
+            encode(input, &mut encoded);
+            let mut decoded = Vec::new();
+            decode(&encoded, &mut decoded).unwrap();
+            assert_eq!(&decoded, input);
+        }
+    }
+
+    #[test]
+    fn test_decode_roundtrip_all_octets() {
+        let input: Vec<u8> = (0..=u8::MAX).collect();
+        let mut encoded = Vec::new();
+        encode(&input, &mut encoded);
+        let mut decoded = Vec::new();
+        decode(&encoded, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_decode_independent_known_vectors() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (&[0b0011_1111], b"o"),
+            (&[0x07], b"0"),
+            (&[0x87], b"A"),
+            (&[0xff, 0xaf], b"#"),
+            (&[0xff, 0xcf], b"$"),
+            (&[0xff, 0xff, 0xff, 0xf3], b"\n"),
+            (&[0xfe, 0x01], b"!0"),
+            (&[0x53, 0xf8], b" !"),
+        ];
+        for &(encoded, expected) in cases {
+            let mut decoded = Vec::new();
+            decode(encoded, &mut decoded).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn test_decode_rejects_eos_and_bad_padding() {
+        let mut decoded = Vec::new();
+        assert_eq!(
+            decode(&[0xff, 0xff, 0xff, 0xff], &mut decoded),
+            Err(DecodeError::UnexpectedEos)
+        );
+        decoded.clear();
+        assert_eq!(
+            decode(&[0x00], &mut decoded),
+            Err(DecodeError::InvalidPadding)
+        );
     }
 }

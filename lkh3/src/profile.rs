@@ -82,6 +82,10 @@ pub struct H3Profile {
     /// modelled yet) simply leave it `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub send_control_grease_frame: bool,
+    /// Use Chromium's random reserved setting and control-frame generators,
+    /// without the generic backend's request-tail or reserved-stream GREASE.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chromium_grease: bool,
 }
 
 /// QUIC transport parameters that influence fingerprinting.
@@ -127,6 +131,12 @@ pub struct QuicTransportParams {
     /// verbatim. Profiles that don't model this leave it `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub shuffle_transport_parameters: bool,
+    /// Randomize reserved GREASE payload lengths over `0..16` and the GREASE
+    /// version's position among available versions. Applied with
+    /// `shuffle_transport_parameters`; custom profiles retain their fixed
+    /// payload lengths and version positions unless enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub randomize_grease_shape: bool,
 }
 
 /// Local packetization knobs that affect the UDP datagram shape outside the
@@ -151,6 +161,10 @@ pub struct QuicPacketizationProfile {
     /// Optional profile for the frame layout inside client Initial packets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_frame_layout: Option<InitialFrameLayoutProfile>,
+    /// Generate Chromium-style CRYPTO splits, PING and PADDING dynamically
+    /// from the pending Initial data. Overrides a fixed layout when enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub initial_packet_chaos: bool,
 }
 
 impl Default for QuicPacketizationProfile {
@@ -162,6 +176,7 @@ impl Default for QuicPacketizationProfile {
             enable_segmentation_offload: true,
             enable_ecn: true,
             initial_frame_layout: None,
+            initial_packet_chaos: false,
         }
     }
 }
@@ -664,6 +679,7 @@ pub fn chrome_h3() -> H3Profile {
         // SETTINGS (observed as the second `GREASE` token in browserleaks'
         // h3_text, before the PRIORITY_UPDATE).
         send_control_grease_frame: true,
+        chromium_grease: true,
     }
 }
 
@@ -688,6 +704,7 @@ pub fn chrome_quic() -> QuicProfile {
             // Chrome shuffles TP order per connection (no-op here until this
             // generic profile carries an explicit order list).
             shuffle_transport_parameters: true,
+            randomize_grease_shape: false,
         },
         h3: chrome_h3(),
         connection_id_length: 0, // Chrome: SetBytesForConnectionIdToSend(0)
@@ -718,8 +735,9 @@ pub fn chrome_146_h3() -> H3Profile {
 /// - `initial_max_streams_uni` = 103 (not 100)
 /// - `max_datagram_frame_size` = 65 536 (QUIC DATAGRAM)
 /// - raw reserved transport parameter `0x17af394a4ef8da0a`
-/// - pcap-observed transport parameter wire order
-/// - packetization starts at 1250-byte UDP payloads in the observed capture
+/// - randomized transport-parameter order and GREASE values
+/// - packetization starts at 1250-byte UDP payloads and dynamically scatters
+///   Initial CRYPTO/PING/PADDING using Chromium's source algorithm
 ///
 /// Google-proprietary transport parameter `google_initial_rtt` is captured as
 /// raw bytes. Its value is path-sensitive and should become dynamic once the
@@ -768,6 +786,7 @@ pub fn chrome_146_quic() -> QuicProfile {
             // Chrome shuffles the TP wire order per connection (capture-verified
             // against Chrome 148: 3 connections produced 3 distinct orders).
             shuffle_transport_parameters: true,
+            randomize_grease_shape: true,
         },
         h3: chrome_146_h3(),
         connection_id_length: 0,
@@ -778,7 +797,8 @@ pub fn chrome_146_quic() -> QuicProfile {
             disable_mtu_discovery: false,
             enable_segmentation_offload: false,
             enable_ecn: false,
-            initial_frame_layout: Some(InitialFrameLayoutProfile::chrome_146()),
+            initial_frame_layout: None,
+            initial_packet_chaos: true,
         },
     }
 }
@@ -845,6 +865,7 @@ pub fn chrome_150_quic() -> QuicProfile {
             ],
             grease_transport_params: false,
             shuffle_transport_parameters: true,
+            randomize_grease_shape: true,
         },
         h3: chrome_150_h3(),
         connection_id_length: 0,
@@ -855,9 +876,9 @@ pub fn chrome_150_quic() -> QuicProfile {
             disable_mtu_discovery: false,
             enable_segmentation_offload: false,
             enable_ecn: false,
-            // The Chrome 150 report did not establish a stable CRYPTO/PADDING
-            // fragmentation layout, so do not reuse Chrome 146's exact layout.
+            // Chromium's source generates layouts for each actual ClientHello.
             initial_frame_layout: None,
+            initial_packet_chaos: true,
         },
     }
 }
@@ -911,6 +932,48 @@ pub fn chrome_152_quic() -> QuicProfile {
     profile
 }
 
+/// Chrome 153 HTTP/3 profile captured from a successful Cloudflare navigation.
+/// SETTINGS, control-stream GREASE and `u=0, i` PRIORITY_UPDATE retain the
+/// previous Chrome navigation shape.
+pub fn chrome_153_h3() -> H3Profile {
+    chrome_152_h3()
+}
+
+/// Chrome 153 fresh-connection QUIC profile, captured against Cloudflare and
+/// Google. Reserved transport-parameter payload lengths vary per connection.
+/// The path-dependent `google_initial_rtt` observed on a later browser
+/// connection is not hardcoded into this fresh-connection preset.
+pub fn chrome_153_quic() -> QuicProfile {
+    let mut profile = chrome_152_quic();
+    profile.transport_params.randomize_grease_shape = true;
+    for (id, value) in &mut profile.transport_params.extra_transport_parameters {
+        if *id >= 27 && (*id - 27) % 31 == 0 {
+            // The opt-in shape policy supplies a fresh 0..15-byte payload.
+            value.clear();
+        }
+    }
+    profile.h3 = chrome_153_h3();
+    profile
+}
+
+/// Chrome 154 HTTP/3 profile.
+///
+/// Public captures verified QUIC through the Initial flight. The application
+/// exchange was blocked by the capture path, so SETTINGS and request priority
+/// retain the latest completed Chrome 153 navigation baseline.
+pub fn chrome_154_h3() -> H3Profile {
+    chrome_153_h3()
+}
+
+/// Chrome 154 fresh-connection QUIC profile captured against public Cloudflare.
+/// Stable transport values and Chromium's randomized GREASE and Initial layout
+/// match Chrome 153 across three independent ClientHello flights.
+pub fn chrome_154_quic() -> QuicProfile {
+    let mut profile = chrome_153_quic();
+    profile.h3 = chrome_154_h3();
+    profile
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![
@@ -930,6 +993,7 @@ pub fn firefox_h3() -> H3Profile {
         priority_updates: vec![],
         // Firefox does not emit a control-stream GREASE frame.
         send_control_grease_frame: false,
+        chromium_grease: false,
     }
 }
 
@@ -948,6 +1012,8 @@ mod tests {
             ("chrome_150_h3", chrome_150_h3()),
             ("chrome_151_h3", chrome_151_h3()),
             ("chrome_152_h3", chrome_152_h3()),
+            ("chrome_153_h3", chrome_153_h3()),
+            ("chrome_154_h3", chrome_154_h3()),
             ("firefox_h3", firefox_h3()),
         ]
     }
@@ -959,6 +1025,8 @@ mod tests {
             ("chrome_150_quic", chrome_150_quic()),
             ("chrome_151_quic", chrome_151_quic()),
             ("chrome_152_quic", chrome_152_quic()),
+            ("chrome_153_quic", chrome_153_quic()),
+            ("chrome_154_quic", chrome_154_quic()),
         ]
     }
 
@@ -1155,11 +1223,9 @@ mod tests {
         assert!(!profile.packetization.disable_mtu_discovery);
         assert!(!profile.packetization.enable_segmentation_offload);
         assert!(!profile.packetization.enable_ecn);
-        let initial_layout = profile
-            .packetization
-            .initial_frame_layout
-            .as_ref()
-            .expect("chrome_146 should include observed Initial frame layout");
+        assert!(profile.packetization.initial_packet_chaos);
+        assert!(profile.packetization.initial_frame_layout.is_none());
+        let initial_layout = InitialFrameLayoutProfile::chrome_146();
         assert_eq!(initial_layout.target_udp_payload_size, 1250);
         assert_eq!(initial_layout.packets.len(), 2);
         assert_eq!(initial_layout.packets[0].packet_number, 0);
@@ -1203,6 +1269,7 @@ mod tests {
         assert_eq!(profile.packetization.initial_mtu, Some(1250));
         assert_eq!(profile.packetization.initial_datagram_size, Some(1250));
         assert!(profile.packetization.initial_frame_layout.is_none());
+        assert!(profile.packetization.initial_packet_chaos);
         assert_eq!(profile.h3.qpack_max_table_capacity, 65_536);
         assert_eq!(profile.h3.qpack_blocked_streams, 100);
         assert_eq!(profile.h3.priority_updates, vec![(0, "u=0, i".into())]);
@@ -1271,6 +1338,86 @@ mod tests {
     }
 
     #[test]
+    fn chrome_153_matches_public_cloudflare_navigation() {
+        let profile = chrome_153_quic();
+        assert_eq!(
+            profile.h3.effective_settings(),
+            vec![(1, 65_536), (6, 262_144), (7, 100), (51, 1)]
+        );
+        assert_eq!(profile.h3.pseudo_header_order_token(), "masp");
+        assert_eq!(profile.h3.priority_updates, vec![(0, "u=0, i".into())]);
+        assert!(profile.h3.grease_settings);
+        assert!(profile.h3.send_control_grease_frame);
+        assert!(profile.transport_params.shuffle_transport_parameters);
+        assert_eq!(profile.connection_id_length, 0);
+        assert_eq!(profile.initial_destination_connection_id_length, Some(8));
+        assert_eq!(profile.packetization.initial_datagram_size, Some(1250));
+        let reserved = profile
+            .transport_params
+            .extra_transport_parameters
+            .iter()
+            .find(|(id, _)| *id >= 27 && (*id - 27) % 31 == 0)
+            .unwrap();
+        assert!(
+            reserved.1.is_empty(),
+            "captured GREASE payload lengths vary"
+        );
+        assert!(!profile
+            .transport_params
+            .transport_parameter_order
+            .contains(&0x3127));
+    }
+
+    #[test]
+    fn chrome_154_matches_public_initial_capture_and_inherits_h3_baseline() {
+        let profile = chrome_154_quic();
+        assert_eq!(profile, chrome_153_quic());
+        assert_eq!(profile.h3, chrome_154_h3());
+        assert!(profile.transport_params.shuffle_transport_parameters);
+        assert!(profile.transport_params.randomize_grease_shape);
+        assert!(profile.packetization.initial_packet_chaos);
+    }
+
+    #[test]
+    fn captured_chromium_profiles_randomize_grease_shape() {
+        for profile in [
+            chrome_146_quic(),
+            chrome_150_quic(),
+            chrome_151_quic(),
+            chrome_152_quic(),
+            chrome_153_quic(),
+            chrome_154_quic(),
+        ] {
+            assert!(profile.transport_params.randomize_grease_shape);
+            assert!(profile.h3.chromium_grease);
+            assert!(profile.packetization.initial_packet_chaos);
+        }
+    }
+
+    #[test]
+    fn grease_shape_defaults_preserve_custom_json() {
+        let mut legacy_json = serde_json::to_value(chrome_153_quic()).unwrap();
+        legacy_json["transport_params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("randomize_grease_shape");
+        let legacy: QuicProfile = serde_json::from_value(legacy_json).unwrap();
+        assert!(!legacy.transport_params.randomize_grease_shape);
+        let mut json = serde_json::to_value(chrome_153_quic()).unwrap();
+        json["h3"]
+            .as_object_mut()
+            .unwrap()
+            .remove("chromium_grease");
+        json["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_packet_chaos");
+        let custom: QuicProfile = serde_json::from_value(json).unwrap();
+        assert!(!custom.h3.chromium_grease);
+        assert!(!custom.packetization.initial_packet_chaos);
+    }
+
+    #[test]
     fn chrome_150_is_independent_from_chrome_146() {
         let v146 = chrome_146_quic();
         let v150 = chrome_150_quic();
@@ -1280,7 +1427,9 @@ mod tests {
             v146.transport_params.extra_transport_parameters,
             v150.transport_params.extra_transport_parameters
         );
-        assert!(v146.packetization.initial_frame_layout.is_some());
+        assert!(v146.packetization.initial_packet_chaos);
+        assert!(v150.packetization.initial_packet_chaos);
+        assert!(v146.packetization.initial_frame_layout.is_none());
         assert!(v150.packetization.initial_frame_layout.is_none());
     }
 
@@ -1338,8 +1487,8 @@ mod tests {
             v146.packetization.initial_datagram_size
         );
         assert_ne!(
-            generic.packetization.initial_frame_layout,
-            v146.packetization.initial_frame_layout
+            generic.packetization.initial_packet_chaos,
+            v146.packetization.initial_packet_chaos
         );
 
         // H3 SETTINGS remain identical; only priority_updates differs
