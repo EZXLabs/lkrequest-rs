@@ -1,0 +1,14 @@
+{
+  "capture": "chrome155-cloudflare-h3-r1.pcapng",
+  "capture_sha256": "e1ccfc7b8ddf5a344c53e118b24e1afdc6ffc02150410cb8edf1e41d61dc8012",
+  "browser_version": "155.0.8059.40",
+  "udp_stream": 0,
+  "control_stream": 2,
+  "raw_control_hex": "00041f018001000006800400000740643301c0000018f0d40f4fc0000000d3f3c3edc00000187292e66801ee800f07000700753d302c2069800f07000704753d312c2069",
+  "tshark_frame_types": [4, 105001444968, 984832, 984832],
+  "tshark_settings": [[1, 65536], [6, 262144], [7, 100], [51, 1], [107119644495, 3555967981]],
+  "tshark_priority_updates": [
+    {"frame_type": 984832, "element_id": 0, "field_value": "u=0, i"},
+    {"frame_type": 984832, "element_id": 4, "field_value": "u=1, i"}
+  ]
+}

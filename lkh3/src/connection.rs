@@ -47,6 +47,16 @@ pub enum H3Error {
     Upload(#[from] std::io::Error),
     #[error("invalid H3 profile: {0}")]
     InvalidProfile(String),
+    #[error("invalid HTTP/3 response: {0}")]
+    InvalidResponse(String),
+    #[error("h3 request failed after final response headers: {0}")]
+    AfterFinalResponse(#[source] Box<H3Error>),
+    #[error("h3 upload stopped with code {stop_code}; response terminated: {source}")]
+    StoppedUpload {
+        stop_code: u64,
+        #[source]
+        source: Box<H3Error>,
+    },
     #[error("h3 connection error: {0}")]
     Connection(#[from] h3::error::ConnectionError),
     #[error("h3 stream error: {0}")]
@@ -74,8 +84,13 @@ fn h3_builder(h3_profile: &H3Profile) -> client::Builder {
     builder.send_grease(h3_profile.grease_settings);
     builder.chromium_grease(h3_profile.chromium_grease);
     builder.control_grease_frame(h3_profile.send_control_grease_frame);
+    builder.accept_truncated_response_payloads(h3_profile.accept_truncated_response_payloads);
+    builder.wait_for_incomplete_response_frame_headers(
+        h3_profile.wait_for_incomplete_response_frame_headers,
+    );
     builder.qpack_max_table_capacity(h3_profile.qpack_max_table_capacity);
     builder.qpack_blocked_streams(h3_profile.qpack_blocked_streams);
+    builder.defer_qpack_stream_prefixes(h3_profile.defer_qpack_stream_prefixes);
     builder.ordered_settings(h3_profile.effective_settings());
     builder.pseudo_header_order(
         h3_profile
@@ -88,7 +103,7 @@ fn h3_builder(h3_profile: &H3Profile) -> client::Builder {
     if let Some(max_field_section_size) = h3_profile.max_field_section_size {
         builder.max_field_section_size(max_field_section_size);
     }
-    if !h3_profile.priority_updates.is_empty() {
+    if !h3_profile.request_priority_updates && !h3_profile.priority_updates.is_empty() {
         builder.priority_updates(
             h3_profile
                 .priority_updates

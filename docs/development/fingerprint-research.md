@@ -15,7 +15,7 @@
 | UDP endpoint、socket 和 QUIC backend 生命周期 | `lkquic` |
 | 默认 HTTP headers、header order 和协议组合 | `lkrequest::ClientPreset` |
 | `Cookie` 头顺序 | Session 的 cookie jar（Chrome `CookieSorter` 规则）；`cookie_order()` 可覆盖 |
-| TCP window、MSS、options、TTL | `TcpFingerprint` |
+| TCP 缓冲区、MSS、TTL；目标 window/scale 与 options 描述 | `TcpFingerprint`，受[平台限制](../reference/tcp-fingerprint.md)，不保证改写完整 SYN |
 
 修改应放在能够完整表达行为的最高层。不要通过 patch 底层序列化结果绕过 profile 模型。
 

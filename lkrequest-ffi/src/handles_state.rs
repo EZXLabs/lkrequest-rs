@@ -17,7 +17,6 @@ type CookieValueCache = HashMap<(String, String), Box<[u8]>>;
 #[derive(Clone, Copy, Debug, Default)]
 pub enum PresetKind {
     Chrome131,
-    #[default]
     Chrome144,
     Chrome145,
     Chrome146,
@@ -29,6 +28,8 @@ pub enum PresetKind {
     Chrome152,
     Chrome153,
     Chrome154,
+    #[default]
+    Chrome155,
     Firefox133,
     Firefox147,
     Firefox156,
@@ -170,9 +171,16 @@ pub struct SessionShared {
     pub client: Arc<ClientShared>,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum CookieJsonCacheKey {
+    NameValues(String),
+    WithAttrs(String),
+    AllWithAttrs,
+}
+
 pub struct SessionHandle {
     pub shared: Arc<SessionShared>,
-    pub cookie_json_cache: Mutex<HashMap<String, Box<[u8]>>>,
+    pub cookie_json_cache: Mutex<HashMap<CookieJsonCacheKey, Box<[u8]>>>,
     pub cookie_value_cache: Mutex<CookieValueCache>,
 }
 
@@ -261,6 +269,7 @@ pub enum RequestBody {
 }
 
 pub struct RequestConfig {
+    pub h2_priority_weight: Option<u8>,
     pub method: http::Method,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -284,6 +293,7 @@ pub struct RequestConfig {
 impl RequestConfig {
     pub fn new(method: http::Method, url: String) -> Self {
         Self {
+            h2_priority_weight: None,
             method,
             url,
             headers: Vec::new(),

@@ -788,7 +788,7 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
 /// CM (low nibble of CMF) must be 8 (deflate), CINFO (high nibble) at most 7
 /// (32 KiB window), and the two header bytes read as a big-endian u16 must be a
 /// multiple of 31 — RFC 1950 §2.2. A raw RFC 1951 stream starts with block
-/// header bits instead and virtually never satisfies all three.
+/// header bits instead, but a stored raw block can satisfy all three too.
 fn looks_like_zlib(data: &[u8]) -> bool {
     if data.len() < 2 {
         return false;
@@ -802,16 +802,16 @@ fn looks_like_zlib(data: &[u8]) -> bool {
 ///
 /// RFC 9110 §8.4.1.2 defines `deflate` as the **zlib** format (RFC 1950)
 /// wrapping a deflate stream, but a sizable minority of servers send a bare RFC
-/// 1951 stream instead. Browsers accept both; we sniff the zlib header and pick
-/// the matching decoder, so the spec-correct form no longer fails outright.
+/// 1951 stream instead. Use the same bounded format detection as streaming
+/// responses so a raw stored-block prefix cannot be mistaken for a zlib header.
 fn decompress_deflate(data: &[u8]) -> Result<Vec<u8>, String> {
-    if looks_like_zlib(data) {
-        let mut decoder = flate2::read::ZlibDecoder::new(data);
-        size_limited_read(&mut decoder, "deflate")
-    } else {
-        let mut decoder = flate2::read::DeflateDecoder::new(data);
-        size_limited_read(&mut decoder, "deflate")
+    let mut decoder = DeflateStream::new();
+    let mut output = Vec::new();
+    for chunk in data.chunks(DEFLATE_PROBE_LIMIT) {
+        output.extend_from_slice(&decoder.feed(chunk)?);
     }
+    output.extend_from_slice(&decoder.finish()?);
+    Ok(output)
 }
 
 fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -836,72 +836,215 @@ enum StreamDecoder {
     Zstd(zstd::stream::write::Decoder<'static, Vec<u8>>),
 }
 
-/// Streaming `deflate` decoder that picks zlib (RFC 1950) or raw (RFC 1951)
-/// from the first two bytes.
-///
-/// The one-shot path can sniff its whole input up front; a stream cannot, and
-/// it cannot retry once bytes have been consumed. So the first bytes are held
-/// back until the format is decidable, then replayed into the chosen decoder.
+const DEFLATE_PROBE_LIMIT: usize = 32 * 1024;
+const DEFLATE_OUTPUT_CHUNK: usize = 8 * 1024;
+
+/// Prefer zlib, allowing one bounded raw retry before zlib produces any output.
+/// After 32 KiB without a decision, retain zlib and release the replay buffer.
 enum DeflateStream {
-    /// Fewer than 2 bytes seen — the format is not yet decidable.
-    Undecided(Vec<u8>),
-    Zlib(flate2::write::ZlibDecoder<Vec<u8>>),
-    Raw(flate2::write::DeflateDecoder<Vec<u8>>),
+    Undecided {
+        prefix: Vec<u8>,
+        output_limit: usize,
+    },
+    Probing {
+        prefix: Vec<u8>,
+        inflater: DeflateInflater,
+    },
+    Active(DeflateInflater),
+    Failed,
+}
+
+struct DeflateInflater {
+    decoder: flate2::Decompress,
+    ended: bool,
+    output_limit: usize,
+}
+
+enum DeflateFailure {
+    Corrupt(flate2::DecompressError),
+    Invalid(&'static str),
+    Limit(usize),
+}
+
+impl std::fmt::Display for DeflateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt(error) => write!(f, "deflate stream decode: {error}"),
+            Self::Invalid(message) => write!(f, "deflate stream: {message}"),
+            Self::Limit(limit) => write!(
+                f,
+                "deflate decompressed data exceeds {limit} byte safety limit"
+            ),
+        }
+    }
+}
+
+impl DeflateInflater {
+    fn new(zlib: bool, output_limit: usize) -> Self {
+        Self {
+            decoder: flate2::Decompress::new(zlib),
+            ended: false,
+            output_limit,
+        }
+    }
+
+    fn feed(&mut self, mut input: &[u8], output: &mut Vec<u8>) -> Result<(), DeflateFailure> {
+        while !self.ended {
+            let mut buffer = [0; DEFLATE_OUTPUT_CHUNK];
+            let remaining = self
+                .output_limit
+                .saturating_sub(self.decoder.total_out() as usize);
+            let available = remaining.saturating_add(1).min(buffer.len());
+            let before_in = self.decoder.total_in();
+            let before_out = self.decoder.total_out();
+            let status = self.decoder.decompress(
+                input,
+                &mut buffer[..available],
+                flate2::FlushDecompress::None,
+            );
+            let consumed = (self.decoder.total_in() - before_in) as usize;
+            let produced = (self.decoder.total_out() - before_out) as usize;
+            if self.decoder.total_out() > self.output_limit as u64 {
+                return Err(DeflateFailure::Limit(self.output_limit));
+            }
+            let status = status.map_err(DeflateFailure::Corrupt)?;
+            output.extend_from_slice(&buffer[..produced]);
+            input = &input[consumed..];
+            if status == flate2::Status::StreamEnd {
+                self.ended = true;
+            } else if consumed == 0 && produced == 0 {
+                if !input.is_empty() {
+                    return Err(DeflateFailure::Invalid("decoder made no progress"));
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Bytes, String> {
+        let mut output = Vec::new();
+        self.feed(&[], &mut output)
+            .map_err(|error| error.to_string())?;
+        if !self.ended {
+            return Err("deflate stream: incomplete compressed body".into());
+        }
+        Ok(Bytes::from(output))
+    }
+}
+
+fn raw_stored_prefix(prefix: &[u8]) -> bool {
+    prefix.len() >= 5
+        && prefix[0] & 7 == 0
+        && prefix[1] ^ prefix[3] == 0xff
+        && prefix[2] ^ prefix[4] == 0xff
+}
+
+/// A complete or output-producing zlib payload is not an early format failure.
+/// Check with the same inflate core without the wrapper, never by error strings.
+fn zlib_payload_has_progress(prefix: &[u8]) -> bool {
+    let mut decoder = flate2::Decompress::new(false);
+    let mut output = [0; 1];
+    let status = decoder.decompress(&prefix[2..], &mut output, flate2::FlushDecompress::None);
+    decoder.total_out() > 0 || matches!(status, Ok(flate2::Status::StreamEnd))
 }
 
 impl DeflateStream {
     fn new() -> Self {
-        Self::Undecided(Vec::new())
-    }
-
-    fn feed(&mut self, data: &[u8]) -> Result<Bytes, String> {
-        if let Self::Undecided(pending) = self {
-            pending.extend_from_slice(data);
-            if pending.len() < 2 {
-                return Ok(Bytes::new());
-            }
-            let buffered = std::mem::take(pending);
-            *self = if looks_like_zlib(&buffered) {
-                Self::Zlib(flate2::write::ZlibDecoder::new(Vec::new()))
-            } else {
-                Self::Raw(flate2::write::DeflateDecoder::new(Vec::new()))
-            };
-            return self.write_resolved(&buffered);
+        Self::Undecided {
+            prefix: Vec::new(),
+            output_limit: MAX_DECOMPRESSED_SIZE,
         }
-        self.write_resolved(data)
     }
 
-    fn write_resolved(&mut self, data: &[u8]) -> Result<Bytes, String> {
-        use std::io::Write;
-        let inner = match self {
-            Self::Zlib(d) => {
-                d.write_all(data)
-                    .map_err(|e| format!("deflate (zlib) stream decode: {e}"))?;
-                d.get_mut()
+    fn feed(&mut self, input: &[u8]) -> Result<Bytes, String> {
+        self.feed_inner(input).map_err(|error| error.to_string())
+    }
+
+    fn feed_inner(&mut self, mut input: &[u8]) -> Result<Bytes, DeflateFailure> {
+        let mut output = Vec::new();
+        loop {
+            match std::mem::replace(self, Self::Failed) {
+                Self::Undecided {
+                    mut prefix,
+                    output_limit,
+                } => {
+                    let count = (2 - prefix.len()).min(input.len());
+                    prefix.extend_from_slice(&input[..count]);
+                    input = &input[count..];
+                    if prefix.len() < 2 {
+                        *self = Self::Undecided {
+                            prefix,
+                            output_limit,
+                        };
+                        break;
+                    }
+                    let zlib = looks_like_zlib(&prefix);
+                    let mut inflater = DeflateInflater::new(zlib, output_limit);
+                    if zlib {
+                        *self = Self::Probing { prefix, inflater };
+                    } else {
+                        inflater.feed(&prefix, &mut output)?;
+                        *self = Self::Active(inflater);
+                    }
+                }
+                Self::Probing {
+                    mut prefix,
+                    mut inflater,
+                } => {
+                    let count = (DEFLATE_PROBE_LIMIT - prefix.len()).min(input.len());
+                    prefix.extend_from_slice(&input[..count]);
+                    input = &input[count..];
+                    if prefix.len() < 5 {
+                        *self = Self::Probing { prefix, inflater };
+                        break;
+                    }
+                    let consumed = inflater.decoder.total_in() as usize;
+                    match inflater.feed(&prefix[consumed..], &mut output) {
+                        Err(DeflateFailure::Corrupt(error))
+                            if inflater.decoder.total_out() == 0
+                                && error.needs_dictionary().is_none()
+                                && prefix[1] & 0x20 == 0
+                                && raw_stored_prefix(&prefix)
+                                && !zlib_payload_has_progress(&prefix) =>
+                        {
+                            let mut raw = DeflateInflater::new(false, inflater.output_limit);
+                            raw.feed(&prefix, &mut output)?;
+                            *self = Self::Active(raw);
+                        }
+                        Err(error) => return Err(error),
+                        Ok(())
+                            if inflater.decoder.total_out() > 0
+                                || inflater.ended
+                                || prefix.len() == DEFLATE_PROBE_LIMIT =>
+                        {
+                            *self = Self::Active(inflater);
+                        }
+                        Ok(()) => {
+                            *self = Self::Probing { prefix, inflater };
+                            break;
+                        }
+                    }
+                }
+                Self::Active(mut inflater) => {
+                    inflater.feed(input, &mut output)?;
+                    *self = Self::Active(inflater);
+                    break;
+                }
+                Self::Failed => return Err(DeflateFailure::Invalid("decoder previously failed")),
             }
-            Self::Raw(d) => {
-                d.write_all(data)
-                    .map_err(|e| format!("deflate (raw) stream decode: {e}"))?;
-                d.get_mut()
-            }
-            // Unreachable: `feed` resolves the format before calling this.
-            Self::Undecided(_) => return Ok(Bytes::new()),
-        };
-        Ok(Bytes::from(std::mem::take(inner)))
+        }
+        Ok(Bytes::from(output))
     }
 
     fn finish(self) -> Result<Bytes, String> {
         match self {
-            // A body of fewer than 2 bytes carries no decodable stream.
-            Self::Undecided(_) => Ok(Bytes::new()),
-            Self::Zlib(d) => d
-                .finish()
-                .map(Bytes::from)
-                .map_err(|e| format!("deflate (zlib) stream finish: {e}")),
-            Self::Raw(d) => d
-                .finish()
-                .map(Bytes::from)
-                .map_err(|e| format!("deflate (raw) stream finish: {e}")),
+            Self::Undecided { prefix, .. } if prefix.is_empty() => Ok(Bytes::new()),
+            Self::Undecided { .. } | Self::Probing { .. } => {
+                Err("deflate stream: incomplete compressed body".into())
+            }
+            Self::Active(inflater) => inflater.finish(),
+            Self::Failed => Err("deflate stream: decoder previously failed".into()),
         }
     }
 }
@@ -1081,7 +1224,50 @@ pub(crate) enum BodyStream {
     H1(tokio::sync::mpsc::Receiver<Result<bytes::Bytes, String>>),
     /// HTTP/3 body stream.
     #[cfg(feature = "quic-h3")]
-    H3(Box<lkh3::H3RecvStream>),
+    H3(Box<H3BodyStream>),
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) struct H3BodyStream {
+    pub(crate) stream: lkh3::H3RecvStream,
+    pub(crate) data_eof: bool,
+    // The backend closes the connection when its final sender is dropped.
+    // An unpooled response must therefore retain one through body completion.
+    pub(crate) sender: Option<lkh3::H3Sender>,
+}
+
+#[cfg(feature = "quic-h3")]
+impl H3BodyStream {
+    async fn chunk(&mut self) -> crate::error::Result<Option<Bytes>> {
+        if self.sender.is_none() {
+            return Ok(None);
+        }
+        if !self.data_eof {
+            match self.stream.data().await {
+                Some(Ok(chunk)) => return Ok(Some(chunk)),
+                Some(Err(error)) => {
+                    self.sender.take();
+                    return Err(crate::error::Error::h3_request_error(
+                        crate::error::ConnectionPhase::HttpRequest,
+                        error,
+                        true,
+                    ));
+                }
+                None => self.data_eof = true,
+            }
+        }
+        // Keep this phase across cancelled chunk futures: DATA ends at trailers,
+        // but success requires validated trailers and the final stream boundary.
+        let completion = self.stream.trailers().await;
+        self.sender.take();
+        completion.map(|_| None).map_err(|error| {
+            crate::error::Error::h3_request_error(
+                crate::error::ConnectionPhase::HttpRequest,
+                error,
+                true,
+            )
+        })
+    }
 }
 
 /// A streaming HTTP response whose body is read on demand.
@@ -1197,14 +1383,7 @@ impl StreamingResponse {
                 None => Ok(None),
             },
             #[cfg(feature = "quic-h3")]
-            BodyStream::H3(recv_stream) => match recv_stream.data().await {
-                Some(Ok(chunk)) => Ok(Some(chunk)),
-                Some(Err(e)) => Err(crate::error::Error::http3_or_connection_closed(
-                    crate::error::ConnectionPhase::HttpRequest,
-                    e.to_string(),
-                )),
-                None => Ok(None),
-            },
+            BodyStream::H3(body) => body.chunk().await,
         };
 
         if let Ok(Some(ref data)) = result {
@@ -1577,6 +1756,208 @@ mod tests {
             }
             out.extend_from_slice(&dec.finish().unwrap());
             assert_eq!(out.as_ref(), original);
+        }
+    }
+
+    fn colliding_raw_deflate(tail: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0x78, 0x9c, 0x00, 0x63, 0xff];
+        raw.extend_from_slice(&[b'A'; 156]);
+        raw.extend_from_slice(&compress_deflate(tail));
+        raw
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn deflate_ambiguous_prefix_survives_split_and_large_source_chunks() {
+        let tail: Vec<u8> = (0..100_000).map(|index| (index % 251) as u8).collect();
+        let raw = colliding_raw_deflate(&tail);
+        let mut expected = vec![b'A'; 156];
+        expected.extend_from_slice(&tail);
+        assert!(looks_like_zlib(&raw));
+        assert_eq!(decompress_deflate(&raw).unwrap(), expected);
+
+        for first_len in [1, 2, 4] {
+            for chunk_len in [1, 2, 4, DEFLATE_PROBE_LIMIT, usize::MAX] {
+                let mut decoder = DeflateStream::new();
+                let mut decoded = decoder.feed(&raw[..first_len]).unwrap().to_vec();
+                for chunk in raw[first_len..].chunks(chunk_len) {
+                    decoded.extend_from_slice(&decoder.feed(chunk).unwrap());
+                }
+                decoded.extend_from_slice(&decoder.finish().unwrap());
+                assert_eq!(decoded, expected, "first={first_len}, chunk={chunk_len}");
+            }
+        }
+    }
+
+    #[test]
+    fn deflate_corrupt_checksum_and_incomplete_streams_are_errors() {
+        let payload = b"complete data followed by a verified end of stream".repeat(256);
+        let zlib = zlib_compress(&payload);
+        let raw = compress_deflate(&payload);
+        let mut checksum = zlib.clone();
+        *checksum.last_mut().unwrap() ^= 1;
+        for malformed in [
+            vec![0x78],
+            vec![0x78, 0x9c],
+            vec![0x78, 0x9c, 0xff, 0xff, 0xff],
+            checksum,
+            zlib[..zlib.len() - 1].to_vec(),
+            raw[..raw.len() - 1].to_vec(),
+            colliding_raw_deflate(&payload)[..7].to_vec(),
+        ] {
+            assert!(decompress_deflate(&malformed).is_err());
+            for chunk_len in [1, 2, 4, usize::MAX] {
+                let mut decoder = DeflateStream::new();
+                let failed_during_feed = malformed
+                    .chunks(chunk_len)
+                    .any(|chunk| decoder.feed(chunk).is_err());
+                assert!(
+                    failed_during_feed || decoder.finish().is_err(),
+                    "chunk={chunk_len}"
+                );
+            }
+        }
+        for valid in [zlib, raw, zlib_compress(&[]), compress_deflate(&[])] {
+            let expected = if valid.len() <= 8 {
+                &[][..]
+            } else {
+                payload.as_slice()
+            };
+            assert_eq!(decompress_deflate(&valid).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn deflate_does_not_replay_after_output_or_checksum_failure() {
+        let payload = b"already delivered decoded bytes".repeat(128);
+        let mut zlib = zlib_compress(&payload);
+        let checksum_start = zlib.len() - 4;
+        *zlib.last_mut().unwrap() ^= 1;
+        let mut decoder = DeflateStream::new();
+        let decoded = decoder.feed(&zlib[..checksum_start]).unwrap();
+        assert_eq!(decoded.as_ref(), payload);
+        assert!(matches!(decoder, DeflateStream::Active(_)));
+        assert!(decoder.feed(&zlib[checksum_start..]).is_err());
+        assert!(decoder
+            .feed(&colliding_raw_deflate(b"must not replay"))
+            .is_err());
+        assert!(decoder.finish().is_err());
+
+        let mut truncated = DeflateStream::new();
+        assert_eq!(
+            truncated.feed(&zlib[..checksum_start]).unwrap().as_ref(),
+            payload
+        );
+        assert!(truncated.finish().is_err());
+    }
+
+    #[test]
+    fn deflate_ambiguous_empty_zlib_checksum_is_not_a_raw_fallback() {
+        use std::io::Read;
+
+        // Both a valid raw stored block and an empty zlib payload with a bad checksum.
+        // The completed zlib payload takes precedence over raw compatibility.
+        let mut ambiguous = vec![0x18, 0x57, 0x03, 0xa8, 0xfc];
+        ambiguous.extend_from_slice(&[b'A'; 855]);
+        ambiguous.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+        let mut raw = Vec::new();
+        flate2::read::DeflateDecoder::new(ambiguous.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(raw, vec![b'A'; 855]);
+        assert!(looks_like_zlib(&ambiguous));
+        assert!(raw_stored_prefix(&ambiguous));
+        assert!(zlib_payload_has_progress(&ambiguous));
+        assert!(decompress_deflate(&ambiguous).is_err());
+        for chunk_len in [1, 4, usize::MAX] {
+            let mut decoder = DeflateStream::new();
+            assert!(ambiguous
+                .chunks(chunk_len)
+                .any(|chunk| decoder.feed(chunk).is_err()));
+        }
+    }
+
+    #[test]
+    fn deflate_probe_limit_commits_zlib_and_releases_replay_prefix() {
+        let mut zlib = vec![0x78, 0x9c];
+        for _ in 0..7000 {
+            zlib.extend_from_slice(&[0x00, 0x00, 0x00, 0xff, 0xff]);
+        }
+        zlib.extend_from_slice(&[0x01, 0x01, 0x00, 0xfe, 0xff, b'Z']);
+        zlib.extend_from_slice(&[0x00, 0x5b, 0x00, 0x5b]);
+        assert!(zlib.len() > DEFLATE_PROBE_LIMIT);
+        let mut decoder = DeflateStream::new();
+        assert!(decoder
+            .feed(&zlib[..DEFLATE_PROBE_LIMIT - 1])
+            .unwrap()
+            .is_empty());
+        assert!(
+            matches!(&decoder, DeflateStream::Probing { prefix, .. } if prefix.len() == DEFLATE_PROBE_LIMIT - 1)
+        );
+        assert!(decoder
+            .feed(&zlib[DEFLATE_PROBE_LIMIT - 1..DEFLATE_PROBE_LIMIT])
+            .unwrap()
+            .is_empty());
+        assert!(matches!(decoder, DeflateStream::Active(_)));
+        let mut decoded = decoder.feed(&zlib[DEFLATE_PROBE_LIMIT..]).unwrap().to_vec();
+        decoded.extend_from_slice(&decoder.finish().unwrap());
+        assert_eq!(decoded, b"Z");
+        assert_eq!(decompress_deflate(&zlib).unwrap(), b"Z");
+
+        let mut invalid = DeflateStream::new();
+        assert!(invalid
+            .feed(&zlib[..DEFLATE_PROBE_LIMIT])
+            .unwrap()
+            .is_empty());
+        assert!(matches!(invalid, DeflateStream::Active(_)));
+        assert!(invalid.feed(&colliding_raw_deflate(&[])).is_err());
+    }
+
+    #[test]
+    fn deflate_output_limit_applies_before_allocation_and_never_retries_raw() {
+        let limit = 1024;
+        for length in [limit, limit + 1] {
+            let payload = vec![b'X'; length];
+            let mut colliding_payload = vec![b'A'; 156];
+            colliding_payload.extend_from_slice(&payload[..length - 156]);
+            for encoded in [
+                zlib_compress(&payload),
+                compress_deflate(&payload),
+                colliding_raw_deflate(&payload[..length - 156]),
+            ] {
+                for chunk_len in [1, DEFLATE_PROBE_LIMIT, usize::MAX] {
+                    let mut decoder = DeflateStream::Undecided {
+                        prefix: Vec::new(),
+                        output_limit: limit,
+                    };
+                    let mut decoded = Vec::new();
+                    let mut failure = None;
+                    for chunk in encoded.chunks(chunk_len) {
+                        match decoder.feed(chunk) {
+                            Ok(bytes) => decoded.extend_from_slice(&bytes),
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if length == limit {
+                        decoded.extend_from_slice(&decoder.finish().unwrap());
+                        assert!(decoded == payload || decoded == colliding_payload);
+                    } else {
+                        assert!(failure.unwrap().contains("safety limit"));
+                        assert!(decoded.len() <= limit);
+                        assert!(matches!(decoder, DeflateStream::Failed));
+                    }
+                }
+            }
         }
     }
 

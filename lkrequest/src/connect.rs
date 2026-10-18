@@ -79,14 +79,14 @@ impl AsyncWrite for TransportKind {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Tls(s) => AsyncWrite::poll_flush(Pin::new(s.as_mut()), cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_browser_flush(cx),
             Self::Plain(s) => AsyncWrite::poll_flush(Pin::new(s), cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Tls(s) => AsyncWrite::poll_shutdown(Pin::new(s.as_mut()), cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_browser_shutdown(cx),
             Self::Plain(s) => AsyncWrite::poll_shutdown(Pin::new(s), cx),
         }
     }
@@ -538,6 +538,16 @@ async fn connect_tcp_direct(
         )
     })?
     .map_err(|e| {
+        if let Some(timeout) = e
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::dns::DnsTimeout>())
+        {
+            return Error::timeout(
+                timeout.to_string(),
+                Some(ConnectionPhase::DnsResolution),
+                Some(timeout.0),
+            );
+        }
         Error::connection(
             ConnectionPhase::TcpConnect,
             format!("TCP connect to {host}:{port} failed: {e}"),

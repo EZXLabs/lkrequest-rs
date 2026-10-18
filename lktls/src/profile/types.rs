@@ -20,8 +20,8 @@ pub struct TlsProfile {
     /// Human-readable name, e.g. "Chrome 131".
     pub name: String,
 
-    /// TLS ClientHello stack style used for browser-family-specific encoding
-    /// rules that cannot be represented as simple ordered lists.
+    /// TLS stack style used for browser-family-specific wire encoding and
+    /// handshake rejection rules that cannot be represented as ordered lists.
     ///
     /// This is intentionally scoped to TLS only. HTTP/2, HTTP/3, and header
     /// ordering stay in their own profile layers.
@@ -121,6 +121,8 @@ pub struct TlsProfile {
     /// - Firefox: typically `[51, 10, 13, 43, 45, 28, 27]`
     ///
     /// If `None`, defaults to compressing `key_share` (51) only.
+    /// Dynamically added HRR cookies are also compressed for Chromium-style
+    /// ClientHellos; generic styles compress them only when 44 is listed here.
     #[serde(default)]
     pub ech_outer_extensions: Option<Vec<u16>>,
 
@@ -137,10 +139,10 @@ pub struct TlsProfile {
     pub session_resumption: SessionResumptionConfig,
 }
 
-/// TLS stack style for ClientHello construction.
+/// TLS stack style for ClientHello construction and handshake validation.
 ///
 /// The style captures browser-family behavior such as GREASE placement,
-/// extension permutation boundaries, and other ClientHello encoding details.
+/// extension permutation boundaries, and fixed ServerHello rejection rules.
 /// Profiles that do not need stack-specific behavior should use `Generic`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -318,6 +320,8 @@ pub struct EchGreaseConfig {
     pub kdf_id: u16,
 
     /// HPKE AEAD algorithm ID (e.g. 0x0001 = AES-128-GCM, 0x0003 = ChaCha20Poly1305).
+    /// Generic and Chromium styles emit this value. Firefox/NSS style selects
+    /// AES-128-GCM or ChaCha20Poly1305 per handshake; this is its capture baseline.
     pub aead_id: u16,
 
     /// Length of the `enc` field in bytes (typically 32 for X25519).

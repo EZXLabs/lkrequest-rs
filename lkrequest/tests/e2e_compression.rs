@@ -29,6 +29,59 @@ fn chrome_client() -> Client {
 
 const EXPECTED_PAYLOAD: &str = "Hello, compressed world! ";
 
+fn raw_deflate_with_zlib_prefix() -> Vec<u8> {
+    use std::io::Read;
+
+    // Non-final stored block with 156 literal bytes, then an empty final block.
+    let mut raw = vec![0x78, 0x9c, 0x00, 0x63, 0xff];
+    raw.extend_from_slice(&[b'A'; 156]);
+    raw.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+    let mut decoded = Vec::new();
+    flate2::read::DeflateDecoder::new(raw.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, vec![b'A'; 156], "fixture is valid raw deflate");
+    raw
+}
+
+#[tokio::test]
+async fn ambiguous_deflate_prefix_decodes_buffered() {
+    let url = spawn_canned_server(&["deflate"], raw_deflate_with_zlib_prefix(), None).await;
+    let session = chrome_client().session().http1_only().build();
+    let response = session
+        .get(&url)
+        .send()
+        .await
+        .expect("valid raw deflate must survive a zlib-looking prefix");
+
+    assert_eq!(response.bytes(), &[b'A'; 156]);
+}
+
+#[tokio::test]
+async fn ambiguous_deflate_prefix_decodes_streaming_one_byte_chunks() {
+    let url = spawn_canned_server(&["deflate"], raw_deflate_with_zlib_prefix(), Some(1)).await;
+    let session = chrome_client().session().http1_only().build();
+    let mut response = session
+        .get(&url)
+        .send_streaming()
+        .await
+        .expect("receive deflate response headers");
+    let mut decoded = Vec::new();
+    while let Some(chunk) = response
+        .chunk_decoded()
+        .await
+        .expect("valid raw deflate must survive split ambiguous prefix")
+    {
+        decoded.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(
+        decoded,
+        vec![b'A'; 156],
+        "fallback must not duplicate output"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // gzip
 // ---------------------------------------------------------------------------

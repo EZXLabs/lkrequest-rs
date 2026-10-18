@@ -67,14 +67,49 @@ pub struct H3Profile {
     pub qpack_max_table_capacity: u64,
     /// Maximum blocked streams for QPACK.
     pub qpack_blocked_streams: u64,
+    /// Defer each QPACK stream's type prefix until its first instruction.
+    /// Control SETTINGS and stream allocation are unaffected. False preserves
+    /// eager prefixes for older/custom profiles; applied by both H3 constructors.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub defer_qpack_stream_prefixes: bool,
     /// Optional `SETTINGS_MAX_FIELD_SECTION_SIZE`.
     pub max_field_section_size: Option<u64>,
     /// RFC 9218 PRIORITY_UPDATE frames to send on the control stream after
-    /// SETTINGS.  Each entry is `(element_id, field_value)` where
+    /// SETTINGS when `request_priority_updates` is false. Each entry is `(element_id, field_value)` where
     /// `element_id` is the predicted request stream ID (0, 4, 8, …) and
-    /// `field_value` is the serialized priority (e.g., `"u=1, i"`).
+    /// `field_value` is the serialized priority (e.g., `"u=1, i"`). In per-request
+    /// mode only the first field value supplies the fallback for unannotated
+    /// low-level requests; targets always come from actual allocated streams.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub priority_updates: Vec<(u64, String)>,
+    /// Send a control-stream priority update for each actual request stream
+    /// before HEADERS, rather than emitting `priority_updates` at connection
+    /// creation. The latter list supplies a fallback when no request priority
+    /// is supplied. Off for older/custom profiles unless explicitly enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_priority_updates: bool,
+    /// Accept incomplete response DATA, HEADERS, and unknown-frame payloads at FIN.
+    /// Requires complete frame type and length fields. Known control-frame and
+    /// message-order checks still apply.
+    /// False preserves the backend's existing response-framing behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub accept_truncated_response_payloads: bool,
+    /// Wait for connection termination if response FIN leaves a partial frame
+    /// type or length. Based on local Chrome 155 fault captures; independent of
+    /// payload EOF tolerance. Older/custom profiles retain immediate errors.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wait_for_incomplete_response_frame_headers: bool,
+    /// Keep the response direction open after a pending buffered upload receives
+    /// STOP_SENDING, until a response reset, connection error, or caller cancellation.
+    /// Based on local Chrome 155 captures; streamed uploads keep their existing policy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wait_for_response_after_upload_stop: bool,
+    /// Cancel the response direction before resetting a cancelled upload on
+    /// streams created outside 0-RTT. Streams opened in 0-RTT retain legacy dispatch.
+    /// Matching packet order also requires the caller to configure the QUIC
+    /// transport with [`QuicPacketizationProfile::stop_before_matching_reset`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancel_response_before_upload: bool,
     /// Whether to emit a single GREASE frame (RFC 9114 §7.2.8 reserved frame
     /// type) on the control stream after SETTINGS. This is separate from
     /// `grease_settings` (the reserved *setting*): Chrome additionally sends a
@@ -165,6 +200,59 @@ pub struct QuicPacketizationProfile {
     /// from the pending Initial data. Overrides a fixed layout when enabled.
     #[serde(default, skip_serializing_if = "is_false")]
     pub initial_packet_chaos: bool,
+    /// Serialize a pending STOP_SENDING before its matching RESET_STREAM.
+    /// Independent of H3 cancellation dispatch; callers must apply this option
+    /// to the QUIC transport configuration.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stop_before_matching_reset: bool,
+    /// Bundle ACKs in 1-RTT packets only while a real ACK obligation is pending,
+    /// without promoting ACK-only receive traffic into an immediate ACK.
+    /// Callers must apply this option to the QUIC transport configuration.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ack_obligation_only: bool,
+    /// Respond to a 1-RTT STOP_SENDING on a locally finished send stream with
+    /// RESET_STREAM carrying the STOP code while data or FIN remains unacknowledged.
+    /// Local finish can precede wire FIN. Callers must apply this option to
+    /// the QUIC transport; false preserves its previous finished-stream policy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reset_finished_on_stop: bool,
+    /// Use one probe and skip one packet number for an actual 1-RTT PTO,
+    /// without requesting IMMEDIATE_ACK solely because PTO fired. Required ACKs
+    /// and non-PTO sources retain their behavior. Callers must apply this option
+    /// to the QUIC transport configuration.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pto_single_probe_with_gap: bool,
+    /// Use Chrome's twice-variation PTO interval and first-flight time bounds
+    /// for 1-RTT after handshake confirmation and an RTT sample. The shared recovery
+    /// alarm retains PTO or time-loss updates strictly below one millisecond.
+    /// Loss thresholds, other timers and the configured initial RTT retain their behavior. Callers
+    /// must apply this option to the QUIC transport configuration.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chrome_pto_timing: bool,
+    /// Retain original early streams after a completed, compatible PSK handshake
+    /// rejects 0-RTT, and retransmit under 1-RTT keys. TLS acceptance stays false.
+    /// Unknown TLS providers, HRR and reduced peer limits retain legacy recovery.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reuse_rejected_0rtt_streams: bool,
+    /// Quantize smoothed RTT and variation using the pinned Chromium arithmetic.
+    /// Raw latest/minimum RTT and other timing policies remain independently configured.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chrome_rtt_quantization: bool,
+    /// Use the previous smoothed RTT and adjusted latest sample for time-based
+    /// loss, applying the 1 ms RTT floor before the configured loss multiplier.
+    /// Independent of PTO timing and S/V quantization; the multiplier is unchanged.
+    /// Callers must apply this option to the QUIC transport configuration.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chrome_loss_timing: bool,
+    /// Queue confirmed 1-RTT PTO retransmissions while the socket writer is blocked.
+    /// This does not permit draining ordinary new application data behind that writer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub queue_pto_while_blocked: bool,
+    /// Discard an unsent application CONNECTION_CLOSE for a confirmed client
+    /// connection when its socket writer is blocked. Callers must apply this
+    /// option to the QUIC transport configuration; older/custom profiles opt in.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub discard_blocked_close: bool,
 }
 
 impl Default for QuicPacketizationProfile {
@@ -177,6 +265,16 @@ impl Default for QuicPacketizationProfile {
             enable_ecn: true,
             initial_frame_layout: None,
             initial_packet_chaos: false,
+            stop_before_matching_reset: false,
+            ack_obligation_only: false,
+            reset_finished_on_stop: false,
+            pto_single_probe_with_gap: false,
+            chrome_pto_timing: false,
+            reuse_rejected_0rtt_streams: false,
+            chrome_rtt_quantization: false,
+            chrome_loss_timing: false,
+            queue_pto_while_blocked: false,
+            discard_blocked_close: false,
         }
     }
 }
@@ -673,8 +771,14 @@ pub fn chrome_h3() -> H3Profile {
         ],
         qpack_max_table_capacity: 65_536,
         qpack_blocked_streams: 100,
+        defer_qpack_stream_prefixes: false,
         max_field_section_size: Some(262_144),
         priority_updates: vec![],
+        request_priority_updates: false,
+        accept_truncated_response_payloads: false,
+        wait_for_incomplete_response_frame_headers: false,
+        wait_for_response_after_upload_stop: false,
+        cancel_response_before_upload: false,
         // Chrome sends a reserved GREASE frame on the control stream after
         // SETTINGS (observed as the second `GREASE` token in browserleaks'
         // h3_text, before the PRIORITY_UPDATE).
@@ -799,6 +903,16 @@ pub fn chrome_146_quic() -> QuicProfile {
             enable_ecn: false,
             initial_frame_layout: None,
             initial_packet_chaos: true,
+            stop_before_matching_reset: false,
+            ack_obligation_only: false,
+            reset_finished_on_stop: false,
+            pto_single_probe_with_gap: false,
+            chrome_pto_timing: false,
+            reuse_rejected_0rtt_streams: false,
+            chrome_rtt_quantization: false,
+            chrome_loss_timing: false,
+            queue_pto_while_blocked: false,
+            discard_blocked_close: false,
         },
     }
 }
@@ -879,6 +993,16 @@ pub fn chrome_150_quic() -> QuicProfile {
             // Chromium's source generates layouts for each actual ClientHello.
             initial_frame_layout: None,
             initial_packet_chaos: true,
+            stop_before_matching_reset: false,
+            ack_obligation_only: false,
+            reset_finished_on_stop: false,
+            pto_single_probe_with_gap: false,
+            chrome_pto_timing: false,
+            reuse_rejected_0rtt_streams: false,
+            chrome_rtt_quantization: false,
+            chrome_loss_timing: false,
+            queue_pto_while_blocked: false,
+            discard_blocked_close: false,
         },
     }
 }
@@ -974,6 +1098,40 @@ pub fn chrome_154_quic() -> QuicProfile {
     profile
 }
 
+/// Chrome 155 HTTP/3 profile.
+/// Public Cloudflare captures establish SETTINGS, control-stream GREASE, and
+/// navigation/favicon priority updates targeting each request before HEADERS.
+/// Response payload EOF tolerance is established separately by local Chrome 155
+/// captures with malformed responses, not by the public SETTINGS/priority evidence.
+pub fn chrome_155_h3() -> H3Profile {
+    let mut profile = chrome_154_h3();
+    profile.defer_qpack_stream_prefixes = true;
+    profile.request_priority_updates = true;
+    profile.accept_truncated_response_payloads = true;
+    profile.wait_for_incomplete_response_frame_headers = true;
+    profile.wait_for_response_after_upload_stop = true;
+    profile.cancel_response_before_upload = true;
+    profile
+}
+
+/// Chrome 155 fresh QUIC transport and Initial layout captured on 2026-10-07.
+/// Stable values match 154; GREASE, parameter order and Initial chaos vary.
+pub fn chrome_155_quic() -> QuicProfile {
+    let mut profile = chrome_154_quic();
+    profile.h3 = chrome_155_h3();
+    profile.packetization.stop_before_matching_reset = true;
+    profile.packetization.ack_obligation_only = true;
+    profile.packetization.reset_finished_on_stop = true;
+    profile.packetization.pto_single_probe_with_gap = true;
+    profile.packetization.chrome_pto_timing = true;
+    profile.packetization.reuse_rejected_0rtt_streams = true;
+    profile.packetization.chrome_rtt_quantization = true;
+    profile.packetization.chrome_loss_timing = true;
+    profile.packetization.queue_pto_while_blocked = true;
+    profile.packetization.discard_blocked_close = true;
+    profile
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![
@@ -989,8 +1147,14 @@ pub fn firefox_h3() -> H3Profile {
         ],
         qpack_max_table_capacity: 65_536,
         qpack_blocked_streams: 20,
+        defer_qpack_stream_prefixes: false,
         max_field_section_size: None,
         priority_updates: vec![],
+        request_priority_updates: false,
+        accept_truncated_response_payloads: false,
+        wait_for_incomplete_response_frame_headers: false,
+        wait_for_response_after_upload_stop: false,
+        cancel_response_before_upload: false,
         // Firefox does not emit a control-stream GREASE frame.
         send_control_grease_frame: false,
         chromium_grease: false,
@@ -1000,6 +1164,654 @@ pub fn firefox_h3() -> H3Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_priority_updates_are_version_scoped_and_serde_opt_in() {
+        assert!(chrome_155_h3().request_priority_updates);
+        assert!(!chrome_154_h3().request_priority_updates);
+        assert!(!chrome_146_h3().request_priority_updates);
+        assert!(!chrome_h3().request_priority_updates);
+        let mut value = serde_json::to_value(chrome_155_h3()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("request_priority_updates");
+        let legacy: H3Profile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.request_priority_updates);
+    }
+
+    #[test]
+    fn clock_and_writer_policies_are_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.chrome_rtt_quantization,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+            assert_eq!(
+                profile.packetization.queue_pto_while_blocked,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert!(!empty.chrome_rtt_quantization);
+        assert!(!empty.queue_pto_while_blocked);
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        for field in ["chrome_rtt_quantization", "queue_pto_while_blocked"] {
+            value["packetization"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        let legacy: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.packetization.chrome_rtt_quantization);
+        assert!(!legacy.packetization.queue_pto_while_blocked);
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+    }
+
+    #[test]
+    fn loss_timing_policy_is_version_scoped_and_serde_opt_in() {
+        let default = QuicPacketizationProfile::default();
+        assert!(!default.chrome_loss_timing);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, default);
+        assert!(serde_json::to_value(default)
+            .unwrap()
+            .get("chrome_loss_timing")
+            .is_none());
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.chrome_loss_timing,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!chrome_154_quic().packetization.chrome_loss_timing);
+
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["chrome_loss_timing"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("chrome_loss_timing");
+        let missing: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert!(!missing.packetization.chrome_loss_timing);
+        assert!(missing.packetization.chrome_pto_timing);
+        assert!(missing.packetization.chrome_rtt_quantization);
+        assert_eq!(serde_json::to_value(&missing).unwrap(), value);
+        value["packetization"]["chrome_loss_timing"] = false.into();
+        let explicit_false: QuicProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(explicit_false, missing);
+        assert!(
+            serde_json::to_value(explicit_false).unwrap()["packetization"]
+                .get("chrome_loss_timing")
+                .is_none()
+        );
+
+        let custom = QuicPacketizationProfile {
+            chrome_loss_timing: true,
+            ..QuicPacketizationProfile::default()
+        };
+        let custom_round_trip: QuicPacketizationProfile =
+            serde_json::from_value(serde_json::to_value(&custom).unwrap()).unwrap();
+        assert_eq!(custom_round_trip, custom);
+        assert!(!custom.chrome_pto_timing);
+        assert!(!custom.chrome_rtt_quantization);
+    }
+
+    #[test]
+    fn loss_timing_policy_is_independent_of_pto_and_rtt_quantization() {
+        let enabled = chrome_155_quic();
+        let independent = [
+            "chrome_loss_timing",
+            "chrome_pto_timing",
+            "chrome_rtt_quantization",
+        ];
+        let mut expected = serde_json::to_value(&enabled).unwrap();
+        for field in independent {
+            expected["packetization"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        for loss in [false, true] {
+            for pto in [false, true] {
+                for quantization in [false, true] {
+                    let mut candidate = enabled.clone();
+                    candidate.packetization.chrome_loss_timing = loss;
+                    candidate.packetization.chrome_pto_timing = pto;
+                    candidate.packetization.chrome_rtt_quantization = quantization;
+                    candidate.validate().unwrap();
+                    let round_trip: QuicProfile =
+                        serde_json::from_value(serde_json::to_value(&candidate).unwrap()).unwrap();
+                    assert_eq!(round_trip.packetization.chrome_loss_timing, loss);
+                    assert_eq!(round_trip.packetization.chrome_pto_timing, pto);
+                    assert_eq!(
+                        round_trip.packetization.chrome_rtt_quantization,
+                        quantization
+                    );
+                    let mut actual = serde_json::to_value(round_trip).unwrap();
+                    for field in independent {
+                        actual["packetization"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(field);
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "loss timing must not change TLS-facing settings, TP, Initial or other policy fields"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_close_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.discard_blocked_close,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!QuicPacketizationProfile::default().discard_blocked_close);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert!(!empty.discard_blocked_close);
+
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["discard_blocked_close"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("discard_blocked_close");
+        let missing: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert!(!missing.packetization.discard_blocked_close);
+        assert_eq!(serde_json::to_value(&missing).unwrap(), value);
+
+        let mut explicit_false = value.clone();
+        explicit_false["packetization"]["discard_blocked_close"] = false.into();
+        let disabled: QuicProfile = serde_json::from_value(explicit_false).unwrap();
+        assert_eq!(disabled, missing);
+        let encoded = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(encoded, value);
+        let disabled_round_trip: QuicProfile = serde_json::from_value(encoded).unwrap();
+        assert_eq!(disabled_round_trip, disabled);
+    }
+
+    #[test]
+    fn early_rejection_reuse_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.reuse_rejected_0rtt_streams,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert!(!empty.reuse_rejected_0rtt_streams);
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reuse_rejected_0rtt_streams");
+        let legacy: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.packetization.reuse_rejected_0rtt_streams);
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+    }
+
+    #[test]
+    fn pto_timing_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.chrome_pto_timing,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!QuicPacketizationProfile::default().chrome_pto_timing);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, QuicPacketizationProfile::default());
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["chrome_pto_timing"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("chrome_pto_timing");
+        let legacy: QuicProfile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.packetization.chrome_pto_timing);
+        assert!(legacy.packetization.pto_single_probe_with_gap);
+        assert!(legacy.packetization.ack_obligation_only);
+        assert!(serde_json::to_value(legacy).unwrap()["packetization"]
+            .get("chrome_pto_timing")
+            .is_none());
+    }
+
+    #[test]
+    fn pto_timing_policy_leaves_other_profile_fields_unchanged() {
+        let enabled = chrome_155_quic();
+        let mut expected = serde_json::to_value(&enabled).unwrap();
+        expected["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("chrome_pto_timing");
+        for chrome_pto_timing in [false, true] {
+            let mut candidate = enabled.clone();
+            candidate.packetization.chrome_pto_timing = chrome_pto_timing;
+            candidate.validate().unwrap();
+            let mut actual = serde_json::to_value(candidate).unwrap();
+            actual["packetization"]
+                .as_object_mut()
+                .unwrap()
+                .remove("chrome_pto_timing");
+            assert_eq!(
+                actual, expected,
+                "header, SETTINGS, TP, Initial and other timing policies must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn pto_probe_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.pto_single_probe_with_gap,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!QuicPacketizationProfile::default().pto_single_probe_with_gap);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, QuicPacketizationProfile::default());
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["pto_single_probe_with_gap"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pto_single_probe_with_gap");
+        let legacy: QuicProfile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.packetization.pto_single_probe_with_gap);
+        assert!(legacy.packetization.reset_finished_on_stop);
+        assert!(legacy.packetization.ack_obligation_only);
+        assert!(serde_json::to_value(legacy).unwrap()["packetization"]
+            .get("pto_single_probe_with_gap")
+            .is_none());
+    }
+
+    #[test]
+    fn pto_probe_policy_leaves_other_profile_fields_unchanged() {
+        let enabled = chrome_155_quic();
+        let mut expected = serde_json::to_value(&enabled).unwrap();
+        expected["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pto_single_probe_with_gap");
+        for pto_single_probe_with_gap in [false, true] {
+            let mut candidate = enabled.clone();
+            candidate.packetization.pto_single_probe_with_gap = pto_single_probe_with_gap;
+            candidate.validate().unwrap();
+            let mut actual = serde_json::to_value(candidate).unwrap();
+            actual["packetization"]
+                .as_object_mut()
+                .unwrap()
+                .remove("pto_single_probe_with_gap");
+            assert_eq!(
+                actual, expected,
+                "header, SETTINGS, TP and Initial configuration must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn finished_stop_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.reset_finished_on_stop,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!QuicPacketizationProfile::default().reset_finished_on_stop);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, QuicPacketizationProfile::default());
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["reset_finished_on_stop"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reset_finished_on_stop");
+        let legacy: QuicProfile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.packetization.reset_finished_on_stop);
+        assert!(legacy.packetization.ack_obligation_only);
+        assert!(legacy.packetization.stop_before_matching_reset);
+        assert!(serde_json::to_value(legacy).unwrap()["packetization"]
+            .get("reset_finished_on_stop")
+            .is_none());
+    }
+
+    #[test]
+    fn finished_stop_policy_leaves_other_profile_fields_unchanged() {
+        let enabled = chrome_155_quic();
+        let mut expected = serde_json::to_value(&enabled).unwrap();
+        expected["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reset_finished_on_stop");
+        for reset_finished_on_stop in [false, true] {
+            let mut candidate = enabled.clone();
+            candidate.packetization.reset_finished_on_stop = reset_finished_on_stop;
+            candidate.validate().unwrap();
+            let mut actual = serde_json::to_value(candidate).unwrap();
+            actual["packetization"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reset_finished_on_stop");
+            assert_eq!(
+                actual, expected,
+                "header, SETTINGS, TP and Initial configuration must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_obligation_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.ack_obligation_only,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!QuicPacketizationProfile::default().ack_obligation_only);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, QuicPacketizationProfile::default());
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["ack_obligation_only"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ack_obligation_only");
+        let legacy: QuicProfile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.packetization.ack_obligation_only);
+        assert!(legacy.packetization.stop_before_matching_reset);
+        assert!(serde_json::to_value(legacy).unwrap()["packetization"]
+            .get("ack_obligation_only")
+            .is_none());
+    }
+
+    #[test]
+    fn ack_obligation_policy_leaves_other_profile_fields_unchanged() {
+        let enabled = chrome_155_quic();
+        let mut expected = serde_json::to_value(&enabled).unwrap();
+        expected["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ack_obligation_only");
+        for ack_obligation_only in [false, true] {
+            let mut candidate = enabled.clone();
+            candidate.packetization.ack_obligation_only = ack_obligation_only;
+            candidate.validate().unwrap();
+            let mut actual = serde_json::to_value(candidate).unwrap();
+            actual["packetization"]
+                .as_object_mut()
+                .unwrap()
+                .remove("ack_obligation_only");
+            assert_eq!(
+                actual, expected,
+                "header, SETTINGS, TP and Initial configuration must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_order_h3_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_h3_profiles() {
+            assert_eq!(
+                profile.cancel_response_before_upload,
+                name == "chrome_155_h3",
+                "{name}"
+            );
+        }
+        let enabled = chrome_155_h3();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["cancel_response_before_upload"], true);
+        let round_trip: H3Profile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("cancel_response_before_upload");
+        let legacy: H3Profile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.cancel_response_before_upload);
+        assert!(legacy.wait_for_response_after_upload_stop);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("cancel_response_before_upload")
+            .is_none());
+        let mut independent = enabled;
+        independent.wait_for_response_after_upload_stop = false;
+        assert!(independent.cancel_response_before_upload);
+    }
+
+    #[test]
+    fn cancel_order_packet_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.packetization.stop_before_matching_reset,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        assert!(!QuicPacketizationProfile::default().stop_before_matching_reset);
+        let empty: QuicPacketizationProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, QuicPacketizationProfile::default());
+        let enabled = chrome_155_quic();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["packetization"]["stop_before_matching_reset"], true);
+        let round_trip: QuicProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stop_before_matching_reset");
+        let legacy: QuicProfile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.packetization.stop_before_matching_reset);
+        assert!(legacy.h3.cancel_response_before_upload);
+        assert!(serde_json::to_value(legacy).unwrap()["packetization"]
+            .get("stop_before_matching_reset")
+            .is_none());
+    }
+
+    #[test]
+    fn cancel_order_flags_leave_other_profile_fields_unchanged() {
+        let enabled = chrome_155_quic();
+        let mut expected = serde_json::to_value(&enabled).unwrap();
+        expected["h3"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cancel_response_before_upload");
+        expected["packetization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stop_before_matching_reset");
+        for response_first in [false, true] {
+            for stop_first in [false, true] {
+                let mut candidate = enabled.clone();
+                candidate.h3.cancel_response_before_upload = response_first;
+                candidate.packetization.stop_before_matching_reset = stop_first;
+                candidate.validate().unwrap();
+                let mut actual = serde_json::to_value(candidate).unwrap();
+                actual["h3"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cancel_response_before_upload");
+                actual["packetization"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("stop_before_matching_reset");
+                assert_eq!(
+                    actual, expected,
+                    "header, SETTINGS, TP and Initial configuration must remain unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qpack_prefix_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_h3_profiles() {
+            assert_eq!(
+                profile.defer_qpack_stream_prefixes,
+                name == "chrome_155_h3",
+                "{name}"
+            );
+        }
+        for (name, profile) in all_shipped_quic_profiles() {
+            assert_eq!(
+                profile.h3.defer_qpack_stream_prefixes,
+                name == "chrome_155_quic",
+                "{name}"
+            );
+        }
+        let enabled = chrome_155_h3();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["defer_qpack_stream_prefixes"], true);
+        let round_trip: H3Profile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("defer_qpack_stream_prefixes");
+        let mut legacy: H3Profile = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.defer_qpack_stream_prefixes);
+        assert_eq!(legacy.effective_settings(), enabled.effective_settings());
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), value);
+        value["defer_qpack_stream_prefixes"] = serde_json::json!(false);
+        let explicit_false: H3Profile = serde_json::from_value(value).unwrap();
+        assert_eq!(explicit_false, legacy);
+        assert!(serde_json::to_value(explicit_false)
+            .unwrap()
+            .get("defer_qpack_stream_prefixes")
+            .is_none());
+        legacy.defer_qpack_stream_prefixes = true;
+        assert_eq!(legacy, enabled);
+
+        let mut custom = chrome_h3();
+        let settings = custom.effective_settings();
+        custom.defer_qpack_stream_prefixes = true;
+        let custom_round_trip: H3Profile =
+            serde_json::from_value(serde_json::to_value(&custom).unwrap()).unwrap();
+        assert_eq!(custom_round_trip, custom);
+        assert_eq!(custom.effective_settings(), settings);
+    }
+
+    #[test]
+    fn upload_stop_wait_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_h3_profiles() {
+            assert_eq!(
+                profile.wait_for_response_after_upload_stop,
+                name == "chrome_155_h3",
+                "{name}"
+            );
+        }
+        let enabled = chrome_155_h3();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["wait_for_response_after_upload_stop"], true);
+        let round_trip: H3Profile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("wait_for_response_after_upload_stop");
+        let legacy: H3Profile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.wait_for_response_after_upload_stop);
+        assert_eq!(legacy.effective_settings(), enabled.effective_settings());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("wait_for_response_after_upload_stop")
+            .is_none());
+    }
+
+    #[test]
+    fn response_header_wait_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_h3_profiles() {
+            assert_eq!(
+                profile.wait_for_incomplete_response_frame_headers,
+                name == "chrome_155_h3",
+                "{name}"
+            );
+        }
+        let enabled = chrome_155_h3();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["wait_for_incomplete_response_frame_headers"], true);
+        let round_trip: H3Profile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled.clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("wait_for_incomplete_response_frame_headers");
+        let legacy: H3Profile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.wait_for_incomplete_response_frame_headers);
+        assert!(legacy.accept_truncated_response_payloads);
+        assert_eq!(legacy.effective_settings(), enabled.effective_settings());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("wait_for_incomplete_response_frame_headers")
+            .is_none());
+    }
+
+    #[test]
+    fn response_payload_policy_is_version_scoped_and_serde_opt_in() {
+        for (name, profile) in all_shipped_h3_profiles() {
+            assert_eq!(
+                profile.accept_truncated_response_payloads,
+                name == "chrome_155_h3",
+                "response payload policy for {name}"
+            );
+        }
+        let enabled = chrome_155_h3();
+        let mut value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["accept_truncated_response_payloads"], true);
+        let round_trip: H3Profile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip, enabled.clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("accept_truncated_response_payloads");
+        let legacy: H3Profile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.accept_truncated_response_payloads);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("accept_truncated_response_payloads")
+            .is_none());
+        assert_eq!(legacy.effective_settings(), enabled.effective_settings());
+    }
 
     // ====================================================================
     // SETTINGS validation (RFC 9114 §7.2.4 / §7.2.4.1, RFC 9297, RFC 9220)
@@ -1014,6 +1826,7 @@ mod tests {
             ("chrome_152_h3", chrome_152_h3()),
             ("chrome_153_h3", chrome_153_h3()),
             ("chrome_154_h3", chrome_154_h3()),
+            ("chrome_155_h3", chrome_155_h3()),
             ("firefox_h3", firefox_h3()),
         ]
     }
@@ -1027,6 +1840,7 @@ mod tests {
             ("chrome_152_quic", chrome_152_quic()),
             ("chrome_153_quic", chrome_153_quic()),
             ("chrome_154_quic", chrome_154_quic()),
+            ("chrome_155_quic", chrome_155_quic()),
         ]
     }
 
@@ -1387,6 +2201,7 @@ mod tests {
             chrome_152_quic(),
             chrome_153_quic(),
             chrome_154_quic(),
+            chrome_155_quic(),
         ] {
             assert!(profile.transport_params.randomize_grease_shape);
             assert!(profile.h3.chromium_grease);

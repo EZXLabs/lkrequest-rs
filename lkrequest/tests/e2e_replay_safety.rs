@@ -52,6 +52,13 @@ impl Drop for RecoveryServer {
 }
 
 async fn recovery_server(redirect: Option<String>) -> RecoveryServer {
+    recovery_server_with_mode(redirect, None).await
+}
+
+async fn recovery_server_with_mode(
+    redirect: Option<String>,
+    pooled_failures: Option<usize>,
+) -> RecoveryServer {
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
     let mut tls = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
@@ -84,16 +91,20 @@ async fn recovery_server(redirect: Option<String>) -> RecoveryServer {
                         let redirect = redirect.clone();
                         connections.spawn(async move {
                             let tls = acceptor.accept(socket).await.unwrap();
+                            let close = Arc::new(tokio::sync::Notify::new());
+                            let close_service = close.clone();
                             let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                                 let counts = counts.clone();
                                 let redirect = redirect.clone();
+                                let close = close_service.clone();
                                 async move {
                                     let method = req.method().clone();
                                     let version = req.version();
                                     let body = req.into_body().collect().await.unwrap().to_bytes();
+                                    let mut post_number = 0;
                                     if method == http::Method::POST {
                                         assert_eq!(body, "one-mutation");
-                                        counts.post.fetch_add(1, Ordering::SeqCst);
+                                        post_number = counts.post.fetch_add(1, Ordering::SeqCst) + 1;
                                     } else {
                                         assert_eq!(method, http::Method::GET);
                                         assert!(body.is_empty());
@@ -111,6 +122,13 @@ async fn recovery_server(redirect: Option<String>) -> RecoveryServer {
                                             .body(Full::new(Bytes::new()))
                                             .unwrap());
                                     }
+                                    if let Some(failures) = pooled_failures {
+                                        if post_number > 0 && post_number <= failures {
+                                            close.notify_one();
+                                            return std::future::pending::<Result<_, std::io::Error>>().await;
+                                        }
+                                        return Ok(http::Response::new(Full::new(Bytes::from_static(b"ok"))));
+                                    }
                                     if version == http::Version::HTTP_2 {
                                         // Hyper converts a service error to RST_STREAM(INTERNAL_ERROR).
                                         return Err(std::io::Error::other("reset after consuming POST"));
@@ -118,9 +136,11 @@ async fn recovery_server(redirect: Option<String>) -> RecoveryServer {
                                     Ok(http::Response::new(Full::new(Bytes::from_static(b"ok"))))
                                 }
                             });
-                            let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                                .serve_connection(TokioIo::new(tls), service)
-                                .await;
+                            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                            tokio::select! {
+                                _ = builder.serve_connection(TokioIo::new(tls), service) => {},
+                                _ = close.notified() => {},
+                            }
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -129,6 +149,299 @@ async fn recovery_server(redirect: Option<String>) -> RecoveryServer {
         }
     });
     RecoveryServer { url, counts, task }
+}
+
+#[tokio::test]
+async fn pooled_connection_recovery_respects_post_replay_safety() {
+    for (http2, streaming) in [(false, false), (true, false), (true, true)] {
+        for idempotency in [
+            Idempotency::Default,
+            Idempotency::NotIdempotent,
+            Idempotency::Idempotent,
+        ] {
+            let server = recovery_server_with_mode(None, Some(1)).await;
+            let client = local_client();
+            let builder = client.session();
+            let session = if http2 {
+                builder.http2_only().build()
+            } else {
+                builder.http1_only().build()
+            };
+            let warmup = session.get(&server.url).send().await.unwrap();
+            assert_eq!(
+                warmup.version(),
+                if http2 {
+                    HttpVersion::H2
+                } else {
+                    HttpVersion::Http11
+                }
+            );
+            assert_eq!(warmup.bytes(), b"ok");
+            let request = session
+                .post(&server.url)
+                .idempotency(idempotency)
+                .body("one-mutation");
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                if streaming {
+                    request.send_streaming().await?.bytes().await.map(|_| ())
+                } else {
+                    request.send().await.map(|_| ())
+                }
+            })
+            .await
+            .unwrap();
+            let allowed = idempotency == Idempotency::Idempotent;
+            assert_eq!(
+                server.counts.post.load(Ordering::SeqCst),
+                if allowed { 2 } else { 1 },
+                "HTTP/2={http2}, streaming={streaming}, idempotency={idempotency:?}"
+            );
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "HTTP/2={http2}, idempotency={idempotency:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pooled_recovery_stops_after_one_additional_send() {
+    for streaming in [false, true] {
+        let server = recovery_server_with_mode(None, Some(usize::MAX)).await;
+        let session = local_client().session().http2_only().build();
+        assert_eq!(
+            session.get(&server.url).send().await.unwrap().bytes(),
+            b"ok"
+        );
+        let request = session
+            .post(&server.url)
+            .idempotency(Idempotency::Idempotent)
+            .body("one-mutation");
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            if streaming {
+                request.send_streaming().await.map(|_| ())
+            } else {
+                request.send().await.map(|_| ())
+            }
+        })
+        .await
+        .expect("pooled recovery repeatedly retried a failed replacement");
+        assert!(result.is_err());
+        assert_eq!(
+            server.counts.h1.load(Ordering::SeqCst),
+            0,
+            "HTTP/2-only recovery downgraded to H1"
+        );
+        assert_eq!(server.counts.post.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn pooled_refused_h2_stream_can_replay_a_post_before_processing() {
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let mut config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            cert.signing_key.serialize_der(),
+        )),
+    )
+    .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}/", listener.local_addr().unwrap());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let processed = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn({
+        let attempts = attempts.clone();
+        let processed = processed.clone();
+        async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (socket, _) = accepted.unwrap();
+                        let acceptor = acceptor.clone();
+                        let attempts = attempts.clone();
+                        let processed = processed.clone();
+                        connections.spawn(async move {
+                            let mut connection = h2::server::handshake(acceptor.accept(socket).await.unwrap()).await.unwrap();
+                            let mut requests = tokio::task::JoinSet::new();
+                            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                                let attempts = attempts.clone();
+                                let processed = processed.clone();
+                                requests.spawn(async move {
+                                    if request.method() == http::Method::POST {
+                                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                            respond.send_reset(h2::Reason::REFUSED_STREAM);
+                                            return;
+                                        }
+                                        let mut body = request.into_body();
+                                        let mut received = Vec::new();
+                                        while let Some(data) = body.data().await { received.extend_from_slice(&data.unwrap()); }
+                                        assert_eq!(received, b"one-mutation");
+                                        processed.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    let mut stream = respond.send_response(http::Response::new(()), false).unwrap();
+                                    stream.send_data(Bytes::from_static(b"ok"), true).unwrap();
+                                });
+                            }
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {},
+                }
+            }
+        }
+    });
+    let session = local_client().session().http2_only().build();
+    assert_eq!(session.get(&url).send().await.unwrap().bytes(), b"ok");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.post(&url).body("one-mutation").send(),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert_eq!(result.unwrap().unwrap().bytes(), b"ok");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(processed.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "quic-h3")]
+#[tokio::test]
+async fn pooled_h3_recovery_respects_post_replay_safety() {
+    use bytes::Buf;
+    use quinn::crypto::rustls::QuicServerConfig;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    for streaming in [false, true] {
+        for reject_before_processing in [false, true] {
+            for idempotency in [
+                Idempotency::Default,
+                Idempotency::NotIdempotent,
+                Idempotency::Idempotent,
+            ] {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+                let mut tls = rustls::ServerConfig::builder_with_provider(
+                    rustls::crypto::ring::default_provider().into(),
+                )
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                        cert.signing_key.serialize_der(),
+                    )),
+                )
+                .unwrap();
+                tls.alpn_protocols = vec![b"h3".to_vec()];
+                let config = quinn::ServerConfig::with_crypto(Arc::new(
+                    QuicServerConfig::try_from(tls).unwrap(),
+                ));
+                let endpoint =
+                    quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+                let url = format!(
+                    "https://localhost:{}/",
+                    endpoint.local_addr().unwrap().port()
+                );
+                let posts = Arc::new(AtomicUsize::new(0));
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let connection_count = Arc::new(AtomicUsize::new(0));
+                let server = tokio::spawn({
+                    let endpoint = endpoint.clone();
+                    let posts = posts.clone();
+                    let attempts = attempts.clone();
+                    let connection_count = connection_count.clone();
+                    async move {
+                        let mut connections = tokio::task::JoinSet::new();
+                        loop {
+                            tokio::select! {
+                                incoming = endpoint.accept() => {
+                                    let Some(incoming) = incoming else { break };
+                                    let posts = posts.clone();
+                                    let attempts = attempts.clone();
+                                    let connection_count = connection_count.clone();
+                                    connections.spawn(async move {
+                                        let connection = incoming.await.unwrap();
+                                        connection_count.fetch_add(1, Ordering::SeqCst);
+                                        let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection.clone())).await.unwrap();
+                                        while let Ok(Some(resolver)) = h3.accept().await {
+                                            let (request, mut stream) = resolver.resolve_request().await.unwrap();
+                                            let mut body = Vec::new();
+                                            while let Some(mut data) = stream.recv_data().await.unwrap() {
+                                                let length = data.remaining();
+                                                body.extend_from_slice(&data.copy_to_bytes(length));
+                                            }
+                                            if request.method() == http::Method::POST {
+                                                assert_eq!(body, b"one-mutation");
+                                                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                                                if reject_before_processing && attempt == 0 {
+                                                    stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                                                    continue;
+                                                }
+                                                if posts.fetch_add(1, Ordering::SeqCst) == 0 && !reject_before_processing {
+                                                    connection.close(0x102u32.into(), b"closed after processing POST");
+                                                    break;
+                                                }
+                                            } else { assert_eq!(request.method(), http::Method::GET); }
+                                            stream.send_response(http::Response::new(())).await.unwrap();
+                                            stream.send_data(Bytes::from_static(b"ok")).await.unwrap();
+                                            stream.finish().await.unwrap();
+                                        }
+                                    });
+                                }
+                                _ = connections.join_next(), if !connections.is_empty() => {},
+                            }
+                        }
+                    }
+                });
+                let session = local_client().session().http3_only().build();
+                let warmup = session.get(&url).send().await.unwrap();
+                assert_eq!(warmup.version(), HttpVersion::H3);
+                let request = session
+                    .post(&url)
+                    .idempotency(idempotency)
+                    .body("one-mutation");
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    if streaming {
+                        request.send_streaming().await?.bytes().await.map(|_| ())
+                    } else {
+                        request.send().await.map(|_| ())
+                    }
+                })
+                .await;
+                endpoint.close(0u32.into(), b"done");
+                server.abort();
+                let _ = server.await;
+                let allowed = reject_before_processing || idempotency == Idempotency::Idempotent;
+                let outcome = result.unwrap();
+                assert_eq!(
+                posts.load(Ordering::SeqCst),
+                if reject_before_processing || !allowed {
+                    1
+                } else {
+                    2
+                },
+                "{idempotency:?}, streaming={streaming}, reject={reject_before_processing}, connections={}, outcome={:?}",
+                connection_count.load(Ordering::SeqCst),
+                outcome.as_ref().map_err(|e| (
+                    e.to_string(),
+                    e.phase(),
+                    e.is_safe_to_replay()
+                ))
+            );
+                assert_eq!(attempts.load(Ordering::SeqCst), if allowed { 2 } else { 1 });
+                assert_eq!(outcome.is_ok(), allowed);
+            }
+        }
+    }
 }
 
 async fn post_after_h2_reset(streaming: bool, idempotency: Idempotency) -> (bool, usize, usize) {

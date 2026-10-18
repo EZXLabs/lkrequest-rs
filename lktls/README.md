@@ -19,9 +19,9 @@ Most applications should use the high-level `lkrequest` crate. Use `lktls` direc
 ## Fingerprint profiles
 
 Built-in profiles are loaded from `profiles/*.json` and exposed through `lktls::profile::presets`.
-The current Chrome and Firefox additions are `chrome_154()` and `firefox_156()`,
-captured from Chrome 154.0.8037.58 and Firefox 156.0.1 on Windows.
-`chrome_154_quic()` supplies the transport-specific QUIC ClientHello profile;
+The current Chrome and Firefox additions are `chrome_155()` and `firefox_156()`,
+captured from Chrome 155.0.8059.40 and Firefox 156.0.1 on Windows.
+`chrome_155_quic()` supplies the transport-specific QUIC ClientHello profile;
 there is no `firefox_156_quic()` preset.
 
 Profiles have different evidence levels, including captured, inherited, and

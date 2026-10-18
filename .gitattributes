@@ -13,6 +13,9 @@
 # indifferent to line endings on Windows.
 * text=auto eol=lf
 
+# Historical evidence manifests hash the original bytes, including line endings.
+/design/audits/** -text
+
 # Belt and braces: never let the rule above touch a format where a stray byte
 # would corrupt the file. `text=auto` should already detect these, but these are
 # exactly the files where being wrong is expensive.

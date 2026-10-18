@@ -4,6 +4,14 @@
 
 mod support;
 
+#[cfg(feature = "quic-h3")]
+#[path = "e2e_connection_pool/h3_race.rs"]
+mod h3_race;
+
+#[cfg(feature = "quic-h3")]
+#[path = "e2e_connection_pool/h3_coalesce.rs"]
+mod h3_coalesce;
+
 use lkrequest::h2::profile::chrome_144_h2;
 #[cfg(feature = "quic-h3")]
 use lkrequest::TimeoutConfig;

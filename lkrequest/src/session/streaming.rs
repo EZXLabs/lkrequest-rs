@@ -34,11 +34,9 @@ pub(crate) struct StreamRequestBuilder {
     pub(crate) h3_header_order: Option<Vec<http::header::HeaderName>>,
     pub(crate) cookie_order: Option<Vec<Box<str>>>,
     pub(crate) header_insertion_order: Vec<http::header::HeaderName>,
-    /// Explicit RFC 9218 priority carried over from the originating
-    /// `RequestBuilder::priority()` (if set). Currently consumed only by the
-    /// HTTP/3 streaming path (the H2 streaming path does not yet apply it).
-    #[cfg_attr(not(feature = "quic-h3"), allow(dead_code))]
+    /// Explicit RFC 9218 priority from the originating RequestBuilder.
     pub(crate) priority: Option<lkh2::RequestPriority>,
+    pub(crate) h2_priority_weight: Option<u8>,
     pub(crate) idempotency: super::Idempotency,
     #[cfg(feature = "quic-h3")]
     pub(crate) race_send_gate: Option<pipeline::RaceSendGate>,
@@ -50,6 +48,56 @@ impl StreamRequestBuilder {
     /// Heap-allocated future to avoid stack overflow (see `establish_and_send`).
     pub(crate) fn send_streaming_inner(
         self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send>>
+    {
+        #[cfg(feature = "quic-h3")]
+        if self.session.h3_retry_mode() == crate::retry::H3RetryMode::Chrome155ProtocolErrors {
+            return Box::pin(async move {
+                let mut request = self;
+                let mut retries = 0;
+                loop {
+                    let result = request.clone().send_streaming_with_pool_retry(true).await;
+                    if let Err(ref error) = result {
+                        if crate::retry::chrome_h3_owns_error(
+                            request.session.h3_retry_mode(),
+                            error,
+                        ) && crate::retry::chrome_h3_can_retry(
+                            error,
+                            request.idempotency,
+                            request.body.as_ref(),
+                            retries,
+                        ) {
+                            let policy = request.effective_protocol_policy();
+                            if let Some(route) = pipeline::chrome_h3_retry_route(
+                                &policy,
+                                request.effective_http_version(&policy),
+                                request.effective_proxy(),
+                            ) {
+                                retries += 1;
+                                if route == pipeline::ProtocolDecision::Tcp {
+                                    request.protocol_policy_override =
+                                        Some(pipeline::chrome_h3_retry_tcp_policy());
+                                    request.version_override = Some(PreferredHttpVersion::Auto);
+                                }
+                                tracing::debug!(
+                                    retry = retries,
+                                    protocol = route.as_str(),
+                                    "h3.chrome_protocol_error_retry",
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    return result;
+                }
+            });
+        }
+        self.send_streaming_with_pool_retry(true)
+    }
+
+    fn send_streaming_with_pool_retry(
+        self,
+        retry_pooled: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send>>
     {
         Box::pin(async move {
@@ -70,12 +118,37 @@ impl StreamRequestBuilder {
 
             match pooled {
                 #[cfg(feature = "quic-h3")]
-                Some(AcquiredConnection::H3(mut cached_sender)) => {
+                Some(AcquiredConnection::H3 {
+                    sender: mut cached_sender,
+                    token,
+                    cleanup,
+                }) => {
                     let result = self.send_h3_streaming(&mut cached_sender, &target).await;
+
+                    if let Err(ref error) = result {
+                        pipeline::finish_closed_h3_attempt(
+                            &self.session,
+                            &target.conn_key,
+                            &token,
+                            &cleanup,
+                            error,
+                        )
+                        .await;
+                    }
 
                     match result {
                         Err(ref e)
-                            if e.is_connection_closed()
+                            if retry_pooled
+                                && !crate::retry::chrome_h3_owns_error(
+                                    self.session.h3_retry_mode(),
+                                    e,
+                                )
+                                && e.is_connection_closed()
+                                && crate::retry::retry_is_replay_safe(
+                                    &self.method,
+                                    self.idempotency,
+                                    e,
+                                )
                                 && self
                                     .session
                                     .inner
@@ -94,20 +167,29 @@ impl StreamRequestBuilder {
                             );
                             {
                                 let mut pool = self.session.inner.pool.lock();
-                                pool.remove(&target.conn_key);
+                                pool.remove_acquired(&target.conn_key, &token);
                             }
-                            self.establish_and_send_streaming(&target, None).await
+                            self.send_streaming_with_pool_retry(false).await
                         }
                         other => other,
                     }
                 }
-                Some(AcquiredConnection::H2(cached_sender)) => match cached_sender.ready().await {
+                Some(AcquiredConnection::H2 {
+                    sender: cached_sender,
+                    token,
+                }) => match cached_sender.ready().await {
                     Ok(sender) => {
                         let result = self.send_h2_streaming(sender, &target).await;
 
                         match result {
                             Err(ref e)
-                                if e.is_connection_closed()
+                                if retry_pooled
+                                    && e.is_connection_closed()
+                                    && crate::retry::retry_is_replay_safe(
+                                        &self.method,
+                                        self.idempotency,
+                                        e,
+                                    )
                                     && self
                                         .session
                                         .inner
@@ -126,9 +208,9 @@ impl StreamRequestBuilder {
                                 );
                                 {
                                     let mut pool = self.session.inner.pool.lock();
-                                    pool.remove(&target.conn_key);
+                                    pool.remove_acquired(&target.conn_key, &token);
                                 }
-                                self.establish_and_send_streaming(&target, None).await
+                                self.send_streaming_with_pool_retry(false).await
                             }
                             other => other,
                         }
@@ -136,22 +218,85 @@ impl StreamRequestBuilder {
                     Err(_) => {
                         {
                             let mut pool = self.session.inner.pool.lock();
-                            pool.remove(&target.conn_key);
+                            pool.remove_acquired(&target.conn_key, &token);
                         }
-                        self.establish_and_send_streaming(&target, None).await
+                        if retry_pooled {
+                            self.send_streaming_with_pool_retry(false).await
+                        } else {
+                            self.establish_and_send_streaming(&target, None).await
+                        }
                     }
                 },
                 Some(AcquiredConnection::H1 {
-                    sender,
+                    mut sender,
                     conn_task,
                     permit,
                 }) => {
-                    self.send_h1_streaming(sender, conn_task, permit, &target)
-                        .await
+                    if sender.ready().await.is_err() {
+                        conn_task.abort();
+                        drop(permit);
+                        return if retry_pooled {
+                            self.send_streaming_with_pool_retry(false).await
+                        } else {
+                            self.establish_and_send_streaming(&target, None).await
+                        };
+                    }
+                    let result = self
+                        .send_h1_streaming(sender, conn_task, permit, &target)
+                        .await;
+                    match result {
+                        Err(ref error)
+                            if retry_pooled
+                                && error.is_connection_closed()
+                                && crate::retry::retry_is_replay_safe(
+                                    &self.method,
+                                    self.idempotency,
+                                    error,
+                                )
+                                && self
+                                    .session
+                                    .inner
+                                    .client
+                                    .fallback()
+                                    .retry_on_connection_close
+                                && self
+                                    .body
+                                    .as_ref()
+                                    .is_none_or(crate::body::RequestBody::can_replay) =>
+                        {
+                            self.send_streaming_with_pool_retry(false).await
+                        }
+                        other => other,
+                    }
                 }
                 None => self.establish_and_send_streaming(&target, discovery).await,
             }
         })
+    }
+
+    fn request_head_input<'a>(
+        &'a self,
+        target: &'a pipeline::ParsedTarget,
+    ) -> pipeline::RequestHeadInput<'a> {
+        pipeline::RequestHeadInput {
+            session: &self.session,
+            method: &self.method,
+            scheme: target.scheme,
+            host: &target.host,
+            port: target.port,
+            path: &target.path,
+            parsed_url: &target.parsed_url,
+            headers: &self.headers,
+            default_headers: self.session.inner.client.default_headers(),
+            extra_cookies: &self.extra_cookies,
+            cookie_overrides: &self.cookie_overrides,
+            priority: self.priority,
+            h2_priority_weight: self.h2_priority_weight,
+            header_order: self.header_order.as_deref(),
+            h3_header_order: self.h3_header_order.as_deref(),
+            cookie_order: self.cookie_order.as_deref(),
+            header_insertion_order: &self.header_insertion_order,
+        }
     }
 
     /// Send a streaming request via HTTP/2 using an existing sender.
@@ -161,48 +306,15 @@ impl StreamRequestBuilder {
         target: &pipeline::ParsedTarget,
     ) -> Result<StreamingResponse> {
         let client = &self.session.inner.client;
-        let uri = pipeline::build_h2_uri(target.scheme, &target.host, target.port, &target.path);
-
-        let has_body = self.body.is_some();
-        let end_stream = !has_body;
-
-        let mut request = http::Request::builder()
-            .method(self.method.clone())
-            .uri(&uri)
-            .body(())
-            .map_err(|e| Error::Http(format!("failed to build HTTP request: {e}")))?;
-
-        let header_order = pipeline::effective_header_order(
-            self.header_order.as_deref(),
-            self.session.inner.header_order.as_deref(),
-            client.header_order(),
-            &self.header_insertion_order,
-        );
-        let cookie_order = pipeline::effective_cookie_order(
-            self.cookie_order.as_deref(),
-            self.session.inner.cookie_order.as_deref(),
-            client.cookie_order(),
-        );
-
-        pipeline::auto_insert_content_length(
-            request.headers_mut(),
+        let end_stream = self.body.is_none();
+        let mut request = pipeline::prepare_h2_request(
+            &self.request_head_input(target),
             self.body
                 .as_ref()
                 .and_then(crate::body::RequestBody::buffered),
-        );
-
-        pipeline::merge_headers(
-            request.headers_mut(),
-            client,
-            &self.headers,
-            &target.parsed_url,
-            false,
-            &self.session,
-            &self.extra_cookies,
-            &self.cookie_overrides,
-            header_order,
-            cookie_order,
-        );
+            pipeline::H2RequestKind::Streaming,
+        )?
+        .into_request(&self.method);
 
         let resp_future = if let Some(body) = self.body.as_ref().filter(|body| body.is_streaming())
         {
@@ -277,62 +389,8 @@ impl StreamRequestBuilder {
             gate.acquired().await;
         }
         let client = &self.session.inner.client;
-        let uri = pipeline::build_h2_uri(target.scheme, &target.host, target.port, &target.path);
-
-        let mut request = http::Request::builder()
-            .method(self.method.clone())
-            .uri(&uri)
-            .body(self.body.clone())
-            .map_err(|e| Error::Http3Request(format!("failed to build HTTP/3 request: {e}")))?;
-
-        let effective_priority = pipeline::resolve_request_priority(
-            self.priority,
-            &self.headers,
-            client.default_headers(),
-        );
-        let rp = effective_priority.unwrap_or_else(lkh2::RequestPriority::fetch);
-
-        if !self.headers.contains_key("priority")
-            && !client.default_headers().contains_key("priority")
-        {
-            if let Ok(hv) = http::HeaderValue::from_str(&rp.to_header_value()) {
-                request.headers_mut().insert("priority", hv);
-            }
-        }
-
-        let header_order = pipeline::effective_h3_header_order(
-            self.h3_header_order.as_deref(),
-            self.header_order.as_deref(),
-            self.session.h3_header_order(),
-            self.session.header_order(),
-            client.h3_header_order(),
-            client.header_order(),
-            &self.header_insertion_order,
-        );
-        let cookie_order = pipeline::effective_cookie_order(
-            self.cookie_order.as_deref(),
-            self.session.inner.cookie_order.as_deref(),
-            client.cookie_order(),
-        );
-
-        pipeline::auto_insert_content_length(
-            request.headers_mut(),
-            self.body
-                .as_ref()
-                .and_then(crate::body::RequestBody::buffered),
-        );
-        pipeline::merge_headers(
-            request.headers_mut(),
-            client,
-            &self.headers,
-            &target.parsed_url,
-            false,
-            &self.session,
-            &self.extra_cookies,
-            &self.cookie_overrides,
-            header_order,
-            cookie_order,
-        );
+        let mut request =
+            pipeline::prepare_h3_request(&self.request_head_input(target), self.body.clone())?;
 
         let ttfb_started = std::time::Instant::now();
         let upload = if let Some(body) = self.body.as_ref().filter(|body| body.is_streaming()) {
@@ -354,9 +412,7 @@ impl StreamRequestBuilder {
             }
         })
         .await?
-        .map_err(|e| {
-            Error::http3_or_connection_closed(ConnectionPhase::HttpRequest, e.to_string())
-        })?;
+        .map_err(|e| pipeline::h3_request_error(&self.session, e, false))?;
         crate::diagnostics::record_ttfb_ms(ttfb_started.elapsed().as_millis() as u64);
         crate::diagnostics::record_protocol("h3");
 
@@ -376,11 +432,17 @@ impl StreamRequestBuilder {
             target.port,
         );
 
-        Ok(
-            StreamingResponse::new(status, resp_headers, BodyStream::H3(Box::new(body)))
-                .with_max_body_size(limits.max_response_body_size)
-                .with_no_decompress(self.no_decompress),
+        Ok(StreamingResponse::new(
+            status,
+            resp_headers,
+            BodyStream::H3(Box::new(crate::response::H3BodyStream {
+                stream: body,
+                data_eof: false,
+                sender: Some(sender.clone()),
+            })),
         )
+        .with_max_body_size(limits.max_response_body_size)
+        .with_no_decompress(self.no_decompress))
     }
 
     /// Establish a new connection and send a streaming request.
@@ -540,16 +602,16 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send + 'a>>
     {
         Box::pin(async move {
-            let race_cfg = pipeline::protocol_policy_chrome_like_config(
+            let config = pipeline::protocol_policy_chrome_like_config(
                 protocol_policy,
                 self.session.chrome_like_protocol_config(),
             );
-            let (quic_gate, tcp_gate, mut selected) = pipeline::RaceSendGate::pair();
+            let (quic_gate, tcp_gate, selected) = pipeline::RaceSendGate::pair();
             let mut quic_request = self.clone();
             quic_request.race_send_gate = Some(quic_gate);
             let mut tcp_request = self.clone();
             tcp_request.race_send_gate = Some(tcp_gate);
-            let mut quic_future = quic_request.establish_and_send_streaming_quic(
+            let quic_future = quic_request.establish_and_send_streaming_quic(
                 target,
                 discovery,
                 proxy,
@@ -558,199 +620,52 @@ impl StreamRequestBuilder {
                 http_version_pref,
                 connect_start,
             );
-
-            if !race_cfg.tcp_main_job_delay.is_zero() {
-                let mut tcp_delay = std::pin::pin!(tokio::time::sleep(race_cfg.tcp_main_job_delay));
-                tokio::select! {
-                    biased;
-
-                    _ = selected.changed() => {
-                        let result = quic_future.await;
-                        if result.is_ok() && race_cfg.keep_tcp_probe_after_quic_win {
-                            self.session.spawn_background_tcp_probe(
-                                target.host.clone(), target.port, target.scheme, target.conn_key.clone(),
-                                effective_proxy_owned.clone(), http_version_pref,
-                            );
-                        }
-                        return result;
+            pipeline::run_protocol_race(
+                config,
+                selected,
+                quic_future,
+                || tcp_request.establish_and_send_streaming_tcp(
+                    target,
+                    effective_proxy_owned.clone(),
+                    protocol_policy,
+                    http_version_pref,
+                    connect_start,
+                ),
+                |event| match event {
+                    pipeline::RaceEvent::Won(pipeline::ProtocolDecision::Quic)
+                        if config.keep_tcp_probe_after_quic_win =>
+                    {
+                        self.session.spawn_background_tcp_probe(
+                            target.host.clone(), target.port, target.scheme, target.conn_key.clone(),
+                            effective_proxy_owned.clone(), http_version_pref,
+                        );
                     }
-                    quic_result = &mut quic_future => match quic_result {
-                        Ok(resp) => {
-                            if race_cfg.keep_tcp_probe_after_quic_win {
-                                self.session.spawn_background_tcp_probe(
-                                    target.host.clone(),
-                                    target.port,
-                                    target.scheme,
-                                    target.conn_key.clone(),
-                                    effective_proxy_owned.clone(),
-                                    http_version_pref,
-                                );
-                            }
-                            return Ok(resp);
+                    pipeline::RaceEvent::Won(pipeline::ProtocolDecision::Tcp)
+                        if config.keep_quic_probe_after_tcp_win =>
+                    {
+                        self.session.spawn_background_quic_probe(
+                            target.host.clone(), target.port, target.conn_key.clone(),
+                            discovery.clone(), effective_proxy_owned.clone(),
+                        );
+                    }
+                    pipeline::RaceEvent::Failed { protocol, stage, error } => match (protocol, stage) {
+                        (pipeline::ProtocolDecision::Quic, pipeline::RaceFailureStage::BeforeTcpRelease) => {
+                            tracing::warn!(host = %target.host, error = %error, fallback = "quic_to_tcp",
+                                "streaming.protocol_race_quic_failed_before_tcp_release");
                         }
-                        Err(quic_error) => {
-                            if *selected.borrow() == Some(pipeline::ProtocolDecision::Quic) {
-                                return Err(quic_error);
-                            }
-                            tracing::warn!(
-                                host = %target.host,
-                                error = %quic_error,
-                                fallback = "quic_to_tcp",
-                                "streaming.protocol_race_quic_failed_before_tcp_release",
-                            );
-                            return match tcp_request.establish_and_send_streaming_tcp(
-                                target,
-                                effective_proxy_owned,
-                                protocol_policy,
-                                http_version_pref,
-                                connect_start,
-                            )
-                            .await {
-                                Ok(resp) => Ok(resp),
-                                Err(tcp_error) if selected.borrow().is_some() => Err(tcp_error),
-                                Err(tcp_error) => Err(pipeline::protocol_race_error(tcp_error, quic_error)),
-                            };
+                        (pipeline::ProtocolDecision::Quic, pipeline::RaceFailureStage::WaitingForPeer) => {
+                            tracing::warn!(host = %target.host, error = %error, fallback = "quic_to_tcp",
+                                "streaming.protocol_race_quic_failed_waiting_for_tcp");
                         }
+                        (pipeline::ProtocolDecision::Tcp, pipeline::RaceFailureStage::WaitingForPeer) => {
+                            tracing::warn!(host = %target.host, error = %error, fallback = "tcp_to_quic",
+                                "streaming.protocol_race_tcp_failed_waiting_for_quic");
+                        }
+                        _ => {}
                     },
-                    _ = &mut tcp_delay => {}
-                }
-            }
-
-            let mut tcp_future = tcp_request.establish_and_send_streaming_tcp(
-                target,
-                effective_proxy_owned.clone(),
-                protocol_policy,
-                http_version_pref,
-                connect_start,
-            );
-
-            tokio::select! {
-                biased;
-
-                _ = selected.changed() => {
-                    let winner = *selected.borrow();
-                    if winner == Some(pipeline::ProtocolDecision::Quic) {
-                        drop(tcp_future);
-                        let result = quic_future.await;
-                        if result.is_ok() && race_cfg.keep_tcp_probe_after_quic_win {
-                            self.session.spawn_background_tcp_probe(
-                                target.host.clone(), target.port, target.scheme, target.conn_key.clone(),
-                                effective_proxy_owned.clone(), http_version_pref,
-                            );
-                        }
-                        result
-                    } else {
-                        drop(quic_future);
-                        let result = tcp_future.await;
-                        if result.is_ok() && race_cfg.keep_quic_probe_after_tcp_win {
-                            self.session.spawn_background_quic_probe(
-                                target.host.clone(), target.port, target.conn_key.clone(),
-                                discovery.clone(), effective_proxy_owned.clone(),
-                            );
-                        }
-                        result
-                    }
-                }
-                quic_result = &mut quic_future => match quic_result {
-                    Ok(resp) => {
-                        if race_cfg.keep_tcp_probe_after_quic_win {
-                            self.session.spawn_background_tcp_probe(
-                                target.host.clone(),
-                                target.port,
-                                target.scheme,
-                                target.conn_key.clone(),
-                                effective_proxy_owned.clone(),
-                                http_version_pref,
-                            );
-                        }
-                        Ok(resp)
-                    }
-                    Err(quic_error) => {
-                        if *selected.borrow() == Some(pipeline::ProtocolDecision::Quic) {
-                            return Err(quic_error);
-                        }
-                        tracing::warn!(
-                            host = %target.host,
-                            error = %quic_error,
-                            fallback = "quic_to_tcp",
-                            "streaming.protocol_race_quic_failed_waiting_for_tcp",
-                        );
-                        match tcp_future.await {
-                            Ok(resp) => Ok(resp),
-                            Err(tcp_error) if selected.borrow().is_some() => Err(tcp_error),
-                            Err(tcp_error) if pipeline::is_connection_limit_error(&tcp_error) => {
-                                tcp_request.establish_and_send_streaming_tcp(
-                                    target,
-                                    effective_proxy_owned,
-                                    protocol_policy,
-                                    http_version_pref,
-                                    connect_start,
-                                )
-                                .await
-                                .map_err(|retry_error| {
-                                    if selected.borrow().is_some() {
-                                        retry_error
-                                    } else {
-                                        pipeline::protocol_race_error(retry_error, quic_error)
-                                    }
-                                })
-                            }
-                            Err(tcp_error) => {
-                                Err(pipeline::protocol_race_error(tcp_error, quic_error))
-                            }
-                        }
-                    }
+                    _ => {}
                 },
-                tcp_result = &mut tcp_future => match tcp_result {
-                    Ok(resp) => {
-                        if race_cfg.keep_quic_probe_after_tcp_win {
-                            self.session.spawn_background_quic_probe(
-                                target.host.clone(),
-                                target.port,
-                                target.conn_key.clone(),
-                                discovery.clone(),
-                                effective_proxy_owned.clone(),
-                            );
-                        }
-                        Ok(resp)
-                    }
-                    Err(tcp_error) => {
-                        if *selected.borrow() == Some(pipeline::ProtocolDecision::Tcp) {
-                            return Err(tcp_error);
-                        }
-                        tracing::warn!(
-                            host = %target.host,
-                            error = %tcp_error,
-                            fallback = "tcp_to_quic",
-                            "streaming.protocol_race_tcp_failed_waiting_for_quic",
-                        );
-                        match quic_future.await {
-                            Ok(resp) => Ok(resp),
-                            Err(quic_error) if selected.borrow().is_some() => Err(quic_error),
-                            Err(quic_error) if pipeline::is_connection_limit_error(&tcp_error) => {
-                                tcp_request.establish_and_send_streaming_tcp(
-                                    target,
-                                    effective_proxy_owned,
-                                    protocol_policy,
-                                    http_version_pref,
-                                    connect_start,
-                                )
-                                .await
-                                .map_err(|retry_error| {
-                                    if selected.borrow().is_some() {
-                                        retry_error
-                                    } else {
-                                        pipeline::protocol_race_error(retry_error, quic_error)
-                                    }
-                                })
-                            }
-                            Err(quic_error) => {
-                                Err(pipeline::protocol_race_error(tcp_error, quic_error))
-                            }
-                        }
-                    }
-                },
-            }
+            ).await
         })
     }
 
@@ -802,6 +717,8 @@ impl StreamRequestBuilder {
                         .as_ref()
                         .is_some_and(|proxy| proxy.forbids_direct_fallback());
                     let fallback_allowed = is_handshake_class
+                        && http_version_pref != PreferredHttpVersion::Http3Only
+                        && protocol_policy.intent != crate::protocol::HttpIntent::H3Only
                         && !proxy_forbids_tcp_fallback
                         && pipeline::fallback_permitted(protocol_policy, &error);
                     if fallback_allowed {
@@ -847,10 +764,10 @@ impl StreamRequestBuilder {
                 .mark_h3_validated_for_route(&discovery.route, &discovery.origin);
             let (sender, driver) = h3_conn.into_parts();
             let mut send_sender = sender.clone();
-            {
+            let cleanup = {
                 let mut pool = self.session.inner.pool.lock();
-                pool.insert_h3_reserved(target.conn_key.clone(), sender, driver, permit);
-            }
+                pool.insert_h3_reserved(target.conn_key.clone(), sender, driver, permit)
+            };
 
             tracing::debug!(
                 route = %target.conn_key.route,
@@ -860,7 +777,18 @@ impl StreamRequestBuilder {
                 "connection.established",
             );
 
-            self.send_h3_streaming(&mut send_sender, target).await
+            let result = self.send_h3_streaming(&mut send_sender, target).await;
+            if let Err(ref error) = result {
+                pipeline::finish_closed_h3_attempt(
+                    &self.session,
+                    &target.conn_key,
+                    &crate::connection_pool::PoolToken::H3Tracked(Arc::downgrade(&cleanup)),
+                    &cleanup,
+                    error,
+                )
+                .await;
+            }
+            result
         })
     }
 
@@ -937,7 +865,8 @@ impl StreamRequestBuilder {
                 match h2_result {
                     Ok(resp) => Ok(resp),
                     Err(e)
-                        if client.fallback().h2_to_h1
+                        if http_version_pref != PreferredHttpVersion::Http2Only
+                            && client.fallback().h2_to_h1
                             && self
                                 .body
                                 .as_ref()
@@ -1026,12 +955,7 @@ impl StreamRequestBuilder {
         let ttfb_started = std::time::Instant::now();
         let resp = pipeline::await_response_headers(client, sender.send_request(request))
             .await?
-            .map_err(|e| {
-                Error::http_or_connection_closed(
-                    ConnectionPhase::HttpRequest,
-                    format!("HTTP/1.1 request failed: {e}"),
-                )
-            })?;
+            .map_err(|e| Error::from_h1_error(e, "HTTP/1.1 request failed"))?;
         crate::diagnostics::record_ttfb_ms(ttfb_started.elapsed().as_millis() as u64);
         crate::diagnostics::record_protocol("http/1.1");
 

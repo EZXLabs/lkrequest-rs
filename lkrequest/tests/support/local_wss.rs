@@ -4,7 +4,7 @@
 //! - Echoes back text and binary messages
 //! - Responds to close frames correctly
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, Role, WebSocket};
@@ -12,7 +12,7 @@ use rcgen::{CertifiedKey, KeyPair};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 /// Running local WSS echo server. Drop to stop.
@@ -20,7 +20,26 @@ pub struct LocalWssServer {
     /// Base URL, e.g. `wss://127.0.0.1:12345`.
     pub url: String,
     pub port: u16,
+    handshakes: Mutex<mpsc::UnboundedReceiver<WssHandshake>>,
     shutdown: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+pub struct WssHandshake {
+    pub request_line: String,
+    pub hosts: Vec<String>,
+}
+
+impl LocalWssServer {
+    pub async fn next_handshake(&self) -> WssHandshake {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.handshakes.lock().await.recv(),
+        )
+        .await
+        .expect("WSS handshake observation timeout")
+        .expect("WSS handshake observation channel closed")
+    }
 }
 
 impl Drop for LocalWssServer {
@@ -66,6 +85,7 @@ fn ws_accept_key(client_key: &str) -> String {
 /// Handle a single WSS connection: manual HTTP/1.1 upgrade + echo loop.
 async fn handle_wss_connection(
     tls_stream: TlsStream<tokio::net::TcpStream>,
+    handshakes: mpsc::UnboundedSender<WssHandshake>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf_reader = BufReader::new(tls_stream);
 
@@ -73,6 +93,7 @@ async fn handle_wss_connection(
     buf_reader.read_line(&mut request_line).await?;
 
     let mut ws_key = String::new();
+    let mut hosts = Vec::new();
     loop {
         let mut line = String::new();
         buf_reader.read_line(&mut line).await?;
@@ -88,7 +109,14 @@ async fn handle_wss_connection(
                 .trim()
                 .to_string();
         }
+        if lower.starts_with("host:") {
+            hosts.push(line.split_once(':').unwrap().1.trim().to_string());
+        }
     }
+    let _ = handshakes.send(WssHandshake {
+        request_line: request_line.trim_end().to_string(),
+        hosts,
+    });
 
     if ws_key.is_empty() {
         let response = "HTTP/1.1 400 Bad Request\r\n\r\n";
@@ -148,17 +176,22 @@ async fn handle_wss_connection(
 
 /// Start a local WSS echo server.
 pub async fn start_local_wss_server() -> LocalWssServer {
+    start_local_wss_server_on(IpAddr::V4(Ipv4Addr::LOCALHOST)).await
+}
+
+pub async fn start_local_wss_server_on(address: IpAddr) -> LocalWssServer {
     let certified = build_certified_key();
     let acceptor = tls_acceptor(&certified);
 
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+    let listener = TcpListener::bind(SocketAddr::new(address, 0))
         .await
         .expect("bind wss");
     let addr = listener.local_addr().expect("local_addr");
     let port = addr.port();
-    let url = format!("wss://127.0.0.1:{port}");
+    let url = format!("wss://{addr}");
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (handshake_tx, handshake_rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
         loop {
@@ -168,12 +201,13 @@ pub async fn start_local_wss_server() -> LocalWssServer {
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
                     let acc = acceptor.clone();
+                    let handshakes = handshake_tx.clone();
                     tokio::spawn(async move {
                         let tls = match acc.accept(stream).await {
                             Ok(t) => t,
                             Err(_) => return,
                         };
-                        let _ = handle_wss_connection(tls).await;
+                        let _ = handle_wss_connection(tls, handshakes).await;
                     });
                 }
             }
@@ -185,6 +219,7 @@ pub async fn start_local_wss_server() -> LocalWssServer {
     LocalWssServer {
         url,
         port,
+        handshakes: Mutex::new(handshake_rx),
         shutdown: Some(shutdown_tx),
     }
 }

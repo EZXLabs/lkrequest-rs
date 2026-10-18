@@ -45,6 +45,9 @@ pub const MAX_TLS13_INNER_PLAINTEXT: usize = MAX_RECORD_PAYLOAD + 1;
 /// plaintext it protects: 256 octets, hence a wire record of at most 2^14 + 256.
 pub const MAX_CIPHERTEXT_EXPANSION: usize = 256;
 
+/// TLS 1.2 permits up to 2048 bytes of ciphertext expansion (RFC 5246 section 6.2.3).
+pub const MAX_TLS12_CIPHERTEXT_EXPANSION: usize = 2048;
+
 /// TLS record header size: ContentType (1) + Version (2) + Length (2).
 pub const RECORD_HEADER_SIZE: usize = 5;
 

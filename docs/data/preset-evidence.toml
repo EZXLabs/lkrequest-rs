@@ -1,5 +1,5 @@
 schema_version = 1
-reviewed_at = "2026-09-25"
+reviewed_at = "2026-10-07"
 allowed_statuses = ["verified", "inherited", "partial", "fixture-only", "unverified"]
 
 [[preset]]
@@ -222,6 +222,24 @@ h2 = "verified"
 quic_tls = "verified"
 quic_transport = "verified"
 h3_settings = "inherited"
+
+[[preset]]
+name = "chrome_155"
+browser_version = "155.0.8059.40"
+platform = "Windows"
+captured_at = "2026-10-07"
+evidence = ["CHANGELOG.md", "lktls/profiles/chrome_155.json", "lkrequest/tests/fixtures/fingerprints/chrome_155_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_155_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_155_quic.json", "lkrequest/tests/fixtures/fingerprints/chrome_155_quic_tls_fresh.json"]
+notes = ["Passive public Cloudflare and example.com captures verify fresh TCP TLS/H2 fields; raw ClientHello parsing was cross-checked with lkprofile.", "Public Cloudflare QUIC captures directly expose the classic nine signature algorithms, 28 trust anchors, transport parameters and randomized Initial layouts; stable fields match Chrome 154.", "H3 SETTINGS 1=65536, 6=262144, 7=100, 51=1 and navigation priority u=0, i were directly observed, including a public HTTP 200 response.", "Application header values remain caller supplied: captured Chrome 155 navigation adds image/jxl to Accept and changes sec-ch-ua brand order/GREASE. ECH inner policy and complete randomization distributions are not established by these samples."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "verified"
+h3_settings = "verified"
 
 [[preset]]
 name = "firefox_133"

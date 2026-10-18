@@ -3,6 +3,9 @@
 
 mod support;
 
+#[path = "e2e_quic_fallback_budget/coalesced.rs"]
+mod coalesced;
+
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

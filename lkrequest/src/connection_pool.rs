@@ -109,6 +109,32 @@ enum H3DriverTask {
 
 #[cfg(feature = "quic-h3")]
 impl H3DriverTask {
+    fn cleanup_task(&self) -> Arc<tokio::task::JoinHandle<()>> {
+        match self {
+            Self::Tracked(task) => task.clone(),
+            Self::Legacy { permit_task, .. } => permit_task.clone(),
+        }
+    }
+
+    fn token(&self) -> PoolToken {
+        match self {
+            Self::Tracked(task) => PoolToken::H3Tracked(Arc::downgrade(task)),
+            Self::Legacy { task, .. } => PoolToken::H3Legacy(Arc::downgrade(task)),
+        }
+    }
+
+    fn matches(&self, token: &PoolToken) -> bool {
+        match (self, token) {
+            (Self::Tracked(task), PoolToken::H3Tracked(expected)) => {
+                Weak::ptr_eq(expected, &Arc::downgrade(task))
+            }
+            (Self::Legacy { task, .. }, PoolToken::H3Legacy(expected)) => {
+                Weak::ptr_eq(expected, &Arc::downgrade(task))
+            }
+            _ => false,
+        }
+    }
+
     fn is_finished(&self) -> bool {
         match self {
             Self::Tracked(task) => task.is_finished(),
@@ -143,13 +169,30 @@ pub enum PooledConnection {
     },
 }
 
-/// Internal pooled connection carrying the physical-connection reservation.
+/// Identity of the acquired driver without keeping its transport alive.
+#[derive(Clone)]
+pub(crate) enum PoolToken {
+    H2(Weak<tokio::task::JoinHandle<()>>),
+    #[cfg(feature = "quic-h3")]
+    H3Tracked(Weak<tokio::task::JoinHandle<()>>),
+    #[cfg(feature = "quic-h3")]
+    H3Legacy(Weak<tokio::task::JoinHandle<Result<(), lkh3::H3Error>>>),
+}
+
+/// Internal pooled connection carrying its acquisition identity.
 pub(crate) enum AcquiredConnection {
     /// An HTTP/2 sender — the pool retains its own clone.
-    H2(lkh2::H2Sender),
+    H2 {
+        sender: lkh2::H2Sender,
+        token: PoolToken,
+    },
     /// An HTTP/3 sender — the pool retains its own clone.
     #[cfg(feature = "quic-h3")]
-    H3(lkh3::H3Sender),
+    H3 {
+        sender: lkh3::H3Sender,
+        token: PoolToken,
+        cleanup: Arc<tokio::task::JoinHandle<()>>,
+    },
     /// An HTTP/1.1 sender — exclusively borrowed from the pool.
     /// The `Arc<JoinHandle>` keeps the connection driver alive.
     H1 {
@@ -438,7 +481,14 @@ impl ConnectionPool {
         self.evict_idle(timeout);
         #[cfg(feature = "quic-h3")]
         {
-            self.try_acquire_h3(key).map(AcquiredConnection::H3)
+            self.h3_connections.get_mut(key).map(|entry| {
+                entry.last_used = Instant::now();
+                AcquiredConnection::H3 {
+                    sender: entry.sender.clone(),
+                    token: entry._driver_task.token(),
+                    cleanup: entry._driver_task.cleanup_task(),
+                }
+            })
         }
         #[cfg(not(feature = "quic-h3"))]
         {
@@ -453,7 +503,13 @@ impl ConnectionPool {
     ) -> Option<AcquiredConnection> {
         let timeout = self.idle_timeout;
         self.evict_idle(timeout);
-        self.try_acquire_h2(key).map(AcquiredConnection::H2)
+        self.h2_connections.get_mut(key).map(|entry| {
+            entry.last_used = Instant::now();
+            AcquiredConnection::H2 {
+                sender: entry.sender.clone(),
+                token: PoolToken::H2(Arc::downgrade(&entry._conn_task)),
+            }
+        })
     }
 
     pub(crate) fn try_acquire_h1_pooled_internal(
@@ -556,6 +612,32 @@ impl ConnectionPool {
         self.h1_connections.remove(key);
     }
 
+    /// A late failure must not evict a replacement or another protocol.
+    pub(crate) fn remove_acquired(&mut self, key: &ConnectionKey, token: &PoolToken) -> bool {
+        match token {
+            PoolToken::H2(expected) => {
+                let matches = self.h2_connections.get(key).is_some_and(|entry| {
+                    Weak::ptr_eq(expected, &Arc::downgrade(&entry._conn_task))
+                });
+                if matches {
+                    self.h2_connections.remove(key);
+                }
+                matches
+            }
+            #[cfg(feature = "quic-h3")]
+            PoolToken::H3Tracked(_) | PoolToken::H3Legacy(_) => {
+                let matches = self
+                    .h3_connections
+                    .get(key)
+                    .is_some_and(|entry| entry._driver_task.matches(token));
+                if matches {
+                    self.h3_connections.remove(key);
+                }
+                matches
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // HTTP/3 API
     // -----------------------------------------------------------------------
@@ -577,6 +659,8 @@ impl ConnectionPool {
     /// continue consuming QUIC events until idle timeout. Use
     /// [`lkh3::H3Connection::into_parts`] to split a freshly built
     /// connection into `(sender, driver)`.
+    /// The returned tracking task completes only after releasing the physical
+    /// permit, so a request observing terminal QUIC closure can await cleanup.
     #[cfg(feature = "quic-h3")]
     pub(crate) fn insert_h3_reserved(
         &mut self,
@@ -584,7 +668,7 @@ impl ConnectionPool {
         sender: lkh3::H3Sender,
         driver: tokio::task::JoinHandle<Result<(), lkh3::H3Error>>,
         permit: ConnectionPermit,
-    ) {
+    ) -> Arc<tokio::task::JoinHandle<()>> {
         // Insert-if-absent. H3 is muxed, so the invariant is one pooled
         // connection per key. A lost establishment race (two callers both
         // missed the acquire before either pooled) must NOT clobber the
@@ -592,22 +676,22 @@ impl ConnectionPool {
         // in-flight streams may still depend on it, and transiently inflates the
         // pool count. The stale-connection replace path removes the dead entry
         // first (see the connection-closed handling in transport/streaming), so
-        // a present entry here is always a live one worth keeping. The losing
-        // connection is aborted so it cannot outlive the reservation that is
-        // released when this function returns.
-        if self.h3_connections.contains_key(&key) {
-            driver.abort();
-            return;
-        }
+        // a present entry here is always a live one worth keeping. The caller
+        // still uses the losing connection for its request. Keep its driver and
+        // physical-connection permit until its final sender is dropped.
         let driver = Arc::new(track_connection_task(driver, permit));
+        if self.h3_connections.contains_key(&key) {
+            return driver;
+        }
         self.h3_connections.insert(
             key,
             H3PoolEntry {
                 sender,
-                _driver_task: H3DriverTask::Tracked(driver),
+                _driver_task: H3DriverTask::Tracked(driver.clone()),
                 last_used: Instant::now(),
             },
         );
+        driver
     }
 
     #[cfg(feature = "quic-h3")]
@@ -1024,6 +1108,71 @@ impl ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_removal_preserves_replacements_and_other_protocols() {
+        let mut pool = ConnectionPool::with_max_total(4);
+        let key = test_key("example.test");
+        let (h1, h1_driver, h1_server) = local_h1::<WireBody>().await;
+        let permit = pool.try_reserve_connection().unwrap();
+        pool.return_h1_reserved(key.clone(), h1, Arc::new(h1_driver), permit);
+        let (old_io, _old_peer) = tokio::io::duplex(4096);
+        let (old_sender, old_driver) = lkh2::spawn_driver(old_io, &lkh2::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        let old_abort = old_driver.abort_handle();
+        let permit = pool.try_reserve_connection().unwrap();
+        pool.insert_h2_reserved(
+            key.clone(),
+            lkh2::H2Sender::Native(old_sender),
+            old_driver,
+            permit,
+        );
+        let Some(AcquiredConnection::H2 {
+            token: old_token, ..
+        }) = pool.try_acquire_h2_pooled_internal(&key)
+        else {
+            panic!("missing old H2 entry")
+        };
+        assert!(pool.remove_acquired(&key, &old_token));
+        assert!(pool.has_h1_connection_inner(&key));
+        let (new_io, _new_peer) = tokio::io::duplex(4096);
+        let (new_sender, new_driver) = lkh2::spawn_driver(new_io, &lkh2::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        let new_abort = new_driver.abort_handle();
+        let permit = pool.try_reserve_connection().unwrap();
+        pool.insert_h2_reserved(
+            key.clone(),
+            lkh2::H2Sender::Native(new_sender),
+            new_driver,
+            permit,
+        );
+        assert!(!pool.remove_acquired(&key, &old_token));
+        assert!(pool.has_h2_connection_inner(&key));
+        assert!(pool.has_h1_connection_inner(&key));
+        let Some(AcquiredConnection::H2 {
+            token: current_token,
+            ..
+        }) = pool.try_acquire_h2_pooled_internal(&key)
+        else {
+            panic!("replacement was removed")
+        };
+        assert!(pool.remove_acquired(&key, &current_token));
+        assert!(!pool.has_h2_connection_inner(&key));
+        assert!(pool.has_h1_connection_inner(&key));
+        old_abort.abort();
+        new_abort.abort();
+        pool.clear();
+        h1_server.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.stats().total != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     async fn local_h1<Body>() -> (
         hyper::client::conn::http1::SendRequest<Body>,

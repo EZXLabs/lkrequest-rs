@@ -18,7 +18,7 @@
 //! | [`firefox_133`] | **Unverified** | no reference data | none |
 //! | [`safari_18`] | **Unverified** | no reference data | none |
 //!
-//! **For production use, prefer the verified profiles (chrome_154 / firefox_156 / safari_26).**
+//! **For production use, prefer the verified profiles (chrome_155 / firefox_156 / safari_26).**
 //! Unverified profiles may have subtle deviations in extension order, parameter values, etc.,
 //! which risk detection in adversarial scenarios.
 
@@ -255,6 +255,27 @@ pub fn chrome_154() -> TlsProfile {
 /// extensions, 28 trust anchors, and lack of ordinary TLS GREASE slots.
 pub fn chrome_154_quic() -> TlsProfile {
     let mut profile = chromium_quic_profile(chrome_154(), "Chrome 154 QUIC");
+    profile.grease = GreaseConfig::default();
+    profile.randomization = Some(RandomizationConfig {
+        shuffle_extensions: true,
+    });
+    profile
+        .signature_algorithms
+        .retain(|algorithm| !matches!(*algorithm, 0x0904..=0x0906));
+    profile
+}
+
+/// Chrome 155.0.8059.40 TCP profile captured against Cloudflare and example.com.
+/// Stable fields, including the 28 trust anchors and sigalgs GREASE, match 154.
+pub fn chrome_155() -> TlsProfile {
+    let json_str = include_str!("../../profiles/chrome_155.json");
+    serde_json::from_str(json_str).expect("built-in chrome_155 profile should be valid")
+}
+
+/// Chrome 155 QUIC ClientHello from successful public Cloudflare H3 captures.
+/// QUIC uses classic signatures without TCP's ML-DSA and ordinary TLS GREASE.
+pub fn chrome_155_quic() -> TlsProfile {
+    let mut profile = chromium_quic_profile(chrome_155(), "Chrome 155 QUIC");
     profile.grease = GreaseConfig::default();
     profile.randomization = Some(RandomizationConfig {
         shuffle_extensions: true,

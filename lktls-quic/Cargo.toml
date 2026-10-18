@@ -1,6 +1,6 @@
 [package]
 name = "lktls-quic"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "QUIC TLS 1.3 bridge from lktls to Quinn"
 license.workspace = true
@@ -12,7 +12,7 @@ keywords = ["quic", "tls", "fingerprint", "browser", "networking"]
 categories = ["cryptography", "network-programming"]
 
 [dependencies]
-lktls = { path = "../lktls", version = "0.2.3" }
+lktls = { path = "../lktls", version = "0.2.4" }
 quinn-proto = { workspace = true }
 quinn = { workspace = true, features = ["runtime-tokio", "ring", "rustls"] }
 bytes = { workspace = true }
@@ -25,6 +25,7 @@ chacha20 = "0.9"
 rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
+lkprofile = { path = "../lkprofile" }
 lkh3 = { path = "../lkh3" }
 h3 = { path = "../deps/h3/h3" }
 h3-quinn = { path = "../deps/h3/h3-quinn" }

@@ -184,6 +184,152 @@ unsafe fn new_client_and_session() -> (*mut lk_client_t, *mut lk_session_t) {
 }
 
 #[test]
+fn cookie_attribute_readers_reject_bad_arguments_and_clear_outputs() {
+    unsafe {
+        let (client, session) = new_client_and_session();
+        let url = cstring("https://example.test/");
+        let sentinel = cstring("unchanged");
+        for scoped in [false, true] {
+            let call = |handle, out_ptr, out_len, out_err| {
+                if scoped {
+                    lkrequest_ffi::lk_session_get_cookies_with_attrs_json(
+                        handle,
+                        url.as_ptr(),
+                        url.as_bytes().len(),
+                        out_ptr,
+                        out_len,
+                        out_err,
+                    )
+                } else {
+                    lkrequest_ffi::lk_session_get_all_cookies_json(
+                        handle, out_ptr, out_len, out_err,
+                    )
+                }
+            };
+            for case in 0..3 {
+                let mut output = sentinel.as_ptr();
+                let mut len = 99usize;
+                let mut err = ptr::null_mut();
+                let (handle, out_ptr, out_len) = match case {
+                    0 => (ptr::null(), &mut output as *mut _, &mut len as *mut _),
+                    1 => (session.cast_const(), ptr::null_mut(), &mut len as *mut _),
+                    _ => (session.cast_const(), &mut output as *mut _, ptr::null_mut()),
+                };
+                assert_eq!(
+                    call(handle, out_ptr, out_len, &mut err),
+                    lk_status_t::LK_ERR
+                );
+                assert!(!err.is_null());
+                assert_eq!(
+                    lk_error_code(err),
+                    lkrequest_ffi::lk_error_code_t::LK_ERR_INVALID_ARGUMENT
+                );
+                if !out_ptr.is_null() {
+                    assert!(output.is_null());
+                }
+                if !out_len.is_null() {
+                    assert_eq!(len, 0);
+                }
+                lk_error_free(err);
+            }
+            assert_eq!(
+                call(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                lk_status_t::LK_ERR
+            );
+        }
+
+        let invalid_utf8 = [0xffu8];
+        for (url_ptr, url_len) in [(ptr::null(), 1), (invalid_utf8.as_ptr().cast(), 1)] {
+            let mut output = sentinel.as_ptr();
+            let mut len = 99usize;
+            let mut err = ptr::null_mut();
+            assert_eq!(
+                lkrequest_ffi::lk_session_get_cookies_with_attrs_json(
+                    session,
+                    url_ptr,
+                    url_len,
+                    &mut output,
+                    &mut len,
+                    &mut err
+                ),
+                lk_status_t::LK_ERR
+            );
+            assert!(output.is_null());
+            assert_eq!(len, 0);
+            assert_eq!(
+                lk_error_code(err),
+                lkrequest_ffi::lk_error_code_t::LK_ERR_INVALID_ARGUMENT
+            );
+            lk_error_free(err);
+        }
+        lk_session_free(session);
+        lk_client_free(client);
+    }
+}
+
+#[test]
+fn h2_weight_setter_validates_wire_range_and_single_consumption() {
+    let server = TestServer::start();
+    unsafe {
+        let (client, session) = new_client_and_session();
+        let url = server.url("/ok");
+        let mut request = ptr::null_mut::<lk_request_t>();
+        let mut error = ptr::null_mut::<lk_error_t>();
+        assert_eq!(
+            lk_request_new(
+                session,
+                cstring("GET").as_ptr(),
+                3,
+                cstring(&url).as_ptr(),
+                url.len(),
+                &mut request,
+                &mut error
+            ),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lkrequest_ffi::lk_request_set_h2_priority_weight(ptr::null_mut(), 21),
+            lk_status_t::LK_ERR
+        );
+        assert_eq!(
+            lkrequest_ffi::lk_request_set_h2_priority_weight(request, 256),
+            lk_status_t::LK_ERR
+        );
+        for weight in [0, 255, 21] {
+            assert_eq!(
+                lkrequest_ffi::lk_request_set_h2_priority_weight(request, weight),
+                lk_status_t::LK_OK
+            );
+        }
+        let mut op = ptr::null_mut();
+        assert_eq!(
+            lk_request_send_async(request, &mut op, &mut error),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lkrequest_ffi::lk_request_set_h2_priority_weight(request, 21),
+            lk_status_t::LK_ERR
+        );
+        assert_eq!(lk_op_wait(op, 5000), lk_op_state_t::LK_OP_COMPLETED_OK);
+        let mut response = ptr::null_mut::<lk_response_t>();
+        assert_eq!(
+            lk_op_take_response(op, &mut response, &mut error),
+            lk_status_t::LK_OK
+        );
+        lk_response_free(response);
+        lk_op_free(op);
+        lk_request_free(request);
+        lk_session_free(session);
+        lk_client_free(client);
+    }
+}
+
+#[test]
 fn op_results_are_single_consume_and_missing_values_return_not_found() {
     let server = TestServer::start();
 

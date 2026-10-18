@@ -116,6 +116,12 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
         ));
     }
     let session_id_len = data[pos] as usize;
+    if session_id_len > 32 {
+        return Err(TlsError::local_alert(
+            AlertDescription::DecodeError,
+            "ServerHello session ID exceeds 32 bytes",
+        ));
+    }
     pos += 1;
     if pos + session_id_len > data.len() {
         return Err(TlsError::UnexpectedMessage(
@@ -146,6 +152,12 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
     // Extensions
     let mut extensions = ServerHelloExtensions::default();
     let mut extension_types: Vec<u16> = Vec::new();
+    if pos < data.len() && data.len() - pos < 2 {
+        return Err(TlsError::local_alert(
+            AlertDescription::DecodeError,
+            "ServerHello has a truncated extensions length prefix",
+        ));
+    }
     if pos + 2 <= data.len() {
         let ext_total = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
@@ -161,10 +173,10 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
                 "ServerHello extensions exceed message length",
             ));
         }
-        if is_hello_retry_request && ext_end != data.len() {
+        if ext_end != data.len() {
             return Err(TlsError::local_alert(
                 AlertDescription::DecodeError,
-                "HelloRetryRequest has trailing bytes after extensions",
+                "ServerHello has trailing bytes after extensions",
             ));
         }
 
@@ -295,10 +307,10 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
             }
         }
 
-        if is_hello_retry_request && pos != ext_end {
+        if pos != ext_end {
             return Err(TlsError::local_alert(
                 AlertDescription::DecodeError,
-                "truncated HelloRetryRequest extension header",
+                "truncated ServerHello extension header",
             ));
         }
     } else if is_hello_retry_request {
@@ -351,10 +363,71 @@ pub fn server_hello_permits_extension(ext_type: u16) -> bool {
 pub const DOWNGRADE_SENTINEL_TLS12: [u8; 8] = [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01];
 pub const DOWNGRADE_SENTINEL_TLS11: [u8; 8] = [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00];
 
+/// Whether basic SH/version parsing has reached Chromium's CCS stage.
+pub(crate) fn tls13_failure_ccs_eligible(message: &[u8]) -> bool {
+    // BoringSSL queues CCS after basic SH/version parsing, before HRR or
+    // key-share semantics. Keep this check independent of those later rules.
+    let parse = || -> Option<bool> {
+        let header = message.get(..4)?;
+        if header[0] != 2 {
+            return Some(false);
+        }
+        let length =
+            ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | header[3] as usize;
+        let body = message.get(4..4 + length)?;
+        let sid = *body.get(34)? as usize;
+        if sid > 32 {
+            return Some(false);
+        }
+        let mut position = 38 + sid;
+        let prefix = body.get(position..position + 2)?;
+        let length = u16::from_be_bytes([prefix[0], prefix[1]]) as usize;
+        position += 2;
+        if position + length != body.len() {
+            return Some(false);
+        }
+        let mut seen = Vec::new();
+        let mut tls13 = false;
+        while position < body.len() {
+            let header = body.get(position..position + 4)?;
+            let kind = u16::from_be_bytes([header[0], header[1]]);
+            let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+            if seen.contains(&kind) {
+                return Some(false);
+            }
+            seen.push(kind);
+            position += 4;
+            let payload = body.get(position..position + length)?;
+            if kind == 43 {
+                if payload != [3, 4] {
+                    return Some(false);
+                }
+                tls13 = true;
+            }
+            position += length;
+        }
+        Some(tls13)
+    };
+    parse().unwrap_or(false)
+}
+
 /// Quick-parse a ServerHello payload to determine the negotiated TLS version.
 ///
 /// Returns 0x0304 for TLS 1.3, 0x0303 for TLS 1.2, etc.
 pub fn detect_version_from_server_hello(payload: &[u8]) -> Result<u16> {
+    detect_version_for_style(
+        payload,
+        crate::profile::types::TlsClientHelloStyle::Generic,
+        false,
+    )
+    .map(|(version, _)| version)
+}
+
+pub(crate) fn detect_version_for_style(
+    payload: &[u8],
+    style: crate::profile::types::TlsClientHelloStyle,
+    after_hrr: bool,
+) -> Result<(u16, bool)> {
     if payload.len() < 4 {
         return Err(TlsError::HandshakeFailure("ServerHello too short".into()));
     }
@@ -379,11 +452,11 @@ pub fn detect_version_from_server_hello(payload: &[u8]) -> Result<u16> {
     let ext_start = 35 + session_id_len + 3;
 
     if ext_start > body.len() {
-        return Ok(legacy_version);
+        return Ok((legacy_version, false));
     }
 
     if ext_start + 2 > body.len() {
-        return Ok(legacy_version);
+        return Ok((legacy_version, false));
     }
 
     let ext_total_len = u16::from_be_bytes([body[ext_start], body[ext_start + 1]]) as usize;
@@ -399,15 +472,34 @@ pub fn detect_version_from_server_hello(payload: &[u8]) -> Result<u16> {
             break;
         }
 
-        if ext_type == 0x002B && ext_len >= 2 {
+        if ext_type == 0x002B {
+            let chromium = style == crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl;
+            let nss = style == crate::profile::types::TlsClientHelloStyle::FirefoxNss;
+            if ext_len != 2 {
+                let alert = if (chromium && after_hrr) || (nss && ext_len > 2) {
+                    AlertDescription::IllegalParameter
+                } else {
+                    AlertDescription::DecodeError
+                };
+                return Err(TlsError::local_alert(
+                    alert,
+                    "ServerHello supported_versions must contain exactly two bytes",
+                ));
+            }
             let version = u16::from_be_bytes([body[offset], body[offset + 1]]);
-            return Ok(version);
+            if (!chromium || after_hrr) && version != 0x0304 {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    "supported_versions must select TLS 1.3",
+                ));
+            }
+            return Ok((version, true));
         }
 
         offset += ext_len;
     }
 
-    Ok(legacy_version)
+    Ok((legacy_version, false))
 }
 
 /// Check the ServerHello random for RFC 8446 §4.1.3 downgrade sentinels.
@@ -440,6 +532,18 @@ pub fn check_downgrade_sentinel(sh_payload: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_hello_session_id_must_fit_the_32_byte_vector() {
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[0x55; 32]);
+        body.push(33);
+        body.extend_from_slice(&[0xa5; 33]);
+        body.extend_from_slice(&[0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
+        assert!(
+            matches!(parse_server_hello(&body), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
+        );
+    }
 
     /// Build a minimal ServerHello byte sequence for testing.
     fn build_test_server_hello(
@@ -622,6 +726,72 @@ mod tests {
         data.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         data.extend_from_slice(extensions);
         data
+    }
+
+    #[test]
+    fn compatibility_ccs_phase_depends_on_framing_not_hrr_payload_rules() {
+        let extensions = [0, 43, 0, 2, 3, 4, 0, 51, 0, 3, 0, 24, 0xa5];
+        let body = build_test_hrr(&extensions);
+        let wrap = |body: &[u8]| {
+            let mut message = vec![2, 0, 0, body.len() as u8];
+            message.extend_from_slice(body);
+            message
+        };
+        assert!(tls13_failure_ccs_eligible(&wrap(&body)));
+        assert!(
+            matches!(parse_server_hello(&body), Err(TlsError::LocalAlert { alert, .. })
+            if alert.description == AlertDescription::DecodeError)
+        );
+        let mut outside = body.clone();
+        outside.push(0xa5);
+        assert!(!tls13_failure_ccs_eligible(&wrap(&outside)));
+        let inside = build_test_server_hello_with_extensions(&[0, 43, 0, 2, 3, 4, 0xa5]);
+        assert!(!tls13_failure_ccs_eligible(&wrap(&inside)));
+        let duplicate =
+            build_test_server_hello_with_extensions(&[0, 43, 0, 2, 3, 4, 0, 43, 0, 2, 3, 4]);
+        assert!(!tls13_failure_ccs_eligible(&wrap(&duplicate)));
+        let version = build_test_server_hello_with_extensions(&[0, 43, 0, 3, 3, 4, 0]);
+        assert!(!tls13_failure_ccs_eligible(&wrap(&version)));
+        assert!(!tls13_failure_ccs_eligible(&[]));
+    }
+
+    #[test]
+    fn server_hello_extension_container_must_be_fully_consumed() {
+        let extensions = [0, 43, 0, 2, 3, 4];
+        for retry in [false, true] {
+            for inside in [false, true] {
+                for tail_len in 1..=3 {
+                    let mut body = if retry {
+                        build_test_hrr(&extensions)
+                    } else {
+                        build_test_server_hello_with_extensions(&extensions)
+                    };
+                    let ext_length_pos = 38 + body[34] as usize;
+                    body.extend_from_slice(&[0xa5; 3][..tail_len]);
+                    if inside {
+                        body[ext_length_pos..ext_length_pos + 2]
+                            .copy_from_slice(&((extensions.len() + tail_len) as u16).to_be_bytes());
+                    }
+                    assert!(
+                        matches!(parse_server_hello(&body),
+                        Err(TlsError::LocalAlert { alert, .. })
+                        if alert.description == AlertDescription::DecodeError),
+                        "retry={retry} inside={inside} tail_len={tail_len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_server_hello_allows_no_extensions_but_not_half_a_length_prefix() {
+        let mut body = build_test_server_hello_with_extensions(&[]);
+        body.truncate(body.len() - 2);
+        assert!(parse_server_hello(&body).is_ok());
+        body.push(0);
+        assert!(matches!(parse_server_hello(&body),
+            Err(TlsError::LocalAlert { alert, .. })
+            if alert.description == AlertDescription::DecodeError));
     }
 
     #[test]

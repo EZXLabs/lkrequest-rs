@@ -10,10 +10,12 @@
 pub struct TlsShapeSpec {
     /// Whether the client shuffles extension order per connection (Chrome 108+,
     /// BoringSSL `permute_extensions`). When `true`, extension order is compared
-    /// as an unordered multiset; when `false`, exact order is required.
+    /// as an unordered multiset within non-anchored slots; GREASE extensions
+    /// retain their observed positions. When `false`, exact order is required.
     pub extensions_shuffled: bool,
     /// Extension types pinned to the end (e.g. `pre_shared_key` = `0x0029`),
-    /// excluded from the shuffle.
+    /// excluded from the shuffle. Their observed positions are retained so a
+    /// misplaced extension remains a mismatch rather than being repaired.
     pub pinned_last: Vec<u16>,
 }
 

@@ -144,13 +144,16 @@ impl LktlsQuicClientConfig {
 
     /// Emit the initial QUIC ClientHello bytes for `server_name`.
     ///
-    /// When the configured session store holds a TLS 1.3 ticket for
-    /// `server_name:port` (and the profile enables PSK resumption), the returned
-    /// ClientHello is a resumed/0-RTT one — it carries the `pre_shared_key`
-    /// extension as the last extension and, when the ticket permits early data,
-    /// the `early_data` extension. `transport_params` is the encoded QUIC
-    /// transport-parameters payload to embed (it does not affect the TLS
-    /// extension structure, so tests may pass an arbitrary/empty value).
+    /// Uses the same ticket selection and QUIC early-data eligibility checks as
+    /// a real connection, consuming a cached ticket from `server_name:port` when
+    /// one is available. An eligible TLS 1.3 ticket permits PSK resumption; the
+    /// profile, ticket allowance, and cached peer transport parameters determine
+    /// whether `early_data` is offered.
+    ///
+    /// With real ECH, the returned bytes are the wire ClientHelloOuter; the PSK
+    /// identity and binder reside in its encrypted ClientHelloInner.
+    /// `transport_params` is the encoded QUIC transport-parameters payload to
+    /// embed (tests may pass an arbitrary/empty value).
     ///
     /// Primarily a diagnostic / fingerprint-inspection entry point that bypasses
     /// quinn's `TransportParameters`; the regular path is via
@@ -160,27 +163,16 @@ impl LktlsQuicClientConfig {
         server_name: &str,
         transport_params: Vec<u8>,
     ) -> Result<Vec<u8>, TlsError> {
-        let mut handshake = self.handshake.clone();
-        handshake.hostname = server_name.to_string();
-        handshake.port = self.port;
-        let quic_config = handshake.into_quic(transport_params);
+        let (quic_config, _) = self.prepare_quic_handshake(server_name, transport_params);
         let mut driver = QuicHandshakeDriver::new(quic_config);
         driver.start()
     }
-}
 
-impl ProtoClientConfig for LktlsQuicClientConfig {
-    fn start_session(
-        self: Arc<Self>,
-        version: u32,
+    fn prepare_quic_handshake(
+        &self,
         server_name: &str,
-        params: &TransportParameters,
-    ) -> Result<Box<dyn Session>, ConnectError> {
-        ensure_supported_version(version)?;
-
-        let mut transport_parameters = Vec::new();
-        params.write(&mut transport_parameters);
-
+        transport_parameters: Vec<u8>,
+    ) -> (QuicHandshakeConfig, Option<SessionTicketData>) {
         let mut handshake = self.handshake.clone();
         handshake.hostname = server_name.to_string();
         handshake.port = self.port;
@@ -196,16 +188,35 @@ impl ProtoClientConfig for LktlsQuicClientConfig {
                 self.handshake.session_store.clone(),
             )));
         }
-        let quic_config: QuicHandshakeConfig = handshake.into_quic(transport_parameters);
+        (handshake.into_quic(transport_parameters), resumed_ticket)
+    }
+}
+
+impl ProtoClientConfig for LktlsQuicClientConfig {
+    fn start_session(
+        self: Arc<Self>,
+        version: u32,
+        server_name: &str,
+        params: &TransportParameters,
+    ) -> Result<Box<dyn Session>, ConnectError> {
+        ensure_supported_version(version)?;
+
+        let mut transport_parameters = Vec::new();
+        params.write(&mut transport_parameters);
+
+        let (quic_config, resumed_ticket) =
+            self.prepare_quic_handshake(server_name, transport_parameters);
 
         let mut driver = QuicHandshakeDriver::new(quic_config);
         let initial_output = driver
             .start()
             .map_err(|e| map_tls_start_error(server_name, e))?;
 
-        let zero_rtt = resumed_ticket
-            .as_ref()
-            .filter(|ticket| {
+        // Use the TLS driver's actual PSK/early-data offer and transcript,
+        // including ClientHelloInner when ECH is active.
+        let zero_rtt = driver
+            .early_data_offer()
+            .filter(|(ticket, _)| {
                 // RFC 9001 §4.6.1: over QUIC the only legal `max_early_data_size`
                 // is 0xffffffff — QUIC's own flow control bounds early data, so a
                 // TLS-level byte budget is meaningless and any other value marks
@@ -215,7 +226,7 @@ impl ProtoClientConfig for LktlsQuicClientConfig {
                     && ticket.max_early_data_size == QUIC_MAX_EARLY_DATA_SIZE
                     && ticket.peer_transport_parameters.is_some()
             })
-            .and_then(|ticket| derive_early_crypto(ticket, &initial_output).ok());
+            .and_then(|(ticket, client_hello)| derive_early_crypto(ticket, client_hello).ok());
 
         tracing::debug!(
             server_name = %server_name,
@@ -313,34 +324,36 @@ impl Session for LktlsQuicSession {
             .is_some_and(|zero_rtt| zero_rtt.rejected)
     }
 
+    fn early_data_rejection_allows_stream_reuse(&self) -> bool {
+        self.established
+            && self.zero_rtt.as_ref().is_some_and(|zero_rtt| {
+                zero_rtt.session_resumed
+                    && !zero_rtt.accepted
+                    && !zero_rtt.rejected
+                    && zero_rtt.alpn.as_deref().is_some_and(|alpn| {
+                        !alpn.is_empty()
+                            && self
+                                .handshake_data
+                                .as_ref()
+                                .and_then(|data| data.protocol.as_deref())
+                                == Some(alpn.as_bytes())
+                    })
+            })
+    }
+
     fn is_handshaking(&self) -> bool {
         !self.established
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
         if self.established {
-            // Borrows `session_ticket_ctx` and `post_handshake_buf` as disjoint
-            // fields of `self`, so the immutable ctx borrow coexists with the
-            // mutable buffer borrows.
-            if let Some(ctx) = self.session_ticket_ctx.as_ref() {
-                self.post_handshake_buf.extend_from_slice(buf);
-                let consumed = process_post_handshake_messages(&self.post_handshake_buf, ctx)?;
-                // Retain any trailing partial message for the next call.
-                self.post_handshake_buf.drain(..consumed);
-                // Bound the accumulator. A legitimate NewSessionTicket is small
-                // (its fields are u16-bounded). A large *unconsumed* remainder
-                // means the peer declared a 24-bit message length it never
-                // completes; drop it rather than let a misbehaving server grow
-                // this buffer without bound.
-                const MAX_POST_HANDSHAKE_BUF: usize = 256 * 1024;
-                if self.post_handshake_buf.len() > MAX_POST_HANDSHAKE_BUF {
-                    tracing::warn!(
-                        buffered = self.post_handshake_buf.len(),
-                        "quic.post_handshake_buffer_overflow_discarded"
-                    );
-                    self.post_handshake_buf.clear();
-                }
-            }
+            self.post_handshake_buf.extend_from_slice(buf);
+            let consumed = process_post_handshake_messages(
+                &self.post_handshake_buf,
+                self.session_ticket_ctx.as_ref(),
+            )?;
+            // Preserve message framing even when ticket storage is disabled.
+            self.post_handshake_buf.drain(..consumed);
             return Ok(false);
         }
 
@@ -390,6 +403,7 @@ impl Session for LktlsQuicSession {
                     self.session_ticket_ctx = result.session_ticket_ctx;
                     if let Some(ref mut zero_rtt) = self.zero_rtt {
                         zero_rtt.accepted = result.early_data_accepted;
+                        zero_rtt.session_resumed = result.session_resumed;
                     }
                     tracing::debug!(
                         alpn = ?self.handshake_data.as_ref().and_then(|data| data.protocol.as_ref()),
@@ -786,9 +800,13 @@ fn map_tls_start_error(server_name: &str, error: TlsError) -> ConnectError {
 }
 
 fn map_tls_error(error: TlsError) -> TransportError {
-    if let Some(alert) = error.as_alert() {
+    let alert_code = match &error {
+        TlsError::EchRejected { .. } => Some(lktls::error::AlertDescription::EchRequired.as_byte()),
+        _ => error.as_alert().map(|alert| alert.description.as_byte()),
+    };
+    if let Some(alert_code) = alert_code {
         return TransportError {
-            code: TransportErrorCode::crypto(alert.description.as_byte()),
+            code: TransportErrorCode::crypto(alert_code),
             frame: None,
             reason: error.to_string(),
         };
@@ -814,6 +832,8 @@ impl fmt::Debug for LktlsQuicClientConfig {
 struct ZeroRttState {
     keys: LktlsPacketKeys,
     aead_algorithm: AeadAlgorithm,
+    alpn: Option<String>,
+    session_resumed: bool,
     accepted: bool,
     rejected: bool,
 }
@@ -860,66 +880,73 @@ impl SessionStore for SeededSessionStore {
 /// A client MUST treat any other value as a connection error.
 const QUIC_MAX_EARLY_DATA_SIZE: u32 = 0xffff_ffff;
 
-/// What the `early_data` extension of a received NewSessionTicket says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TicketEarlyData {
-    /// No `early_data` extension: the ticket simply does not permit 0-RTT.
-    Absent,
-    /// `early_data` present, carrying this `max_early_data_size`.
-    Present(u32),
-    /// `early_data` present but not a 4-byte `max_early_data_size`.
-    Malformed,
-}
-
-/// Reads the `early_data` (0x002a) extension out of a NewSessionTicket.
+/// Validates a NewSessionTicket and returns its optional early-data allowance.
 ///
 /// `msg` is the complete handshake message (type byte + 3-byte length + body).
-/// A message that does not parse reports [`TicketEarlyData::Absent`]: this
-/// check is only about the early-data field, and the ticket parser in `lktls`
-/// is what decides whether the message is usable at all.
-fn new_session_ticket_early_data(msg: &[u8]) -> TicketEarlyData {
-    // handshake header (4) + ticket_lifetime (4) + ticket_age_add (4)
-    let mut pos = 4 + 4 + 4;
-    // ticket_nonce
-    let Some(&nonce_len) = msg.get(pos) else {
-        return TicketEarlyData::Absent;
-    };
-    pos += 1 + nonce_len as usize;
-    // ticket
-    if pos + 2 > msg.len() {
-        return TicketEarlyData::Absent;
+/// Unknown extensions, including repeated unknown types, follow BoringSSL's
+/// ignore-unknown policy. Duplicate early_data is an illegal parameter.
+fn new_session_ticket_early_data(msg: &[u8]) -> Result<Option<u32>, TransportError> {
+    use bytes::Buf;
+
+    fn decode_error() -> TransportError {
+        map_tls_error(TlsError::local_alert(
+            lktls::error::AlertDescription::DecodeError,
+            "malformed NewSessionTicket structure",
+        ))
     }
-    let ticket_len = u16::from_be_bytes([msg[pos], msg[pos + 1]]) as usize;
-    pos += 2 + ticket_len;
-    // extensions
-    if pos + 2 > msg.len() {
-        return TicketEarlyData::Absent;
+
+    let mut reader = msg;
+    let message_type = reader.try_get_u8().map_err(|_| decode_error())?;
+    let body_len = reader.try_get_uint(3).map_err(|_| decode_error())?;
+    if message_type != 0x04 || body_len != reader.remaining() as u64 {
+        return Err(decode_error());
     }
-    let ext_total = u16::from_be_bytes([msg[pos], msg[pos + 1]]) as usize;
-    pos += 2;
-    let ext_end = (pos + ext_total).min(msg.len());
-    while pos + 4 <= ext_end {
-        let ext_type = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
-        let ext_len = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]) as usize;
-        pos += 4;
-        if pos + ext_len > ext_end {
-            break;
+    reader.try_get_u32().map_err(|_| decode_error())?; // ticket_lifetime
+    reader.try_get_u32().map_err(|_| decode_error())?; // ticket_age_add
+    let nonce_len = usize::from(reader.try_get_u8().map_err(|_| decode_error())?);
+    let (_, remaining) = reader
+        .split_at_checked(nonce_len)
+        .ok_or_else(decode_error)?;
+    reader = remaining;
+    let ticket_len = usize::from(reader.try_get_u16().map_err(|_| decode_error())?);
+    if ticket_len == 0 {
+        return Err(decode_error());
+    }
+    let (_, remaining) = reader
+        .split_at_checked(ticket_len)
+        .ok_or_else(decode_error)?;
+    reader = remaining;
+    let ext_len = usize::from(reader.try_get_u16().map_err(|_| decode_error())?);
+    if ext_len != reader.remaining() {
+        return Err(decode_error());
+    }
+
+    // Scan the whole block before interpreting early_data so duplicate and
+    // framing errors do not depend on the order of the advertised values.
+    let mut early_data = None;
+    while reader.has_remaining() {
+        let extension_type = reader.try_get_u16().map_err(|_| decode_error())?;
+        let extension_len = usize::from(reader.try_get_u16().map_err(|_| decode_error())?);
+        let (payload, remaining) = reader
+            .split_at_checked(extension_len)
+            .ok_or_else(decode_error)?;
+        reader = remaining;
+        if extension_type == 0x002a {
+            if early_data.is_some() {
+                return Err(map_tls_error(TlsError::local_alert(
+                    lktls::error::AlertDescription::IllegalParameter,
+                    "duplicate NewSessionTicket early_data extension",
+                )));
+            }
+            early_data = Some(payload);
         }
-        if ext_type == 0x002a {
-            return if ext_len == 4 {
-                TicketEarlyData::Present(u32::from_be_bytes([
-                    msg[pos],
-                    msg[pos + 1],
-                    msg[pos + 2],
-                    msg[pos + 3],
-                ]))
-            } else {
-                TicketEarlyData::Malformed
-            };
-        }
-        pos += ext_len;
     }
-    TicketEarlyData::Absent
+    match early_data {
+        None => Ok(None),
+        Some(payload) => Ok(Some(u32::from_be_bytes(
+            payload.try_into().map_err(|_| decode_error())?,
+        ))),
+    }
 }
 
 /// RFC 9001 §4.6.1 check on a received NewSessionTicket.
@@ -930,19 +957,12 @@ fn new_session_ticket_early_data(msg: &[u8]) -> TicketEarlyData {
 ///
 /// A ticket without the extension is fine — it only means no 0-RTT.
 fn validate_quic_new_session_ticket(msg: &[u8]) -> Result<(), TransportError> {
-    let reason = match new_session_ticket_early_data(msg) {
-        TicketEarlyData::Absent | TicketEarlyData::Present(QUIC_MAX_EARLY_DATA_SIZE) => {
-            return Ok(())
-        }
-        TicketEarlyData::Present(size) => format!(
+    let reason = match new_session_ticket_early_data(msg)? {
+        None | Some(QUIC_MAX_EARLY_DATA_SIZE) => return Ok(()),
+        Some(size) => format!(
             "NewSessionTicket early_data max_early_data_size is {size:#010x}, \
              but QUIC permits only 0xffffffff (RFC 9001 §4.6.1)"
         ),
-        TicketEarlyData::Malformed => {
-            "NewSessionTicket early_data extension is not a 4-byte max_early_data_size \
-             (RFC 9001 §4.6.1)"
-                .to_string()
-        }
     };
     tracing::warn!(reason = %reason, "quic.tls_new_session_ticket_invalid_early_data");
     Err(TransportError {
@@ -1002,35 +1022,56 @@ fn derive_early_crypto(
     Ok(ZeroRttState {
         keys,
         aead_algorithm: ticket.aead_algorithm,
+        alpn: ticket.alpn.clone(),
+        session_resumed: false,
         accepted: false,
         rejected: false,
     })
 }
+
+// Larger than any valid TLS 1.3 ticket's nonce and two u16-sized vectors.
+const MAX_POST_HANDSHAKE_MESSAGE: usize = 256 * 1024;
 
 /// Processes every complete TLS handshake message contained in `payload`,
 /// returning the number of leading bytes fully consumed. Any trailing bytes
 /// that form only a partial message are left for the caller to retain and
 /// re-submit once more data arrives.
 ///
-/// Returns the connection error RFC 9001 §4.6.1 mandates if a NewSessionTicket
-/// carries an `early_data` extension QUIC does not permit; that ticket is not
-/// stored.
+/// Rejects unexpected message types, oversized messages, and the invalid ticket
+/// early-data allowance covered by RFC 9001 §4.6.1. Ticket storage is optional;
+/// message validation is always required.
 fn process_post_handshake_messages(
     payload: &[u8],
-    ctx: &SessionTicketContext,
+    ctx: Option<&SessionTicketContext>,
 ) -> Result<usize, TransportError> {
     let mut pos = 0usize;
     while pos + 4 <= payload.len() {
+        if payload[pos] != 0x04 {
+            return Err(map_tls_error(TlsError::local_alert(
+                lktls::error::AlertDescription::UnexpectedMessage,
+                format!(
+                    "unexpected QUIC post-handshake TLS message {:#04x}",
+                    payload[pos]
+                ),
+            )));
+        }
         let len = ((payload[pos + 1] as usize) << 16)
             | ((payload[pos + 2] as usize) << 8)
             | (payload[pos + 3] as usize);
+        if len > MAX_POST_HANDSHAKE_MESSAGE - 4 {
+            return Err(TransportError {
+                code: TransportErrorCode::CRYPTO_BUFFER_EXCEEDED,
+                frame: None,
+                reason: "post-handshake TLS message exceeds buffer limit".into(),
+            });
+        }
         let end = pos + 4 + len;
         if end > payload.len() {
             break;
         }
-        if payload[pos] == 0x04 {
-            tracing::debug!(ticket_len = len, "quic.tls_new_session_ticket");
-            validate_quic_new_session_ticket(&payload[pos..end])?;
+        tracing::debug!(ticket_len = len, "quic.tls_new_session_ticket");
+        validate_quic_new_session_ticket(&payload[pos..end])?;
+        if let Some(ctx) = ctx {
             ctx.process_new_session_ticket(&payload[pos..end]);
         }
         pos = end;
@@ -1055,6 +1096,7 @@ mod tests {
     use http::{Request, Response, StatusCode};
     use lkh3::connect_h3;
     use lktls::profile::presets;
+    use lktls::session_store::AlpsSessionState;
     use quinn::crypto::rustls::QuicServerConfig;
     use quinn::Endpoint;
     use rcgen::generate_simple_self_signed;
@@ -1073,6 +1115,331 @@ mod tests {
         cert: &CertificateDer<'static>,
     ) -> rustls_pki_types::TrustAnchor<'static> {
         lktls::verify::certchain::parse_trust_anchor_from_der(cert.as_ref()).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct StreamReuseHandshake {
+        early_available: bool,
+        early_accepted: Option<bool>,
+        reuse_allowed: bool,
+        server_resumed: bool,
+        finished_prefix_checked: bool,
+        alpn: Option<Vec<u8>>,
+        cipher_suite: Option<u16>,
+    }
+
+    fn stream_reuse_handshake(
+        config: Arc<LktlsQuicClientConfig>,
+        server_config: Arc<rustls::ServerConfig>,
+        corrupt_finished: bool,
+    ) -> Result<StreamReuseHandshake, TransportError> {
+        let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+        let mut client = ProtoClientConfig::start_session(config, 1, "localhost", &params).unwrap();
+        let early_available = client.early_crypto().is_some();
+        assert!(!client.early_data_rejection_allows_stream_reuse());
+        let mut server = rustls::quic::ServerConnection::new(
+            server_config,
+            rustls::quic::Version::V1,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut finished_prefix_checked = false;
+        for _ in 0..64 {
+            let mut to_server = Vec::new();
+            let client_keys = client.write_handshake(&mut to_server);
+            let mut progressed = client_keys.is_some() || !to_server.is_empty();
+            if !to_server.is_empty() {
+                server.read_hs(&to_server).unwrap();
+            }
+            let mut to_client = Vec::new();
+            let server_keys = server.write_hs(&mut to_client);
+            progressed |= server_keys.is_some() || !to_client.is_empty();
+            if !to_client.is_empty() {
+                if matches!(server_keys, Some(rustls::quic::KeyChange::OneRtt { .. })) {
+                    if corrupt_finished {
+                        *to_client.last_mut().unwrap() ^= 1;
+                    }
+                    // EE and a partial Finished cannot authorize stream reuse.
+                    let last = to_client.len() - 1;
+                    client.read_handshake(&to_client[..last])?;
+                    assert!(client.is_handshaking());
+                    assert!(!client.early_data_rejection_allows_stream_reuse());
+                    finished_prefix_checked = true;
+                    let result = client.read_handshake(&to_client[last..]);
+                    if result.is_err() {
+                        assert!(!client.early_data_rejection_allows_stream_reuse());
+                    }
+                    result?;
+                } else {
+                    client.read_handshake(&to_client)?;
+                }
+            }
+            if !progressed {
+                assert!(!client.is_handshaking());
+                assert!(!server.is_handshaking());
+                let data = client
+                    .handshake_data()
+                    .unwrap()
+                    .downcast::<HandshakeData>()
+                    .unwrap();
+                return Ok(StreamReuseHandshake {
+                    early_available,
+                    early_accepted: client.early_data_accepted(),
+                    reuse_allowed: client.early_data_rejection_allows_stream_reuse(),
+                    server_resumed: server.handshake_kind() == Some(rustls::HandshakeKind::Resumed),
+                    finished_prefix_checked,
+                    alpn: data.protocol,
+                    cipher_suite: data.cipher_suite,
+                });
+            }
+        }
+        panic!("in-memory TLS exchange did not finish");
+    }
+
+    fn stream_reuse_server_config(
+        certificate: &CertificateDer<'static>,
+        key: &[u8],
+        chacha: bool,
+        hrr: bool,
+    ) -> rustls::ServerConfig {
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.cipher_suites = vec![if chacha {
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
+        } else {
+            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+        }];
+        if hrr {
+            provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP384R1];
+        }
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())),
+            )
+            .unwrap();
+        server.alpn_protocols = vec![b"h3".to_vec()];
+        server.max_early_data_size = u32::MAX;
+        server
+    }
+
+    #[test]
+    fn quic_early_rejection_reuse_authority_requires_verified_resumption() {
+        ensure_rustls_provider();
+        for variant in [
+            "reject",
+            "accept",
+            "full",
+            "no_offer",
+            "hrr",
+            "alpn",
+            "cipher_not_resumed",
+        ] {
+            let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let certificate = CertificateDer::from(cert.cert.der().to_vec());
+            let key = cert.signing_key.serialize_der();
+            let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+            let client = LktlsQuicClientConfig::new(presets::chrome_155_quic())
+                .custom_ca_anchors(Arc::new(vec![trust_anchor_from_der(&certificate)]))
+                .session_store(store);
+            let server = stream_reuse_server_config(&certificate, &key, false, false);
+            let warm =
+                stream_reuse_handshake(Arc::new(client.clone()), Arc::new(server.clone()), false)
+                    .unwrap();
+            assert!(!warm.early_available && !warm.server_resumed && !warm.reuse_allowed);
+
+            let mut resumed_server = stream_reuse_server_config(
+                &certificate,
+                &key,
+                variant == "cipher_not_resumed",
+                variant == "hrr",
+            );
+            if variant != "full" {
+                resumed_server.session_storage = server.session_storage.clone();
+            }
+            if variant != "accept" {
+                resumed_server.max_early_data_size = 0;
+            }
+            let mut client = client;
+            if variant == "no_offer" {
+                client.handshake.profile = presets::chrome_144();
+                client.handshake.profile.alpn_protocols = vec!["h3".into()];
+            }
+            if variant == "alpn" {
+                client.handshake.profile.alpn_protocols = vec!["h3".into(), "hq-test".into()];
+                resumed_server.alpn_protocols = vec![b"hq-test".to_vec()];
+            }
+            let result =
+                stream_reuse_handshake(Arc::new(client), Arc::new(resumed_server), false).unwrap();
+            assert_eq!(
+                result.early_available,
+                variant != "no_offer",
+                "{variant}: {result:?}"
+            );
+            assert_eq!(
+                result.server_resumed,
+                !matches!(variant, "full" | "cipher_not_resumed"),
+                "{variant}: {result:?}"
+            );
+            assert_eq!(
+                result.early_accepted,
+                (variant != "no_offer").then_some(variant == "accept"),
+                "{variant}: {result:?}"
+            );
+            assert_eq!(
+                result.reuse_allowed,
+                variant == "reject",
+                "{variant}: {result:?}"
+            );
+            assert!(result.finished_prefix_checked, "{variant}: {result:?}");
+            assert_eq!(
+                result.alpn.as_deref(),
+                Some(if variant == "alpn" {
+                    &b"hq-test"[..]
+                } else {
+                    &b"h3"[..]
+                })
+            );
+            assert_eq!(
+                result.cipher_suite,
+                Some(if variant == "cipher_not_resumed" {
+                    0x1303
+                } else {
+                    0x1301
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn quic_early_rejection_reuse_authority_rejects_invalid_finished() {
+        ensure_rustls_provider();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = CertificateDer::from(cert.cert.der().to_vec());
+        let key = cert.signing_key.serialize_der();
+        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        let client = Arc::new(
+            LktlsQuicClientConfig::new(presets::chrome_155_quic())
+                .custom_ca_anchors(Arc::new(vec![trust_anchor_from_der(&certificate)]))
+                .session_store(store),
+        );
+        let mut server = stream_reuse_server_config(&certificate, &key, false, false);
+        let warm = stream_reuse_handshake(client.clone(), Arc::new(server.clone()), false).unwrap();
+        assert!(!warm.early_available);
+        server.max_early_data_size = 0;
+        let error = stream_reuse_handshake(client, Arc::new(server), true)
+            .expect_err("a corrupted server Finished must not complete the reuse authority");
+        assert_eq!(error.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        assert!(error
+            .reason
+            .contains("server Finished verify_data mismatch"));
+    }
+
+    #[derive(Debug, Default)]
+    struct RejectionTicketCounter(std::sync::atomic::AtomicUsize);
+
+    impl SessionStore for RejectionTicketCounter {
+        fn store(&self, _host: &str, _ticket: SessionTicketData) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn take(&self, _host: &str) -> Option<SessionTicketData> {
+            None
+        }
+    }
+
+    fn local_rejection_ech_config(public_name: &str) -> Vec<u8> {
+        let mut contents = vec![42, 0, 32, 0, 32];
+        contents.extend_from_slice(&[0x42; 32]);
+        contents.extend_from_slice(&[0, 4, 0, 1, 0, 1, 64]);
+        contents.push(public_name.len() as u8);
+        contents.extend_from_slice(public_name.as_bytes());
+        contents.extend_from_slice(&[0, 0]);
+        let mut config = vec![0xfe, 0x0d];
+        config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+        config.extend_from_slice(&contents);
+        let mut list = (config.len() as u16).to_be_bytes().to_vec();
+        list.extend_from_slice(&config);
+        list
+    }
+
+    #[test]
+    fn ech_rejected_transport_error_preserves_retry_config_diagnostics() {
+        let error = map_tls_error(TlsError::EchRejected {
+            retry_configs: Some(vec![1, 2, 3]),
+        });
+        assert_eq!(error.code, TransportErrorCode::crypto(121));
+        assert!(error.reason.contains("retry_configs: 3 bytes"));
+        assert!(error.frame.is_none());
+        let other = map_tls_error(TlsError::HandshakeFailure("synthetic failure".into()));
+        assert_eq!(other.code, TransportErrorCode::PROTOCOL_VIOLATION);
+    }
+
+    #[tokio::test]
+    async fn quic_ech_rejection_maps_ech_required_at_both_peers() {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            ensure_rustls_provider();
+            let public_name = "public.quic-ech-test.invalid";
+            for force_hrr in [false, true] {
+                let cert = generate_simple_self_signed(vec![public_name.into()]).unwrap();
+                let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+                let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+                let mut provider = rustls::crypto::ring::default_provider();
+                if force_hrr { provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP384R1]; }
+                let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+                    .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+                    .with_no_client_auth().with_single_cert(vec![cert_der.clone()], key).unwrap();
+                tls.alpn_protocols = vec![b"h3".to_vec()];
+                let port = std::env::var("QUIC_REJECTION_CAPTURE_PORT").ok().map(|value| {
+                    let base: u16 = value.parse().unwrap();
+                    assert!((1024..=65534).contains(&base));
+                    base + u16::from(force_hrr)
+                }).unwrap_or(0);
+                let server = Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(
+                    QuicServerConfig::try_from(tls).unwrap(),
+                )), SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))).unwrap();
+                let addr = server.local_addr().unwrap();
+                let peer = tokio::spawn({
+                    let server = server.clone();
+                    async move {
+                        match server.accept().await.unwrap().await {
+                            Ok(connection) => connection.closed().await,
+                            Err(error) => error,
+                        }
+                    }
+                });
+                let tickets = Arc::new(RejectionTicketCounter::default());
+                let mut profile = presets::chrome_155();
+                profile.alpn_protocols = vec!["h3".into()];
+                let mut crypto = LktlsQuicClientConfig::new(profile)
+                    .custom_ca_anchors(Arc::new(vec![trust_anchor_from_der(&cert_der)]))
+                    .session_store(tickets.clone()).port(addr.port())
+                    .ech_config(local_rejection_ech_config(public_name));
+                if let Some(path) = std::env::var_os("FINGERPRINT_CAPTURE_KEYLOG") {
+                    use std::io::Write;
+                    let path = std::path::PathBuf::from(path);
+                    assert!(path.is_absolute());
+                    let file = std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap());
+                    crypto = crypto.keylog(Arc::new(move |line| { writeln!(file.lock().unwrap(), "{line}").unwrap(); }));
+                }
+                let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                client.set_default_client_config(crypto.into_quinn());
+                let error = client.connect(addr, "secret.quic-ech-test.invalid").unwrap().await.expect_err("ECH rejection cannot establish a usable connection");
+                let remote = peer.await.unwrap();
+                let expected = TransportErrorCode::crypto(121);
+                assert!(matches!(&error, quinn::ConnectionError::TransportError(error) if error.code == expected), "client HRR={force_hrr}: {error:?}");
+                assert!(matches!(&remote, quinn::ConnectionError::ConnectionClosed(close) if close.error_code == expected), "peer HRR={force_hrr}: {remote:?}");
+                assert_eq!(tickets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                println!("QUIC ECH rejection HRR={force_hrr}: both peers CRYPTO_ERROR 0x179, no ticket stores");
+                client.close(0u32.into(), b"test complete");
+                server.close(0u32.into(), b"test complete");
+                client.wait_idle().await;
+                server.wait_idle().await;
+            }
+        }).await.expect("local QUIC ECH rejection timed out");
     }
 
     fn build_hrr(session_id: &[u8], cipher_suite: u16, selected_group: u16) -> Vec<u8> {
@@ -1109,6 +1476,210 @@ mod tests {
         ];
         message.extend_from_slice(&body);
         message
+    }
+
+    #[tokio::test]
+    async fn quic_incompatible_alpn_peer_reports_no_application_protocol() {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            ensure_rustls_provider();
+            for force_hrr in [false, true] {
+                let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+                let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+                let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+                let mut provider = rustls::crypto::ring::default_provider();
+                if force_hrr { provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP384R1]; }
+                let tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+                    .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+                    .with_no_client_auth().with_single_cert(vec![cert_der.clone()], key).unwrap();
+                let server = Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(
+                    QuicServerConfig::try_from(tls).unwrap(),
+                )), "127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = server.local_addr().unwrap();
+                let peer = tokio::spawn({
+                    let server = server.clone();
+                    async move {
+                        match server.accept().await.unwrap().await {
+                            Ok(connection) => connection.closed().await,
+                            Err(error) => error,
+                        }
+                    }
+                });
+                let tickets = Arc::new(RejectionTicketCounter::default());
+                let mut profile = presets::chrome_155();
+                profile.alpn_protocols = vec!["h3".into()];
+                let crypto = LktlsQuicClientConfig::new(profile)
+                    .custom_ca_anchors(Arc::new(vec![trust_anchor_from_der(&cert_der)]))
+                    .session_store(tickets.clone()).port(addr.port());
+                let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                client.set_default_client_config(crypto.into_quinn());
+                let error = client.connect(addr, "localhost").unwrap().await
+                    .expect_err("QUIC must not establish when offered ALPN goes unnegotiated");
+                let remote = peer.await.unwrap();
+                let expected = TransportErrorCode::crypto(120);
+                assert!(matches!(&error, quinn::ConnectionError::ConnectionClosed(close) if close.error_code == expected), "client HRR={force_hrr}: {error:?}");
+                assert!(matches!(&remote, quinn::ConnectionError::TransportError(error) if error.code == expected), "peer HRR={force_hrr}: {remote:?}");
+                assert_eq!(tickets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                client.close(0u32.into(), b"test complete");
+                server.close(0u32.into(), b"test complete");
+                client.wait_idle().await;
+                server.wait_idle().await;
+            }
+        }).await.expect("local QUIC ALPN test timed out");
+    }
+
+    #[test]
+    fn quic_session_checks_actual_version_offer_before_handshake_keys_or_retry() {
+        use lktls::crypto::kx::{generate_key_pair, KxGroup};
+        use lktls::profile::types::ExtensionSource;
+
+        for retry in [false, true] {
+            // None omits supported_versions; raw bytes can replace the profile offer.
+            for offer in [Some("020303"), None, Some("020304")] {
+                let tickets = Arc::new(RejectionTicketCounter::default());
+                let mut profile = presets::chrome_155();
+                if let Some(data) = offer {
+                    profile
+                        .extensions
+                        .iter_mut()
+                        .find(|extension| extension.extension_type == 43)
+                        .unwrap()
+                        .source = ExtensionSource::RawBytes { data: data.into() };
+                } else {
+                    profile
+                        .extensions
+                        .retain(|extension| extension.extension_type != 43);
+                }
+                let config =
+                    Arc::new(LktlsQuicClientConfig::new(profile).session_store(tickets.clone()));
+                let parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+                let mut session = config.start_session(1, "localhost", &parameters).unwrap();
+                let mut hello = Vec::new();
+                assert!(session.write_handshake(&mut hello).is_none());
+                let observed = lkprofile::parse_client_hello(&hello).unwrap();
+                let versions = observed
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.extension_type == 43);
+                if let Some(data) = offer {
+                    assert_eq!(
+                        versions.unwrap().data,
+                        [2, 3, if data == "020304" { 4 } else { 3 }]
+                    );
+                } else {
+                    assert!(versions.is_none());
+                }
+
+                let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                let key_share = if retry {
+                    vec![0, 24]
+                } else {
+                    let server_key = generate_key_pair(KxGroup::X25519).unwrap();
+                    let mut share = vec![0, 29];
+                    share.extend_from_slice(&(server_key.public_key.len() as u16).to_be_bytes());
+                    share.extend_from_slice(&server_key.public_key);
+                    share
+                };
+                extensions.extend_from_slice(&[0, 51]);
+                extensions.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&key_share);
+                let mut body = vec![3, 3];
+                body.extend_from_slice(if retry {
+                    &lktls::handshake::server_hello::HRR_RANDOM
+                } else {
+                    &[0x55; 32]
+                });
+                body.extend_from_slice(&[0, 0x13, 1, 0]);
+                body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+                body.extend_from_slice(&extensions);
+                let mut message = vec![2, 0, 0, body.len() as u8];
+                message.extend_from_slice(&body);
+
+                if offer == Some("020304") {
+                    assert!(!session.read_handshake(&message).unwrap());
+                    let mut outbound = Vec::new();
+                    let keys = session.write_handshake(&mut outbound);
+                    assert_eq!(keys.is_some(), !retry);
+                    assert_eq!(!outbound.is_empty(), retry);
+                } else {
+                    let error = session
+                        .read_handshake(&message)
+                        .expect_err("TLS 1.3 was absent from the emitted offer");
+                    assert_eq!(
+                        error.code,
+                        TransportErrorCode::crypto(if offer.is_some() { 47 } else { 110 })
+                    );
+                    let mut outbound = Vec::new();
+                    assert!(session.write_handshake(&mut outbound).is_none());
+                    assert!(outbound.is_empty(), "no CH2 after an unoffered version");
+                    assert!(session.handshake_data().is_none());
+                }
+                assert_eq!(tickets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn quic_session_rejects_missing_or_unoffered_server_alpn_before_application_keys() {
+        use lktls::crypto::kx::{generate_key_pair, KxGroup};
+
+        for selected in [None, Some(b"h2".as_slice())] {
+            let tickets = Arc::new(RejectionTicketCounter::default());
+            let mut profile = presets::chrome_155();
+            profile.alpn_protocols = vec!["h3".into()];
+            let config =
+                Arc::new(LktlsQuicClientConfig::new(profile).session_store(tickets.clone()));
+            let parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+            let mut session = config.start_session(1, "localhost", &parameters).unwrap();
+            let mut hello = Vec::new();
+            assert!(session.write_handshake(&mut hello).is_none());
+            let server_key = generate_key_pair(KxGroup::X25519).unwrap();
+            let mut extensions = vec![0, 43, 0, 2, 3, 4];
+            let mut key_share = vec![0, 29];
+            key_share.extend_from_slice(&(server_key.public_key.len() as u16).to_be_bytes());
+            key_share.extend_from_slice(&server_key.public_key);
+            extensions.extend_from_slice(&[0, 51]);
+            extensions.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&key_share);
+            let mut body = vec![3, 3];
+            body.extend_from_slice(&[0x55; 32]);
+            body.extend_from_slice(&[0, 0x13, 1, 0]);
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(&extensions);
+            let mut message = vec![2, 0, 0, body.len() as u8];
+            message.extend_from_slice(&body);
+            assert!(!session.read_handshake(&message).unwrap());
+            assert!(
+                session.write_handshake(&mut Vec::new()).is_some(),
+                "only handshake keys so far"
+            );
+            let mut extensions = vec![0, 57, 0, 0];
+            if let Some(protocol) = selected {
+                extensions.extend_from_slice(&[0, 16]);
+                extensions.extend_from_slice(&((3 + protocol.len()) as u16).to_be_bytes());
+                extensions.extend_from_slice(&((1 + protocol.len()) as u16).to_be_bytes());
+                extensions.push(protocol.len() as u8);
+                extensions.extend_from_slice(protocol);
+            }
+            let mut message = vec![8, 0, 0, (2 + extensions.len()) as u8];
+            message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            message.extend_from_slice(&extensions);
+            let error = session
+                .read_handshake(&message)
+                .expect_err("malformed peer ALPN must close locally");
+            assert_eq!(
+                error.code,
+                TransportErrorCode::crypto(if selected.is_some() { 47 } else { 120 })
+            );
+            assert!(session.is_handshaking());
+            assert!(session.handshake_data().is_none());
+            assert!(
+                session.write_handshake(&mut Vec::new()).is_none(),
+                "no application keys"
+            );
+            assert_eq!(tickets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
@@ -1242,14 +1813,10 @@ mod tests {
 
         let anchor = trust_anchor_from_der(&cert_der);
         let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
-        let client_crypto = LktlsQuicClientConfig::new({
-            let mut profile = presets::chrome_144();
-            profile.alpn_protocols = vec!["h3".to_string()];
-            profile
-        })
-        .custom_ca_anchors(Arc::new(vec![anchor]))
-        .session_store(store.clone())
-        .port(server_addr.port());
+        let client_crypto = LktlsQuicClientConfig::new(presets::chrome_155_quic())
+            .custom_ca_anchors(Arc::new(vec![anchor]))
+            .session_store(store.clone())
+            .port(server_addr.port());
 
         let mut endpoint =
             Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
@@ -1278,7 +1845,12 @@ mod tests {
             .expect("expected session ticket to make 0-RTT available");
         let stream = connection.open_uni().await.expect("0-rtt stream open");
         drop(stream);
-        let _ = accepted.await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
+                .await
+                .expect("0-RTT handshake completion"),
+            "the compatible QUIC profile must be accepted for 0-RTT"
+        );
 
         server_task.abort();
         endpoint.wait_idle().await;
@@ -1297,6 +1869,7 @@ mod tests {
             age_add: 0,
             received_at: std::time::Instant::now(),
             alpn: Some("h3".into()),
+            alps: Default::default(),
             hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: Vec::new(),
@@ -1386,7 +1959,7 @@ mod tests {
             0x00, 0x2a, 0x00, 0x02, 0xff, 0xff,
         ]))
         .expect_err("a malformed early_data extension must fail the connection");
-        assert_eq!(malformed.code, TransportErrorCode::PROTOCOL_VIOLATION);
+        assert_eq!(malformed.code, TransportErrorCode::crypto(50));
     }
 
     fn ticket_context(store: Arc<dyn SessionStore>) -> SessionTicketContext {
@@ -1396,6 +1969,7 @@ mod tests {
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             cipher_suite: 0x1301,
             alpn: Some("h3".into()),
+            alps: AlpsSessionState::NotNegotiated,
             peer_transport_parameters: Some(vec![0x01, 0x00]),
             store,
             host_key: "example.com:443".to_string(),
@@ -1411,7 +1985,7 @@ mod tests {
         let ctx = ticket_context(store.clone());
 
         let bad = build_new_session_ticket(&early_data_extension(16_384));
-        let err = process_post_handshake_messages(&bad, &ctx)
+        let err = process_post_handshake_messages(&bad, Some(&ctx))
             .expect_err("an illegal early_data must fail the connection");
         assert_eq!(err.code, TransportErrorCode::PROTOCOL_VIOLATION);
         assert!(
@@ -1421,7 +1995,7 @@ mod tests {
 
         let good = build_new_session_ticket(&early_data_extension(QUIC_MAX_EARLY_DATA_SIZE));
         assert_eq!(
-            process_post_handshake_messages(&good, &ctx),
+            process_post_handshake_messages(&good, Some(&ctx)),
             Ok(good.len()),
             "a conforming ticket must be consumed without error",
         );
@@ -1429,6 +2003,362 @@ mod tests {
             store.take("example.com:443").is_some(),
             "a conforming ticket must still be stored",
         );
+    }
+
+    fn established_quic_session(ctx: Option<SessionTicketContext>) -> LktlsQuicSession {
+        let config = LktlsQuicClientConfig::new(presets::chrome_155_quic());
+        LktlsQuicSession {
+            side: Side::Client,
+            driver: QuicHandshakeDriver::new(config.handshake.into_quic(Vec::new())),
+            pending_output: VecDeque::new(),
+            pending_keys: VecDeque::new(),
+            handshake_data: None,
+            peer_transport_parameters: None,
+            post_handshake: None,
+            session_ticket_ctx: ctx,
+            post_handshake_buf: Vec::new(),
+            established: true,
+            zero_rtt: None,
+        }
+    }
+
+    #[test]
+    fn quic_post_handshake_rejects_tls_key_update() {
+        let store = Arc::new(RejectionTicketCounter::default());
+        let ctx = ticket_context(store.clone());
+        let error = process_post_handshake_messages(&[0x18, 0, 0, 1, 0], Some(&ctx))
+            .expect_err("QUIC replaces TLS KeyUpdate with its own key phase update");
+        assert_eq!(error.code, TransportErrorCode::crypto(10));
+        assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn quic_post_handshake_rejects_non_ticket_messages() {
+        let store = Arc::new(RejectionTicketCounter::default());
+        let ctx = ticket_context(store.clone());
+        for kind in [0x00, 0x05, 0x14] {
+            let mut message = vec![kind, 0, 0, 0];
+            if kind == 0x14 {
+                message[3] = 32;
+                message.extend_from_slice(&[0; 32]);
+            }
+            let error = process_post_handshake_messages(&message, Some(&ctx))
+                .expect_err("only NewSessionTicket is valid for this QUIC client state");
+            assert_eq!(error.code, TransportErrorCode::crypto(10), "type={kind:#x}");
+        }
+        assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn quic_post_handshake_rejects_fragmented_key_update_without_ticket_storage() {
+        let mut session = established_quic_session(None);
+        let error = match session.read_handshake(&[0x18, 0]) {
+            Err(error) => error,
+            Ok(_) => session
+                .read_handshake(&[0, 1, 0])
+                .expect_err("disabling ticket storage must not disable CRYPTO message validation"),
+        };
+        assert_eq!(error.code, TransportErrorCode::crypto(10));
+    }
+
+    #[test]
+    fn quic_post_handshake_overflow_cannot_restart_message_framing() {
+        let store = Arc::new(RejectionTicketCounter::default());
+        let mut session = established_quic_session(Some(ticket_context(store.clone())));
+        let mut oversized_fragment = vec![0; 256 * 1024 + 1];
+        oversized_fragment[..4].copy_from_slice(&[0x04, 0x08, 0, 0]);
+        match session.read_handshake(&oversized_fragment) {
+            Err(error) => assert_eq!(error.code, TransportErrorCode::CRYPTO_BUFFER_EXCEEDED),
+            Ok(_) => {
+                // An endpoint may permanently ignore further CRYPTO after overflow,
+                // but must not interpret a continuation as a new handshake message.
+                let continuation = build_new_session_ticket(&[]);
+                assert_eq!(session.read_handshake(&continuation), Ok(false));
+            }
+        }
+        assert_eq!(
+            store.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "overflow must not turn later bytes inside an unfinished message into a ticket"
+        );
+    }
+
+    #[test]
+    fn quic_post_handshake_preserves_fragmented_and_coalesced_tickets() {
+        let ticket = build_new_session_ticket(&[]);
+        for split in [1, 3, 4, 11, ticket.len() - 1] {
+            let store = Arc::new(RejectionTicketCounter::default());
+            let mut session = established_quic_session(Some(ticket_context(store.clone())));
+            assert_eq!(session.read_handshake(&ticket[..split]), Ok(false));
+            assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let mut rest = ticket[split..].to_vec();
+            rest.extend_from_slice(&ticket);
+            assert_eq!(session.read_handshake(&rest), Ok(false));
+            assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(session.post_handshake_buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn quic_post_handshake_accepts_valid_tickets_without_storage() {
+        let ticket = build_new_session_ticket(&[]);
+        let mut session = established_quic_session(None);
+        for byte in ticket {
+            assert_eq!(session.read_handshake(&[byte]), Ok(false));
+        }
+        assert!(session.post_handshake_buf.is_empty());
+    }
+
+    #[test]
+    fn quic_post_handshake_validates_ticket_allowance_without_storage() {
+        let ticket = build_new_session_ticket(&early_data_extension(16_384));
+        let mut session = established_quic_session(None);
+        let error = session
+            .read_handshake(&ticket)
+            .expect_err("ticket storage must not gate QUIC ticket validation");
+        assert_eq!(error.code, TransportErrorCode::PROTOCOL_VIOLATION);
+    }
+
+    #[test]
+    fn quic_post_handshake_consumes_large_coalesced_ticket_batch() {
+        let ticket = build_new_session_ticket(&[]);
+        let count = (256 * 1024) / ticket.len() + 1;
+        let store = Arc::new(RejectionTicketCounter::default());
+        let mut session = established_quic_session(Some(ticket_context(store.clone())));
+        assert_eq!(session.read_handshake(&ticket.repeat(count)), Ok(false));
+        assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), count);
+        assert!(session.post_handshake_buf.is_empty());
+    }
+
+    fn nst_structure_body(nonce: &[u8], ticket: &[u8], extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3600u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.push(nonce.len() as u8);
+        body.extend_from_slice(nonce);
+        body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+        body.extend_from_slice(ticket);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        body
+    }
+
+    fn nst_structure_message(body: &[u8]) -> Vec<u8> {
+        let len = body.len();
+        let mut message = vec![0x04, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        message.extend_from_slice(body);
+        message
+    }
+
+    fn nst_structure_observe(
+        message: &[u8],
+        storage: bool,
+    ) -> (Result<bool, TransportError>, Vec<u32>) {
+        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        let mut session = established_quic_session(storage.then(|| ticket_context(store.clone())));
+        let result = session.read_handshake(message);
+        let stored = std::iter::from_fn(|| store.take("example.com:443"))
+            .map(|ticket| ticket.max_early_data_size)
+            .collect();
+        (result, stored)
+    }
+
+    fn nst_structure_failures(cases: &[(&str, Vec<u8>)], alert: u8) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (name, message) in cases {
+            for storage in [false, true] {
+                let (result, stored) = nst_structure_observe(message, storage);
+                eprintln!(
+                    "NST {name}: storage={storage}, result={result:?}, stored_early_data={stored:?}"
+                );
+                if !matches!(&result, Err(error) if error.code == TransportErrorCode::crypto(alert))
+                    || !stored.is_empty()
+                {
+                    failures.push(format!(
+                        "{name}, storage={storage}: result={result:?}, stored={stored:?}"
+                    ));
+                }
+            }
+        }
+        failures
+    }
+
+    #[test]
+    fn quic_nst_structure_rejects_missing_and_truncated_fields() {
+        let body = nst_structure_body(&[0; 4], &[1, 2, 3], &[]);
+        let cases = [
+            ("empty_body", nst_structure_message(&[])),
+            ("short_lifetime", nst_structure_message(&body[..2])),
+            ("missing_nonce_length", nst_structure_message(&body[..8])),
+            ("truncated_nonce", nst_structure_message(&body[..10])),
+            (
+                "truncated_ticket_length",
+                nst_structure_message(&body[..14]),
+            ),
+            ("truncated_ticket", nst_structure_message(&body[..16])),
+            (
+                "missing_extensions_length",
+                nst_structure_message(&body[..18]),
+            ),
+            (
+                "empty_ticket",
+                nst_structure_message(&nst_structure_body(&[], &[], &[])),
+            ),
+        ];
+        let failures = nst_structure_failures(&cases, 50);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn quic_nst_structure_rejects_extension_length_mismatches() {
+        let body = nst_structure_body(&[0; 4], &[1, 2, 3], &[]);
+        let mut oversized = body.clone();
+        oversized[19] = 1;
+        let mut undersized = nst_structure_body(&[0; 4], &[1, 2, 3], &[0xbe, 0xef, 0, 1, 7]);
+        undersized[19] = 4;
+        let mut trailing = body;
+        trailing.push(7);
+        let mut cases = vec![
+            (
+                "extensions_length_exceeds_body",
+                nst_structure_message(&oversized),
+            ),
+            (
+                "extensions_length_leaves_byte",
+                nst_structure_message(&undersized),
+            ),
+            (
+                "trailing_after_empty_extensions",
+                nst_structure_message(&trailing),
+            ),
+        ];
+        for (name, extensions) in [
+            ("partial_extension_type", vec![0xbe]),
+            ("missing_extension_length", vec![0xbe, 0xef]),
+            ("partial_extension_length", vec![0xbe, 0xef, 0]),
+            ("truncated_unknown_extension", vec![0xbe, 0xef, 0, 2, 7]),
+            (
+                "truncated_early_data_payload",
+                vec![0, 42, 0, 4, 0xff, 0xff],
+            ),
+        ] {
+            cases.push((name, build_new_session_ticket(&extensions)));
+        }
+        let failures = nst_structure_failures(&cases, 50);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn quic_nst_structure_rejects_duplicate_early_data_in_both_orders() {
+        let mut cases = Vec::new();
+        for (name, first, second) in [
+            ("max_then_zero", QUIC_MAX_EARLY_DATA_SIZE, 0),
+            ("zero_then_max", 0, QUIC_MAX_EARLY_DATA_SIZE),
+            (
+                "max_then_max",
+                QUIC_MAX_EARLY_DATA_SIZE,
+                QUIC_MAX_EARLY_DATA_SIZE,
+            ),
+        ] {
+            let mut extensions = early_data_extension(first);
+            extensions.extend_from_slice(&early_data_extension(second));
+            cases.push((name, build_new_session_ticket(&extensions)));
+        }
+        let failures = nst_structure_failures(&cases, 47);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn quic_nst_structure_reports_decode_error_for_non_u32_early_data() {
+        let mut cases = Vec::new();
+        for (name, len) in [
+            ("empty", 0),
+            ("one", 1),
+            ("two", 2),
+            ("three", 3),
+            ("five", 5),
+        ] {
+            let mut extensions = vec![0, 42, 0, len];
+            extensions.extend(std::iter::repeat_n(0xff, len as usize));
+            cases.push((name, build_new_session_ticket(&extensions)));
+        }
+        let failures = nst_structure_failures(&cases, 50);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn quic_nst_structure_stops_before_a_later_coalesced_ticket() {
+        let body = nst_structure_body(&[0; 4], &[1, 2, 3], &[]);
+        let valid = build_new_session_ticket(&[]);
+        let mut cases = Vec::new();
+        for (name, malformed) in [
+            ("empty_before_valid", nst_structure_message(&[])),
+            (
+                "missing_extensions_before_valid",
+                nst_structure_message(&body[..18]),
+            ),
+        ] {
+            let mut batch = malformed;
+            batch.extend_from_slice(&valid);
+            cases.push((name, batch));
+        }
+        let failures = nst_structure_failures(&cases, 50);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn quic_nst_structure_retains_boringssl_unknown_extension_controls() {
+        let unknown = vec![0xbe, 0xef, 0, 1, 7];
+        let mut duplicate_unknown = unknown.clone();
+        duplicate_unknown.extend_from_slice(&[0xbe, 0xef, 0, 0]);
+        let mut unknown_and_early = unknown.clone();
+        unknown_and_early.extend_from_slice(&early_data_extension(QUIC_MAX_EARLY_DATA_SIZE));
+        for (name, extensions, expected_early) in [
+            ("empty_nonce_and_extensions", Vec::new(), 0),
+            ("unknown_extension", unknown, 0),
+            ("ignored_duplicate_unknown", duplicate_unknown, 0),
+            (
+                "unknown_with_early_data",
+                unknown_and_early,
+                QUIC_MAX_EARLY_DATA_SIZE,
+            ),
+        ] {
+            let message = nst_structure_message(&nst_structure_body(&[], &[1], &extensions));
+            for storage in [false, true] {
+                let (result, stored) = nst_structure_observe(&message, storage);
+                assert_eq!(result, Ok(false), "{name}, storage={storage}");
+                assert_eq!(
+                    stored,
+                    if storage {
+                        vec![expected_early]
+                    } else {
+                        Vec::new()
+                    },
+                    "{name}, storage={storage}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quic_nst_structure_retains_fragmented_valid_extensions() {
+        let mut extensions = vec![0xbe, 0xef, 0, 1, 7];
+        extensions.extend_from_slice(&early_data_extension(QUIC_MAX_EARLY_DATA_SIZE));
+        let message = nst_structure_message(&nst_structure_body(&[], &[1], &extensions));
+        for storage in [false, true] {
+            let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+            let mut session =
+                established_quic_session(storage.then(|| ticket_context(store.clone())));
+            for chunk in message.chunks(3) {
+                assert_eq!(session.read_handshake(chunk), Ok(false));
+            }
+            let ticket = store.take("example.com:443");
+            assert_eq!(
+                ticket.map(|ticket| ticket.max_early_data_size),
+                storage.then_some(QUIC_MAX_EARLY_DATA_SIZE)
+            );
+            assert!(session.post_handshake_buf.is_empty());
+        }
     }
 
     /// Extension types of a ClientHello handshake message, in wire order.
@@ -1463,6 +2393,7 @@ mod tests {
             age_add: 0,
             received_at: std::time::Instant::now(),
             alpn: Some("h3".into()),
+            alps: Default::default(),
             hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: Vec::new(),
@@ -1472,14 +2403,28 @@ mod tests {
     }
 
     fn start_quic_session_with_ticket(ticket: SessionTicketData) -> (Box<dyn Session>, Vec<u16>) {
-        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
-        store.store("example.com:443", ticket);
         // A QUIC preset: its extension order is the one that carries
         // `early_data`, so the ClientHello below actually reflects what the
         // ticket permits.
         let mut profile = presets::chrome_146_quic();
         profile.session_resumption.tls13_psk = true;
-        let config = Arc::new(LktlsQuicClientConfig::new(profile).session_store(store));
+        start_quic_session_with_profile_and_ticket(profile, ticket)
+    }
+
+    fn start_quic_session_with_profile_and_ticket(
+        profile: TlsProfile,
+        ticket: SessionTicketData,
+    ) -> (Box<dyn Session>, Vec<u16>) {
+        start_quic_session_with_config_and_ticket(LktlsQuicClientConfig::new(profile), ticket)
+    }
+
+    fn start_quic_session_with_config_and_ticket(
+        config: LktlsQuicClientConfig,
+        ticket: SessionTicketData,
+    ) -> (Box<dyn Session>, Vec<u16>) {
+        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        store.store("example.com:443", ticket);
+        let config = Arc::new(config.session_store(store));
         let transport_parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
         let mut session =
             ProtoClientConfig::start_session(config, 1, "example.com", &transport_parameters)
@@ -1491,6 +2436,296 @@ mod tests {
         );
         let extensions = client_hello_extension_types(&client_hello);
         (session, extensions)
+    }
+
+    #[test]
+    fn quic_early_crypto_requires_emitted_early_data() {
+        let mut profile = presets::chrome_144();
+        profile.alpn_protocols = vec!["h3".into()];
+        let (session, extensions) = start_quic_session_with_profile_and_ticket(
+            profile,
+            ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE),
+        );
+        assert!(
+            extensions.contains(&0x0029),
+            "ordinary PSK resumption remains enabled"
+        );
+        assert!(
+            !extensions.contains(&0x002a),
+            "the TCP profile omits early_data"
+        );
+        assert!(
+            session.early_crypto().is_none(),
+            "missing early_data must prevent 0-RTT keys"
+        );
+    }
+
+    #[test]
+    fn quic_early_crypto_requires_enabled_psk() {
+        let mut profile = presets::chrome_155_quic();
+        profile.session_resumption.tls13_psk = false;
+        let (session, extensions) = start_quic_session_with_profile_and_ticket(
+            profile,
+            ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE),
+        );
+        assert!(!extensions.contains(&0x0029), "PSK is disabled");
+        assert!(
+            !extensions.contains(&0x002a),
+            "early_data requires a PSK offer"
+        );
+        assert!(
+            session.early_crypto().is_none(),
+            "disabled PSK must prevent 0-RTT keys"
+        );
+    }
+
+    #[test]
+    fn quic_early_crypto_requires_compatible_ticket_alpn() {
+        let mut ticket = ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE);
+        ticket.alpn = Some("h2".into());
+        let (session, extensions) =
+            start_quic_session_with_profile_and_ticket(presets::chrome_155_quic(), ticket);
+        assert!(
+            !extensions.contains(&0x0029),
+            "incompatible ticket must not resume"
+        );
+        assert!(
+            !extensions.contains(&0x002a),
+            "early_data requires a PSK offer"
+        );
+        assert!(
+            session.early_crypto().is_none(),
+            "incompatible ALPN must prevent 0-RTT keys"
+        );
+    }
+
+    #[test]
+    fn quic_early_crypto_available_for_compatible_quic_profile() {
+        let (session, extensions) = start_quic_session_with_profile_and_ticket(
+            presets::chrome_155_quic(),
+            ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE),
+        );
+        assert!(extensions.contains(&0x0029));
+        assert!(extensions.contains(&0x002a));
+        assert!(
+            session.early_crypto().is_some(),
+            "valid QUIC 0-RTT remains available"
+        );
+    }
+
+    #[test]
+    fn quic_early_crypto_agrees_with_offer_for_cached_alps_settings() {
+        let settings_a = lkh3::encode_alps_h3_settings(&lkh3::chrome_155_h3());
+        let mut changed_profile = lkh3::chrome_155_h3();
+        changed_profile.qpack_blocked_streams += 1;
+        let settings_b = lkh3::encode_alps_h3_settings(&changed_profile);
+        assert_ne!(settings_a, settings_b);
+
+        for (name, current_settings, expected_early) in [
+            ("same", Some(settings_a.clone()), true),
+            ("changed", Some(settings_b.clone()), false),
+            ("empty", Some(Vec::new()), false),
+            ("disabled", None, false),
+        ] {
+            let mut ticket = ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE);
+            ticket.alps = AlpsSessionState::Negotiated {
+                client_settings: settings_a.clone(),
+                server_settings: settings_b.clone(),
+            };
+            let alps_offered = current_settings.is_some();
+            let mut config = LktlsQuicClientConfig::new(presets::chrome_155_quic());
+            if let Some(settings) = current_settings {
+                config = config.alps_payload(settings);
+            }
+            let (session, extensions) = start_quic_session_with_config_and_ticket(config, ticket);
+            let early_offered = extensions.contains(&0x002a);
+            let early_crypto = session.early_crypto().is_some();
+            assert!(
+                extensions.contains(&0x0029),
+                "{name}: ordinary PSK remains available"
+            );
+            assert_eq!(extensions.contains(&0x44cd), alps_offered, "{name}");
+            assert_eq!(
+                early_offered, expected_early,
+                "{name}: serialized early_data"
+            );
+            assert_eq!(
+                early_crypto, early_offered,
+                "{name}: keys must match the offer"
+            );
+            eprintln!(
+                "cached ALPS A/current {name}: early_data={early_offered}, early_crypto={early_crypto}"
+            );
+        }
+    }
+
+    fn quic_diagnostic_and_production_early_data(
+        profile: TlsProfile,
+        ticket: Option<SessionTicketData>,
+        ech: bool,
+        expected_early_data: bool,
+        expected_psk: bool,
+    ) -> (bool, bool) {
+        let diagnostic_store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        let production_store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        if let Some(ticket) = ticket {
+            diagnostic_store.store("private.example.com:8443", ticket.clone());
+            production_store.store("private.example.com:8443", ticket);
+        }
+        let mut config = LktlsQuicClientConfig::new(profile).port(8443);
+        if ech {
+            config = config.ech_config(local_rejection_ech_config("public.example.com"));
+        }
+        let parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+        let mut encoded_parameters = Vec::new();
+        parameters.write(&mut encoded_parameters);
+        let diagnostic = config
+            .clone()
+            .session_store(diagnostic_store)
+            .emit_initial_client_hello("private.example.com", encoded_parameters)
+            .unwrap();
+        let mut session = Arc::new(config.session_store(production_store))
+            .start_session(1, "private.example.com", &parameters)
+            .unwrap();
+        let mut production = Vec::new();
+        assert!(session.write_handshake(&mut production).is_none());
+        assert_eq!(session.early_crypto().is_some(), expected_early_data);
+
+        let diagnostic = lkprofile::parse_client_hello(&diagnostic).unwrap();
+        let production = lkprofile::parse_client_hello(&production).unwrap();
+        assert_eq!(diagnostic.cipher_suites, production.cipher_suites);
+        assert_eq!(diagnostic.session_id_length, production.session_id_length);
+        for (path, hello) in [("production", &production), ("diagnostic", &diagnostic)] {
+            let extension = |kind| {
+                hello
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.extension_type == kind)
+            };
+            assert_eq!(
+                extension(0x0029).is_some(),
+                expected_psk && !ech,
+                "{path}, ECH={ech}: real ECH keeps the PSK in ClientHelloInner"
+            );
+            let server_name = if ech {
+                "public.example.com"
+            } else {
+                "private.example.com"
+            };
+            assert_eq!(
+                &extension(0x0000).unwrap().data[5..],
+                server_name.as_bytes()
+            );
+            if ech {
+                assert_eq!(extension(0xfe0d).unwrap().data[0], 0, "ECH outer form");
+            }
+        }
+        for kind in [0x0010, 0x0039] {
+            let payload = |hello: &lkprofile::ParsedClientHello| {
+                hello
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.extension_type == kind)
+                    .unwrap()
+                    .data
+                    .clone()
+            };
+            assert_eq!(payload(&diagnostic), payload(&production));
+        }
+        let types = |hello: &lkprofile::ParsedClientHello| {
+            let mut types = hello
+                .extensions
+                .iter()
+                .map(|extension| extension.extension_type)
+                .collect::<Vec<_>>();
+            types.sort_unstable();
+            types
+        };
+        assert_eq!(types(&diagnostic), types(&production));
+        let early_data = |hello: &lkprofile::ParsedClientHello| {
+            hello
+                .extensions
+                .iter()
+                .any(|extension| extension.extension_type == 0x002a)
+        };
+        (early_data(&diagnostic), early_data(&production))
+    }
+
+    #[test]
+    fn quic_diagnostic_sanitizes_non_quic_ticket_allowance() {
+        let early_data = quic_diagnostic_and_production_early_data(
+            presets::chrome_155_quic(),
+            Some(ticket_with_early_data_size(16_384)),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(early_data, (false, false));
+    }
+
+    #[test]
+    fn quic_diagnostic_sanitizes_non_quic_ticket_allowance_with_ech() {
+        let early_data = quic_diagnostic_and_production_early_data(
+            presets::chrome_155_quic(),
+            Some(ticket_with_early_data_size(16_384)),
+            true,
+            false,
+            true,
+        );
+        assert_eq!(early_data, (false, false));
+    }
+
+    #[test]
+    fn quic_diagnostic_sanitizes_missing_transport_parameters() {
+        let mut ticket = ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE);
+        ticket.peer_transport_parameters = None;
+        let early_data = quic_diagnostic_and_production_early_data(
+            presets::chrome_155_quic(),
+            Some(ticket),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(early_data, (false, false));
+    }
+
+    #[test]
+    fn quic_diagnostic_sanitizes_missing_transport_parameters_with_ech() {
+        let mut ticket = ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE);
+        ticket.peer_transport_parameters = None;
+        let early_data = quic_diagnostic_and_production_early_data(
+            presets::chrome_155_quic(),
+            Some(ticket),
+            true,
+            false,
+            true,
+        );
+        assert_eq!(early_data, (false, false));
+    }
+
+    #[test]
+    fn quic_diagnostic_preserves_ticket_selection_and_ech_outer() {
+        for ech in [false, true] {
+            for case in 0..6 {
+                let mut profile = presets::chrome_155_quic();
+                let mut ticket = ticket_with_early_data_size(QUIC_MAX_EARLY_DATA_SIZE);
+                match case {
+                    2 => ticket.max_early_data_size = 0,
+                    3 => ticket.alpn = Some("h2".into()),
+                    4 => profile.session_resumption.tls13_psk = false,
+                    5 => ticket.tls_version = TicketTlsVersion::Tls12,
+                    _ => {}
+                }
+                let early_data = quic_diagnostic_and_production_early_data(
+                    profile,
+                    (case != 0).then_some(ticket),
+                    ech,
+                    case == 1,
+                    matches!(case, 1 | 2),
+                );
+                assert_eq!(early_data, (case == 1, case == 1), "case={case}, ECH={ech}");
+            }
+        }
     }
 
     /// A stored ticket whose `max_early_data_size` is not the 0xffffffff QUIC
@@ -1566,6 +2801,7 @@ mod tests {
                 age_add: 0,
                 received_at: std::time::Instant::now(),
                 alpn: Some("h3".into()),
+                alps: Default::default(),
                 hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
                 aead_algorithm: AeadAlgorithm::Aes128Gcm,
                 master_secret: Vec::new(),
@@ -1576,9 +2812,8 @@ mod tests {
             },
         );
 
-        let mut profile = presets::chrome_144();
-        profile.alpn_protocols = vec!["h3".to_string()];
-        let config = Arc::new(LktlsQuicClientConfig::new(profile).session_store(store));
+        let config =
+            Arc::new(LktlsQuicClientConfig::new(presets::chrome_155_quic()).session_store(store));
         let transport_parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
         let mut session =
             ProtoClientConfig::start_session(config, 1, "example.com", &transport_parameters)
@@ -1588,6 +2823,17 @@ mod tests {
         assert!(!session.early_data_rejected());
         let mut ch1 = Vec::new();
         assert!(session.write_handshake(&mut ch1).is_none());
+        let offered = lkprofile::parse_client_hello(&ch1).unwrap();
+        let key_shares = offered
+            .extensions
+            .iter()
+            .find(|extension| extension.extension_type == 0x0033)
+            .unwrap();
+        assert!(
+            !lkprofile::extract_key_share_curves(&key_shares.data).contains(&0x0018),
+            "HRR must select a group absent from CH1 key_share"
+        );
+        assert!(client_hello_extension_types(&ch1).contains(&0x002a));
         let sid_len = ch1[38] as usize;
         let session_id = &ch1[39..39 + sid_len];
         let hrr = build_hrr(session_id, 0x1301, 0x0018);
@@ -1597,6 +2843,17 @@ mod tests {
         let mut ch2 = Vec::new();
         assert!(session.write_handshake(&mut ch2).is_none());
         assert!(!ch2.is_empty());
+        let offered = lkprofile::parse_client_hello(&ch2).unwrap();
+        let key_shares = offered
+            .extensions
+            .iter()
+            .find(|extension| extension.extension_type == 0x0033)
+            .unwrap();
+        assert_eq!(
+            lkprofile::extract_key_share_curves(&key_shares.data),
+            [0x0018]
+        );
+        assert!(!client_hello_extension_types(&ch2).contains(&0x002a));
     }
 
     #[test]

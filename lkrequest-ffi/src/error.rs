@@ -57,7 +57,7 @@ impl FfiError {
         let retryable = err.is_retryable();
         let phase = map_phase(err.phase());
         let http_status = err.status().map_or(-1, |status| i32::from(status.as_u16()));
-        let code = match &err {
+        let code = match err.unwrapped() {
             lkrequest::error::Error::Tls(_) => lk_error_code_t::LK_ERR_TLS,
             lkrequest::error::Error::Http(_) => lk_error_code_t::LK_ERR_HTTP,
             lkrequest::error::Error::Body(_) => lk_error_code_t::LK_ERR_DECOMPRESSION_FAILED,
@@ -231,6 +231,42 @@ pub extern "C" fn lk_error_free(err: *mut lk_error_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h3_context_keeps_underlying_ffi_code_phase_and_retryability() {
+        use lkrequest::error::{Error, H3FailureKind, H3RequestContext, H3ResponseStage};
+        for source in [
+            Error::Http3Request("stream protocol failure".into()),
+            Error::ConnectionClosed {
+                phase: lkrequest::ConnectionPhase::HttpRequest,
+                kind: lkrequest::ConnectionClosedKind::Reset,
+                message: "peer reset".into(),
+            },
+        ] {
+            let expected_code = if matches!(source, Error::Http3Request(_)) {
+                lk_error_code_t::LK_ERR_H3
+            } else {
+                lk_error_code_t::LK_ERR_CONNECTION
+            };
+            let phase = map_phase(source.phase());
+            let message = source.to_string().into_bytes();
+            let retryable = source.is_retryable();
+            let error = Error::H3RequestContext(Box::new(H3RequestContext {
+                stage: H3ResponseStage::AwaitingResponse,
+                kind: H3FailureKind::Protocol,
+                backend_final_received: true,
+                stopped_upload: Some(268),
+                connection_terminated: false,
+                source: Box::new(source),
+            }));
+            let ffi = FfiError::from_lkrequest(error);
+            assert_eq!(ffi.code, expected_code);
+            assert_eq!(ffi.phase, phase);
+            assert_eq!(ffi.message, message);
+            assert_eq!(ffi.retryable, retryable);
+            assert_eq!(ffi.http_status, -1);
+        }
+    }
 
     #[test]
     fn structured_quic_error_maps_to_quic_code_and_phase() {

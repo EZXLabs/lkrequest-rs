@@ -160,6 +160,39 @@ pub trait DnsResolver: Send + Sync + 'static {
     }
 }
 
+/// Client-wide budget installed around the selected resolver, including custom resolvers.
+pub(crate) struct TimeoutResolver {
+    pub inner: Arc<dyn DnsResolver>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("DNS query timed out after {0:?}")]
+pub(crate) struct DnsTimeout(pub Duration);
+
+impl TimeoutResolver {
+    async fn run<T>(&self, future: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+        tokio::time::timeout(self.timeout, future)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, DnsTimeout(self.timeout)))?
+    }
+}
+
+#[async_trait]
+impl DnsResolver for TimeoutResolver {
+    fn resolver_impl_name(&self) -> &'static str {
+        self.inner.resolver_impl_name()
+    }
+
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        self.run(self.inner.resolve(host, port)).await
+    }
+
+    async fn lookup_https(&self, host: &str) -> io::Result<Option<HttpsRecord>> {
+        self.run(self.inner.lookup_https(host)).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HttpsRecord
 // ---------------------------------------------------------------------------
@@ -1405,6 +1438,66 @@ mod tests {
             vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 443)]
         );
         assert_eq!(lookup_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn client_dns_timeout_does_not_cancel_shared_lookup() {
+        let group = Arc::new(SystemDnsFlightGroup::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let short = {
+            let group = group.clone();
+            let count = count.clone();
+            let started = started.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let budget = TimeoutResolver {
+                    inner: Arc::new(SystemDns),
+                    timeout: Duration::from_millis(20),
+                };
+                budget
+                    .run(
+                        group.resolve_with("budget.test", 443, move |_, port| async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            started.add_permits(1);
+                            release.acquire().await.unwrap().forget();
+                            Ok(vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)])
+                        }),
+                    )
+                    .await
+            })
+        };
+        started.acquire().await.unwrap().forget();
+        assert_eq!(
+            short.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let long = {
+            let group = group.clone();
+            let count = count.clone();
+            tokio::spawn(async move {
+                let budget = TimeoutResolver {
+                    inner: Arc::new(SystemDns),
+                    timeout: Duration::from_secs(1),
+                };
+                budget
+                    .run(
+                        group.resolve_with("budget.test", 443, move |_, port| async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)])
+                        }),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        assert_eq!(
+            long.await.unwrap().unwrap(),
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 443)]
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "lkmasque"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "MASQUE CONNECT-UDP (RFC 9298) wire codec and tunnel layer for lkrequest"
 license.workspace = true

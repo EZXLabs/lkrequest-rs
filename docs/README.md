@@ -19,6 +19,7 @@
 - [Client、Session 与连接复用](guides/client-session.md)
 - [代理与 DNS](guides/networking.md)
 - [HTTP 协议策略](guides/protocols.md)
+- [TCP 指纹的平台支持与限制](reference/tcp-fingerprint.md)
 - [C ABI 与其他语言绑定](guides/ffi.md)
 
 ### 高级场景

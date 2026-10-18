@@ -116,6 +116,7 @@ impl fmt::Display for DriverError {
         match self {
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            Self::StreamReset(7) => write!(f, "stream reset: refused stream (error_code=7)"),
             Self::StreamReset(code) => write!(f, "stream reset: error_code={code}"),
             Self::GoAway(msg) => write!(f, "GOAWAY: {msg}"),
             Self::Shutdown => write!(f, "connection shut down"),
@@ -216,7 +217,11 @@ impl NativeSendRequest {
                 .acquire_owned()
                 .await
                 .map(Some)
-                .map_err(|_| DriverError::Shutdown),
+                .map_err(|_| {
+                    DriverError::GoAway(
+                        "refused stream: request admission closed before dispatch".into(),
+                    )
+                }),
             None => Ok(None),
         }
     }
@@ -260,10 +265,9 @@ impl NativeSendRequest {
             pending_permit,
         };
 
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| DriverError::ChannelClosed)?;
+        self.cmd_tx.send(cmd).await.map_err(|_| {
+            DriverError::GoAway("refused stream: request channel closed before dispatch".into())
+        })?;
 
         let mut cancel_guard = RequestCancelGuard::new(request_id, self.cancel_tx.clone());
         let response = headers_rx.await.map_err(|_| DriverError::ChannelClosed)?;
@@ -297,10 +301,9 @@ impl NativeSendRequest {
             pending_permit,
         };
 
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| DriverError::ChannelClosed)?;
+        self.cmd_tx.send(cmd).await.map_err(|_| {
+            DriverError::GoAway("refused stream: request channel closed before dispatch".into())
+        })?;
 
         let mut cancel_guard = RequestCancelGuard::new(request_id, self.cancel_tx.clone());
         let response = headers_rx.await.map_err(|_| DriverError::ChannelClosed)?;
@@ -321,7 +324,7 @@ impl fmt::Debug for NativeSendRequest {
 
 struct PendingStream {
     upload: Option<PendingUpload>,
-    // Keep cancellation alive after upload EOF, until the response is released.
+    // The response receiver owns cancellation before and after headers handoff.
     cancelled: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
     /// Sends response headers (used once, then becomes None).
     headers_tx: Option<oneshot::Sender<Result<NativeResponseHeaders, DriverError>>>,
@@ -342,9 +345,10 @@ impl PendingStream {
         headers_tx: oneshot::Sender<Result<NativeResponseHeaders, DriverError>>,
         body_tx: mpsc::UnboundedSender<Result<Bytes, DriverError>>,
     ) -> Self {
+        let cancelled_tx = body_tx.clone();
         Self {
             upload: None,
-            cancelled: None,
+            cancelled: Some(Box::pin(async move { cancelled_tx.closed().await })),
             headers_tx: Some(headers_tx),
             body_tx,
             method,
@@ -564,6 +568,11 @@ pub async fn spawn_driver_with_first_request_and_config<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    if !crate::profile::valid_initial_stream_id(profile.initial_stream_id) {
+        return Err(DriverError::Protocol(
+            "initial_stream_id must be a nonzero odd 31-bit client stream ID".into(),
+        ));
+    }
     if config.max_pending_requests == Some(0) {
         return Err(DriverError::Protocol(
             "max_pending_requests must be greater than zero".into(),
@@ -844,6 +853,9 @@ async fn driver_loop<S>(
     let mut terminating = false;
     let mut cancel_rx_open = true;
     let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+    let mut shutdown_transport = false;
+    let mut allow_close_goaway = false;
+    let mut peer_goaway_received = false;
 
     loop {
         let allow_upload_data = stream.is_empty();
@@ -869,6 +881,8 @@ async fn driver_loop<S>(
             result = reader.read_buf(&mut read_buf), if !terminating => {
                 match result {
                     Ok(0) => {
+                        shutdown_transport = true;
+                        allow_close_goaway = true;
                         let error = DriverError::Io("connection closed".into());
                         notify_all_error(&mut pending, error.clone());
                         notify_waiting_error(&mut waiting, error);
@@ -876,6 +890,11 @@ async fn driver_loop<S>(
                     }
                     Ok(_n) => {
                         let (mut events, outbound_frames) = engine.process(&mut read_buf);
+                        for event in &events {
+                            if let H2Event::GoAway { .. } = event {
+                                peer_goaway_received = true;
+                            }
+                        }
                         let connection_error = events.iter().find_map(|event| match event {
                             H2Event::Error(message) => Some(DriverError::Protocol(format!(
                                 "connection error: {message}"
@@ -1111,11 +1130,32 @@ async fn driver_loop<S>(
             }
         }
 
-        if shutdown && pending.is_empty() && waiting.is_empty() {
+        if (shutdown || peer_goaway_received) && pending.is_empty() && waiting.is_empty() {
+            shutdown_transport = true;
+            allow_close_goaway = !terminating;
             break;
         }
     }
 
+    if shutdown_transport {
+        let finish = async {
+            if allow_close_goaway && write_policy.send_goaway_on_close() {
+                if let Some(frame) = engine.graceful_shutdown_frame() {
+                    encode_and_write_frames(&mut stream, &engine, &*write_policy, vec![frame])
+                        .await?;
+                }
+            }
+            while !stream.is_empty() {
+                std::future::poll_fn(|cx| stream.poll_drain(&mut writer, cx)).await?;
+            }
+            writer.shutdown().await
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(1), finish).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!(%error, "h2.native.transport_shutdown_error"),
+            Err(_) => tracing::debug!("h2.native.transport_shutdown_timeout"),
+        }
+    }
     tracing::debug!("h2.native.driver_exited");
 }
 
@@ -1227,10 +1267,6 @@ async fn dispatch_waiting_requests(
         drop(pending_permit);
 
         let mut response = PendingStream::new(method, headers_tx, body_tx);
-        if upload.is_some() {
-            let body_tx = response.body_tx.clone();
-            response.cancelled = Some(Box::pin(async move { body_tx.closed().await }));
-        }
         response.upload = upload;
         pending.insert(stream_id, response);
 
@@ -1328,17 +1364,7 @@ where
     let stream_id = engine.open_stream();
     let (parts, body) = first_req.request.into_parts();
     let method = parts.method.clone();
-    let priority = parts
-        .extensions
-        .get::<crate::profile::RequestPriority>()
-        .copied();
-    let native_req = crate::adapter::NativeH2Request::new(
-        parts.method,
-        parts.uri,
-        parts.headers,
-        body,
-        priority,
-    );
+    let native_req = crate::adapter::build_native_request(parts, body);
     let frames = engine.build_native_request(stream_id, native_req);
 
     pending.insert(
@@ -1660,7 +1686,13 @@ fn handle_event_inner(
             error_code,
         } => {
             if let Some(ps) = pending.remove(&stream_id) {
-                let err = DriverError::StreamReset(error_code);
+                let err = if error_code == 7 && ps.headers_tx.is_none() {
+                    DriverError::Protocol(
+                        "stream reset after response headers: error_code=7".into(),
+                    )
+                } else {
+                    DriverError::StreamReset(error_code)
+                };
                 if let Some(tx) = ps.headers_tx {
                     let _ = tx.send(Err(err.clone()));
                 }
@@ -1670,29 +1702,26 @@ fn handle_event_inner(
         H2Event::GoAway {
             last_stream_id,
             error_code,
-            debug_data,
+            ..
         } => {
-            if error_code != 0 {
-                let msg = format!(
-                    "error_code={error_code}, debug={}",
-                    String::from_utf8_lossy(&debug_data)
-                );
-                notify_all_error(pending, DriverError::GoAway(msg));
-            } else {
-                // Graceful GOAWAY (error_code=0): only fail streams that
-                // the server will NOT process (stream_id > last_stream_id).
-                let stale: Vec<u32> = pending
-                    .keys()
-                    .filter(|&&sid| sid > last_stream_id)
-                    .copied()
-                    .collect();
-                for sid in stale {
-                    if let Some(ps) = pending.remove(&sid) {
-                        if let Some(tx) = ps.headers_tx {
-                            let _ = tx
-                                .send(Err(DriverError::GoAway("stream rejected by GOAWAY".into())));
-                        }
+            // The cutoff applies even when GOAWAY carries a nonzero error.
+            // Accepted streams may still finish on this connection.
+            let stale: Vec<u32> = pending
+                .keys()
+                .filter(|&&sid| sid > last_stream_id)
+                .copied()
+                .collect();
+            for sid in stale {
+                if let Some(ps) = pending.remove(&sid) {
+                    let error = if ps.headers_tx.is_some() {
+                        DriverError::GoAway(format!("refused stream above GOAWAY last_stream_id={last_stream_id}, error_code={error_code}"))
+                    } else {
+                        DriverError::GoAway(format!("stream excluded by GOAWAY after response headers: last_stream_id={last_stream_id}, error_code={error_code}"))
+                    };
+                    if let Some(tx) = ps.headers_tx {
+                        let _ = tx.send(Err(error.clone()));
                     }
+                    let _ = ps.body_tx.send(Err(error));
                 }
             }
         }
@@ -1715,6 +1744,23 @@ fn remove_waiting_request(waiting: &mut VecDeque<QueuedRequest>, request_id: u64
 }
 
 fn notify_waiting_error(waiting: &mut VecDeque<QueuedRequest>, err: DriverError) {
+    if waiting.is_empty() {
+        return;
+    }
+    // These requests have not reached the encoder or transport. Keep the
+    // underlying failure category while preserving that replay guarantee.
+    let err = match err {
+        DriverError::Io(message) => {
+            DriverError::Io(format!("refused stream before dispatch: {message}"))
+        }
+        DriverError::Protocol(message) => {
+            DriverError::Protocol(format!("refused stream before dispatch: {message}"))
+        }
+        DriverError::GoAway(message) => {
+            DriverError::GoAway(format!("refused stream before dispatch: {message}"))
+        }
+        other => DriverError::GoAway(format!("refused stream before dispatch: {other}")),
+    };
     for request in waiting.drain(..) {
         match request {
             QueuedRequest::Request {
@@ -1746,6 +1792,270 @@ fn notify_all_error(pending: &mut HashMap<u32, PendingStream>, err: DriverError)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_goaway_drains_accepted_response_then_closes_with_sender_alive() {
+        for profile in [
+            crate::profile::chrome_155_h2(),
+            crate::profile::firefox_156_h2(),
+        ] {
+            for goaway_code in [0, 1, 2, 11] {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let stream_id = profile.initial_stream_id;
+                    let sends_goaway = profile.behavior().write_policy.send_goaway_on_close();
+                    let (client_io, mut server_io) = tokio::io::duplex(65536);
+                    let (finish_tx, finish_rx) = oneshot::channel();
+                    let server = tokio::spawn(async move {
+                        use crate::frame::{
+                            DataFrame, GoAwayFrame, H2Frame, HeadersFrame, SettingsFrame,
+                        };
+                        let codec = crate::codec::H2Codec::new();
+                        let mut preface = [0; 24];
+                        server_io.read_exact(&mut preface).await.unwrap();
+                        assert_eq!(&preface, crate::CONNECTION_PREFACE);
+                        let mut output = BytesMut::new();
+                        codec.encode(
+                            &H2Frame::Settings(SettingsFrame {
+                                ack: false,
+                                settings: Vec::new(),
+                            }),
+                            &mut output,
+                        );
+                        server_io.write_all(&output).await.unwrap();
+                        let mut wire = BytesMut::new();
+                        while !has_frame(&wire, 1, stream_id) {
+                            assert!(server_io.read_buf(&mut wire).await.unwrap() > 0);
+                        }
+                        output.clear();
+                        codec.encode(
+                            &H2Frame::Headers(HeadersFrame {
+                                stream_id,
+                                end_stream: false,
+                                end_headers: true,
+                                priority: None,
+                                padding: None,
+                                header_block: Bytes::from_static(&[0x88]),
+                            }),
+                            &mut output,
+                        );
+                        codec.encode(
+                            &H2Frame::GoAway(GoAwayFrame {
+                                last_stream_id: stream_id,
+                                error_code: goaway_code,
+                                debug_data: Bytes::new(),
+                            }),
+                            &mut output,
+                        );
+                        server_io.write_all(&output).await.unwrap();
+                        finish_rx.await.unwrap();
+                        output.clear();
+                        codec.encode(
+                            &H2Frame::Data(DataFrame {
+                                stream_id,
+                                end_stream: true,
+                                padding: None,
+                                data: Bytes::from_static(b"complete"),
+                            }),
+                            &mut output,
+                        );
+                        server_io.write_all(&output).await.unwrap();
+                        let mut tail = Vec::new();
+                        server_io.read_to_end(&mut tail).await.unwrap();
+                        wire.extend_from_slice(&tail);
+                        assert!(!has_frame(&wire, 1, stream_id + 2));
+                        let mut codec = crate::codec::H2Codec::new();
+                        let mut goaways = Vec::new();
+                        while let crate::codec::DecodeResult::Frame(frame) = codec.decode(&mut wire)
+                        {
+                            if let H2Frame::GoAway(frame) = frame {
+                                goaways.push((frame.last_stream_id, frame.error_code));
+                            }
+                        }
+                        assert!(wire.is_empty());
+                        assert_eq!(
+                            goaways,
+                            if sends_goaway {
+                                vec![(0, 0)]
+                            } else {
+                                Vec::new()
+                            }
+                        );
+                    });
+                    let (mut sender, driver) =
+                        spawn_driver_with_behavior(client_io, &profile, Some(profile.behavior()))
+                            .await
+                            .unwrap();
+                    let (headers, mut body) =
+                        sender.send_request(request("accepted")).await.unwrap();
+                    assert_eq!(headers.status, 200);
+                    assert!(!driver.is_finished());
+                    let next = sender.send_request(request("rejected")).await;
+                    assert!(matches!(next, Err(DriverError::GoAway(_))));
+                    assert!(!driver.is_finished());
+                    finish_tx.send(()).unwrap();
+                    assert_eq!(
+                        body.recv().await.unwrap().unwrap(),
+                        Bytes::from_static(b"complete")
+                    );
+                    assert!(body.recv().await.is_none());
+                    driver.await.unwrap();
+                    assert!(sender.ready().await.is_err());
+                    server.await.unwrap();
+                })
+                .await
+                .expect("accepted response did not drain before shutdown");
+            }
+        }
+    }
+
+    #[test]
+    fn goaway_cutoff_refuses_unprocessed_requests_and_fails_visible_bodies() {
+        for code in [0, 1, 2, 11] {
+            for headers_seen in [false, true] {
+                let (mut pending, mut headers, mut body) = pending_with_channels();
+                if headers_seen {
+                    handle_event(headers_event(1, &[(":status", "200")], false), &mut pending);
+                    assert_eq!(headers.try_recv().unwrap().unwrap().status, 200);
+                }
+                handle_event(
+                    H2Event::GoAway {
+                        last_stream_id: 0,
+                        error_code: code,
+                        debug_data: Bytes::from_static(b"refused stream in peer debug data"),
+                    },
+                    &mut pending,
+                );
+                assert!(pending.is_empty());
+                let error = body.try_recv().unwrap().unwrap_err();
+                assert_eq!(error.to_string().contains("refused stream"), !headers_seen);
+                if !headers_seen {
+                    assert!(headers
+                        .try_recv()
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("refused stream"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_reset_after_response_headers_does_not_claim_nonprocessing() {
+        for headers_seen in [false, true] {
+            let (mut pending, mut headers, mut body) = pending_with_channels();
+            if headers_seen {
+                handle_event(headers_event(1, &[(":status", "200")], false), &mut pending);
+                assert_eq!(headers.try_recv().unwrap().unwrap().status, 200);
+            }
+            handle_event(
+                H2Event::StreamReset {
+                    stream_id: 1,
+                    error_code: 7,
+                },
+                &mut pending,
+            );
+            let error = body.try_recv().unwrap().unwrap_err();
+            assert_eq!(error.to_string().contains("refused stream"), !headers_seen);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_refusals_are_distinct_from_lost_response_channels() {
+        for error in [
+            DriverError::Io("connection closed".into()),
+            DriverError::Protocol("connection error".into()),
+            DriverError::Shutdown,
+        ] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut sender = test_sender(tx, None);
+            let sending =
+                tokio::spawn(async move { sender.send_request(request("waiting")).await });
+            let mut waiting = VecDeque::new();
+            assert!(!queue_driver_command(
+                rx.recv().await.unwrap(),
+                &mut waiting
+            ));
+            notify_waiting_error(&mut waiting, error);
+            assert!(sending
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("refused stream before dispatch"));
+        }
+        for bounded in [false, true] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut sender = test_sender(tx, bounded.then_some(1));
+            rx.close();
+            if let Some(slots) = &sender.pending_slots {
+                slots.close();
+            }
+            assert!(sender
+                .send_request(request("not-dispatched"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("refused stream"));
+        }
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut sender = test_sender(tx, None);
+        let sending = tokio::spawn(async move { sender.send_request(request("dispatched")).await });
+        drop(rx.recv().await.unwrap());
+        assert!(matches!(
+            sending.await.unwrap(),
+            Err(DriverError::ChannelClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_shutdown_cannot_keep_an_eof_driver_alive_forever() {
+        struct StalledShutdown(Arc<AtomicU64>);
+        impl AsyncRead for StalledShutdown {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for StalledShutdown {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut Context<'_>,
+                data: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(data.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Pending
+            }
+        }
+        let shutdown_calls = Arc::new(AtomicU64::new(0));
+        let (mut sender, driver) = spawn_driver(
+            StalledShutdown(shutdown_calls.clone()),
+            &crate::profile::chrome_155_h2(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("transport shutdown was unbounded")
+            .unwrap();
+        assert!(shutdown_calls.load(Ordering::SeqCst) > 0);
+        assert!(sender.ready().await.is_err());
+    }
 
     #[derive(Default)]
     struct WriteTrace(Vec<Option<Vec<u8>>>);
@@ -1964,6 +2274,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_programmatic_initial_stream_id_is_rejected() {
+        for id in [0, 2, u32::MAX] {
+            let mut profile = crate::profile::chrome_155_h2();
+            profile.initial_stream_id = id;
+            let (client, _peer) = tokio::io::duplex(1024);
+            let result = spawn_driver(client, &profile).await;
+            assert!(
+                matches!(result, Err(DriverError::Protocol(message)) if message.contains("initial_stream_id"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_client_stream_ids_fail_new_requests_without_hanging() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut profile = crate::profile::chrome_155_h2();
+            profile.initial_stream_id = crate::profile::MAX_CLIENT_STREAM_ID;
+            let (client, mut peer) = tokio::io::duplex(65536);
+            let (mut sender, driver) = spawn_driver(client, &profile).await.unwrap();
+            let requests = tokio::spawn(async move {
+                let (first, _) = sender.send_request(request("last")).await.unwrap();
+                assert_eq!(first.status, 200);
+                assert!(matches!(
+                    sender.send_request(request("exhausted")).await,
+                    Err(DriverError::GoAway(_))
+                ));
+            });
+            let mut magic = [0; 24];
+            peer.read_exact(&mut magic).await.unwrap();
+            peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+            loop {
+                let mut header = [0; 9];
+                peer.read_exact(&mut header).await.unwrap();
+                let length =
+                    ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+                let mut payload = vec![0; length];
+                peer.read_exact(&mut payload).await.unwrap();
+                if header[3] == 1 {
+                    assert_eq!(
+                        u32::from_be_bytes(header[5..9].try_into().unwrap()),
+                        crate::profile::MAX_CLIENT_STREAM_ID
+                    );
+                    break;
+                }
+            }
+            peer.write_all(&[0, 0, 1, 1, 5, 0x7f, 0xff, 0xff, 0xff, 0x88])
+                .await
+                .unwrap();
+            requests.await.unwrap();
+            drop(peer);
+            driver.abort();
+            let _ = driver.await;
+        })
+        .await
+        .expect("last stream succeeds and further requests fail promptly");
+    }
+
+    #[tokio::test]
     async fn zero_ready_command_batch_is_rejected() {
         let (client_io, _server_io) = tokio::io::duplex(1024);
         let result = spawn_driver_with_config(
@@ -2120,6 +2489,210 @@ mod tests {
         first_task.await.unwrap().unwrap();
         server_task.await.unwrap();
         driver_task.abort();
+    }
+
+    async fn cancellation_frame(io: &mut tokio::io::DuplexStream) -> (u8, u8, u32, Vec<u8>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut header = [0; 9];
+            io.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let stream_id = u32::from_be_bytes(header[5..9].try_into().unwrap()) & 0x7fff_ffff;
+            let mut payload = vec![0; len];
+            io.read_exact(&mut payload).await.unwrap();
+            (header[3], header[4], stream_id, payload)
+        })
+        .await
+        .expect("client did not emit the expected H2 frame")
+    }
+
+    async fn cancellation_peer_ready(io: &mut tokio::io::DuplexStream) -> Vec<u32> {
+        let mut preface = [0; 24];
+        io.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, crate::CONNECTION_PREFACE);
+        io.write_all(&h2_frame(4, 0, 0, &[0, 3, 0, 0, 0, 1]))
+            .await
+            .unwrap();
+        let mut first_headers = Vec::new();
+        loop {
+            let (kind, flags, stream_id, _) = cancellation_frame(io).await;
+            if kind == 1 {
+                first_headers.push(stream_id);
+            }
+            if kind == 4 && flags & 1 != 0 {
+                return first_headers;
+            }
+        }
+    }
+
+    async fn cancellation_expect_reset(io: &mut tokio::io::DuplexStream, stream_id: u32) {
+        let (kind, _, actual_id, payload) = cancellation_frame(io).await;
+        assert_eq!(
+            (kind, actual_id, payload.as_slice()),
+            (3, stream_id, &8u32.to_be_bytes()[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_h2_sent_future_drop_resets_and_releases_capacity() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let (mut sender, driver) = spawn_driver(client, &crate::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        assert!(cancellation_peer_ready(&mut peer).await.is_empty());
+        let mut response = Box::pin(sender.send_request(request("abandoned")));
+        let stream_id = tokio::select! {
+            frame = cancellation_frame(&mut peer) => { assert_eq!(frame.0, 1); frame.2 }
+            result = &mut response => panic!("response arrived without a server reply: {result:?}"),
+        };
+        drop(response);
+        cancellation_expect_reset(&mut peer, stream_id).await;
+
+        let mut next = Box::pin(sender.send_request(request("after-cancel")));
+        let next_id = tokio::select! {
+            frame = cancellation_frame(&mut peer) => { assert_eq!(frame.0, 1); frame.2 }
+            result = &mut next => panic!("next request failed before HEADERS: {result:?}"),
+        };
+        assert_eq!(next_id, stream_id + 2);
+        peer.write_all(&h2_frame(1, 5, next_id, &[0x88]))
+            .await
+            .unwrap();
+        let (headers, mut body) = next.await.unwrap();
+        assert_eq!(headers.status, 200);
+        assert!(body.recv().await.is_none());
+        drop(body);
+        peer.write_all(&h2_frame(6, 0, 0, &[0; 8])).await.unwrap();
+        let (kind, flags, id, _) = cancellation_frame(&mut peer).await;
+        assert_eq!(
+            (kind, flags, id),
+            (6, 1, 0),
+            "completed response must not be reset"
+        );
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("driver retained abandoned request")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_h2_sent_task_abort_all_senders_dropped_exits_promptly() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let (mut sender, driver) = spawn_driver(client, &crate::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        assert!(cancellation_peer_ready(&mut peer).await.is_empty());
+        let task = tokio::spawn(async move { sender.send_request(request("aborted")).await });
+        let (kind, _, stream_id, _) = cancellation_frame(&mut peer).await;
+        assert_eq!(kind, 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        cancellation_expect_reset(&mut peer, stream_id).await;
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("driver waited for the 30-second grace period")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_h2_native_request_resets_after_dispatch() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let (mut sender, driver) = spawn_driver(client, &crate::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        assert!(cancellation_peer_ready(&mut peer).await.is_empty());
+        let native = crate::adapter::NativeH2Request::new(
+            http::Method::GET,
+            "https://example.test/native".parse().unwrap(),
+            http::HeaderMap::new(),
+            None,
+            None,
+        );
+        let mut response = Box::pin(sender.send_native_request(native));
+        let stream_id = tokio::select! {
+            frame = cancellation_frame(&mut peer) => { assert_eq!(frame.0, 1); frame.2 }
+            result = &mut response => panic!("response arrived without a server reply: {result:?}"),
+        };
+        drop(response);
+        cancellation_expect_reset(&mut peer, stream_id).await;
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_h2_sent_future_timeout_resets() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let (mut sender, driver) = spawn_driver(client, &crate::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        assert!(cancellation_peer_ready(&mut peer).await.is_empty());
+        let mut response = Box::pin(sender.send_request(request("timed-out")));
+        let stream_id = tokio::select! {
+            frame = cancellation_frame(&mut peer) => { assert_eq!(frame.0, 1); frame.2 }
+            result = &mut response => panic!("response arrived without a server reply: {result:?}"),
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(1), response)
+            .await
+            .is_err());
+        cancellation_expect_reset(&mut peer, stream_id).await;
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_h2_response_body_owns_cancellation_after_headers() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let (mut sender, driver) = spawn_driver(client, &crate::profile::chrome_155_h2())
+            .await
+            .unwrap();
+        assert!(cancellation_peer_ready(&mut peer).await.is_empty());
+        let mut response = Box::pin(sender.send_request(request("body-owner")));
+        let stream_id = tokio::select! {
+            frame = cancellation_frame(&mut peer) => { assert_eq!(frame.0, 1); frame.2 }
+            result = &mut response => panic!("response arrived without a server reply: {result:?}"),
+        };
+        peer.write_all(&h2_frame(1, 4, stream_id, &[0x88]))
+            .await
+            .unwrap();
+        let (headers, body) = response.await.unwrap();
+        assert_eq!(headers.status, 200);
+        // A PING round trip proves the driver runs after the headers future ended.
+        peer.write_all(&h2_frame(6, 0, 0, &[0; 8])).await.unwrap();
+        let (kind, flags, id, _) = cancellation_frame(&mut peer).await;
+        assert_eq!((kind, flags, id), (6, 1, 0));
+        drop(body);
+        cancellation_expect_reset(&mut peer, stream_id).await;
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_h2_piggyback_response_resets_without_request_guard() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let profile = crate::profile::chrome_155_h2();
+        let (first, response) = FirstRequest::new(request("piggyback"));
+        let (sender, driver) = spawn_driver_with_first_request(client, &profile, None, Some(first))
+            .await
+            .unwrap();
+        assert_eq!(
+            cancellation_peer_ready(&mut peer).await,
+            vec![profile.initial_stream_id]
+        );
+        drop(response);
+        cancellation_expect_reset(&mut peer, profile.initial_stream_id).await;
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

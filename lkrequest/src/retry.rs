@@ -12,7 +12,8 @@
 //! all. Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) are always retried;
 //! non-idempotent methods (`POST`/`PUT`/`PATCH`/`DELETE`) are retried only
 //! when the failure proves the request was never processed
-//! (connection-establishment failures, HTTP/2 `REFUSED_STREAM`), or when the
+//! (connection-establishment failures, HTTP/2 `REFUSED_STREAM` or GOAWAY
+//! excluding an unprocessed request, or HTTP/3 `H3_REQUEST_REJECTED`), or when the
 //! request is explicitly marked [`Idempotency::Idempotent`](crate::Idempotency).
 //! This prevents a timeout/reset *after* a `POST` was sent from silently
 //! duplicating a side effect.
@@ -23,6 +24,11 @@
 //! prove that the request was not applied. Safe methods and callers that
 //! explicitly opt into replay with [`Idempotency::Idempotent`](crate::Idempotency)
 //! remain eligible for status-code retries.
+//!
+//! With `quic-h3`, the explicit `H3RetryMode::Chrome155ProtocolErrors` mode
+//! separately authorizes limited replay of buffered requests after selected
+//! HTTP/3 protocol errors. It is disabled by default and does not change
+//! status retries or QUIC 0-RTT eligibility.
 //!
 //! # Built-in Strategies
 //!
@@ -45,6 +51,64 @@
 use std::time::Duration;
 
 use crate::error::Error;
+
+/// HTTP/3 protocol-error retry behavior for a session.
+///
+/// This is independent of [`RetryPolicy`] and the request's QUIC 0-RTT gate.
+/// Existing client presets use [`Safe`](Self::Safe).
+#[cfg(feature = "quic-h3")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H3RetryMode {
+    /// Preserve the existing automatic replay safety checks.
+    #[default]
+    Safe,
+    /// Retry selected HTTP/3 protocol errors up to twice per redirect hop,
+    /// before response headers reach the request transaction.
+    ///
+    /// This explicitly permits replay of a finite buffered request, including
+    /// a POST the peer may already have processed. Absent or buffered bodies
+    /// are eligible; streaming uploads are excluded. Set the request's
+    /// [`Idempotency`](crate::Idempotency) to `NotIdempotent` to opt out.
+    ///
+    /// Applies to buffered and streaming response APIs only before their H3
+    /// sender returns response headers. It does not add status-code retries,
+    /// retries after response headers, or the other Chrome retry classes.
+    /// Existing deadlines and 0-RTT eligibility remain in force.
+    ///
+    /// H3-only requests retry over H3. Other requests require
+    /// [`FallbackPolicy::AllowFallback`](crate::FallbackPolicy::AllowFallback)
+    /// and a route that permits TCP; their retry disables H3 for that redirect
+    /// hop while retaining H1/H2 ALPN negotiation. A protocol error handled by
+    /// this mode is not retried again by the outer [`RetryPolicy`].
+    Chrome155ProtocolErrors,
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) const MAX_CHROME_H3_RETRIES: u32 = 2;
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn chrome_h3_owns_error(mode: H3RetryMode, error: &Error) -> bool {
+    mode == H3RetryMode::Chrome155ProtocolErrors
+        && error
+            .h3_request_context()
+            .is_some_and(|context| context.kind == crate::error::H3FailureKind::Protocol)
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn chrome_h3_can_retry(
+    error: &Error,
+    idempotency: crate::Idempotency,
+    body: Option<&crate::body::RequestBody>,
+    retries: u32,
+) -> bool {
+    retries < MAX_CHROME_H3_RETRIES
+        && idempotency != crate::Idempotency::NotIdempotent
+        && body.is_none_or(|body| body.buffered().is_some())
+        && error.h3_request_context().is_some_and(|context| {
+            context.stage == crate::error::H3ResponseStage::AwaitingResponse
+                && context.kind == crate::error::H3FailureKind::Protocol
+        })
+}
 
 // ---------------------------------------------------------------------------
 // RetryPolicy trait
@@ -103,16 +167,17 @@ pub fn is_retryable_status(status: http::StatusCode) -> bool {
 ///
 /// - the failure proves the server never processed the request
 ///   ([`Error::is_safe_to_replay`]: connection-establishment failures and
-///   HTTP/2 `REFUSED_STREAM`); or
+///   HTTP/2 `REFUSED_STREAM`, a GOAWAY cutoff before response headers, or
+///   HTTP/3 `H3_REQUEST_REJECTED` before response headers); or
 /// - the caller has declared the request replay-safe via
 ///   [`Idempotency::Idempotent`](crate::Idempotency) (e.g. it carries an
 ///   `Idempotency-Key` header).
 ///
-/// Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) are always replay-safe. This
-/// mirrors Chromium's transaction-restart rules and reqwest's behaviour: a
-/// timeout or connection reset that occurs *after* a `POST` was transmitted is
-/// not auto-retried, because the server may already have applied it and a
-/// silent replay would duplicate the side effect.
+/// Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) with default idempotency and
+/// requests explicitly marked idempotent can be replayed. This is this client's
+/// deliberate automatic replay safety contract: a timeout or connection reset
+/// after a default `POST` was transmitted does not authorize retry, because the
+/// server may already have applied it and replay could duplicate the side effect.
 ///
 /// The [`RetryPolicy`] still decides *whether and how long* to back off; this
 /// gate is an additional safety check applied to the error-retry path.

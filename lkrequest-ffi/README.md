@@ -57,8 +57,8 @@ Implemented ABI surface includes:
 - Streaming reads and chunk ops
 - Response text / cookies / redirect history / diagnostics
 - Streaming diagnostics and header-by-name lookup
-- Session cookie CRUD (setting and removal; the Rust-side attribute readers
-  `get_cookies_with_attrs` / `get_all_cookies` are not exported yet)
+- Session cookie CRUD and JSON readers for URL-matched or all-domain cookies,
+  including domain/path, Secure, HttpOnly, SameSite and expiry attributes
 - Session preconnect sync/async
 - Session connection-pool stats / clear
 - Request `cookie_override`
@@ -194,19 +194,25 @@ Pass a canonical preset name to `lk_client_builder_set_preset`:
 
 | Family | Names | TLS/H2 | QUIC/H3 |
 |---|---|---|---|
-| Chrome | `chrome_131`, `chrome_144` through `chrome_154` | Yes | Requires `quic-h3` |
+| Chrome | `chrome_131`, `chrome_144` through `chrome_155` | Yes | Requires `quic-h3` |
 | Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Yes | Not provided |
 | Safari | `safari_18`, `safari_26` | Yes | Not provided |
 
 Use `lk_preset_list_json` to discover names in the loaded library and
 `lk_preset_get_detail_json` to inspect a canonical name. The builder also accepts
-`default` as an alias for `chrome_144` and `safari_26_2` for `safari_26`; the list
+`default` as an alias for `chrome_155` and `safari_26_2` for `safari_26`; the list
 and detail APIs use canonical names.
+
+`lk_client_new_default` and a builder with no explicit preset also select
+`chrome_155`. Use the explicit `chrome_144` name to retain the previous default.
 
 Chrome 154's H3 SETTINGS inherit the Chrome 153 baseline. Firefox 156's TLS/H2
 fields were captured directly; its preset has no QUIC/H3 configuration even when
 the library is built with `quic-h3`. See the
 [support and verification matrix](../docs/reference/presets.md).
+
+`chrome_155` directly verifies the Windows 155.0.8059.40 TLS/H2/QUIC fields
+and H3 SETTINGS using passive public captures, including an H3 HTTP 200 response.
 
 ## Fingerprint Randomization
 
@@ -243,6 +249,47 @@ lk_client_builder_set_randomize(b, LK_RANDOMIZE_RECOMBINE, 0);
 /* Or synthesize only TLS, keeping the real H2/H3 preset: */
 lk_client_builder_set_randomize(b, LK_RANDOMIZE_RECOMBINE, LK_FP_LAYER_TLS);
 ```
+
+## Cookie Attributes
+
+`lk_session_get_cookies_with_attrs_json(session, url, url_len, &json, &len, &err)`
+returns unexpired cookies matching the URL, ordered by longest path and then
+creation time. `lk_session_get_all_cookies_json(session, &json, &len, &err)`
+returns all unexpired cookies across domains and paths, oldest first, including
+Secure and HttpOnly cookies. Distinct cookies with the same name remain separate
+array entries.
+
+Each entry has `name`, `value`, `domain`, `host_only`, `path`, `secure`,
+`http_only`, `same_site`, and `expires_unix`. Optional fields are JSON `null`;
+`same_site` is `"Strict"`, `"Lax"`, `"None"`, or null. `expires_unix` is an
+integer Unix timestamp in seconds, or null for a session cookie.
+
+Both output parameters are required. The JSON is UTF-8 and NUL-terminated;
+`len` excludes the terminator. Empty results are `[]`. The URL-filtered reader
+also returns `[]` for an invalid URL, matching Rust. Invalid handles, pointer
+arguments or UTF-8 produce `LK_ERR` with provided outputs reset to NULL/0.
+
+The session handle owns the buffers: do not free them. A buffer remains valid
+until its query is repeated, an explicit cookie setter/removal/clear runs, or
+the handle is freed. Different queries and the legacy name/value reader have
+separate cached buffers. Copy the result before an invalidating call and
+synchronize reads with such calls when sharing a handle between threads.
+
+```c
+const char *json = NULL;
+size_t len = 0;
+lk_error_t *err = NULL;
+if (lk_session_get_all_cookies_json(session, &json, &len, &err) == LK_OK) {
+    /* Parse or copy the len bytes before another invalidating cookie call. */
+}
+if (err != NULL) {
+    lk_error_free(err);
+}
+```
+
+`lk_session_get_cookies_json` retains its original name/value-only schema.
+Attribute export does not add attribute import: the current attribute setter
+supports path/domain/Secure/HttpOnly, but not SameSite or expiry.
 
 ## ABI Notes
 

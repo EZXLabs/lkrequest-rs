@@ -24,6 +24,62 @@ use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+struct ObservedTcp {
+    tcp: tokio::net::TcpStream,
+    bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl tokio::io::AsyncRead for ObservedTcp {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut self.tcp).poll_read(cx, buffer);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let mut bytes = self.bytes.lock().unwrap();
+            bytes.extend_from_slice(&buffer.filled()[before..]);
+            assert!(bytes.len() < 65_536, "bounded synthetic TLS capture");
+        }
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedTcp {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.tcp).poll_write(cx, buffer)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_shutdown(cx)
+    }
+}
+
+#[derive(Debug, Default)]
+struct TicketCounter(std::sync::atomic::AtomicUsize);
+
+impl lktls::session_store::SessionStore for TicketCounter {
+    fn store(&self, _host: &str, _ticket: lktls::session_store::SessionTicketData) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn take(&self, _host: &str) -> Option<lktls::session_store::SessionTicketData> {
+        None
+    }
+}
+
 /// The name the ECH config publishes — what a rejecting server is authenticated
 /// as, and what the outer ClientHello carries as SNI.
 const PUBLIC_NAME: &str = "public.ech-test.invalid";
@@ -159,4 +215,246 @@ async fn grease_ech_is_not_treated_as_a_rejected_offer() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn hrr_rejection_authenticates_public_name_and_sends_ech_required() {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for wrong_name in [false, true] {
+            let cert = rcgen::generate_simple_self_signed(vec![if wrong_name {
+                "secret.ech-test.invalid"
+            } else {
+                PUBLIC_NAME
+            }
+            .to_string()])
+            .unwrap();
+            let anchor =
+                lktls::verify::certchain::parse_trust_anchor_from_der(cert.cert.der()).unwrap();
+            let mut provider = rustls::crypto::ring::default_provider();
+            provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP384R1];
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                        cert.signing_key.serialize_der(),
+                    )),
+                )
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = bytes.clone();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let error = match acceptor
+                    .accept(ObservedTcp {
+                        tcp,
+                        bytes: observed,
+                    })
+                    .await
+                {
+                    Ok(mut stream) => {
+                        let mut application = [0; 1];
+                        stream
+                            .read(&mut application)
+                            .await
+                            .expect_err("no application data after ECH rejection")
+                    }
+                    Err(error) => error,
+                };
+                error
+            });
+            let tickets = Arc::new(TicketCounter::default());
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let result = TlsConnector::new(presets::chrome_155())
+                .custom_ca_anchors(Arc::new(vec![anchor]))
+                .session_store(tickets.clone())
+                .ech_config(ech_config_list(PUBLIC_NAME))
+                .connect("secret.ech-test.invalid", addr.port(), tcp)
+                .await;
+            let error = match result {
+                Ok(_) => panic!("rejected outer handshake must not return a connection"),
+                Err(error) => error,
+            };
+            let peer_error = server.await.unwrap();
+            if wrong_name {
+                assert!(
+                    matches!(error, lktls::error::TlsError::CertificateError(_)),
+                    "wrong public-name identity: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, lktls::error::TlsError::EchRejected { .. }),
+                    "expected authenticated ECH rejection: {error:?}"
+                );
+                assert!(
+                    matches!(
+                        peer_error
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<rustls::Error>()),
+                        Some(rustls::Error::AlertReceived(
+                            rustls::AlertDescription::EncryptedClientHelloRequired
+                        ))
+                    ),
+                    "server sees ech_required, got {peer_error:?}"
+                );
+            }
+            assert_eq!(tickets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let wire = bytes.lock().unwrap();
+            let mut offset = 0;
+            let mut plaintext = Vec::new();
+            while offset < wire.len() {
+                assert!(offset + 5 <= wire.len());
+                let kind = wire[offset];
+                let length = u16::from_be_bytes([wire[offset + 3], wire[offset + 4]]) as usize;
+                offset += 5;
+                assert!(offset + length <= wire.len());
+                if kind == 22 {
+                    plaintext.extend_from_slice(&wire[offset..offset + length]);
+                }
+                offset += length;
+            }
+            let mut hellos = Vec::new();
+            let mut offset = 0;
+            while offset < plaintext.len() {
+                assert!(offset + 4 <= plaintext.len());
+                let length = ((plaintext[offset + 1] as usize) << 16)
+                    | ((plaintext[offset + 2] as usize) << 8)
+                    | plaintext[offset + 3] as usize;
+                let end = offset + 4 + length;
+                assert!(end <= plaintext.len());
+                hellos.push(lkprofile::parse_client_hello(&plaintext[offset..end]).unwrap());
+                offset = end;
+            }
+            assert_eq!(hellos.len(), 2, "real P-384 HRR occurred");
+            let extension = |index: usize, kind: u16| {
+                hellos[index]
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.extension_type == kind)
+                    .unwrap()
+                    .data
+                    .clone()
+            };
+            assert_eq!(
+                extension(0, 0xfe0d),
+                extension(1, 0xfe0d),
+                "retained ECH payload"
+            );
+            assert_eq!(extension(0, 0), extension(1, 0), "public SNI unchanged");
+            assert_eq!(&extension(1, 51)[2..4], &[0, 24]);
+            assert!(hellos[1]
+                .extensions
+                .iter()
+                .all(|extension| extension.extension_type != 41));
+        }
+    })
+    .await
+    .expect("local ECH HRR rejection timed out");
+}
+
+#[tokio::test]
+async fn tls12_ech_rejection_keeps_public_identity_and_never_returns_a_connection() {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for identity in 0..3 {
+            let names = match identity {
+                0 => vec![
+                    PUBLIC_NAME.to_string(),
+                    "secret.ech-test.invalid".to_string(),
+                ],
+                1 => vec![PUBLIC_NAME.to_string()],
+                _ => vec!["secret.ech-test.invalid".to_string()],
+            };
+            let cert = rcgen::generate_simple_self_signed(names).unwrap();
+            let anchor =
+                lktls::verify::certchain::parse_trust_anchor_from_der(cert.cert.der()).unwrap();
+            let mut config = rustls::ServerConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())),
+            )
+            .unwrap();
+            config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                match acceptor.accept(tcp).await {
+                    Ok(mut stream) => {
+                        assert_eq!(
+                            stream.get_ref().1.protocol_version(),
+                            Some(rustls::ProtocolVersion::TLSv1_2)
+                        );
+                        let mut application = [0; 1];
+                        stream
+                            .read(&mut application)
+                            .await
+                            .expect_err("no application data on rejected ECH")
+                    }
+                    Err(error) => error,
+                }
+            });
+            let tickets = Arc::new(TicketCounter::default());
+            let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+            let result = TlsConnector::new(presets::chrome_155())
+                .custom_ca_anchors(Arc::new(vec![anchor]))
+                .session_store(tickets.clone())
+                .ech_config(ech_config_list(PUBLIC_NAME))
+                .connect("secret.ech-test.invalid", address.port(), tcp)
+                .await;
+            let error = match result {
+                Ok(_) => {
+                    panic!("real ECH rejected by TLS 1.2 must never produce a usable connection")
+                }
+                Err(error) => error,
+            };
+            let remote = server.await.unwrap();
+            if identity == 2 {
+                assert!(
+                    matches!(error, lktls::error::TlsError::CertificateError(_)),
+                    "only-secret identity: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        lktls::error::TlsError::EchRejected {
+                            retry_configs: None
+                        }
+                    ),
+                    "public identity: {error:?}"
+                );
+                assert!(
+                    matches!(
+                        remote
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<rustls::Error>()),
+                        Some(rustls::Error::AlertReceived(
+                            rustls::AlertDescription::EncryptedClientHelloRequired
+                        ))
+                    ),
+                    "peer sees ech_required: {remote:?}"
+                );
+            }
+            assert_eq!(tickets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    })
+    .await
+    .expect("TLS 1.2 ECH rejection test timed out");
 }

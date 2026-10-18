@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.3" src="https://img.shields.io/badge/version-0.2.3-4c1.svg">
+  <img alt="Version 0.2.4" src="https://img.shields.io/badge/version-0.2.4-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -43,7 +43,7 @@ The core invariant is simple: **a browser preset should match the target browser
 
 ## Project Status
 
-- Current workspace release: **0.2.3**.
+- Current workspace release: **0.2.4**.
 - **0.2.3 Rust upgrade notice:** public proxy and H3/QUIC profile construction has source-level breaking changes; see [migration steps](CHANGELOG.md#upgrade-from-022) before updating from 0.2.2.
 - The public API is usable but still evolving before 1.0.
 - The crate is currently consumed through a Cargo Git dependency; cloning the workspace is only required for contributors.
@@ -155,7 +155,7 @@ The high-level presets bundle TLS, H2, optional QUIC/H3, protocol policy, and he
 
 | Family | Presets | TLS / H2 | QUIC / H3 |
 |---|---|---|---|
-| Chrome | `chrome_131`, `chrome_144`–`chrome_154` | Supported | Requires `quic-h3` |
+| Chrome | `chrome_131`, `chrome_144`–`chrome_155` | Supported | Requires `quic-h3` |
 | Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Supported | Not provided |
 | Safari | `safari_18`, `safari_26` | Supported | Not provided |
 
@@ -167,6 +167,7 @@ behind each protocol layer.
 | New preset | Captured browser | Verification boundary |
 |---|---|---|
 | `chrome_154` | Chrome 154.0.8037.58, Windows | TLS/H2 and outgoing QUIC fields captured; H3 SETTINGS inherited from Chrome 153 |
+| `chrome_155` | Chrome 155.0.8059.40, Windows | Passive public TLS/H2/QUIC captures and directly observed H3 SETTINGS with HTTP 200 |
 | `firefox_156` | Firefox 156.0.1, Windows | TLS/H2 captured; the complete preset returned HTTP 200 over H2; no QUIC/H3 preset |
 
 Use explicit versions for reproducible behavior:

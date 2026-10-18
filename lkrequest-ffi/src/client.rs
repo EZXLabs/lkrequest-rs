@@ -24,7 +24,7 @@ use crate::panic::{catch_status, catch_value, null_error_out};
 pub(crate) fn parse_preset_name(name: &str) -> Result<PresetKind, FfiError> {
     match name {
         "chrome_131" => Ok(PresetKind::Chrome131),
-        "chrome_144" | "default" => Ok(PresetKind::Chrome144),
+        "chrome_144" => Ok(PresetKind::Chrome144),
         "chrome_145" => Ok(PresetKind::Chrome145),
         "chrome_146" => Ok(PresetKind::Chrome146),
         "chrome_147" => Ok(PresetKind::Chrome147),
@@ -35,6 +35,7 @@ pub(crate) fn parse_preset_name(name: &str) -> Result<PresetKind, FfiError> {
         "chrome_152" => Ok(PresetKind::Chrome152),
         "chrome_153" => Ok(PresetKind::Chrome153),
         "chrome_154" => Ok(PresetKind::Chrome154),
+        "chrome_155" | "default" => Ok(PresetKind::Chrome155),
         "firefox_133" => Ok(PresetKind::Firefox133),
         "firefox_147" => Ok(PresetKind::Firefox147),
         "firefox_156" => Ok(PresetKind::Firefox156),
@@ -58,6 +59,7 @@ pub(crate) fn preset_bundle(preset: PresetKind) -> lkrequest::preset::ClientPres
         PresetKind::Chrome152 => lkrequest::preset::chrome_152(),
         PresetKind::Chrome153 => lkrequest::preset::chrome_153(),
         PresetKind::Chrome154 => lkrequest::preset::chrome_154(),
+        PresetKind::Chrome155 => lkrequest::preset::chrome_155(),
         PresetKind::Firefox133 => lkrequest::preset::firefox_133(),
         PresetKind::Firefox147 => lkrequest::preset::firefox_147(),
         PresetKind::Firefox156 => lkrequest::preset::firefox_156(),

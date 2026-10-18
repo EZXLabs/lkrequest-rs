@@ -158,6 +158,19 @@ fn handle_connection(mut stream: TcpStream) {
                 ("Set-Cookie", "beta=two; Path=/"),
             ],
         ),
+        "/set-cookie-attrs" => write_response(
+            &mut stream,
+            200,
+            b"cookies",
+            &[
+                (
+                    "Set-Cookie",
+                    "ttl=live; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax",
+                ),
+                ("Set-Cookie", "session=present; Path=/; SameSite=Strict"),
+                ("Set-Cookie", "expired=gone; Path=/; Max-Age=0"),
+            ],
+        ),
         "/status/404" => write_response(&mut stream, 404, b"missing", &[]),
         "/echo-cookie" => {
             let cookie = request
@@ -384,6 +397,219 @@ unsafe extern "C" fn log_callback(
         .lock()
         .unwrap()
         .push((level, view_c_string(target), view_c_string(message)));
+}
+
+unsafe fn cookie_attrs_json(session: *const lk_session_t, url: Option<&str>) -> serde_json::Value {
+    let mut json_ptr = ptr::null();
+    let mut json_len = 0;
+    let mut err = ptr::null_mut();
+    let status = match url {
+        Some(url) => lkrequest_ffi::lk_session_get_cookies_with_attrs_json(
+            session,
+            url.as_ptr().cast(),
+            url.len(),
+            &mut json_ptr,
+            &mut json_len,
+            &mut err,
+        ),
+        None => lkrequest_ffi::lk_session_get_all_cookies_json(
+            session,
+            &mut json_ptr,
+            &mut json_len,
+            &mut err,
+        ),
+    };
+    assert_eq!(status, lk_status_t::LK_OK);
+    assert!(err.is_null());
+    assert!(!json_ptr.is_null());
+    assert_eq!(CStr::from_ptr(json_ptr).to_bytes().len(), json_len);
+    serde_json::from_slice(slice::from_raw_parts(json_ptr.cast::<u8>(), json_len))
+        .expect("cookie attributes JSON")
+}
+
+#[test]
+fn cookie_attribute_readers_preserve_scope_order_and_legacy_schema() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    unsafe {
+        let (client, session) = new_client_and_session();
+        assert_eq!(cookie_attrs_json(session, None), serde_json::json!([]));
+        for (url, value, path, domain, secure) in [
+            ("https://a.example.test/", "root", "/", None, false),
+            (
+                "https://a.example.test/api",
+                "api",
+                "/api",
+                Some("example.test"),
+                true,
+            ),
+            ("https://b.other.test/", "other", "/", None, false),
+        ] {
+            let mut err = ptr::null_mut();
+            let (domain_ptr, domain_len) = domain
+                .map(|domain| (domain.as_ptr().cast(), domain.len()))
+                .unwrap_or((ptr::null(), 0));
+            assert_eq!(
+                lkrequest_ffi::lk_session_set_cookie_with_attrs(
+                    session,
+                    url.as_ptr().cast(),
+                    url.len(),
+                    cstring("dup").as_ptr(),
+                    3,
+                    value.as_ptr().cast(),
+                    value.len(),
+                    path.as_ptr().cast(),
+                    path.len(),
+                    domain_ptr,
+                    domain_len,
+                    secure,
+                    true,
+                    &mut err,
+                ),
+                lk_status_t::LK_OK
+            );
+            assert!(err.is_null());
+        }
+
+        let all = cookie_attrs_json(session, None);
+        assert_eq!(all.as_array().unwrap().len(), 3);
+        assert_eq!(
+            all[0],
+            serde_json::json!({
+                "name": "dup", "value": "root", "domain": "a.example.test",
+                "host_only": true, "path": "/", "secure": false, "http_only": true,
+                "same_site": null, "expires_unix": null,
+            })
+        );
+        assert_eq!(all[1]["value"], "api");
+        assert_eq!(all[1]["path"], "/api");
+        assert_eq!(all[1]["domain"], "example.test");
+        assert_eq!(all[1]["host_only"], false);
+        assert_eq!(all[1]["secure"], true);
+        assert_eq!(all[2]["value"], "other");
+
+        let url = "https://a.example.test/api/users";
+        let mut legacy_ptr = ptr::null();
+        assert_eq!(
+            lk_session_get_cookies_json(session, url.as_ptr().cast(), url.len(), &mut legacy_ptr),
+            lk_status_t::LK_OK
+        );
+        let legacy_copy = view_c_string(legacy_ptr);
+        let filtered = cookie_attrs_json(session, Some(url));
+        assert_eq!(filtered, serde_json::json!([all[1], all[0]]));
+        assert_eq!(view_c_string(legacy_ptr), legacy_copy);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&legacy_copy).unwrap(),
+            serde_json::json!([
+                {"name": "dup", "value": "api"}, {"name": "dup", "value": "root"},
+            ])
+        );
+        assert_eq!(
+            cookie_attrs_json(session, Some("http://a.example.test/api/users")),
+            serde_json::json!([all[0]])
+        );
+        assert_eq!(
+            cookie_attrs_json(session, Some("https://sub.a.example.test/api")),
+            serde_json::json!([all[1]])
+        );
+        assert_eq!(
+            cookie_attrs_json(session, Some("https://a.example.test/apix")),
+            serde_json::json!([all[0]])
+        );
+        assert_eq!(
+            cookie_attrs_json(session, Some("https://unrelated.test/")),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            cookie_attrs_json(session, Some("not-a-url")),
+            serde_json::json!([])
+        );
+
+        assert_eq!(
+            lk_session_set_cookie(
+                session,
+                url.as_ptr().cast(),
+                url.len(),
+                cstring("new").as_ptr(),
+                3,
+                cstring("value").as_ptr(),
+                5
+            ),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            cookie_attrs_json(session, None).as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(lk_session_clear_cookies(session), lk_status_t::LK_OK);
+        assert_eq!(cookie_attrs_json(session, None), serde_json::json!([]));
+        assert_eq!(cookie_attrs_json(session, Some(url)), serde_json::json!([]));
+        lk_session_free(session);
+        lk_client_free(client);
+    }
+}
+
+#[test]
+fn cookie_attribute_readers_include_response_expiry_and_same_site() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let server = TestServer::start();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    unsafe {
+        let (client, session) = new_client_and_session();
+        let url = server.url("/set-cookie-attrs");
+        let mut request = ptr::null_mut();
+        let mut response = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        assert_eq!(
+            lk_request_new(
+                session,
+                cstring("GET").as_ptr(),
+                3,
+                url.as_ptr().cast(),
+                url.len(),
+                &mut request,
+                &mut err
+            ),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lk_request_send(request, &mut response, &mut err),
+            lk_status_t::LK_OK
+        );
+        assert!(err.is_null());
+        lk_response_free(response);
+        lk_request_free(request);
+
+        let all = cookie_attrs_json(session, None);
+        let filtered = cookie_attrs_json(session, Some(&url));
+        assert_eq!(filtered, all);
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        let ttl = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cookie| cookie["name"] == "ttl")
+            .unwrap();
+        assert_eq!(ttl["same_site"], "Lax");
+        assert_eq!(ttl["http_only"], true);
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((before + 3600..=after + 3600).contains(&ttl["expires_unix"].as_i64().unwrap()));
+        let transient = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cookie| cookie["name"] == "session")
+            .unwrap();
+        assert_eq!(transient["same_site"], "Strict");
+        assert!(transient["expires_unix"].is_null());
+        lk_session_free(session);
+        lk_client_free(client);
+    }
 }
 
 fn response_and_session_extensions_work() -> usize {
@@ -950,7 +1176,10 @@ fn proxy_and_session_pool_extensions_work() -> usize {
             lk_session_pool_stats(session_pool, &mut idle, &mut max),
             lk_status_t::LK_OK
         );
-        assert!(idle >= 1);
+        assert_eq!(
+            idle, 0,
+            "a marked-bad session must not return to the idle pool"
+        );
         assert_eq!(max, 2);
 
         let mut pool_op = ptr::null_mut();
@@ -965,6 +1194,11 @@ fn proxy_and_session_pool_extensions_work() -> usize {
         );
         lk_op_free(pool_op);
         lk_session_pool_guard_free(session_guard);
+        assert_eq!(
+            lk_session_pool_stats(session_pool, &mut idle, &mut max),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(idle, 1, "a healthy replacement remains reusable");
         lk_session_pool_free(session_pool);
         lk_client_free(client);
     }
@@ -1196,6 +1430,11 @@ fn browser_preset_ffi_extensions_work(
             expected_h2_window_update
         );
         assert_eq!(
+            detail["h2_profile"]["initial_stream_id"],
+            if preset_name == "firefox_156" { 3 } else { 1 },
+            "FFI preset details preserve the browser's initial H2 stream ID"
+        );
+        assert_eq!(
             detail["h2_profile"]["settings"].as_array().unwrap().len(),
             4
         );
@@ -1262,6 +1501,85 @@ fn firefox_156_preset_is_exposed_through_ffi() {
         browser_preset_ffi_extensions_work("firefox_156", "Firefox 156", false, 12_517_377),
         3
     );
+}
+
+#[test]
+fn chrome_155_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("chrome_155", "Chrome 155", true, 15_663_105),
+        3
+    );
+}
+
+#[test]
+fn default_clients_use_chrome_155_and_explicit_144_remains_available() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    unsafe {
+        let mut clients = Vec::new();
+        let mut client = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        assert_eq!(
+            lk_client_new_default(&mut client, &mut err),
+            lk_status_t::LK_OK
+        );
+        assert!(err.is_null());
+        clients.push((client, lkrequest::preset::chrome_155()));
+
+        let builder = lk_client_builder_new();
+        assert!(!builder.is_null());
+        assert_eq!(
+            lk_client_builder_build(builder, &mut client, &mut err),
+            lk_status_t::LK_OK
+        );
+        assert!(err.is_null());
+        lk_client_builder_free(builder);
+        clients.push((client, lkrequest::preset::chrome_155()));
+
+        for (name, expected) in [
+            ("default", lkrequest::preset::chrome_155()),
+            ("chrome_144", lkrequest::preset::chrome_144()),
+        ] {
+            let name = cstring(name);
+            assert_eq!(
+                lk_client_new(name.as_ptr(), &mut client, &mut err),
+                lk_status_t::LK_OK
+            );
+            assert!(err.is_null());
+            clients.push((client, expected));
+        }
+
+        for (client, expected) in clients {
+            let mut json_ptr = ptr::null();
+            let mut json_len = 0;
+            assert_eq!(
+                lkrequest_ffi::lk_client_fingerprint_info_json(
+                    client,
+                    &mut json_ptr,
+                    &mut json_len,
+                    &mut err,
+                ),
+                lk_status_t::LK_OK
+            );
+            assert!(err.is_null());
+            let actual: serde_json::Value =
+                serde_json::from_slice(slice::from_raw_parts(json_ptr.cast::<u8>(), json_len))
+                    .expect("client fingerprint JSON");
+            assert_eq!(
+                actual["tls"],
+                serde_json::to_value(expected.tls_profile).unwrap()
+            );
+            assert_eq!(
+                actual["h2"],
+                serde_json::to_value(expected.h2_profile).unwrap()
+            );
+            assert_eq!(
+                actual["quic"],
+                serde_json::to_value(expected.quic_profile).unwrap()
+            );
+            lk_client_free(client);
+        }
+    }
 }
 
 #[test]

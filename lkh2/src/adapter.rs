@@ -30,6 +30,7 @@ pub struct NativeH2Request {
     pub(crate) ordered_headers: Vec<(HeaderName, HeaderValue)>,
     pub(crate) body: Option<Bytes>,
     pub(crate) priority: Option<crate::profile::RequestPriority>,
+    pub(crate) h2_priority_weight: Option<u8>,
     pub(crate) upload: Option<crate::driver::PendingUpload>,
     pub(crate) streaming: bool,
 }
@@ -49,9 +50,16 @@ impl NativeH2Request {
             ordered_headers: ordered_headers_from_map(headers),
             body,
             priority,
+            h2_priority_weight: None,
             upload: None,
             streaming: false,
         }
+    }
+
+    /// Override the raw legacy HEADERS weight without changing HTTP priority.
+    pub fn with_h2_priority_weight(mut self, weight: u8) -> Self {
+        self.h2_priority_weight = Some(weight);
+        self
     }
 }
 
@@ -228,12 +236,23 @@ pub async fn await_first_response(
     build_native_response(resp_headers, recv)
 }
 
-fn build_native_request(parts: http::request::Parts, body: Option<Bytes>) -> NativeH2Request {
+pub(crate) fn build_native_request(
+    parts: http::request::Parts,
+    body: Option<Bytes>,
+) -> NativeH2Request {
     let priority = parts
         .extensions
         .get::<crate::profile::RequestPriority>()
         .copied();
-    NativeH2Request::new(parts.method, parts.uri, parts.headers, body, priority)
+    let weight = parts
+        .extensions
+        .get::<crate::profile::H2PriorityWeight>()
+        .copied();
+    let mut request = NativeH2Request::new(parts.method, parts.uri, parts.headers, body, priority);
+    if let Some(weight) = weight {
+        request = request.with_h2_priority_weight(weight.0);
+    }
+    request
 }
 
 fn ordered_headers_from_map(headers: HeaderMap) -> Vec<(HeaderName, HeaderValue)> {

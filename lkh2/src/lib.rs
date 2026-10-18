@@ -20,8 +20,8 @@ pub mod synthesis;
 pub use error::{H2Error, Result};
 pub use profile::ProfilePriorityFrame;
 pub use profile::{
-    encode_alps_h2_settings, H2Profile, H2Setting, H2SettingId, HeadersPriority, PriorityConfig,
-    PseudoHeaderId, RequestPriority, StreamDepPolicy,
+    encode_alps_h2_settings, H2PriorityWeight, H2Profile, H2Setting, H2SettingId, HeadersPriority,
+    PriorityConfig, PseudoHeaderId, RequestPriority, StreamDepPolicy,
 };
 pub use synthesis::{validate as validate_h2_profile, H2Constraints, InvalidH2Spec};
 

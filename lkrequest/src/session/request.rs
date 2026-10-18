@@ -51,6 +51,8 @@ pub struct RequestBuilder {
     pub(crate) method: http::Method,
     pub(crate) url: String,
     pub(crate) headers: HeaderMap,
+    /// Per-attempt defaults after redirect filtering; absent until the first hop.
+    pub(crate) redirect_defaults: Option<HeaderMap>,
     pub(crate) body: Option<RequestBody>,
     pub(crate) query_params: Vec<(String, String)>,
     /// Request-level cookies (appended to jar cookies at send time).
@@ -78,9 +80,9 @@ pub struct RequestBuilder {
     /// Tracks the order in which headers were added via .header() calls.
     pub(crate) header_insertion_order: Vec<http::header::HeaderName>,
     /// Per-request RFC 9218 priority (urgency + incremental).
-    /// Used to derive both the H2 HEADERS frame weight and the
-    /// HTTP `priority` header.
+    /// Used for the HTTP priority header and profile-specific H2 weight mapping.
     pub(crate) priority: Option<lkh2::RequestPriority>,
+    pub(crate) h2_priority_weight: Option<u8>,
     /// Per-request 0-RTT / early-data gate. See [`Idempotency`].
     pub(crate) idempotency: Idempotency,
     /// Deferred error from infallible builder methods (e.g. json/form
@@ -114,6 +116,7 @@ pub(crate) struct SharedRequestContext {
     pub(crate) cookie_order: Option<Vec<Box<str>>>,
     pub(crate) header_insertion_order: Vec<http::header::HeaderName>,
     pub(crate) priority: Option<lkh2::RequestPriority>,
+    pub(crate) h2_priority_weight: Option<u8>,
     pub(crate) idempotency: Idempotency,
 }
 
@@ -124,6 +127,7 @@ impl RequestBuilder {
             method,
             url: url.to_string(),
             headers: HeaderMap::new(),
+            redirect_defaults: None,
             body: None,
             query_params: Vec::new(),
             extra_cookies: Vec::new(),
@@ -139,6 +143,7 @@ impl RequestBuilder {
             cookie_order: None,
             header_insertion_order: Vec::new(),
             priority: None,
+            h2_priority_weight: None,
             idempotency: Idempotency::default(),
             deferred_error: None,
             collect_diagnostics: false,
@@ -157,6 +162,7 @@ impl RequestBuilder {
             method: ctx.method.clone(),
             url: ctx.url.clone(),
             headers: ctx.headers.clone(),
+            redirect_defaults: None,
             body,
             query_params: ctx.query_params.clone(),
             extra_cookies: ctx.extra_cookies.clone(),
@@ -172,6 +178,7 @@ impl RequestBuilder {
             cookie_order: ctx.cookie_order.clone(),
             header_insertion_order: ctx.header_insertion_order.clone(),
             priority: ctx.priority,
+            h2_priority_weight: ctx.h2_priority_weight,
             idempotency: ctx.idempotency,
             deferred_error: None,
             collect_diagnostics: false,
@@ -285,7 +292,8 @@ impl RequestBuilder {
     /// Add a set of headers to this request.
     ///
     /// Headers are merged into any already set on this request, with new
-    /// values overriding existing ones for the same header name.
+    /// values overriding existing ones for the same header name. All values
+    /// supplied for a name are preserved in their original order.
     ///
     /// # Example
     ///
@@ -381,23 +389,24 @@ impl RequestBuilder {
     fn merge_header_map(mut self, map: HeaderMap, order: Option<&[&str]>) -> Self {
         use std::collections::HashSet;
 
-        let entries: Vec<(http::header::HeaderName, http::header::HeaderValue)> = map
-            .into_iter()
-            .filter_map(|(opt_n, v)| opt_n.map(|n| (n, v)))
-            .collect();
-        let map_names: HashSet<_> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<_> = map.keys().cloned().collect();
+        for name in &names {
+            let mut values = map.get_all(name).iter();
+            if let Some(first) = values.next() {
+                self.headers.insert(name.clone(), first.clone());
+            }
+            for value in values {
+                self.headers.append(name.clone(), value.clone());
+            }
+        }
 
         if let Some(order_sl) = order {
-            for (name, value) in &entries {
-                self.headers.insert(name.clone(), value.clone());
-            }
-            self.header_insertion_order
-                .retain(|n| !map_names.contains(n));
+            self.header_insertion_order.retain(|n| !map.contains_key(n));
             let mut tail = Vec::new();
             let mut seen_in_tail = HashSet::new();
             for s in order_sl {
                 if let Ok(n) = http::header::HeaderName::from_bytes(s.as_bytes()) {
-                    if map_names.contains(&n)
+                    if map.contains_key(&n)
                         && self.headers.contains_key(&n)
                         && seen_in_tail.insert(n.clone())
                     {
@@ -405,7 +414,7 @@ impl RequestBuilder {
                     }
                 }
             }
-            for (n, _) in &entries {
+            for n in &names {
                 if !seen_in_tail.contains(n) {
                     tail.push(n.clone());
                     seen_in_tail.insert(n.clone());
@@ -413,11 +422,10 @@ impl RequestBuilder {
             }
             self.header_insertion_order.extend(tail);
         } else {
-            for (name, value) in entries {
+            for name in names {
                 if !self.header_insertion_order.contains(&name) {
-                    self.header_insertion_order.push(name.clone());
+                    self.header_insertion_order.push(name);
                 }
-                self.headers.insert(name, value);
             }
         }
 
@@ -552,9 +560,13 @@ impl RequestBuilder {
     /// ```
     /// Set the RFC 9218 request priority (urgency + incremental).
     ///
-    /// This controls both the H2 HEADERS frame weight and the HTTP
-    /// `priority` header. The mapping from urgency to weight is
-    /// determined by the browser H2 profile (e.g. Chrome: u=1 → weight 219).
+    /// Sets HTTP priority and the profile's optional H2 urgency-to-weight
+    /// mapping (e.g. Chrome u=1 uses wire weight 219). Browsers such as Firefox
+    /// use independent legacy weights; use [`Self::h2_priority_weight`] for
+    /// that separate dimension.
+    /// With per-request H3 priority updates enabled (Chrome 155), the resolved
+    /// value also controls the update for the actual allocated request stream.
+    /// Disabling automatic HTTP priority headers does not suppress that update.
     ///
     /// If not called, the profile's default priority is used
     /// (Chrome defaults to `u=1, i` for fetch/XHR).
@@ -580,6 +592,19 @@ impl RequestBuilder {
         self
     }
 
+    /// Override the wire-level legacy H2 HEADERS weight (0 through 255).
+    /// This is independent of the HTTP `priority` header, stream dependency,
+    /// and exclusive flag. Profiles without legacy HEADERS priority remain
+    /// unchanged. Has no effect on H1/H3.
+    ///
+    /// For the captured Firefox 156 favicon context, pair
+    /// `.priority(RequestPriority::custom(6, false))` with
+    /// `.h2_priority_weight(21)`. This describes that resource role, not every image.
+    pub fn h2_priority_weight(mut self, weight: u8) -> Self {
+        self.h2_priority_weight = Some(weight);
+        self
+    }
+
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -590,6 +615,8 @@ impl RequestBuilder {
     /// Overrides the session-level proxy for this request only. Useful when
     /// you want to route specific requests through different proxies while
     /// sharing the same session (cookie jar, connection pool).
+    /// Invalid configuration is returned by `send` or `send_streaming` before
+    /// DNS or connection establishment; it never falls back to another route.
     ///
     /// # Example
     ///
@@ -609,8 +636,8 @@ impl RequestBuilder {
     pub fn proxy(mut self, proxy_url: &str) -> Self {
         match ProxyConfig::parse(proxy_url) {
             Ok(config) => self.proxy_override = Some(config),
-            Err(e) => {
-                tracing::warn!(url = %proxy_url, error = %e, "request.invalid_proxy_url");
+            Err(error) => {
+                self.deferred_error.get_or_insert(error);
             }
         }
         self
@@ -1125,6 +1152,7 @@ impl RequestBuilder {
             cookie_order: self.cookie_order,
             header_insertion_order: self.header_insertion_order,
             priority: self.priority,
+            h2_priority_weight: self.h2_priority_weight,
             idempotency: self.idempotency,
         });
 
@@ -1139,12 +1167,16 @@ impl RequestBuilder {
                         body.clone(),
                     );
                     let mut replay_safe = true;
-                    let result = rb.send_with_redirects(&mut replay_safe).await;
+                    let mut allow_policy_retry = true;
+                    let result = rb
+                        .send_with_redirects(&mut replay_safe, &mut allow_policy_retry)
+                        .await;
 
                     match result {
                         Ok(resp) => {
                             let status = resp.status();
-                            if crate::retry::is_retryable_status(status)
+                            if allow_policy_retry
+                                && crate::retry::is_retryable_status(status)
                                 && body.as_ref().is_none_or(RequestBody::can_replay)
                             {
                                 attempt += 1;
@@ -1181,6 +1213,9 @@ impl RequestBuilder {
                             break Ok(resp);
                         }
                         Err(e) => {
+                            if !allow_policy_retry {
+                                break Err(e);
+                            }
                             attempt += 1;
                             if let Some(delay) = policy.should_retry(attempt, Some(&e), None) {
                                 // Only replay if doing so cannot duplicate a
@@ -1221,7 +1256,9 @@ impl RequestBuilder {
             } else {
                 let rb = RequestBuilder::from_shared_context(session.clone(), ctx, body);
                 let mut replay_safe = true;
-                rb.send_with_redirects(&mut replay_safe).await
+                let mut allow_policy_retry = true;
+                rb.send_with_redirects(&mut replay_safe, &mut allow_policy_retry)
+                    .await
             };
 
             // --- Middleware: on_response phase ---
@@ -1415,6 +1452,7 @@ impl RequestBuilder {
             cookie_order: self.cookie_order,
             header_insertion_order: self.header_insertion_order,
             priority: self.priority,
+            h2_priority_weight: self.h2_priority_weight,
             idempotency: self.idempotency,
             #[cfg(feature = "quic-h3")]
             race_send_gate: None,

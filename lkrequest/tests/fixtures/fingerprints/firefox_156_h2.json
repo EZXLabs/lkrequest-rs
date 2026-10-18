@@ -2,8 +2,9 @@
   "headers_priority": {
     "exclusive": false,
     "stream_dependency": 0,
-    "weight": 42
+    "weight": 41
   },
+  "initial_stream_id": 3,
   "priority_frames": [],
   "pseudo_header_order": [
     "method",

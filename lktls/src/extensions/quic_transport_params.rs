@@ -75,12 +75,13 @@ pub fn decode_transport_params(data: &[u8]) -> Result<QuicTransportParams> {
 
     while pos < data.len() {
         let id = decode_varint(data, &mut pos)?;
-        let value_len = decode_varint(data, &mut pos)? as usize;
-        if pos + value_len > data.len() {
+        let value_len = decode_varint(data, &mut pos)?;
+        if value_len > (data.len() - pos) as u64 {
             return Err(TlsError::UnexpectedMessage(
                 "QUIC transport parameter exceeds payload length".to_string(),
             ));
         }
+        let value_len = value_len as usize;
         parameters.push(QuicTransportParam::new(
             id,
             data[pos..pos + value_len].to_vec(),
@@ -190,5 +191,21 @@ mod tests {
         let data = [0x01, 0x02, 0xaa];
         let err = decode_transport_params(&data).unwrap_err();
         assert!(err.to_string().contains("exceeds payload length"));
+    }
+
+    #[test]
+    fn decode_transport_params_rejects_lengths_exceeding_32_bits() {
+        for length in [1u64 << 32, (1u64 << 32) + 1, (1u64 << 62) - 1] {
+            let mut data = vec![0x01];
+            encode_varint(length, &mut data);
+            assert!(decode_transport_params(&data).is_err(), "length={length}");
+        }
+    }
+
+    #[test]
+    fn decode_transport_params_rejects_length_plus_offset_overflow() {
+        let mut data = vec![0x01];
+        encode_varint(u32::MAX as u64, &mut data);
+        assert!(decode_transport_params(&data).is_err());
     }
 }

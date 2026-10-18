@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.3" src="https://img.shields.io/badge/version-0.2.3-4c1.svg">
+  <img alt="Version 0.2.4" src="https://img.shields.io/badge/version-0.2.4-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -42,7 +42,7 @@
 
 ## 项目状态
 
-- 当前工作区发布版本：**0.2.3**。
+- 当前工作区发布版本：**0.2.4**。
 - **0.2.3 Rust 升级提示：** 代理配置与 H3/QUIC profile 的构造方式有源码级不兼容变化；从 0.2.2 升级前请阅读[迁移说明](CHANGELOG.md#upgrade-from-022)。
 - API 已可使用，但在 1.0 前仍可能演进。
 - 当前通过 Cargo Git 依赖集成；只有贡献者修改 workspace 时才需要手动 clone。
@@ -154,7 +154,7 @@ cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 
 | 浏览器家族 | 预设 | TLS / H2 | QUIC / H3 |
 |---|---|---|---|
-| Chrome | `chrome_131`、`chrome_144`–`chrome_154` | 支持 | 需要 `quic-h3` |
+| Chrome | `chrome_131`、`chrome_144`–`chrome_155` | 支持 | 需要 `quic-h3` |
 | Firefox | `firefox_133`、`firefox_147`、`firefox_156` | 支持 | 未提供 |
 | Safari | `safari_18`、`safari_26` | 支持 | 未提供 |
 
@@ -164,6 +164,7 @@ preset 增加 QUIC/H3 指纹。各协议层的证据见[支持与验证矩阵](d
 | 新增 preset | 采集浏览器 | 验证边界 |
 |---|---|---|
 | `chrome_154` | Chrome 154.0.8037.58，Windows | TLS/H2 与发出的 QUIC 字段已抓包；H3 SETTINGS 继承 Chrome 153 |
+| `chrome_155` | Chrome 155.0.8059.40，Windows | 公网被动抓包验证 TLS/H2/QUIC；直接观察到 H3 SETTINGS 和 HTTP 200 |
 | `firefox_156` | Firefox 156.0.1，Windows | TLS/H2 已抓包；完整 preset 实测 H2 返回 HTTP 200；未提供 QUIC/H3 preset |
 
 为保证可复现性，建议明确指定版本：

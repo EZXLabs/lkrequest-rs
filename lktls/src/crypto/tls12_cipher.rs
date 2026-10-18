@@ -470,7 +470,7 @@ impl Tls12CbcCipher {
         // Total = plaintext + mac + padding_length + 1 must be multiple of block_size.
         // All padding bytes (including the last padding_length byte) = padding_length.
         let content_len = plaintext.len() + mac_len;
-        let padding_length = self.block_size - ((content_len + 1) % self.block_size);
+        let padding_length = self.block_size - 1 - (content_len % self.block_size);
         // padding_length can be 0..block_size-1, total padding bytes = padding_length + 1
         let total_padding = padding_length + 1;
 
@@ -639,6 +639,56 @@ impl Tls12CbcCipher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbc_uses_minimal_padding_at_every_block_boundary() {
+        for key_length in [16, 32] {
+            for mac_algorithm in [
+                CbcMacAlgorithm::HmacSha1,
+                CbcMacAlgorithm::HmacSha256,
+                CbcMacAlgorithm::HmacSha384,
+            ] {
+                let cipher = Tls12CbcCipher::new(
+                    &vec![0x42; key_length],
+                    &vec![0x24; mac_algorithm.mac_len()],
+                    mac_algorithm,
+                );
+                for length in (0..=64).chain([683]) {
+                    let plain = vec![0x5a; length];
+                    let mut aad = [0; 13];
+                    aad[8] = 23;
+                    aad[9..11].copy_from_slice(&[3, 3]);
+                    aad[11..].copy_from_slice(&(length as u16).to_be_bytes());
+                    let record = cipher.encrypt(0, &aad, &plain).unwrap();
+                    let expected = 16 + ((length + mac_algorithm.mac_len()) / 16 + 1) * 16;
+                    assert_eq!(
+                        record.len(),
+                        expected,
+                        "length={length}, MAC={mac_algorithm:?}"
+                    );
+                    assert_eq!(cipher.decrypt(&aad, &record).unwrap(), plain);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cbc_accepts_valid_nonminimal_peer_padding() {
+        let cipher = Tls12CbcCipher::new(&[0x42; 16], &[0x24; 20], CbcMacAlgorithm::HmacSha1);
+        let plain = vec![0x5a; 16_384];
+        let mut aad = [0; 13];
+        aad[8] = 23;
+        aad[9..11].copy_from_slice(&[3, 3]);
+        aad[11..].copy_from_slice(&16384u16.to_be_bytes());
+        let mut inner = plain.clone();
+        inner.extend_from_slice(&cipher.compute_mac(&aad, &plain));
+        inner.resize(inner.len() + 252, 251);
+        let iv = [0x17; 16];
+        let mut record = iv.to_vec();
+        record.extend_from_slice(&cipher.cbc_encrypt(&iv, &mut inner).unwrap());
+        assert_eq!(record.len(), 16_672);
+        assert_eq!(cipher.decrypt(&aad, &record).unwrap(), plain);
+    }
 
     #[test]
     fn test_cipher_suite_resolution() {

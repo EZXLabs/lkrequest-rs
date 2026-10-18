@@ -1,13 +1,14 @@
 //! HTTP/2 fingerprint profile — controls H2-level fingerprint dimensions.
 //!
 //! The `H2Profile` data structure describes the HTTP/2 connection parameters
-//! that affect the Akamai H2 fingerprint:
+//! that affect wire fingerprints, including the Akamai H2 summary:
 //!
 //! - SETTINGS frame parameters and their order
 //! - Connection-level WINDOW_UPDATE value
 //! - Pseudo-header order (`:method`, `:authority`, `:scheme`, `:path`)
 //! - HEADERS frame priority (stream dependency embedded in HEADERS frames)
 //! - Optional initial PRIORITY frames sent after connection setup
+//! - Initial client request stream ID (not included in the Akamai summary)
 //!
 //! These are applied through lkh2's native HTTP/2 engine, which provides
 //! fine-grained frame and HPACK control.
@@ -22,7 +23,8 @@ use crate::policy::H2Behavior;
 /// Contains two layers of information:
 ///
 /// - **Identity** (serialisable): SETTINGS, WINDOW_UPDATE, pseudo-header
-///   order, HEADERS priority — the Akamai fingerprint dimensions.
+///   order, HEADERS priority and initial client stream ID. The stream ID is
+///   an additional wire dimension beyond the Akamai summary.
 /// - **Behaviour** (runtime): how frames are grouped into
 ///   TLS records, when WINDOW_UPDATE is sent, HPACK encoding choices.
 ///
@@ -41,6 +43,13 @@ use crate::policy::H2Behavior;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct H2Profile {
+    /// First client request stream ID. Must be a nonzero odd 31-bit value.
+    /// Legacy JSON defaults to 1; Firefox 156 reserves stream 1 and starts at 3.
+    #[serde(
+        default = "default_initial_stream_id",
+        deserialize_with = "deserialize_initial_stream_id"
+    )]
+    pub initial_stream_id: u32,
     /// Ordered list of SETTINGS parameters.
     ///
     /// The order matters for the Akamai fingerprint. Each entry specifies
@@ -102,6 +111,29 @@ pub struct H2Profile {
     /// Skipped during serialisation.
     #[serde(skip)]
     pub behavior: Option<H2Behavior>,
+}
+
+pub(crate) const MAX_CLIENT_STREAM_ID: u32 = 0x7fff_ffff;
+
+fn default_initial_stream_id() -> u32 {
+    1
+}
+
+pub(crate) fn valid_initial_stream_id(id: u32) -> bool {
+    id != 0 && id <= MAX_CLIENT_STREAM_ID && id % 2 == 1
+}
+
+fn deserialize_initial_stream_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let id = u32::deserialize(deserializer)?;
+    if valid_initial_stream_id(id) {
+        Ok(id)
+    } else {
+        Err(serde::de::Error::custom(
+            "initial_stream_id must be a nonzero odd 31-bit client stream ID",
+        ))
+    }
 }
 
 /// A single HTTP/2 SETTINGS parameter (id + value).
@@ -204,12 +236,12 @@ pub struct ProfilePriorityFrame {
 // Request-level priority (RFC 9218)
 // ---------------------------------------------------------------------------
 
-/// RFC 9218 request priority — the common source from which both the HTTP
-/// `priority` header and the H2 HEADERS frame weight are derived.
+/// RFC 9218 request priority. Chrome profiles also derive legacy H2 weight
+/// from it; Firefox's channel priority and legacy weight are independent.
 ///
 /// In a real browser the resource type (navigation, XHR, image, …)
-/// determines an urgency level; the browser then uses that single value
-/// to produce both the HTTP `priority` header and the H2 frame weight.
+/// determines urgency and incremental processing. Legacy H2 weight can be
+/// overridden separately using [`H2PriorityWeight`].
 ///
 /// # Examples
 ///
@@ -230,6 +262,12 @@ pub struct RequestPriority {
     /// Whether the response can be processed incrementally (RFC 9218 §4.2).
     pub incremental: bool,
 }
+
+/// Per-request wire weight override for an existing legacy H2 priority field.
+/// This does not change RFC 9218 urgency, dependency, or exclusive flags, and
+/// does not enable legacy priority when the profile omits that field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H2PriorityWeight(pub u8);
 
 impl RequestPriority {
     /// Navigation / top-level document request.
@@ -358,7 +396,8 @@ impl Default for RequestPriority {
 }
 
 /// Per-browser priority strategy — controls how `RequestPriority` maps
-/// to H2 wire-level priority and HTTP headers.
+/// to H2 wire-level priority and HTTP headers. The high-level client also
+/// applies the automatic HTTP-header switch to H3 requests.
 ///
 /// Embedded in `H2Profile` and populated by browser presets.
 /// Users normally do not need to configure this directly.
@@ -379,14 +418,17 @@ pub struct PriorityConfig {
     #[serde(default)]
     pub exclusive: bool,
 
-    /// How concurrent stream dependencies are formed.
+    /// How dependencies among active client streams are formed.
     #[serde(default)]
     pub stream_dep_policy: StreamDepPolicy,
 
     /// Whether to auto-inject the RFC 9218 `priority` HTTP header.
     ///
     /// When `true`, if the request does not already contain a `priority`
-    /// header, one is generated from the active `RequestPriority`.
+    /// header, one is generated from the active `RequestPriority`. The
+    /// high-level client applies this switch to H2 and H3, including streaming
+    /// requests. Disabling it preserves supplied headers and does not change
+    /// legacy H2 priority fields or profile-defined H3 PRIORITY_UPDATE frames.
     #[serde(default)]
     pub auto_priority_header: bool,
 
@@ -425,7 +467,7 @@ impl PriorityConfig {
         Self {
             urgency_weights: Some([255, 219, 146, 110, 73, 36, 0, 0]),
             exclusive: true,
-            stream_dep_policy: StreamDepPolicy::Chain,
+            stream_dep_policy: StreamDepPolicy::PriorityChain,
             auto_priority_header: true,
             default_urgency: 1,
             default_incremental: true,
@@ -434,9 +476,9 @@ impl PriorityConfig {
 
     /// Firefox-like priority configuration.
     ///
-    /// Firefox uses a fixed weight (42) for all requests regardless of
-    /// urgency, so `urgency_weights` is `None` and the engine falls back
-    /// to `headers_priority.weight`.
+    /// Firefox's legacy channel weight is independent of RFC 9218 urgency.
+    /// Use the captured profile fallback or a per-request H2PriorityWeight;
+    /// do not infer its legacy weight from a Chrome urgency table.
     pub fn firefox() -> Self {
         Self {
             urgency_weights: None,
@@ -496,10 +538,15 @@ pub enum StreamDepPolicy {
     /// All streams depend on stream 0 (Firefox / Safari style).
     #[default]
     Flat,
-    /// Each new stream depends on the previous client stream (Chrome style).
-    ///
-    /// Stream 1 → dep=0, stream 3 → dep=1, stream 5 → dep=3, etc.
+    /// Each new stream depends on the previous encoded client stream.
+    /// This explicit linear policy retains closed/reset stream references.
     Chain,
+    /// Chrome-style priority-ordered chain of active streams.
+    ///
+    /// Select the newest active stream in the nearest equal/higher priority
+    /// band, or stream 0 when none exists. Same-priority active requests form
+    /// a creation-order chain; completed/reset streams are removed.
+    PriorityChain,
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +567,7 @@ pub enum StreamDepPolicy {
 /// `spdy_framer.cc: builder.WriteUInt8(weight - 1)`.
 pub fn chrome_144_h2() -> H2Profile {
     H2Profile {
+        initial_stream_id: 1,
         settings: vec![
             H2Setting {
                 id: H2SettingId::HeaderTableSize,
@@ -565,6 +613,7 @@ pub fn chrome_144_h2() -> H2Profile {
 /// Akamai: `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`
 pub fn chrome_145_h2() -> H2Profile {
     H2Profile {
+        initial_stream_id: 1,
         settings: vec![
             H2Setting {
                 id: H2SettingId::HeaderTableSize,
@@ -679,6 +728,12 @@ pub fn chrome_154_h2() -> H2Profile {
     chrome_153_h2()
 }
 
+/// Chrome 155.0.8059.40 H2 profile, captured against public Cloudflare and
+/// example.com on 2026-10-07. SETTINGS, window and navigation priority match 154.
+pub fn chrome_155_h2() -> H2Profile {
+    chrome_154_h2()
+}
+
 /// Returns the Chrome 131 H2 fingerprint profile.
 ///
 /// Same H2 parameters as Chrome 144 (H2 fingerprint hasn't changed).
@@ -725,6 +780,7 @@ pub fn encode_h2_settings_base64url(profile: &H2Profile) -> String {
 /// (same as Firefox 147 — H2 priority behaviour unchanged)
 pub fn firefox_133_h2() -> H2Profile {
     H2Profile {
+        initial_stream_id: 1,
         settings: vec![
             H2Setting {
                 id: H2SettingId::HeaderTableSize,
@@ -768,6 +824,7 @@ pub fn firefox_133_h2() -> H2Profile {
 /// (`flags_raw = 0x25`: END_STREAM | END_HEADERS | PRIORITY)
 pub fn firefox_147_h2() -> H2Profile {
     H2Profile {
+        initial_stream_id: 1,
         settings: vec![
             H2Setting {
                 id: H2SettingId::HeaderTableSize,
@@ -807,9 +864,17 @@ pub fn firefox_147_h2() -> H2Profile {
 /// Returns the Firefox 156 H2 fingerprint profile.
 ///
 /// Firefox 156.0.1 captured against public Cloudflare retained Firefox 147's
-/// SETTINGS, connection window, pseudo-header order, and HEADERS priority.
+/// SETTINGS, connection window, and pseudo-header order. Navigation HEADERS
+/// carry wire weight 41 (semantic weight 42), non-exclusive, dependent on 0.
 pub fn firefox_156_h2() -> H2Profile {
-    firefox_147_h2()
+    let mut profile = firefox_147_h2();
+    profile.initial_stream_id = 3;
+    profile.headers_priority = Some(HeadersPriority {
+        stream_dependency: 0,
+        weight: 41,
+        exclusive: false,
+    });
+    profile
 }
 
 /// Returns the Safari 18 H2 fingerprint profile.
@@ -824,6 +889,7 @@ pub fn firefox_156_h2() -> H2Profile {
 /// on HEADERS frames. Calibrated value: `exclusive=1, dependency=0, weight=255`.
 pub fn safari_18_h2() -> H2Profile {
     H2Profile {
+        initial_stream_id: 1,
         settings: vec![
             H2Setting {
                 id: H2SettingId::InitialWindowSize,
@@ -865,6 +931,7 @@ pub fn safari_18_h2() -> H2Profile {
 /// (`flags_raw = 0x05`: END_STREAM | END_HEADERS only)
 pub fn safari_26_h2() -> H2Profile {
     H2Profile {
+        initial_stream_id: 1,
         settings: vec![
             H2Setting {
                 id: H2SettingId::EnablePush,
@@ -1146,6 +1213,11 @@ pub fn chrome_154_header_order() -> Vec<String> {
     chrome_153_header_order()
 }
 
+/// Returns the Chrome 155 HTTP header sending order (navigation only).
+pub fn chrome_155_header_order() -> Vec<String> {
+    chrome_154_header_order()
+}
+
 /// Returns the Chrome 131 HTTP header sending order.
 ///
 /// Same as Chrome 144 (header order hasn't changed).
@@ -1324,9 +1396,16 @@ mod tests {
 
     #[test]
     fn test_firefox_156_h2_matches_public_navigation_capture() {
+        let mut expected = firefox_147_h2();
+        expected.initial_stream_id = 3;
+        expected.headers_priority = Some(HeadersPriority {
+            stream_dependency: 0,
+            weight: 41,
+            exclusive: false,
+        });
         assert_eq!(
             serde_json::to_value(firefox_156_h2()).unwrap(),
-            serde_json::to_value(firefox_147_h2()).unwrap()
+            serde_json::to_value(expected).unwrap()
         );
         assert_eq!(firefox_156_header_order(), firefox_147_header_order());
     }
@@ -1640,7 +1719,10 @@ mod tests {
         let p = chrome_144_h2();
         assert!(p.priority_config.urgency_weights.is_some());
         assert!(p.priority_config.exclusive);
-        assert_eq!(p.priority_config.stream_dep_policy, StreamDepPolicy::Chain);
+        assert_eq!(
+            p.priority_config.stream_dep_policy,
+            StreamDepPolicy::PriorityChain
+        );
         assert!(p.priority_config.auto_priority_header);
         assert_eq!(p.priority_config.default_urgency, 1);
     }
@@ -1659,5 +1741,25 @@ mod tests {
         let p = safari_26_h2();
         assert!(p.headers_priority.is_none());
         assert!(p.priority_config.auto_priority_header);
+    }
+}
+#[test]
+fn initial_stream_id_json_validates_range_and_preserves_legacy_default() {
+    let mut value = serde_json::to_value(chrome_155_h2()).unwrap();
+    value.as_object_mut().unwrap().remove("initial_stream_id");
+    let legacy: H2Profile = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.initial_stream_id, 1);
+    for id in [0, 2, 0x8000_0001, u32::MAX] {
+        value["initial_stream_id"] = serde_json::json!(id);
+        assert!(serde_json::from_value::<H2Profile>(value.clone()).is_err());
+    }
+    for id in [1, 3, 7, MAX_CLIENT_STREAM_ID] {
+        value["initial_stream_id"] = serde_json::json!(id);
+        assert_eq!(
+            serde_json::from_value::<H2Profile>(value.clone())
+                .unwrap()
+                .initial_stream_id,
+            id
+        );
     }
 }

@@ -1,0 +1,13 @@
+{
+  "capture": "library-h3-navigation-favicon-control.pcapng",
+  "capture_sha256": "caa7dd5d2f8cd76339498713f773e0e500510c911cc8c632efdfa186d89f2425",
+  "subject": "library_chrome155",
+  "udp_stream": 0,
+  "control_stream": 2,
+  "raw_control_hex": "00041b018001000006800400000740643301c000000684c7d8cc935af87cc0000001e838b3880113800f07000700753d302c2069",
+  "tshark_frame_types": [4, 8190997384, 984832],
+  "tshark_settings": [[1, 65536], [6, 262144], [7, 100], [51, 1], [27997493452, 324728956]],
+  "tshark_priority_updates": [
+    {"frame_type": 984832, "element_id": 0, "field_value": "u=0, i"}
+  ]
+}

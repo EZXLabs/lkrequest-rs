@@ -197,6 +197,7 @@ mod tests {
             age_add: 0,
             received_at: Instant::now(),
             alpn: Some("h2".to_string()),
+            alps: Default::default(),
             hkdf_algorithm: HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: Vec::new(),

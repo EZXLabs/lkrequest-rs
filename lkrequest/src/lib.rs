@@ -166,6 +166,8 @@ pub use randomize::Randomize;
 pub use response::{
     HttpVersion, NegotiatedHttpVersion, RedirectRecord, Response, StreamingResponse,
 };
+#[cfg(feature = "quic-h3")]
+pub use retry::H3RetryMode;
 pub use retry::{ExponentialBackoff, FixedInterval, RetryPolicy};
 pub use session::{
     can_send_early_data, AcceptEncoding, ChromeLikeProtocolConfig, CookieInfo, Idempotency,

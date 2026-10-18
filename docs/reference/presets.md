@@ -1,12 +1,13 @@
 # 指纹 preset 支持与验证矩阵
 
-本页区分两件事：**API 可以构造某个完整 preset**，以及**该 preset 的每一协议层是否有直接外部证据**。数据源是 `docs/data/preset-evidence.toml`，审阅日期为 2026-09-25。
+本页区分两件事：**API 可以构造某个完整 preset**，以及**该 preset 的每一协议层是否有直接外部证据**。数据源是 `docs/data/preset-evidence.toml`，审阅日期为 2026-10-07。
 
-当前源码提供 17 个完整 preset，Rust 与 FFI 名称一致。Chrome 154 和 Firefox 156 是本次新增版本。
+当前源码提供 18 个完整 preset，Rust 与 FFI 名称一致。最新新增版本为 Chrome 155。
 
 | 选择 | TLS / H2 | QUIC / H3 | 验证说明 |
 |---|---|---|---|
 | `chrome_154` | 支持 | 需要 `quic-h3` | TLS/H2、发出的 QUIC ClientHello 和传输参数已抓包；H3 SETTINGS 继承 Chrome 153 |
+| `chrome_155` | 支持 | 需要 `quic-h3` | Chrome 155.0.8059.40 的 TLS/H2、QUIC 和 H3 SETTINGS 均有公网抓包证据，H3 返回 200 |
 | `firefox_156` | 支持 | 未提供 | Firefox 156.0.1 的 TLS/H2 已抓包，库的完整 preset 已完成公网 H2 请求 |
 
 支持范围按当前源码描述。使用发布包或固定 Git revision 时，应确认该版本包含所需 preset；FFI 可通过 `lk_preset_list_json` 查询实际可用名称。
@@ -38,13 +39,16 @@
 | `chrome_152` | 152.0.7977.65 | Windows | 是 | 是 | 是 |
 | `chrome_153` | 153.0.8010.37 | Windows | 是 | 是 | 是 |
 | `chrome_154` | 154.0.8037.58 | Windows | 是 | 是 | 是 |
+| `chrome_155` | 155.0.8059.40 | Windows | 是 | 是 | 是 |
 | `firefox_133` | 133 | 未记录 | 是 | 是 | 否 |
 | `firefox_147` | 147.0.3 | 未记录 | 是 | 是 | 否 |
 | `firefox_156` | 156.0.1 | Windows | 是 | 是 | 否 |
 | `safari_18` | 18 | 未记录 | 是 | 是 | 否 |
 | `safari_26` | 26.2 | 未记录 | 是 | 是 | 否 |
 
-`default` 是 FFI 对 `chrome_144` 的兼容 alias；`safari_26_2` 是 `safari_26` 的 FFI alias。Rust API 使用明确函数名。
+`default` 是 FFI 对 `chrome_155` 的 alias；`safari_26_2` 是 `safari_26` 的 FFI alias。Rust API 使用明确函数名。
+
+Rust `Client::default()` 和未指定指纹的 `Client::builder().build()` 默认使用 Chrome 155 TLS/H2，QUIC/H3 仍需显式启用。FFI 默认构造器和未指定 preset 的 builder 使用完整 `chrome_155` preset，QUIC/H3 取决于构建时的 feature。需要旧默认版本时显式指定 `chrome_144`。
 
 H3 profile 的“是”要求构建时启用 `quic-h3`；“否”表示该 preset 本身没有 QUIC/H3 配置，即使启用 feature 也不会补齐。Firefox 和 Safari 可使用 H1/H2，但不能通过 `http3_only()` 获得对应浏览器的 H3 指纹。
 
@@ -64,6 +68,7 @@ H3 profile 的“是”要求构建时启用 `quic-h3`；“否”表示该 pres
 | `chrome_152` | verified | inherited | verified | partial | inherited |
 | `chrome_153` | verified | verified | verified | verified | verified |
 | `chrome_154` | verified | verified | verified | verified | inherited |
+| `chrome_155` | verified | verified | verified | verified | verified |
 | `firefox_133` | unverified | fixture-only | — | — | — |
 | `firefox_147` | verified | fixture-only | — | — | — |
 | `firefox_156` | verified | verified | — | — | — |
@@ -77,6 +82,7 @@ H3 profile 的“是”要求构建时启用 `quic-h3`；“否”表示该 pres
 - Chrome 152 直接验证了 TCP TLS 的 sigalgs GREASE slot、trust-anchor ID 集合，以及 QUIC ClientHello/部分 transport changes；完整 H3 SETTINGS 未被该次公共流量证明。
 - Chrome 153 的公共抓包同时覆盖了 TCP TLS、H2、QUIC TLS、QUIC transport 与 H3：H3 导航返回 200，SETTINGS `1=65536`、`6=262144`、`7=100`、`51=1` 被直接观察到，因此这五层都标为 verified。profile 与回归 fixture 的路径记录在 `docs/data/preset-evidence.toml` 中。
 - Chrome 154 的公共抓包验证了 TCP TLS、H2、QUIC TLS、QUIC transport 和 Initial packetization 与 Chrome 153 一致；当前路径没有收到 QUIC 回包，因此 H3 SETTINGS 明确继承 Chrome 153，不标为直接验证。
+- Chrome 155 的稳定 TLS/H2/QUIC 字段与 154 一致；本次直接观察到 H3 SETTINGS、`u=0, i` 导航优先级和 H3 200 响应。证据限定为 Windows 新连接导航，不覆盖完整随机分布、ECH 内层、恢复或所有请求上下文。
 - Firefox 156 的公共抓包验证了 TLS 和 H2，也观察到 Firefox QUIC Initial；由于当前实现不能精确表达非对称 stream window、`max_ack_delay=20`、active CID limit 8 和 Firefox Initial 布局，因此公开 preset 不启用 QUIC/H3。QUIC 采集记录仅用于后续研究，不代表已有可用 profile，所以表中标为“—”。
 - GREASE、extension order、CID、packet number、timing、ACK 和 retransmission 等随机/路径字段不能直接做整包 byte equality。Chrome 146 与 150–154 还额外包含逐连接生成的部分：保留 transport parameter 的 id 与 0–15 字节 payload、GREASE version 在可用版本列表中的位置、H3 保留 SETTINGS 的 id/value、control stream 上 0–3 字节的 GREASE 帧，以及 Initial 包内 CRYPTO 的拆分顺序与穿插的 PING/PADDING。这些字段只能按生成规则比对，不能按某一次抓包逐字节比对。
 - preset 能完成请求不代表该协议层已验证。验证必须同时记录浏览器版本、平台、采集日期、目标和规范化规则。

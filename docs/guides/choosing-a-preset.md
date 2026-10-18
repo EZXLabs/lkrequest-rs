@@ -6,9 +6,14 @@
 
 ## 当前公共 preset 名称
 
+默认浏览器版本为 Chrome 155。Rust 默认客户端提供 TLS/H2，完整
+`chrome_155()` preset 在启用 `quic-h3` 时附带 QUIC/H3。FFI 默认构造器、
+未指定 preset 的 builder 和 `default` alias 均选择完整 `chrome_155` preset。
+需要维持旧版本时显式指定 `chrome_144`。
+
 当前源码提供：
 
-- Chrome：`chrome_131`、`chrome_144`–`chrome_154`；
+- Chrome：`chrome_131`、`chrome_144`–`chrome_155`；
 - Firefox：`firefox_133`、`firefox_147`、`firefox_156`；
 - Safari：`safari_18`、`safari_26`。
 
@@ -17,6 +22,7 @@
 | 需求 | 选择 | 协议范围 |
 |---|---|---|
 | Chrome 154 | `chrome_154` | TLS/H2；启用 `quic-h3` 后可用 QUIC/H3，H3 SETTINGS 继承 Chrome 153 |
+| Chrome 155 | `chrome_155` | Windows 155.0.8059.40 的 TLS/H2 与 QUIC/H3 均有直接公网抓包证据 |
 | Firefox 156 | `firefox_156` | TLS/H2；不提供 QUIC/H3 profile |
 
 Chrome 154.0.8037.58 与 Firefox 156.0.1 的采集平台均为 Windows。启用 `quic-h3` 不会为 Firefox 或 Safari preset 增加缺失的 QUIC/H3 配置。
@@ -25,7 +31,7 @@ Chrome 154.0.8037.58 与 Firefox 156.0.1 的采集平台均为 Windows。启用 
 
 ```rust,ignore
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_154())
+    .preset(lkrequest::preset::chrome_155())
     .build();
 ```
 
@@ -50,7 +56,7 @@ let session = client.session().http2_only().build();
 
 ## FFI 名称
 
-`lk_client_builder_set_preset(builder, "chrome_154")` 和
+`lk_client_builder_set_preset(builder, "chrome_155")` 和
 `lk_client_builder_set_preset(builder, "firefox_156")` 使用与 Rust 函数相同的规范名称。
 `lk_preset_list_json` 列出加载的库实际提供的 preset；`lk_preset_get_detail_json` 返回指定规范名称的配置。
 已发布的旧版本不一定包含本页的新 preset，绑定调用方应按实际库版本查询。
@@ -58,6 +64,12 @@ let session = client.session().http2_only().build();
 ## User-Agent 与 preset
 
 preset 不会自动填充 `User-Agent`、Client Hints 或 `Accept-Language`。通过 `default_header()` 或请求级 headers 设置这些值时，应与浏览器版本、平台和请求上下文保持一致。只设置 TLS profile 或 User-Agent 都不等于完整浏览器指纹。
+
+Chrome 155.0.8059.40 的 Windows 导航抓包使用 `Chrome/155.0.0.0`，
+`sec-ch-ua` 为 `"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"`。
+其导航 `Accept` 为
+`text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7`。
+这些值来自该构建的导航上下文；升级已显式配置的应用请求头时，应同时核对它们。
 
 如果目标要求自定义 User-Agent，应把它视为一个新的组合配置，并记录：
 

@@ -122,6 +122,20 @@ fn handle_connection(mut stream: TcpStream) {
         let _ = stream.write_all(resp.as_bytes());
         return;
     }
+    if route == "/cookie-empty-max-age" {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Set-Cookie: expired=gone; Path=/; Max-Age=; Expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+            "Set-Cookie: valid=live; Path=/; Max-Age=3600; Max-Age=; Expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+            "Set-Cookie: session=live; Path=/; Max-Age=; Max-Age=\r\n",
+            "Set-Cookie: deleted=gone; Path=/; Max-Age=0; Max-Age=\r\n",
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("cookie response");
+        return;
+    }
 
     let body = match route {
         "/ok" => b"hello ffi".to_vec(),
@@ -131,6 +145,14 @@ fn handle_connection(mut stream: TcpStream) {
             b"slow".to_vec()
         }
         "/query" => request.path.as_bytes().to_vec(),
+        "/cookie-echo" => request
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+            .into_bytes(),
         _ => b"not found".to_vec(),
     };
 
@@ -249,6 +271,118 @@ unsafe fn error_message_string(err: *const lk_error_t) -> String {
         lk_status_t::LK_OK
     );
     view_string(ptr, len)
+}
+
+#[test]
+fn wreq_cookie_empty_max_age_ffi_response_roundtrip() {
+    let server = TestServer::start();
+    unsafe {
+        let mut client = ptr::null_mut();
+        let mut session = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        assert_eq!(
+            lk_client_new_default(&mut client, &mut err),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lk_session_new(client, &mut session, &mut err),
+            lk_status_t::LK_OK
+        );
+        let send = |path: &str| {
+            let url = server.url(path);
+            let mut request = ptr::null_mut();
+            let mut response = ptr::null_mut();
+            let mut error = ptr::null_mut();
+            assert_eq!(
+                lk_request_new(
+                    session,
+                    cstring("GET").as_ptr(),
+                    3,
+                    cstring(&url).as_ptr(),
+                    url.len(),
+                    &mut request,
+                    &mut error
+                ),
+                lk_status_t::LK_OK
+            );
+            assert_eq!(
+                lk_request_set_preferred_http_version(
+                    request,
+                    lk_preferred_http_version_t::LK_PREFERRED_HTTP_VERSION_HTTP1_ONLY
+                ),
+                lk_status_t::LK_OK
+            );
+            assert_eq!(lk_request_set_timeout(request, 3_000), lk_status_t::LK_OK);
+            assert_eq!(
+                lk_request_send(request, &mut response, &mut error),
+                lk_status_t::LK_OK
+            );
+            lk_request_free(request);
+            assert_eq!(lk_response_status(response), 200);
+            let mut text = ptr::null();
+            let mut len = 0;
+            assert_eq!(
+                lkrequest_ffi::lk_response_text(response, &mut text, &mut len, &mut error),
+                lk_status_t::LK_OK
+            );
+            let body = view_string(text, len);
+            lk_response_free(response);
+            body
+        };
+        assert_eq!(send("/cookie-empty-max-age"), "");
+        let echoed = send("/cookie-echo");
+
+        let url = server.url("/");
+        let mut values = Vec::new();
+        for name in ["expired", "deleted", "valid", "session"] {
+            let mut value = ptr::null();
+            let mut len = 0;
+            let status = lkrequest_ffi::lk_session_get_cookie(
+                session,
+                cstring(&url).as_ptr(),
+                url.len(),
+                cstring(name).as_ptr(),
+                name.len(),
+                &mut value,
+                &mut len,
+                &mut err,
+            );
+            values.push((status, view_string(value, len)));
+            if !err.is_null() {
+                lk_error_free(err);
+                err = ptr::null_mut();
+            }
+        }
+        let mut json = ptr::null();
+        let mut json_len = 0;
+        assert_eq!(
+            lkrequest_ffi::lk_session_get_all_cookies_json(
+                session,
+                &mut json,
+                &mut json_len,
+                &mut err
+            ),
+            lk_status_t::LK_OK
+        );
+        let cookies: serde_json::Value =
+            serde_json::from_str(&view_string(json, json_len)).unwrap();
+        lk_session_free(session);
+        lk_client_free(client);
+
+        assert_eq!(values[0], (lk_status_t::LK_ERR, String::new()));
+        assert_eq!(values[1], (lk_status_t::LK_ERR, String::new()));
+        assert_eq!(values[2], (lk_status_t::LK_OK, "live".into()));
+        assert_eq!(values[3], (lk_status_t::LK_OK, "live".into()));
+        assert_eq!(echoed, "valid=live; session=live");
+        let cookies = cookies.as_array().unwrap();
+        assert_eq!(cookies.len(), 2);
+        let session_cookie = cookies
+            .iter()
+            .find(|cookie| cookie["name"] == "session")
+            .unwrap();
+        assert_eq!(session_cookie["host_only"], true);
+        assert!(session_cookie["expires_unix"].is_null());
+    }
 }
 
 #[test]

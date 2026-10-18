@@ -27,7 +27,10 @@
 //! `failure_threshold: 2`, a single `mark_bad_proxy()` afterwards is enough to
 //! reach the threshold *only if* the health check already blamed the proxy. A
 //! proxy that then stops being acquirable was judged unhealthy; one that stays
-//! acquirable was judged healthy, or skipped.
+//! acquirable was judged healthy, or skipped. A second, local CONNECT proxy
+//! witnesses completion of the first probe and remains available during its
+//! cooldown. Two round-robin leases then identify which proxies are eligible;
+//! neither a direct lease nor an acquisition timeout is a health verdict.
 //!
 //! Requires the `masque` feature (`required-features` in `Cargo.toml`): without
 //! it there is no CONNECT-UDP client and every MASQUE proxy is skipped, which
@@ -42,9 +45,10 @@ use h3::ext::Protocol;
 use http::{Method, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
-use lkrequest::proxy::{MasqueOuterConfig, ProxyConfig};
+use lkrequest::proxy::{MasqueOuterConfig, ProxyConfig, RotationStrategy};
 use lkrequest::proxy_pool::{BadProxyConfig, HealthCheckConfig, ProxyPool};
 
 const TUNNEL_TEMPLATE_PREFIX: &str = "/.well-known/masque/udp/";
@@ -58,9 +62,9 @@ const TARGET_PORT: u16 = 443;
 
 /// Bound on a single probe. Also the time an unreachable proxy costs.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long to let the pool's first (immediate) health-check round finish.
+/// Bound for the witness that follows the pool's first health-check probe.
 const SETTLE: Duration = Duration::from_secs(4);
-/// How long to wait for a `mark_bad_proxy` to be reflected in the pool.
+/// Bound on an acquisition; expiry is a test failure, never a health verdict.
 const MARK_BAD_SETTLE: Duration = Duration::from_secs(2);
 
 fn localhost_addr(port: u16) -> SocketAddr {
@@ -273,12 +277,81 @@ enum Verdict {
     NotBlamed,
 }
 
+struct HealthCheckWitness {
+    proxy: ProxyConfig,
+    task: JoinHandle<()>,
+}
+
+impl HealthCheckWitness {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind(localhost_addr(0))
+            .await
+            .expect("health-check witness listener");
+        let address = listener.local_addr().unwrap();
+        let proxy = ProxyConfig::parse(&format!("http://{address}")).unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192, "oversized witness CONNECT request");
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"CONNECT target.test:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        Self { proxy, task }
+    }
+
+    async fn wait(&mut self) {
+        // Static probes are serial and preserve list order. Reaching this
+        // second proxy means the target's verdict has already been recorded.
+        tokio::time::timeout(SETTLE, &mut self.task)
+            .await
+            .expect("health check did not reach the witness after the target")
+            .expect("health-check witness failed");
+    }
+}
+
+impl Drop for HealthCheckWitness {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn observed_verdict(pool: &ProxyPool, target: &str, witness: &str) -> Verdict {
+    let mut target_seen = false;
+    for _ in 0..2 {
+        let guard = tokio::time::timeout(MARK_BAD_SETTLE, pool.acquire())
+            .await
+            .expect("the witness must remain acquirable during target cooldown");
+        let identity = guard
+            .proxy()
+            .expect("a configured fixed pool must never return a direct lease")
+            .identity();
+        assert!(
+            identity == target || identity == witness,
+            "pool returned an unconfigured proxy"
+        );
+        target_seen |= identity == target;
+    }
+    if target_seen {
+        Verdict::NotBlamed
+    } else {
+        Verdict::Blamed
+    }
+}
+
 async fn health_check_verdict(
     proxy: ProxyConfig,
     tunnel_probe: bool,
     masque_outer_config: Option<MasqueOuterConfig>,
 ) -> Verdict {
     let identity = proxy.identity();
+    let mut witness = HealthCheckWitness::start().await;
+    let witness_identity = witness.proxy.identity();
     // `HealthCheckConfig` is `#[non_exhaustive]`: from `Default`, then adjust.
     let mut health_check = HealthCheckConfig::default();
     // One round only: the maintenance task's first tick is immediate.
@@ -290,7 +363,8 @@ async fn health_check_verdict(
     health_check.masque_outer_config = masque_outer_config;
 
     let pool = ProxyPool::builder()
-        .proxies(vec![proxy])
+        .proxies(vec![proxy, witness.proxy.clone()])
+        .rotation(RotationStrategy::RoundRobin)
         .bad_proxy_config(BadProxyConfig {
             failure_threshold: 2,
             window: Duration::from_secs(600),
@@ -300,17 +374,9 @@ async fn health_check_verdict(
         .health_check(health_check)
         .build();
 
-    tokio::time::sleep(SETTLE).await;
+    witness.wait().await;
     pool.mark_bad_proxy(&identity);
-
-    let deadline = tokio::time::Instant::now() + MARK_BAD_SETTLE;
-    while tokio::time::Instant::now() < deadline {
-        if pool.acquire().await.proxy().is_none() {
-            return Verdict::Blamed;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    Verdict::NotBlamed
+    observed_verdict(&pool, &identity, &witness_identity).await
 }
 
 // ---------------------------------------------------------------------------
@@ -335,8 +401,14 @@ async fn default_health_check_skips_a_nonexistent_masque_proxy() {
 #[tokio::test]
 async fn default_health_check_still_blames_a_nonexistent_tcp_proxy() {
     let proxy = ProxyConfig::parse("http://127.0.0.1:1").unwrap();
+    let verdict = tokio::time::timeout(
+        SETTLE + MARK_BAD_SETTLE,
+        health_check_verdict(proxy, false, None),
+    )
+    .await
+    .expect("health-check verdict must not wait for the 600-second proxy cooldown");
     assert_eq!(
-        health_check_verdict(proxy, false, None).await,
+        verdict,
         Verdict::Blamed,
         "the non-MASQUE health check path must be unchanged"
     );

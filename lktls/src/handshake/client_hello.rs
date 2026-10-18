@@ -41,6 +41,35 @@ use crate::profile::types::{
 
 use super::handshake_type;
 
+/// Check ALPS protocol support using the same sources as extension encoding.
+pub(crate) fn profile_offers_alps_protocol(profile: &TlsProfile, protocol: &[u8]) -> bool {
+    profile.extensions.iter().any(|extension| {
+        if !matches!(
+            extension.extension_type,
+            ext_type::APPLICATION_SETTINGS | ext_type::APPLICATION_SETTINGS_NEW
+        ) {
+            return false;
+        }
+        match &extension.source {
+            ExtensionSource::Auto => profile.alps_protocols.as_ref().is_some_and(|protocols| {
+                protocols
+                    .iter()
+                    .any(|candidate| candidate.as_bytes() == protocol)
+            }),
+            ExtensionSource::RawBytes { data } => decode_hex(data).ok().is_some_and(|payload| {
+                crate::extensions::alpn::parse_alpn_list_bytes(&payload)
+                    .is_some_and(|protocols| protocols.contains(&protocol))
+            }),
+            ExtensionSource::TrustAnchorIds { ids, .. } => ids.iter().any(|id| {
+                decode_hex(id)
+                    .ok()
+                    .is_some_and(|candidate| candidate == protocol)
+            }),
+            ExtensionSource::Grease => false,
+        }
+    })
+}
+
 /// Builder that produces a complete ClientHello message as raw bytes.
 ///
 /// # Usage
@@ -169,6 +198,7 @@ impl<'a> ClientHelloBuilder<'a> {
     }
 
     /// Set a cookie from HelloRetryRequest (will be added as cookie extension in CH2).
+    /// Building rejects empty/oversized cookies and a conflicting profile cookie.
     pub fn with_cookie(mut self, cookie: Vec<u8>) -> Self {
         self.cookie = Some(cookie);
         self
@@ -250,7 +280,7 @@ impl<'a> ClientHelloBuilder<'a> {
         self
     }
 
-    /// Reuse the complete fake ECH extension emitted in CH1.
+    /// Reuse a complete CH1 ECH extension: GREASE or a rejected real offer.
     pub(crate) fn with_ech_grease_extension(mut self, extension: Vec<u8>) -> Self {
         self.ech_grease_extension = Some(extension);
         self
@@ -361,10 +391,21 @@ impl<'a> ClientHelloBuilder<'a> {
         // --- Step 6: Extensions (first pass, without padding) ---
         // Compute the (possibly shuffled) extension order once.  This order
         // is stored in the output so the ECH inner CH can reuse it.
-        let extension_order = self
+        let mut extension_order = self
             .extension_order
             .clone()
             .unwrap_or_else(|| self.compute_extension_order());
+        // Freeze per-handshake anchor order in the saved extension specs. HRR
+        // and ECH inner serialization reuse these bytes without another shuffle.
+        for spec in &mut extension_order {
+            if let ExtensionSource::TrustAnchorIds { ids, shuffle } = &spec.source {
+                let mut encoded = Vec::new();
+                self.encode_trust_anchor_ids(spec.extension_type, ids, *shuffle, &mut encoded)?;
+                spec.source = ExtensionSource::RawBytes {
+                    data: crate::crypto::to_hex(&encoded[4..]),
+                };
+            }
+        }
         let (ext_data_no_padding, padding_insert_pos) = self.encode_extensions_without_padding(
             key_pairs_for_encoding,
             &grease,
@@ -471,6 +512,18 @@ impl<'a> ClientHelloBuilder<'a> {
         }
 
         self.validate_no_duplicate_grease_sources(chromium_boringssl)?;
+
+        if self.cookie.is_some()
+            && self
+                .profile
+                .extensions
+                .iter()
+                .any(|extension| extension.extension_type == ext_type::COOKIE)
+        {
+            return Err(TlsError::InvalidProfile(
+                "HRR cookie conflicts with a profile-defined cookie extension".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -1002,6 +1055,18 @@ impl<'a> ClientHelloBuilder<'a> {
                 ExtensionSource::TrustAnchorIds { ids, shuffle } => {
                     self.encode_trust_anchor_ids(ext_spec.extension_type, ids, *shuffle, &mut buf)?;
                 }
+            }
+        }
+
+        // HRR cookies are dynamic and absent from the saved profile permutation.
+        if self.cookie.is_some() {
+            if chromium_boringssl || compress_ext_types.contains(&ext_type::COOKIE) {
+                compressed_types.push(ext_type::COOKIE);
+                if first_compressed_pos.is_none() {
+                    first_compressed_pos = Some(buf.len());
+                }
+            } else {
+                self.encode_cookie(&mut buf)?;
             }
         }
 
@@ -1537,15 +1602,7 @@ impl<'a> ClientHelloBuilder<'a> {
             )?;
         }
 
-        // If a cookie was provided (from HRR), append it as an extension.
-        if let Some(ref cookie_data) = self.cookie {
-            // cookie extension: type (2) + length (2) + cookie_length (2) + cookie
-            let cookie_ext_len = 2 + cookie_data.len();
-            buf.extend_from_slice(&ext_type::COOKIE.to_be_bytes());
-            buf.extend_from_slice(&(cookie_ext_len as u16).to_be_bytes());
-            buf.extend_from_slice(&(cookie_data.len() as u16).to_be_bytes());
-            buf.extend_from_slice(cookie_data);
-        }
+        self.encode_cookie(&mut buf)?;
 
         if chromium_boringssl && self.profile.grease.extensions {
             GreaseExtension::with_value_and_len(grease.get(grease::GreaseIndex::Extension2), 1)
@@ -1600,6 +1657,28 @@ impl<'a> ClientHelloBuilder<'a> {
                     GreaseExtension::with_value_and_len(ext_grease, payload_len).encode(buf);
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn encode_cookie(&self, buf: &mut Vec<u8>) -> Result<()> {
+        if let Some(cookie) = &self.cookie {
+            if cookie.is_empty() {
+                return Err(TlsError::InvalidProfile(
+                    "HRR cookie must not be empty".into(),
+                ));
+            }
+            let payload_len = cookie
+                .len()
+                .checked_add(2)
+                .and_then(|length| u16::try_from(length).ok())
+                .ok_or_else(|| {
+                    TlsError::InvalidProfile("HRR cookie extension exceeds 65535 bytes".into())
+                })?;
+            buf.extend_from_slice(&ext_type::COOKIE.to_be_bytes());
+            buf.extend_from_slice(&payload_len.to_be_bytes());
+            buf.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+            buf.extend_from_slice(cookie);
         }
         Ok(())
     }
@@ -1850,7 +1929,9 @@ impl<'a> ClientHelloBuilder<'a> {
                             // config_id comes from per-connection GREASE seed, matching
                             // BoringSSL's hs->grease_seed[ssl_grease_ech_config_id].
                             let config_id = grease.raw_seed(grease::GreaseIndex::EchConfigId);
-                            EchGreaseExtension::new(config, &self.hostname, config_id).encode(buf);
+                            EchGreaseExtension::new(config, &self.hostname, config_id)
+                                .with_client_hello_style(self.profile.tls_client_hello_style)
+                                .encode(buf);
                         }
                         EchMode::Disabled => {}
                         EchMode::Real { .. } => {
@@ -2027,7 +2108,7 @@ fn find_ech_extension_in_message(msg: &[u8]) -> Result<EchExtensionOffsets> {
     ))
 }
 
-fn extract_ech_extension(msg: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn extract_ech_extension(msg: &[u8]) -> Result<Vec<u8>> {
     let offsets = find_ech_extension_in_message(msg)?;
     msg.get(offsets.extension_offset..offsets.extension_offset + offsets.extension_len)
         .map(ToOwned::to_owned)
@@ -2558,57 +2639,37 @@ mod tests {
     #[test]
     fn test_build_chrome_144_contains_ech_grease() {
         let profile = presets::chrome_144();
-        let builder = ClientHelloBuilder::new(&profile, "example.com");
+        let mut random = [0xaa; 32];
+        random[..2].copy_from_slice(&[0xfe, 0x0d]);
+        let builder = ClientHelloBuilder::new(&profile, "example.com").with_random(random);
         let output = builder.build().expect("build should succeed");
 
-        let msg = &output.message;
-
-        // Search for ECH extension type (0xFE0D) in the extensions section.
-        // The extensions start after: handshake_header(4) + version(2) + random(32)
-        //   + session_id_len(1) + session_id(32) + cipher_suites_len(2) + cipher_suites
-        //   + comp_methods_len(1) + comp_methods(1) + extensions_len(2)
-        // We scan for the 0xFE 0x0D byte pair.
-        let mut found_ech = false;
-        for i in 0..msg.len().saturating_sub(1) {
-            if msg[i] == 0xFE && msg[i + 1] == 0x0D {
-                found_ech = true;
-                // After the 4-byte extension header, the first byte should be 0x00 (outer)
-                if i + 4 < msg.len() {
-                    assert_eq!(msg[i + 4], 0x00, "ECH type should be outer (0x00)");
-                }
-                break;
-            }
-        }
-        assert!(
-            found_ech,
-            "Chrome 144 ClientHello should contain ECH extension (0xFE0D)"
-        );
+        let ech = extract_extension_payload_from_body(
+            &output.message[4..],
+            ext_type::ENCRYPTED_CLIENT_HELLO,
+        )
+        .expect("Chrome 144 ClientHello contains ECH GREASE");
+        assert_eq!(&ech[..5], &[0, 0, 1, 0, 1]);
     }
 
     #[test]
     fn test_build_firefox_147_contains_ech_grease() {
         let profile = presets::firefox_147();
-        let builder = ClientHelloBuilder::new(&profile, "tls.browserleaks.com");
+        let mut random = [0xaa; 32];
+        random[..2].copy_from_slice(&[0xfe, 0x0d]);
+        let builder = ClientHelloBuilder::new(&profile, "tls.browserleaks.com").with_random(random);
         let output = builder.build().expect("build should succeed");
 
-        let msg = &output.message;
-
-        let mut found_ech = false;
-        for i in 0..msg.len().saturating_sub(1) {
-            if msg[i] == 0xFE && msg[i + 1] == 0x0D {
-                found_ech = true;
-                // After 4-byte ext header: type=0x00, kdf=0x0001, aead=0x0003 (ChaCha20)
-                if i + 8 < msg.len() {
-                    assert_eq!(msg[i + 4], 0x00, "ECH type should be outer");
-                    let aead_id = u16::from_be_bytes([msg[i + 7], msg[i + 8]]);
-                    assert_eq!(aead_id, 0x0003, "Firefox should use ChaCha20Poly1305");
-                }
-                break;
-            }
-        }
+        let ech = extract_extension_payload_from_body(
+            &output.message[4..],
+            ext_type::ENCRYPTED_CLIENT_HELLO,
+        )
+        .expect("Firefox 147 ClientHello contains ECH GREASE");
+        assert_eq!(&ech[..3], &[0, 0, 1]);
+        let aead_id = u16::from_be_bytes([ech[3], ech[4]]);
         assert!(
-            found_ech,
-            "Firefox 147 ClientHello should contain ECH extension (0xFE0D)"
+            [1, 3].contains(&aead_id),
+            "NSS chooses AES-128-GCM or ChaCha20Poly1305"
         );
     }
 
@@ -3329,40 +3390,90 @@ mod tests {
 
     #[test]
     fn test_hrr_reuses_extension_order_and_fake_ech_bytes() {
-        let profile = presets::chrome_150();
-        let mut ch1 = ClientHelloBuilder::new(&profile, "example.com")
-            .build()
-            .expect("CH1 build");
-        let random: [u8; 32] = ch1.message[6..38].try_into().unwrap();
-        let sid_len = ch1.message[38] as usize;
-        let session_id = ch1.message[39..39 + sid_len].to_vec();
-        let ch1_types = extract_extension_types_from_body(&ch1.message[4..]);
-        let ch1_ech = extract_extension_body(&ch1.message, ext_type::ENCRYPTED_CLIENT_HELLO)
-            .expect("CH1 fake ECH");
+        for profile in [presets::chrome_150(), presets::firefox_156()] {
+            let mut ch1 = ClientHelloBuilder::new(&profile, "example.com")
+                .build()
+                .expect("CH1 build");
+            let random: [u8; 32] = ch1.message[6..38].try_into().unwrap();
+            let sid_len = ch1.message[38] as usize;
+            let session_id = ch1.message[39..39 + sid_len].to_vec();
+            let ch1_types = extract_extension_types_from_body(&ch1.message[4..]);
+            let ch1_ech = extract_extension_body(&ch1.message, ext_type::ENCRYPTED_CLIENT_HELLO)
+                .expect("CH1 fake ECH");
 
-        let ch2 = ClientHelloBuilder::new(&profile, "example.com")
-            .with_random(random)
-            .with_session_id(session_id)
-            .with_grease_values(ch1.grease_values.clone())
-            .with_extension_order(ch1.shuffled_extensions.clone())
-            .with_ech_grease_extension(
-                ch1.ech_grease_extension
-                    .take()
-                    .expect("saved fake ECH extension"),
-            )
-            .build_with_key_pairs(&ch1.key_shares)
-            .expect("CH2 build");
+            let ch2 = ClientHelloBuilder::new(&profile, "example.com")
+                .with_random(random)
+                .with_session_id(session_id)
+                .with_grease_values(ch1.grease_values.clone())
+                .with_extension_order(ch1.shuffled_extensions.clone())
+                .with_ech_grease_extension(
+                    ch1.ech_grease_extension
+                        .take()
+                        .expect("saved fake ECH extension"),
+                )
+                .build_with_key_pairs(&ch1.key_shares)
+                .expect("CH2 build");
 
-        assert_eq!(
-            extract_extension_types_from_body(&ch2.message[4..]),
-            ch1_types,
-            "HRR must retain the CH1 extension permutation",
+            assert_eq!(
+                extract_extension_types_from_body(&ch2.message[4..]),
+                ch1_types,
+                "HRR must retain the CH1 extension permutation",
+            );
+            assert_eq!(
+                extract_extension_body(&ch2.message, ext_type::ENCRYPTED_CLIENT_HELLO)
+                    .expect("CH2 fake ECH"),
+                ch1_ech,
+                "HRR must copy the complete fake ECH extension",
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_trust_anchor_orders_vary_but_retry_uses_the_first_encoding() {
+        use rand_core::SeedableRng;
+
+        let profile = presets::chrome_155();
+        let mut observed = std::collections::BTreeSet::new();
+        for seed in 1u8..=4 {
+            let first = ClientHelloBuilder::new(&profile, "example.com")
+                .with_rng(rand_chacha::ChaCha20Rng::from_seed([seed; 32]))
+                .build()
+                .unwrap();
+            let payload =
+                extract_extension_body(&first.message, ext_type::TRUST_ANCHOR_IDS).unwrap();
+            let retry = ClientHelloBuilder::new(&profile, "example.com")
+                .with_rng(rand_chacha::ChaCha20Rng::from_seed([seed + 10; 32]))
+                .with_extension_order(first.shuffled_extensions.clone())
+                .build_with_key_pairs(&first.key_shares)
+                .unwrap();
+            assert_eq!(
+                extract_extension_body(&retry.message, ext_type::TRUST_ANCHOR_IDS).unwrap(),
+                payload
+            );
+            observed.insert(payload);
+        }
+        assert!(
+            observed.len() > 1,
+            "fresh connections retain anchor randomization"
         );
+    }
+
+    #[test]
+    fn real_ech_serializes_one_resolved_trust_anchor_list() {
+        let profile = presets::chrome_155();
+        let output = ClientHelloBuilder::new(&profile, "secret.example.com")
+            .with_ech_config(build_test_ech_config_list_with_keypair(0x0001))
+            .build()
+            .unwrap();
+        let outer = extract_extension_body(&output.message, ext_type::TRUST_ANCHOR_IDS).unwrap();
+        let inner = extract_extension_body(
+            output.inner_hello.as_ref().unwrap(),
+            ext_type::TRUST_ANCHOR_IDS,
+        )
+        .unwrap();
         assert_eq!(
-            extract_extension_body(&ch2.message, ext_type::ENCRYPTED_CLIENT_HELLO)
-                .expect("CH2 fake ECH"),
-            ch1_ech,
-            "HRR must copy the complete fake ECH extension",
+            inner, outer,
+            "inner and outer must serialize the same per-handshake anchor list"
         );
     }
 
@@ -3410,6 +3521,163 @@ mod tests {
             extract_extension_types_from_body(&ch2.message[4..]),
             extract_extension_types_from_body(&ch1.message[4..]),
             "real ECH CH2 must retain the CH1 extension permutation",
+        );
+    }
+
+    #[test]
+    fn real_ech_hrr_echoes_cookie_in_the_reconstructed_inner() {
+        use hpke::aead::AesGcm128;
+        use hpke::kdf::HkdfSha256;
+        use hpke::kem::X25519HkdfSha256;
+        use hpke::{Deserializable, Kem, OpModeR};
+
+        let profile = presets::chrome_155();
+        let (config, sk_bytes) = build_test_ech_config_list_and_sk(0x0001);
+        let mut ch1 = ClientHelloBuilder::new(&profile, "secret.example.com")
+            .with_ech_config(config.clone())
+            .build()
+            .unwrap();
+        let random = ch1.message[6..38].try_into().unwrap();
+        let sid_len = ch1.message[38] as usize;
+        let session_id = ch1.message[39..39 + sid_len].to_vec();
+        let mut context = ch1.ech_retry_state.take().unwrap();
+        let cookie = b"local-hrr-cookie";
+        let ch2 = ClientHelloBuilder::new(&profile, "secret.example.com")
+            .with_random(random)
+            .with_session_id(session_id)
+            .with_grease_values(ch1.grease_values.clone())
+            .with_extension_order(ch1.shuffled_extensions.clone())
+            .with_cookie(cookie.to_vec())
+            .with_ech_config(config.clone())
+            .build_cookie_retry_with_key_pairs(&ch1.key_shares, Some(&mut context))
+            .unwrap();
+        let expected = [&(cookie.len() as u16).to_be_bytes()[..], cookie].concat();
+        assert_eq!(
+            extract_extension_body(&ch2.message, ext_type::COOKIE),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            extract_extension_body(ch2.inner_hello.as_ref().unwrap(), ext_type::COOKIE),
+            Some(expected)
+        );
+
+        let inputs = |message: &[u8]| {
+            let offsets = find_ech_extension_in_message(message).unwrap();
+            let enc_len = u16::from_be_bytes(
+                message[offsets.enc_offset - 2..offsets.enc_offset]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let payload_len = u16::from_be_bytes(
+                message[offsets.payload_offset - 2..offsets.payload_offset]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let enc = message[offsets.enc_offset..offsets.enc_offset + enc_len].to_vec();
+            let ciphertext =
+                message[offsets.payload_offset..offsets.payload_offset + payload_len].to_vec();
+            let mut aad = message[4..].to_vec();
+            aad[offsets.payload_offset - 4..offsets.payload_offset - 4 + payload_len].fill(0);
+            (enc, ciphertext, aad)
+        };
+        let (enc1, ciphertext1, aad1) = inputs(&ch1.message);
+        let (enc2, ciphertext2, aad2) = inputs(&ch2.message);
+        assert_eq!(enc1.len(), 32);
+        assert!(enc2.is_empty(), "HRR continues the first HPKE context");
+        let sk = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&sk_bytes).unwrap();
+        let enc = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(&enc1).unwrap();
+        let info = [b"tls ech\x00".as_slice(), &config[2..]].concat();
+        let mut receiver = hpke::setup_receiver::<AesGcm128, HkdfSha256, X25519HkdfSha256>(
+            &OpModeR::Base,
+            &sk,
+            &enc,
+            &info,
+        )
+        .unwrap();
+        let inner1 = receiver.open(&ciphertext1, &aad1).unwrap();
+        let inner2 = receiver.open(&ciphertext2, &aad2).unwrap();
+        assert_eq!(ch1.encoded_inner_hello.as_deref(), Some(inner1.as_slice()));
+        assert_eq!(ch2.encoded_inner_hello.as_deref(), Some(inner2.as_slice()));
+        let refs1 = extract_ech_outer_extension_types_from_body(&inner1);
+        let refs2 = extract_ech_outer_extension_types_from_body(&inner2);
+        assert!(!refs1.contains(&ext_type::COOKIE), "no cookie before HRR");
+        assert_eq!(
+            refs2.iter().filter(|id| **id == ext_type::COOKIE).count(),
+            1
+        );
+        let outer_types = extract_extension_types_from_body(&ch2.message[4..]);
+        let mut last_position = None;
+        for id in refs2 {
+            let position = outer_types
+                .iter()
+                .position(|candidate| *candidate == id)
+                .unwrap();
+            assert!(
+                last_position.is_none_or(|previous| previous < position),
+                "outer references preserve wire order"
+            );
+            last_position = Some(position);
+        }
+        assert!(
+            extract_extension_payload_from_body(&inner2, ext_type::COOKIE).is_none(),
+            "Chromium compresses the cookie"
+        );
+    }
+
+    #[test]
+    fn generic_ech_cookie_obeys_explicit_compression_selection() {
+        for compress in [false, true] {
+            let mut profile = presets::chrome_155();
+            profile.tls_client_hello_style = TlsClientHelloStyle::Generic;
+            profile.ech_outer_extensions = Some(if compress { vec![51, 44] } else { vec![51] });
+            let output = ClientHelloBuilder::new(&profile, "secret.example.com")
+                .with_cookie(b"cookie".to_vec())
+                .with_ech_config(build_test_ech_config_list_with_keypair(1))
+                .build()
+                .unwrap();
+            let encoded = output.encoded_inner_hello.as_ref().unwrap();
+            let references = extract_ech_outer_extension_types_from_body(encoded);
+            assert_eq!(references.contains(&ext_type::COOKIE), compress);
+            assert_eq!(
+                extract_extension_payload_from_body(encoded, ext_type::COOKIE).is_none(),
+                compress
+            );
+            assert_eq!(
+                extract_extension_body(output.inner_hello.as_ref().unwrap(), ext_type::COOKIE),
+                Some(b"\x00\x06cookie".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_encoding_rejects_oversized_extension_without_truncation() {
+        let profile = presets::chrome_155();
+        let builder =
+            ClientHelloBuilder::new(&profile, "example.com").with_cookie(vec![0xa5; 65534]);
+        let mut bytes = Vec::new();
+        assert!(builder.encode_cookie(&mut bytes).is_err());
+        assert!(bytes.is_empty());
+        let builder =
+            ClientHelloBuilder::new(&profile, "example.com").with_cookie(vec![0xa5; 65533]);
+        builder.encode_cookie(&mut bytes).unwrap();
+        assert_eq!(&bytes[..6], &[0, 44, 0xff, 0xff, 0xff, 0xfd]);
+        assert_eq!(bytes.len(), 65539);
+        let builder = ClientHelloBuilder::new(&profile, "example.com").with_cookie(Vec::new());
+        assert!(builder.encode_cookie(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn runtime_cookie_rejects_a_conflicting_profile_extension() {
+        let mut profile = presets::chrome_155();
+        profile.extensions.push(ExtensionSpec {
+            extension_type: ext_type::COOKIE,
+            source: ExtensionSource::Auto,
+        });
+        let result = ClientHelloBuilder::new(&profile, "example.com")
+            .with_cookie(b"cookie".to_vec())
+            .build();
+        assert!(
+            matches!(result, Err(TlsError::InvalidProfile(message)) if message.contains("conflicts"))
         );
     }
 

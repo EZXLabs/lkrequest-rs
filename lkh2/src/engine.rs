@@ -20,7 +20,7 @@ use crate::frame::*;
 use crate::policy::{FlowControlPolicy, HpackEncodePolicy, ImmediateFlowControl};
 use crate::profile::H2Profile;
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tracing::debug;
 
 // ─── CONTINUATION assembler ──────────────────────────────────────────────────
@@ -239,6 +239,38 @@ pub enum H2Event {
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Default)]
+struct PriorityDependencies {
+    bands: [BTreeSet<u32>; 8],
+    priorities: HashMap<u32, u8>,
+}
+
+impl PriorityDependencies {
+    fn parent(&self, stream_id: u32, urgency: u8) -> u32 {
+        for band in (0..=urgency.min(7) as usize).rev() {
+            // Client stream IDs increase in wire creation order.
+            if let Some(&parent) = self.bands[band].iter().rev().find(|&&id| id != stream_id) {
+                return parent;
+            }
+        }
+        0
+    }
+
+    fn track(&mut self, stream_id: u32, urgency: u8) {
+        let urgency = urgency.min(7);
+        if let Some(previous) = self.priorities.insert(stream_id, urgency) {
+            self.bands[previous as usize].remove(&stream_id);
+        }
+        self.bands[urgency as usize].insert(stream_id);
+    }
+
+    fn remove(&mut self, stream_id: u32) {
+        if let Some(urgency) = self.priorities.remove(&stream_id) {
+            self.bands[urgency as usize].remove(&stream_id);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct H2Engine {
     codec: H2Codec,
@@ -254,7 +286,9 @@ pub struct H2Engine {
     headers_priority: Option<PrioritySpec>,
     /// Per-browser priority strategy (urgency→weight mapping, stream dep policy).
     priority_config: crate::profile::PriorityConfig,
-    /// Last client stream ID we opened, for Chain dependency policy.
+    /// Active client streams grouped for Chrome's priority-ordered chain.
+    priority_dependencies: PriorityDependencies,
+    /// Last encoded client stream for the explicitly configured linear chain.
     last_client_stream_id: Option<u32>,
     /// Flow control strategy (controls WINDOW_UPDATE emission).
     flow_control: Box<dyn FlowControlPolicy>,
@@ -344,7 +378,7 @@ impl H2Engine {
         let preface_frames = profile.to_preface_frames();
         let headers_priority = profile.to_headers_priority_spec();
 
-        let mut state = ConnState::client();
+        let mut state = ConnState::client_with_initial_stream_id(profile.initial_stream_id);
         state.apply_profile_settings(&profile.settings);
 
         if profile.window_update > 0 {
@@ -383,6 +417,7 @@ impl H2Engine {
             remote_settings_received: false,
             headers_priority,
             priority_config: profile.priority_config.clone(),
+            priority_dependencies: PriorityDependencies::default(),
             last_client_stream_id: None,
             flow_control,
             hpack_policy,
@@ -496,7 +531,8 @@ impl H2Engine {
     ///
     /// Stream dependency is computed according to `StreamDepPolicy`:
     /// - `Flat`: always depends on stream 0
-    /// - `Chain`: depends on the previous client stream ID
+    /// - `Chain`: previous encoded client stream, including closed streams
+    /// - `PriorityChain`: newest active stream in the nearest equal/higher band
     pub fn build_headers<N: AsRef<str>, V: AsRef<str>>(
         &mut self,
         stream_id: u32,
@@ -504,7 +540,21 @@ impl H2Engine {
         end_stream: bool,
         req_priority: Option<crate::profile::RequestPriority>,
     ) -> Vec<H2Frame> {
-        let priority = self.resolve_priority(stream_id, req_priority);
+        self.build_headers_with_weight(stream_id, headers, end_stream, req_priority, None)
+    }
+
+    fn build_headers_with_weight<N: AsRef<str>, V: AsRef<str>>(
+        &mut self,
+        stream_id: u32,
+        headers: &[(N, V)],
+        end_stream: bool,
+        req_priority: Option<crate::profile::RequestPriority>,
+        weight_override: Option<u8>,
+    ) -> Vec<H2Frame> {
+        let mut priority = self.resolve_priority(stream_id, req_priority);
+        if let (Some(priority), Some(weight)) = (&mut priority, weight_override) {
+            priority.weight = weight;
+        }
 
         let header_block = match &self.hpack_policy {
             Some(policy) => self.state.encode_headers_with_policy(headers, &**policy),
@@ -552,16 +602,39 @@ impl H2Engine {
             }
         }
 
+        if self.priority_config.stream_dep_policy == crate::profile::StreamDepPolicy::PriorityChain
+            && priority.is_some()
+            && self
+                .state
+                .get_stream(stream_id)
+                .is_some_and(|stream| stream.state().is_active())
+        {
+            let urgency = self
+                .priority_config
+                .effective_priority(req_priority)
+                .urgency;
+            self.priority_dependencies.track(stream_id, urgency);
+        }
+
         if end_stream {
             if let Some(stream) = self.state.get_stream_mut(stream_id) {
                 let _ = stream.send_end_stream();
             }
+            self.forget_closed_priority_stream(stream_id);
         }
-
-        // Track for Chain dependency policy
         self.last_client_stream_id = Some(stream_id);
 
         frames
+    }
+
+    fn forget_closed_priority_stream(&mut self, stream_id: u32) {
+        if self
+            .state
+            .get_stream(stream_id)
+            .is_none_or(|stream| stream.state().is_closed())
+        {
+            self.priority_dependencies.remove(stream_id);
+        }
     }
 
     /// Compute the H2 PrioritySpec for a given request.
@@ -571,7 +644,7 @@ impl H2Engine {
     /// 2. Else → use static `headers_priority` from profile (fallback)
     fn resolve_priority(
         &self,
-        _stream_id: u32,
+        stream_id: u32,
         req_priority: Option<crate::profile::RequestPriority>,
     ) -> Option<PrioritySpec> {
         let cfg = &self.priority_config;
@@ -581,6 +654,9 @@ impl H2Engine {
             let dep = match cfg.stream_dep_policy {
                 crate::profile::StreamDepPolicy::Flat => 0,
                 crate::profile::StreamDepPolicy::Chain => self.last_client_stream_id.unwrap_or(0),
+                crate::profile::StreamDepPolicy::PriorityChain => {
+                    self.priority_dependencies.parent(stream_id, rp.urgency)
+                }
             };
             Some(PrioritySpec {
                 exclusive: cfg.exclusive,
@@ -675,6 +751,7 @@ impl H2Engine {
                 if let Some(stream) = self.state.get_stream_mut(stream_id) {
                     let _ = stream.send_end_stream();
                 }
+                self.forget_closed_priority_stream(stream_id);
             }
         }
 
@@ -688,6 +765,7 @@ impl H2Engine {
             if let Some(stream) = self.state.get_stream_mut(stream_id) {
                 let _ = stream.send_end_stream();
             }
+            self.forget_closed_priority_stream(stream_id);
         }
 
         frames
@@ -733,13 +811,21 @@ impl H2Engine {
     // ── Frame builders (produce H2Frame without encoding) ────────────
 
     fn make_rst_stream(&mut self, stream_id: u32, error_code: u32) -> H2Frame {
-        if let Some(stream) = self.state.get_stream_mut(stream_id) {
-            stream.reset();
-        }
+        self.retire_reset_stream(stream_id);
         H2Frame::RstStream(RstStreamFrame {
             stream_id,
             error_code,
         })
+    }
+
+    fn retire_reset_stream(&mut self, stream_id: u32) {
+        if let Some(stream) = self.state.get_stream_mut(stream_id) {
+            stream.reset();
+        }
+        self.priority_dependencies.remove(stream_id);
+        self.flow_control.on_stream_closed(stream_id);
+        self.pending_data.retain(|data| data.stream_id != stream_id);
+        self.state.cleanup_closed_streams();
     }
 
     fn make_window_update(stream_id: u32, increment: u32) -> H2Frame {
@@ -816,18 +902,31 @@ impl H2Engine {
     /// detected (RFC 9113 §5.4.1) — see [`Self::local_connection_error`]. Both
     /// conditions mean the same thing to a caller asking "may I still put a
     /// request on this connection?", which is why they share one predicate.
+    /// Exhausting the 31-bit client stream ID space also drains the connection;
+    /// responses on already opened streams continue to be processed normally.
     pub fn is_goaway(&self) -> bool {
-        self.state.goaway_received() || self.local_goaway.is_some()
+        self.state.goaway_received()
+            || self.local_goaway.is_some()
+            || self.state.stream_ids_exhausted()
     }
 
-    /// The error code of a connection error *this endpoint* detected and
-    /// answered with a GOAWAY, if any.
+    /// The code of a locally sent GOAWAY, if any. This includes `NoError`
+    /// after the driver has completed a graceful close.
     ///
     /// Distinct from a GOAWAY we *received* ([`ConnState::goaway_received`]):
     /// this one means we terminated the connection, so no further inbound
     /// frames are processed by [`Self::process`].
     pub fn local_connection_error(&self) -> Option<H2ErrorCode> {
         self.local_goaway
+    }
+
+    pub(crate) fn graceful_shutdown_frame(&mut self) -> Option<H2Frame> {
+        if self.local_goaway.is_some() {
+            return None;
+        }
+        let frame = self.make_goaway(H2ErrorCode::NoError);
+        self.local_goaway = Some(H2ErrorCode::NoError);
+        Some(frame)
     }
 
     /// Get the connection-level send window size.
@@ -1123,6 +1222,7 @@ impl H2Engine {
             if let Some(stream) = self.state.get_stream_mut(stream_id) {
                 let _ = stream.recv_end_stream();
             }
+            self.forget_closed_priority_stream(stream_id);
         }
 
         events.push(H2Event::ResponseHeaders {
@@ -1231,6 +1331,7 @@ impl H2Engine {
 
         if frame.end_stream {
             self.flow_control.on_stream_closed(frame.stream_id);
+            self.forget_closed_priority_stream(frame.stream_id);
             self.state.cleanup_closed_streams();
         }
 
@@ -1316,10 +1417,7 @@ impl H2Engine {
     }
 
     fn handle_rst_stream(&mut self, frame: RstStreamFrame, events: &mut Vec<H2Event>) {
-        if let Some(stream) = self.state.get_stream_mut(frame.stream_id) {
-            stream.reset();
-        }
-        self.state.cleanup_closed_streams();
+        self.retire_reset_stream(frame.stream_id);
         events.push(H2Event::StreamReset {
             stream_id: frame.stream_id,
             error_code: frame.error_code,
@@ -1346,6 +1444,10 @@ impl H2Engine {
             .extensions
             .get::<crate::profile::RequestPriority>()
             .copied();
+        let weight = parts
+            .extensions
+            .get::<crate::profile::H2PriorityWeight>()
+            .map(|weight| weight.0);
 
         let method = parts.method.as_str();
         let authority = parts.uri.authority().map(|a| a.as_str()).unwrap_or("");
@@ -1362,7 +1464,13 @@ impl H2Engine {
         let has_body = body.as_ref().is_some_and(|b| !b.is_empty());
         let headers_end_stream = !has_body;
 
-        let mut frames = self.build_headers(stream_id, &ordered, headers_end_stream, req_priority);
+        let mut frames = self.build_headers_with_weight(
+            stream_id,
+            &ordered,
+            headers_end_stream,
+            req_priority,
+            weight,
+        );
 
         if let Some(body_data) = body {
             if !body_data.is_empty() {
@@ -1412,8 +1520,13 @@ impl H2Engine {
         let has_body = request.streaming || request.body.as_ref().is_some_and(|b| !b.is_empty());
         let headers_end_stream = !has_body;
 
-        let mut frames =
-            self.build_headers(stream_id, &ordered, headers_end_stream, request.priority);
+        let mut frames = self.build_headers_with_weight(
+            stream_id,
+            &ordered,
+            headers_end_stream,
+            request.priority,
+            request.h2_priority_weight,
+        );
 
         if let Some(body_data) = request.body {
             if !body_data.is_empty() {
@@ -1544,6 +1657,38 @@ mod tests {
         assert_eq!(engine.open_stream(), 1);
         assert_eq!(engine.open_stream(), 3);
         assert_eq!(engine.open_stream(), 5);
+    }
+
+    #[test]
+    fn firefox_156_starts_requests_on_stream_three() {
+        let (mut engine, _) = H2Engine::client(&crate::profile::firefox_156_h2());
+        assert_eq!(
+            engine.open_stream(),
+            3,
+            "Firefox reserves stream 1 for upgrades"
+        );
+        assert_eq!(engine.open_stream(), 5);
+    }
+
+    #[test]
+    fn last_valid_client_stream_id_drains_without_wrapping() {
+        let mut profile = crate::profile::chrome_155_h2();
+        profile.initial_stream_id = crate::profile::MAX_CLIENT_STREAM_ID;
+        let (mut engine, _) = H2Engine::client(&profile);
+        assert!(engine.can_open_stream());
+        let last = engine.open_stream();
+        assert_eq!(last, crate::profile::MAX_CLIENT_STREAM_ID);
+        let headers = engine.order_headers("GET", "https", "example.com", "/", &[]);
+        engine.build_headers(last, &headers, true, None);
+        assert!(!engine.can_open_stream());
+        assert!(engine.is_goaway());
+        let mut inbound = BytesMut::from(
+            &[
+                0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 1, 5, 0x7f, 0xff, 0xff, 0xff, 0x88,
+            ][..],
+        );
+        let (events, _) = engine.process(&mut inbound);
+        assert!(events.iter().any(|event| matches!(event, H2Event::ResponseHeaders { stream_id, end_stream: true, .. } if *stream_id == last)));
     }
 
     #[test]
@@ -1847,6 +1992,50 @@ mod tests {
     }
 
     // ── Body / flow-control tests ─────────────────────────────────────
+
+    #[test]
+    fn abandoned_h2_reset_discards_only_its_flow_control_blocked_body() {
+        for remote_reset in [false, true] {
+            let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+            let cancelled = engine.open_stream();
+            let retained = engine.open_stream();
+            let body = Bytes::from(vec![0x41; 65536]);
+            engine.build_data(cancelled, body, true);
+            engine.build_data(retained, Bytes::from_static(b"retained"), true);
+            assert_eq!(engine.pending_data.len(), 2);
+
+            if remote_reset {
+                engine.handle_rst_stream(
+                    RstStreamFrame {
+                        stream_id: cancelled,
+                        error_code: 8,
+                    },
+                    &mut Vec::new(),
+                );
+            } else {
+                engine.send_rst_stream(cancelled, 8, &mut BytesMut::new());
+            }
+            assert_eq!(
+                engine.pending_data.len(),
+                1,
+                "reset retained the cancelled upload"
+            );
+            assert_eq!(engine.pending_data[0].stream_id, retained);
+            assert!(engine.state.get_stream(cancelled).is_none());
+            engine.retire_reset_stream(cancelled);
+            assert_eq!(
+                engine.pending_data.len(),
+                1,
+                "repeated reset must preserve other streams"
+            );
+            engine.state.update_send_window(65536).unwrap();
+            let frames = engine.drain_pending_data();
+            assert!(frames
+                .iter()
+                .all(|frame| matches!(frame, H2Frame::Data(data) if data.stream_id == retained)));
+            assert!(engine.pending_data.is_empty());
+        }
+    }
 
     #[test]
     fn test_build_data_small_body_single_frame() {
@@ -2461,6 +2650,220 @@ mod tests {
                 "third stream should depend on second"
             );
         }
+    }
+
+    #[test]
+    fn chrome_completed_stream_is_not_a_priority_parent() {
+        let (mut engine, _) = H2Engine::client(&crate::profile::chrome_155_h2());
+        let headers = engine.order_headers("GET", "https", "example.com", "/", &[]);
+        let first = engine.open_stream();
+        engine.build_headers(
+            first,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::navigation()),
+        );
+        let mut inbound =
+            BytesMut::from(&[0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88][..]);
+        let (events, _) = engine.process(&mut inbound);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            H2Event::ResponseHeaders {
+                end_stream: true,
+                ..
+            }
+        )));
+        let second = engine.open_stream();
+        let frames = engine.build_headers(
+            second,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(
+            frame.priority.unwrap().stream_dependency,
+            0,
+            "completed navigation is no longer a parent"
+        );
+    }
+
+    #[test]
+    fn chrome_priority_parent_uses_nearest_active_band() {
+        let (mut engine, _) = H2Engine::client(&crate::profile::chrome_155_h2());
+        let headers = engine.order_headers("GET", "https", "example.com", "/", &[]);
+        let fetch = engine.open_stream();
+        engine.build_headers(
+            fetch,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        let navigation = engine.open_stream();
+        let frames = engine.build_headers(
+            navigation,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::navigation()),
+        );
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(
+            frame.priority.unwrap().stream_dependency,
+            0,
+            "higher priority is inserted above active fetch"
+        );
+        let image = engine.open_stream();
+        let frames = engine.build_headers(
+            image,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::image()),
+        );
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(
+            frame.priority.unwrap().stream_dependency,
+            fetch,
+            "closest higher priority band is fetch"
+        );
+    }
+
+    #[test]
+    fn chrome_reset_stream_is_not_a_priority_parent() {
+        let (mut engine, _) = H2Engine::client(&crate::profile::chrome_155_h2());
+        let headers = engine.order_headers("GET", "https", "example.com", "/", &[]);
+        let first = engine.open_stream();
+        engine.build_headers(
+            first,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        engine.send_rst_stream(first, 8, &mut BytesMut::new());
+        let next = engine.open_stream();
+        let frames = engine.build_headers(
+            next,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(frame.priority.unwrap().stream_dependency, 0);
+    }
+
+    #[test]
+    fn explicit_linear_chain_preserves_legacy_wire_dependencies() {
+        let mut profile = crate::profile::chrome_155_h2();
+        profile.priority_config.stream_dep_policy = crate::profile::StreamDepPolicy::Chain;
+        let (mut engine, _) = H2Engine::client(&profile);
+        let headers = engine.order_headers("GET", "https", "example.com", "/", &[]);
+        let first = engine.open_stream();
+        engine.build_headers(
+            first,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        engine.send_rst_stream(first, 8, &mut BytesMut::new());
+        let next = engine.open_stream();
+        let frames = engine.build_headers(
+            next,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::navigation()),
+        );
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(frame.priority.unwrap().stream_dependency, first);
+        assert!(engine.priority_dependencies.priorities.is_empty());
+    }
+
+    #[test]
+    fn chrome_priority_dependencies_follow_both_stream_halves() {
+        let (mut engine, _) = H2Engine::client(&crate::profile::chrome_155_h2());
+        let headers = engine.order_headers("POST", "https", "example.com", "/", &[]);
+        let upload = engine.open_stream();
+        engine.build_headers(
+            upload,
+            &headers,
+            false,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        let mut response =
+            BytesMut::from(&[0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88][..]);
+        let _ = engine.process(&mut response);
+        let next = engine.open_stream();
+        let frames = engine.build_headers(
+            next,
+            &headers,
+            true,
+            Some(crate::profile::RequestPriority::fetch()),
+        );
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(
+            frame.priority.unwrap().stream_dependency,
+            upload,
+            "upload is still active after response end"
+        );
+        engine.build_data(upload, Bytes::new(), true);
+        assert!(!engine
+            .priority_dependencies
+            .priorities
+            .contains_key(&upload));
+        let mut reset = BytesMut::from(&[0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8][..]);
+        let _ = engine.process(&mut reset);
+        assert!(engine.priority_dependencies.priorities.is_empty());
+        assert!(engine
+            .priority_dependencies
+            .bands
+            .iter()
+            .all(BTreeSet::is_empty));
+    }
+
+    #[test]
+    fn request_weight_override_is_independent_and_does_not_create_priority() {
+        let (mut engine, _) = H2Engine::client(&crate::profile::firefox_156_h2());
+        let stream = engine.open_stream();
+        let request = crate::adapter::NativeH2Request::new(
+            http::Method::GET,
+            "https://example.com/favicon.ico".parse().unwrap(),
+            http::HeaderMap::new(),
+            None,
+            Some(crate::profile::RequestPriority::custom(6, false)),
+        )
+        .with_h2_priority_weight(21);
+        let frames = engine.build_native_request(stream, request);
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert_eq!(frame.priority.unwrap().weight, 21);
+        assert_eq!(frame.priority.unwrap().stream_dependency, 0);
+        assert!(!frame.priority.unwrap().exclusive);
+        let (mut safari, _) = H2Engine::client(&crate::profile::safari_26_h2());
+        let stream = safari.open_stream();
+        let request = crate::adapter::NativeH2Request::new(
+            http::Method::GET,
+            "https://example.com/".parse().unwrap(),
+            http::HeaderMap::new(),
+            None,
+            None,
+        )
+        .with_h2_priority_weight(255);
+        let frames = safari.build_native_request(stream, request);
+        let H2Frame::Headers(frame) = &frames[0] else {
+            panic!("HEADERS expected")
+        };
+        assert!(frame.priority.is_none());
     }
 
     #[test]

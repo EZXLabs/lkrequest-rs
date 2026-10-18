@@ -27,11 +27,10 @@
 //! internally.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 
 use crate::proxy::{
     BufferedProxyProvider, FnProxyProvider, ProxyConfig, ProxyProvider, ProxyRotator,
@@ -94,7 +93,32 @@ pub(crate) struct ProxyPoolInner {
     cooldown_counts: Mutex<HashMap<String, u32>>,
     pub(crate) bad_proxy_config: BadProxyConfig,
     health_check: Option<HealthCheckConfig>,
-    pub(crate) shutdown: AtomicBool,
+    availability: Notify,
+    maintenance: PoolMaintenance,
+    direct: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct PoolMaintenance(Mutex<Option<tokio::task::JoinHandle<()>>>);
+
+impl PoolMaintenance {
+    pub(crate) fn start(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut current = self.0.lock().unwrap();
+        if current.as_ref().is_none_or(|task| task.is_finished()) {
+            *current = Some(runtime.spawn(task));
+        }
+    }
+}
+
+impl Drop for PoolMaintenance {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.get_mut().unwrap().take() {
+            task.abort();
+        }
+    }
 }
 
 impl ProxyPool {
@@ -108,10 +132,15 @@ impl ProxyPool {
     /// Waits for a semaphore permit if the pool is at capacity, then selects
     /// the next usable proxy from the provider (skipping proxies in cooldown
     /// or permanently removed).
+    /// A configured nonempty provider never falls back to a direct connection.
+    /// Acquisitions wait for cooldown recovery; if every proxy is permanently
+    /// removed they remain pending. Wrap the future in a timeout or cancel it
+    /// when waiting is no longer useful. Cancellation releases its permit.
     ///
     /// Returns a [`ProxyGuard`] that releases the permit on drop.
     pub async fn acquire(&self) -> ProxyGuard {
         tracing::trace!("proxy_pool.acquiring");
+        Self::spawn_maintenance_task(Arc::clone(&self.inner));
 
         let permit = self
             .inner
@@ -121,7 +150,25 @@ impl ProxyPool {
             .await
             .expect("semaphore closed");
 
-        let proxy = self.next_usable_proxy().await;
+        let proxy = if self.inner.direct {
+            None
+        } else {
+            loop {
+                let changed = self.inner.availability.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some(proxy) = self.next_usable_proxy().await {
+                    break Some(proxy);
+                }
+                match self.next_retry_delay() {
+                    Some(delay) => tokio::select! {
+                        _ = &mut changed => {},
+                        _ = tokio::time::sleep(delay) => {},
+                    },
+                    None => changed.await,
+                }
+            }
+        };
 
         tracing::debug!("proxy_pool.acquired");
 
@@ -146,6 +193,10 @@ impl ProxyPool {
         self.inner.max_proxies
     }
 
+    pub(crate) fn ensure_maintenance(&self) {
+        Self::spawn_maintenance_task(Arc::clone(&self.inner));
+    }
+
     /// Mark a proxy as bad by its identity string.
     ///
     /// Feeds the sliding-window failure counter.  When the threshold is reached,
@@ -154,6 +205,36 @@ impl ProxyPool {
     /// No-op for dynamic providers (ephemeral identities).
     pub fn mark_bad_proxy(&self, identity: &str) {
         record_bad_proxy(&self.inner, identity.to_string());
+    }
+
+    fn next_retry_delay(&self) -> Option<Duration> {
+        let provider = &self.inner.proxy_provider;
+        if provider.is_dynamic() {
+            return Some(Duration::from_millis(100));
+        }
+        let proxies = provider.all_proxies();
+        let removed = self.inner.permanently_removed.lock().unwrap();
+        let cooldown = self.inner.cooldown.lock().unwrap();
+        let now = Instant::now();
+        let mut next = None;
+        for proxy in &proxies {
+            let identity = proxy.identity();
+            if removed.contains(&identity) {
+                continue;
+            }
+            let delay = cooldown
+                .get(&identity)
+                .and_then(|expiry| expiry.checked_duration_since(now))
+                .unwrap_or(Duration::from_millis(100));
+            next = Some(next.map_or(delay, |current: Duration| current.min(delay)));
+        }
+        // Custom static providers may not expose their membership. Retry them
+        // at a bounded rate; known permanently removed membership never spins.
+        if proxies.is_empty() {
+            Some(Duration::from_millis(100))
+        } else {
+            next
+        }
     }
 
     /// Select the next usable proxy, skipping those in cooldown or removed.
@@ -170,7 +251,7 @@ impl ProxyPool {
                 let identity = proxy.identity();
 
                 {
-                    let removed = self.inner.permanently_removed.lock().await;
+                    let removed = self.inner.permanently_removed.lock().unwrap();
                     if removed.contains(&identity) {
                         tracing::trace!(
                             proxy = %identity,
@@ -181,7 +262,7 @@ impl ProxyPool {
                 }
 
                 let in_cooldown = {
-                    let map = self.inner.cooldown.lock().await;
+                    let map = self.inner.cooldown.lock().unwrap();
                     map.get(&identity)
                         .is_some_and(|expires| Instant::now() < *expires)
                 };
@@ -202,26 +283,26 @@ impl ProxyPool {
 
     fn spawn_maintenance_task(inner: Arc<ProxyPoolInner>) {
         let check_interval = Duration::from_secs(30);
-
-        tokio::spawn(async move {
+        let weak = Arc::downgrade(&inner);
+        inner.maintenance.start(async move {
             let mut interval = tokio::time::interval(check_interval);
             let mut health_check_due = Instant::now();
             loop {
                 interval.tick().await;
 
-                if inner.shutdown.load(Ordering::Relaxed) {
-                    tracing::debug!("proxy_pool.maintenance_task_shutdown");
+                let Some(inner) = weak.upgrade() else {
                     break;
-                }
+                };
 
                 // 1. Clean up expired cooldown entries
                 {
-                    let mut cooldown = inner.cooldown.lock().await;
+                    let mut cooldown = inner.cooldown.lock().unwrap();
                     let now = Instant::now();
                     let before = cooldown.len();
                     cooldown.retain(|_, expires| now < *expires);
                     let recovered = before - cooldown.len();
                     if recovered > 0 {
+                        inner.availability.notify_waiters();
                         tracing::info!(
                             recovered = recovered,
                             "proxy_pool.cooldown_proxies_recovered",
@@ -252,14 +333,6 @@ impl Clone for ProxyPool {
     }
 }
 
-impl Drop for ProxyPool {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) <= 2 {
-            self.inner.shutdown.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ProxyGuard — RAII permit holder
 // ---------------------------------------------------------------------------
@@ -277,8 +350,7 @@ pub struct ProxyGuard {
 impl ProxyGuard {
     /// Get the proxy configuration held by this guard.
     ///
-    /// Returns `None` if no proxy was available from the provider (direct
-    /// connection scenario).
+    /// Returns `None` only for an explicitly empty fixed list (direct mode).
     pub fn proxy(&self) -> Option<&ProxyConfig> {
         self.proxy.as_ref()
     }
@@ -292,6 +364,22 @@ impl ProxyGuard {
             record_bad_proxy(&self.pool, proxy.identity());
         }
     }
+
+    pub(crate) fn is_usable(&self) -> bool {
+        let Some(proxy) = &self.proxy else {
+            return self.pool.direct;
+        };
+        if self.pool.proxy_provider.is_dynamic() {
+            return true;
+        }
+        let identity = proxy.identity();
+        let removed = self.pool.permanently_removed.lock().unwrap();
+        let cooldown = self.pool.cooldown.lock().unwrap();
+        !removed.contains(&identity)
+            && !cooldown
+                .get(&identity)
+                .is_some_and(|expiry| Instant::now() < *expiry)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,21 +391,19 @@ fn record_bad_proxy(inner: &Arc<ProxyPoolInner>, identity: String) {
         return;
     }
 
-    let pool_inner = Arc::clone(inner);
-    tokio::spawn(async move {
-        {
-            let removed = pool_inner.permanently_removed.lock().await;
-            if removed.contains(&identity) {
-                return;
-            }
+    {
+        // The removal lock serializes bad marks through their complete health
+        // transition. These locks protect only in-memory state and never await.
+        let mut removed = inner.permanently_removed.lock().unwrap();
+        if removed.contains(&identity) {
+            return;
         }
-
-        let config = &pool_inner.bad_proxy_config;
+        let config = &inner.bad_proxy_config;
         let now = Instant::now();
         let window_start = now - config.window;
 
         let failure_count = {
-            let mut failures = pool_inner.failures.lock().await;
+            let mut failures = inner.failures.lock().unwrap();
             let entries = failures.entry(identity.clone()).or_default();
             entries.retain(|t| *t > window_start);
             entries.push_back(now);
@@ -326,25 +412,24 @@ fn record_bad_proxy(inner: &Arc<ProxyPoolInner>, identity: String) {
 
         if failure_count >= config.failure_threshold {
             {
-                let mut failures = pool_inner.failures.lock().await;
+                let mut failures = inner.failures.lock().unwrap();
                 if let Some(entries) = failures.get_mut(&identity) {
                     entries.clear();
                 }
             }
 
-            let mut cooldown_map = pool_inner.cooldown.lock().await;
+            let mut cooldown_map = inner.cooldown.lock().unwrap();
             let expires = now + config.cooldown_duration;
             cooldown_map.insert(identity.clone(), expires);
 
             let cumulative = {
-                let mut counts = pool_inner.cooldown_counts.lock().await;
+                let mut counts = inner.cooldown_counts.lock().unwrap();
                 let count = counts.entry(identity.clone()).or_insert(0);
                 *count += 1;
                 *count
             };
 
             if cumulative >= config.max_cooldowns {
-                let mut removed = pool_inner.permanently_removed.lock().await;
                 removed.insert(identity.clone());
                 tracing::error!(
                     proxy = %identity,
@@ -368,7 +453,8 @@ fn record_bad_proxy(inner: &Arc<ProxyPoolInner>, identity: String) {
                 "proxy_pool.proxy_failure_recorded",
             );
         }
-    });
+    }
+    inner.availability.notify_waiters();
 }
 
 // ---------------------------------------------------------------------------
@@ -376,14 +462,14 @@ fn record_bad_proxy(inner: &Arc<ProxyPoolInner>, identity: String) {
 // ---------------------------------------------------------------------------
 
 async fn run_health_checks(inner: &Arc<ProxyPoolInner>, config: &HealthCheckConfig) {
-    let removed = inner.permanently_removed.lock().await;
-    let proxies: Vec<_> = inner
-        .proxy_provider
-        .all_proxies()
-        .into_iter()
-        .filter(|p| !removed.contains(&p.identity()))
-        .collect();
-    drop(removed);
+    let candidates = inner.proxy_provider.all_proxies();
+    let proxies: Vec<_> = {
+        let removed = inner.permanently_removed.lock().unwrap();
+        candidates
+            .into_iter()
+            .filter(|p| !removed.contains(&p.identity()))
+            .collect()
+    };
 
     if proxies.is_empty() {
         return;
@@ -434,10 +520,11 @@ async fn run_health_checks(inner: &Arc<ProxyPoolInner>, config: &HealthCheckConf
 /// A proxy answered the probe: drop it out of cooldown if it was in one.
 async fn record_health_check_success(inner: &Arc<ProxyPoolInner>, identity: &str) {
     let was_in_cooldown = {
-        let mut cooldown = inner.cooldown.lock().await;
+        let mut cooldown = inner.cooldown.lock().unwrap();
         cooldown.remove(identity).is_some()
     };
     if was_in_cooldown {
+        inner.availability.notify_waiters();
         tracing::info!(
             proxy = %identity,
             "proxy_pool.health_check_recovered_proxy",
@@ -452,7 +539,7 @@ async fn record_health_check_failure(inner: &Arc<ProxyPoolInner>, identity: Stri
     let bp = &inner.bad_proxy_config;
     let now = Instant::now();
     let window_start = now - bp.window;
-    let mut failures = inner.failures.lock().await;
+    let mut failures = inner.failures.lock().unwrap();
     let entries = failures.entry(identity).or_default();
     entries.retain(|t| *t > window_start);
     entries.push_back(now);
@@ -853,7 +940,11 @@ impl ProxyPoolBuilder {
     }
 
     /// Build the `ProxyPool`.
+    ///
+    /// Can be called outside a Tokio runtime. Maintenance starts in the current
+    /// runtime when available, otherwise on the first acquisition.
     pub fn build(self) -> ProxyPool {
+        let direct = self.custom_provider.is_none() && self.proxies.is_empty();
         let provider: Box<dyn ProxyProvider> = if let Some(p) = self.custom_provider {
             p
         } else {
@@ -876,7 +967,9 @@ impl ProxyPoolBuilder {
             cooldown_counts: Mutex::new(HashMap::new()),
             bad_proxy_config: self.bad_proxy_config,
             health_check: self.health_check,
-            shutdown: AtomicBool::new(false),
+            availability: Notify::new(),
+            maintenance: PoolMaintenance::default(),
+            direct,
         });
 
         ProxyPool::spawn_maintenance_task(Arc::clone(&inner));
@@ -889,13 +982,239 @@ impl ProxyPoolBuilder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn user_issue_5_proxy_pool_builds_without_runtime() {
+        let pool = ProxyPool::builder().max_proxies(1).build();
+        assert_eq!(pool.max_concurrent(), 1);
+    }
+
+    #[test]
+    fn user_issue_5_mark_bad_records_without_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let identity = proxy("http://127.0.0.1:19001").identity();
+        let pool = {
+            let _entered = runtime.enter();
+            ProxyPool::builder()
+                .proxies(vec![proxy("http://127.0.0.1:19001")])
+                .bad_proxy_config(BadProxyConfig {
+                    failure_threshold: 1,
+                    ..BadProxyConfig::default()
+                })
+                .build()
+        };
+        pool.mark_bad_proxy(&identity);
+        runtime.block_on(async {
+            assert!(pool.next_usable_proxy().await.is_none());
+        });
+    }
+
+    #[test]
+    fn user_issue_5_maintenance_starts_lazily_and_restarts_after_runtime_drop() {
+        let pool = ProxyPool::builder().build();
+        assert!(pool.inner.maintenance.0.lock().unwrap().is_none());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async { drop(pool.acquire().await) });
+        assert!(pool.inner.maintenance.0.lock().unwrap().is_some());
+        drop(runtime);
+        assert!(pool
+            .inner
+            .maintenance
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_finished());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            drop(pool.acquire().await);
+            assert!(!pool
+                .inner
+                .maintenance
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished());
+        });
+        drop(pool);
+    }
+
+    #[test]
+    fn user_issue_5_dropping_pool_aborts_maintenance_outside_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = {
+            let _entered = runtime.enter();
+            ProxyPool::builder().build()
+        };
+        let inner = Arc::downgrade(&pool.inner);
+        let abort = pool
+            .inner
+            .maintenance
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        drop(pool);
+        assert!(
+            inner.upgrade().is_none(),
+            "maintenance must not retain the pool"
+        );
+        runtime.block_on(async { tokio::task::yield_now().await });
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn user_issue_5_mark_bad_takes_effect_before_returning() {
+        let p = proxy("http://127.0.0.1:19001");
+        let id = p.identity();
+        let pool = ProxyPool::builder()
+            .proxies(vec![p])
+            .bad_proxy_config(BadProxyConfig {
+                failure_threshold: 1,
+                ..BadProxyConfig::default()
+            })
+            .build();
+        pool.mark_bad_proxy(&id);
+        assert!(pool.next_usable_proxy().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn user_issue_10_cooldown_expiry_returns_the_configured_proxy() {
+        let p = proxy("http://127.0.0.1:19001");
+        let id = p.identity();
+        let pool = ProxyPool::builder()
+            .proxies(vec![p])
+            .bad_proxy_config(BadProxyConfig {
+                failure_threshold: 1,
+                cooldown_duration: Duration::from_millis(30),
+                ..BadProxyConfig::default()
+            })
+            .build();
+        pool.mark_bad_proxy(&id);
+        let recovered = tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("cooldown timer should wake acquisition");
+        assert_eq!(recovered.proxy().unwrap().identity(), id);
+    }
+
+    #[tokio::test]
+    async fn user_issue_10_health_recovery_notifies_waiters() {
+        let p = proxy("http://127.0.0.1:19001");
+        let id = p.identity();
+        let pool = ProxyPool::builder()
+            .proxies(vec![p])
+            .bad_proxy_config(BadProxyConfig {
+                failure_threshold: 1,
+                ..BadProxyConfig::default()
+            })
+            .build();
+        pool.mark_bad_proxy(&id);
+        let acquisition = pool.acquire();
+        tokio::pin!(acquisition);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut acquisition)
+                .await
+                .is_err()
+        );
+        record_health_check_success(&pool.inner, &id).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(1), acquisition)
+            .await
+            .expect("health notification should interrupt the long cooldown wait");
+        assert_eq!(recovered.proxy().unwrap().identity(), id);
+    }
+
+    #[tokio::test]
+    async fn user_issue_10_dynamic_none_retries_without_direct_fallback() {
+        struct DelayedProvider(std::sync::atomic::AtomicUsize);
+        impl ProxyProvider for DelayedProvider {
+            fn next_proxy(&self) -> Option<ProxyConfig> {
+                (self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0)
+                    .then(|| proxy("http://127.0.0.1:19001"))
+            }
+            fn len(&self) -> usize {
+                1
+            }
+            fn is_dynamic(&self) -> bool {
+                true
+            }
+        }
+        let pool = ProxyPool::builder()
+            .proxy_provider(DelayedProvider(std::sync::atomic::AtomicUsize::new(0)))
+            .build();
+        let lease = tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("a later provider result should release acquisition");
+        assert_eq!(
+            lease.proxy().unwrap().identity(),
+            proxy("http://127.0.0.1:19001").identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_issue_10_cooling_fixed_proxy_never_becomes_direct() {
+        let p = proxy("http://127.0.0.1:19001");
+        let identity = p.identity();
+        let pool = ProxyPool::builder().proxies(vec![p]).max_proxies(1).build();
+        pool.inner
+            .cooldown
+            .lock()
+            .unwrap()
+            .insert(identity.clone(), Instant::now() + Duration::from_secs(60));
+
+        let unavailable = tokio::time::timeout(Duration::from_millis(10), pool.acquire()).await;
+        assert!(
+            unavailable.is_err(),
+            "cooldown must not produce a direct lease"
+        );
+        assert_eq!(pool.inner.semaphore.available_permits(), 1);
+
+        pool.inner.cooldown.lock().unwrap().remove(&identity);
+        let recovered = tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("cancelled acquisition must release capacity");
+        assert_eq!(recovered.proxy().unwrap().identity(), identity);
+    }
+
+    #[tokio::test]
+    async fn user_issue_10_removed_fixed_proxy_never_becomes_direct() {
+        let p = proxy("http://127.0.0.1:19001");
+        let identity = p.identity();
+        let pool = ProxyPool::builder().proxies(vec![p]).max_proxies(1).build();
+        pool.inner
+            .permanently_removed
+            .lock()
+            .unwrap()
+            .insert(identity);
+        let unavailable = tokio::time::timeout(Duration::from_millis(10), pool.acquire()).await;
+        assert!(
+            unavailable.is_err(),
+            "removal must not produce a direct lease"
+        );
+        assert_eq!(pool.inner.semaphore.available_permits(), 1);
+    }
+
     fn proxy(url: &str) -> ProxyConfig {
         ProxyConfig::parse(url).expect("valid proxy url")
     }
 
     /// Yield to the runtime until `pred` holds or we exhaust the budget.
-    /// `record_bad_proxy` does its work on a spawned task, so observable state
-    /// only settles after the current task yields a few times.
     async fn yield_until(mut pred: impl FnMut() -> bool) -> bool {
         for _ in 0..2000 {
             if pred() {
@@ -986,7 +1305,7 @@ mod tests {
         pool.inner
             .failures
             .lock()
-            .await
+            .unwrap()
             .get(identity)
             .map_or(0, |entries| entries.len())
     }
@@ -1022,10 +1341,10 @@ mod tests {
             "the non-MASQUE path must keep recording failures exactly as before"
         );
         assert!(
-            pool.inner.permanently_removed.lock().await.is_empty(),
+            pool.inner.permanently_removed.lock().unwrap().is_empty(),
             "a single health check never removes anything"
         );
-        assert!(pool.inner.cooldown.lock().await.is_empty());
+        assert!(pool.inner.cooldown.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1038,12 +1357,16 @@ mod tests {
         let id = masque.identity();
         let pool = ProxyPool::builder().proxies(vec![masque]).build();
         let expires = Instant::now() + Duration::from_secs(300);
-        pool.inner.cooldown.lock().await.insert(id.clone(), expires);
+        pool.inner
+            .cooldown
+            .lock()
+            .unwrap()
+            .insert(id.clone(), expires);
 
         run_health_checks(&pool.inner, &health_check_config()).await;
 
         assert_eq!(
-            pool.inner.cooldown.lock().await.get(&id).copied(),
+            pool.inner.cooldown.lock().unwrap().get(&id).copied(),
             Some(expires),
             "a skipped MASQUE proxy must stay in cooldown"
         );
@@ -1088,14 +1411,14 @@ mod tests {
         pool.inner
             .cooldown
             .lock()
-            .await
+            .unwrap()
             .insert(id.clone(), Instant::now() + Duration::from_secs(300));
 
         run_health_checks(&pool.inner, &health_check_config()).await;
 
         assert_eq!(recorded_failures(&pool, &id).await, 0);
         assert!(
-            !pool.inner.cooldown.lock().await.contains_key(&id),
+            !pool.inner.cooldown.lock().unwrap().contains_key(&id),
             "a healthy TCP proxy is recovered from cooldown"
         );
         stub.abort();
@@ -1112,13 +1435,13 @@ mod tests {
         pool.inner
             .cooldown
             .lock()
-            .await
+            .unwrap()
             .insert(id.clone(), Instant::now() + Duration::from_secs(300));
 
         run_health_checks(&pool.inner, &health_check_config_with_tunnel_probe()).await;
 
         assert_eq!(recorded_failures(&pool, &id).await, 0);
-        assert!(!pool.inner.cooldown.lock().await.contains_key(&id));
+        assert!(!pool.inner.cooldown.lock().unwrap().contains_key(&id));
         stub.abort();
     }
 
@@ -1171,7 +1494,7 @@ mod tests {
         pool.inner
             .cooldown
             .lock()
-            .await
+            .unwrap()
             .insert(masque_id.clone(), expires);
 
         run_health_checks(
@@ -1186,7 +1509,7 @@ mod tests {
             "a probe with no trust anchors must not blame the proxy it could not verify"
         );
         assert_eq!(
-            pool.inner.cooldown.lock().await.get(&masque_id).copied(),
+            pool.inner.cooldown.lock().unwrap().get(&masque_id).copied(),
             Some(expires),
             "skipping means no opinion: the proxy is not credited out of cooldown either"
         );
@@ -1252,7 +1575,7 @@ mod tests {
         let id = p.identity();
         let pool = ProxyPool::builder().proxies(vec![p]).build();
 
-        pool.inner.permanently_removed.lock().await.insert(id);
+        pool.inner.permanently_removed.lock().unwrap().insert(id);
         assert!(pool.next_usable_proxy().await.is_none());
     }
 
@@ -1266,7 +1589,7 @@ mod tests {
         pool.inner
             .cooldown
             .lock()
-            .await
+            .unwrap()
             .insert(id.clone(), Instant::now() + Duration::from_secs(60));
         assert!(pool.next_usable_proxy().await.is_none());
 
@@ -1274,7 +1597,7 @@ mod tests {
         pool.inner
             .cooldown
             .lock()
-            .await
+            .unwrap()
             .insert(id, Instant::now() - Duration::from_secs(1));
         assert!(pool.next_usable_proxy().await.is_some());
     }

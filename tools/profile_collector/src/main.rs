@@ -321,6 +321,8 @@ enum ChromePresetVersion {
     Chrome153,
     #[value(name = "chrome_154")]
     Chrome154,
+    #[value(name = "chrome_155")]
+    Chrome155,
 }
 
 struct CaptureChromeOptions {
@@ -481,6 +483,9 @@ struct OutputEchConfig {
 
 #[derive(Debug, Clone, Serialize)]
 struct H2Fingerprint {
+    /// First observed/configured client stream; absent without HEADERS evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_stream_id: Option<u32>,
     /// SETTINGS parameters in the order they appeared in the frame.
     settings: Vec<H2Setting>,
     /// Connection-level WINDOW_UPDATE increment (0 if not sent).
@@ -1182,39 +1187,33 @@ fn hpack_static_pseudo_header(index: usize) -> Option<&'static str> {
 }
 
 /// Decode an HPACK integer with the given prefix bit width.
-/// Returns (value, bytes_consumed).
-fn decode_hpack_integer(data: &[u8], prefix_bits: u8) -> (usize, usize) {
-    if data.is_empty() {
-        return (0, 0);
-    }
+/// Returns (value, bytes_consumed), or None for truncation or overflow.
+fn decode_hpack_integer(data: &[u8], prefix_bits: u8) -> Option<(usize, usize)> {
     let mask = (1u16 << prefix_bits) - 1;
-    let value = (data[0] & mask as u8) as usize;
+    let value = (*data.first()? & mask as u8) as usize;
     if value < mask as usize {
-        return (value, 1);
+        return Some((value, 1));
     }
     // Multi-byte integer
     let mut result = mask as usize;
-    let mut shift = 0usize;
-    let mut i = 1;
-    while i < data.len() {
-        let b = data[i];
-        result += ((b & 0x7f) as usize) << shift;
-        shift += 7;
-        i += 1;
+    let mut shift = 0u32;
+    for (offset, &b) in data[1..].iter().enumerate() {
+        let chunk = ((b & 0x7f) as usize).checked_mul(1usize.checked_shl(shift)?)?;
+        result = result.checked_add(chunk)?;
         if b & 0x80 == 0 {
-            break;
+            return Some((result, offset + 2));
         }
+        shift += 7;
     }
-    (result, i)
+    None
 }
 
 /// Skip over an HPACK string (Huffman or raw). Returns bytes consumed.
-fn skip_hpack_string(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    let (length, header_bytes) = decode_hpack_integer(data, 7);
-    header_bytes + length
+fn skip_hpack_string(data: &[u8]) -> Option<usize> {
+    let (length, header_bytes) = decode_hpack_integer(data, 7)?;
+    let end = header_bytes.checked_add(length)?;
+    data.get(..end)?;
+    Some(end)
 }
 
 /// Extract the pseudo-header order from HPACK-encoded header block data.
@@ -1230,7 +1229,9 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<String> {
 
         if byte & 0x80 != 0 {
             // Indexed header field (1xxxxxxx)
-            let (index, consumed) = decode_hpack_integer(&hpack_data[pos..], 7);
+            let Some((index, consumed)) = decode_hpack_integer(&hpack_data[pos..], 7) else {
+                break;
+            };
             pos += consumed;
 
             if let Some(name) = hpack_static_pseudo_header(index) {
@@ -1243,7 +1244,9 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<String> {
             }
         } else if byte & 0xc0 == 0x40 {
             // Literal with incremental indexing (01xxxxxx)
-            let (name_index, consumed) = decode_hpack_integer(&hpack_data[pos..], 6);
+            let Some((name_index, consumed)) = decode_hpack_integer(&hpack_data[pos..], 6) else {
+                break;
+            };
             pos += consumed;
 
             if name_index > 0 {
@@ -1256,13 +1259,18 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<String> {
                 }
             } else {
                 // Literal name — skip name string, check if pseudo
-                let name_len_consumed = skip_hpack_string(&hpack_data[pos..]);
+                let Some(name_len_consumed) = skip_hpack_string(&hpack_data[pos..]) else {
+                    break;
+                };
                 // Peek at the name to see if it's a pseudo-header
                 if pos < hpack_data.len() {
-                    let (str_len, str_header) = decode_hpack_integer(&hpack_data[pos..], 7);
+                    let Some((str_len, str_header)) = decode_hpack_integer(&hpack_data[pos..], 7)
+                    else {
+                        break;
+                    };
                     let is_huffman = hpack_data[pos] & 0x80 != 0;
                     let name_start = pos + str_header;
-                    if !is_huffman && name_start + str_len <= hpack_data.len() {
+                    if !is_huffman && str_len <= hpack_data.len() - name_start {
                         if let Ok(name) =
                             std::str::from_utf8(&hpack_data[name_start..name_start + str_len])
                         {
@@ -1277,14 +1285,21 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<String> {
                 pos += name_len_consumed;
             }
             // Skip value string
-            pos += skip_hpack_string(&hpack_data[pos..]);
+            let Some(consumed) = skip_hpack_string(&hpack_data[pos..]) else {
+                break;
+            };
+            pos += consumed;
         } else if byte & 0xe0 == 0x20 {
             // Dynamic table size update (001xxxxx)
-            let (_, consumed) = decode_hpack_integer(&hpack_data[pos..], 5);
+            let Some((_, consumed)) = decode_hpack_integer(&hpack_data[pos..], 5) else {
+                break;
+            };
             pos += consumed;
         } else {
             // Literal without indexing (0000xxxx) or never indexed (0001xxxx)
-            let (name_index, consumed) = decode_hpack_integer(&hpack_data[pos..], 4);
+            let Some((name_index, consumed)) = decode_hpack_integer(&hpack_data[pos..], 4) else {
+                break;
+            };
             pos += consumed;
 
             if name_index > 0 {
@@ -1299,7 +1314,10 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<String> {
                 // Literal name — stop (pseudo-headers always use indexed names)
                 break;
             }
-            pos += skip_hpack_string(&hpack_data[pos..]);
+            let Some(consumed) = skip_hpack_string(&hpack_data[pos..]) else {
+                break;
+            };
+            pos += consumed;
         }
     }
 
@@ -1445,6 +1463,7 @@ fn h2_fingerprint_from_profile(profile: &lkh2::profile::H2Profile) -> H2Fingerpr
         &pseudo_header_order,
     );
     H2Fingerprint {
+        initial_stream_id: Some(profile.initial_stream_id),
         settings,
         window_update: profile.window_update,
         priority_frames,
@@ -1901,6 +1920,7 @@ fn capture_h2_fingerprint(
     eprintln!("  Akamai hash (MD5):  {akamai_hash}");
 
     let fp = H2Fingerprint {
+        initial_stream_id: got_headers.then_some(request_stream_id),
         settings,
         window_update,
         priority_frames,
@@ -2291,6 +2311,7 @@ fn chrome_base_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome152 => lktls::profile::presets::chrome_152(),
         ChromePresetVersion::Chrome153 => lktls::profile::presets::chrome_153(),
         ChromePresetVersion::Chrome154 => lktls::profile::presets::chrome_154(),
+        ChromePresetVersion::Chrome155 => lktls::profile::presets::chrome_155(),
     }
 }
 
@@ -2304,6 +2325,7 @@ fn chrome_quic_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome152 => return lktls::profile::presets::chrome_152_quic(),
         ChromePresetVersion::Chrome153 => return lktls::profile::presets::chrome_153_quic(),
         ChromePresetVersion::Chrome154 => return lktls::profile::presets::chrome_154_quic(),
+        ChromePresetVersion::Chrome155 => return lktls::profile::presets::chrome_155_quic(),
         _ => {}
     }
 
@@ -2384,6 +2406,7 @@ fn chrome_h2_profile(version: ChromePresetVersion) -> lkh2::profile::H2Profile {
         ChromePresetVersion::Chrome152 => lkh2::profile::chrome_152_h2(),
         ChromePresetVersion::Chrome153 => lkh2::profile::chrome_153_h2(),
         ChromePresetVersion::Chrome154 => lkh2::profile::chrome_154_h2(),
+        ChromePresetVersion::Chrome155 => lkh2::profile::chrome_155_h2(),
     }
 }
 
@@ -2395,6 +2418,7 @@ fn chrome_quic_profile(version: ChromePresetVersion) -> lkh3::QuicProfile {
         ChromePresetVersion::Chrome152 => lkh3::chrome_152_quic(),
         ChromePresetVersion::Chrome153 => lkh3::chrome_153_quic(),
         ChromePresetVersion::Chrome154 => lkh3::chrome_154_quic(),
+        ChromePresetVersion::Chrome155 => lkh3::chrome_155_quic(),
         _ => lkh3::chrome_quic(),
     }
 }
@@ -3258,10 +3282,11 @@ fn parse_initial_crypto_frames(payload: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, St
             0x03 => skip_ack_frame(payload, &mut pos, true)?,
             0x06 => {
                 let offset = decode_varint(payload, &mut pos).map_err(|e| e.to_string())?;
-                let len = decode_varint(payload, &mut pos).map_err(|e| e.to_string())? as usize;
-                if pos + len > payload.len() {
+                let len = decode_varint(payload, &mut pos).map_err(|e| e.to_string())?;
+                if len > (payload.len() - pos) as u64 {
                     return Err("CRYPTO frame exceeds decrypted payload".into());
                 }
+                let len = len as usize;
                 crypto.push((offset, payload[pos..pos + len].to_vec()));
                 pos += len;
             }
@@ -3381,6 +3406,15 @@ fn parse_observed_initial_from_crypto(
     })
 }
 
+fn read_packet_length(packet: &[u8], pos: &mut usize, field: &str) -> Result<usize, String> {
+    let length =
+        try_decode_prefix_varint(packet, pos)?.ok_or_else(|| format!("truncated {field}"))?;
+    if length > (packet.len() - *pos) as u64 {
+        return Err(format!("{field} exceeds packet length"));
+    }
+    Ok(length as usize)
+}
+
 fn try_process_initial_packet(
     packet: &[u8],
     state: &mut PartialInitialCapture,
@@ -3416,38 +3450,23 @@ fn try_process_initial_packet(
 
     if version != 1 {
         if packet_type == 0 {
-            let token_len = try_decode_prefix_varint(packet, &mut pos)?
-                .ok_or_else(|| "truncated Initial token length".to_string())?
-                as usize;
+            let token_len = read_packet_length(packet, &mut pos, "Initial token length")?;
             pos += token_len;
         }
-        let payload_len = try_decode_prefix_varint(packet, &mut pos)?
-            .ok_or_else(|| "truncated QUIC payload length".to_string())?
-            as usize;
+        let payload_len = read_packet_length(packet, &mut pos, "QUIC payload length")?;
         return Ok(Some(pos + payload_len));
     }
 
     if packet_type != 0 {
-        let payload_len = try_decode_prefix_varint(packet, &mut pos)?
-            .ok_or_else(|| "truncated QUIC payload length".to_string())?
-            as usize;
+        let payload_len = read_packet_length(packet, &mut pos, "QUIC payload length")?;
         return Ok(Some(pos + payload_len));
     }
 
-    let token_len = try_decode_prefix_varint(packet, &mut pos)?
-        .ok_or_else(|| "truncated Initial token length".to_string())? as usize;
-    if pos + token_len > packet.len() {
-        return Err("Initial token exceeds packet length".into());
-    }
+    let token_len = read_packet_length(packet, &mut pos, "Initial token length")?;
     pos += token_len;
 
-    let payload_len = try_decode_prefix_varint(packet, &mut pos)?
-        .ok_or_else(|| "truncated Initial payload length".to_string())?
-        as usize;
+    let payload_len = read_packet_length(packet, &mut pos, "Initial payload length")?;
     let packet_len = pos + payload_len;
-    if packet_len > packet.len() {
-        return Err("Initial packet length exceeds datagram payload".into());
-    }
 
     let keys = derive_initial_keys(dcid, QuicKeySide::Server).map_err(|e| e.to_string())?;
     let hp = InitialHeaderProtection::new(&keys.remote.hp_key)?;
@@ -3519,13 +3538,13 @@ fn try_parse_h3_frame(buf: &[u8]) -> Result<Option<(u64, usize, usize)>, String>
         None => return Ok(None),
     };
     let len = match try_decode_prefix_varint(buf, &mut pos)? {
-        Some(value) => value as usize,
+        Some(value) => value,
         None => return Ok(None),
     };
-    if pos + len > buf.len() {
+    if len > (buf.len() - pos) as u64 {
         return Ok(None);
     }
-    Ok(Some((frame_type, pos, len)))
+    Ok(Some((frame_type, pos, len as usize)))
 }
 
 fn parse_h3_settings_payload(payload: &[u8]) -> Result<(Vec<(u64, u64)>, bool), String> {
@@ -4756,12 +4775,84 @@ mod tests {
     #[test]
     fn test_hpack_integer_decode() {
         // Single-byte: value < 2^prefix - 1
-        assert_eq!(decode_hpack_integer(&[0x82], 7), (2, 1)); // 0x82 & 0x7f = 2
-        assert_eq!(decode_hpack_integer(&[0x41], 6), (1, 1)); // 0x41 & 0x3f = 1
+        assert_eq!(decode_hpack_integer(&[0x82], 7), Some((2, 1))); // 0x82 & 0x7f = 2
+        assert_eq!(decode_hpack_integer(&[0x41], 6), Some((1, 1))); // 0x41 & 0x3f = 1
 
         // Multi-byte: value >= 2^prefix - 1
         // 7-bit prefix, value = 127 + 0 = 127
-        assert_eq!(decode_hpack_integer(&[0xff, 0x00], 7), (127, 2));
+        assert_eq!(decode_hpack_integer(&[0xff, 0x00], 7), Some((127, 2)));
+    }
+
+    #[test]
+    fn oversized_hpack_lengths_do_not_panic_or_fabricate_headers() {
+        for data in [
+            &[0x3f, 0xe1, 0xff, 0xff, 0xff, 0x0f][..],
+            &[0x40, 0x7f, 0x80, 0xff, 0xff, 0xff, 0x0f],
+            &[0x40, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            &[0x40, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        ] {
+            assert!(extract_pseudo_header_order(data).is_empty());
+        }
+    }
+
+    #[test]
+    fn oversized_quic_crypto_lengths_are_rejected() {
+        for length in [u32::MAX as u64, 1u64 << 32, (1u64 << 62) - 1] {
+            let mut payload = vec![0x06, 0x00];
+            lktls::extensions::quic_transport_params::encode_varint(length, &mut payload);
+            assert!(parse_initial_crypto_frames(&payload).is_err());
+        }
+    }
+
+    #[test]
+    fn oversized_h3_lengths_remain_incomplete() {
+        for length in [u32::MAX as u64, 1u64 << 32, (1u64 << 62) - 1] {
+            let mut payload = vec![0x00];
+            lktls::extensions::quic_transport_params::encode_varint(length, &mut payload);
+            assert_eq!(try_parse_h3_frame(&payload).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn bounded_quic_and_h3_lengths_preserve_payloads() {
+        assert_eq!(
+            parse_initial_crypto_frames(&[0x06, 0x02, 0x03, 1, 2, 3]).unwrap(),
+            vec![(2, vec![1, 2, 3])]
+        );
+        let frame = [0x00, 0x03, 1, 2, 3];
+        assert_eq!(try_parse_h3_frame(&frame).unwrap(), Some((0, 2, 3)));
+        assert_eq!(try_parse_h3_frame(&frame[..4]).unwrap(), None);
+        let mut pos = 0;
+        assert_eq!(
+            read_packet_length(&[0x02, 1, 2], &mut pos, "test").unwrap(),
+            2
+        );
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn oversized_initial_lengths_are_rejected_before_decryption() {
+        for version in [1u32, 2] {
+            for packet_type in [0u8, 1] {
+                for length in [u32::MAX as u64, 1u64 << 32, (1u64 << 62) - 1] {
+                    let mut packet = vec![0xc0 | (packet_type << 4)];
+                    packet.extend_from_slice(&version.to_be_bytes());
+                    packet.extend_from_slice(&[0, 0]);
+                    lktls::extensions::quic_transport_params::encode_varint(length, &mut packet);
+                    let mut state = PartialInitialCapture::default();
+                    assert!(try_process_initial_packet(&packet, &mut state).is_err());
+                    if packet_type == 0 {
+                        let mut packet = packet[..7].to_vec();
+                        packet.push(0);
+                        lktls::extensions::quic_transport_params::encode_varint(
+                            length,
+                            &mut packet,
+                        );
+                        assert!(try_process_initial_packet(&packet, &mut state).is_err());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4884,4 +4975,19 @@ mod tests {
         handle.join().unwrap();
         assert!(matches!(result.unwrap(), ConnectionData::HttpRequest));
     }
+}
+#[test]
+fn h2_export_preserves_stream_id_and_omits_unknown_observations() {
+    let mut fingerprint = h2_fingerprint_from_profile(&lkh2::profile::firefox_156_h2());
+    assert_eq!(fingerprint.initial_stream_id, Some(3));
+    assert_eq!(
+        serde_json::to_value(&fingerprint).unwrap()["initial_stream_id"],
+        3
+    );
+    fingerprint.initial_stream_id = None;
+    assert!(!serde_json::to_value(fingerprint)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("initial_stream_id"));
 }

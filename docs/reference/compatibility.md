@@ -25,3 +25,5 @@
 浏览器 milestone、平台、Finch、请求类型、session state、GREASE 和网络路径都会改变可观察行为。preset 应视为一个经过版本化审阅的配置快照，而不是“任何环境下都与浏览器完全相同”的保证。
 
 完整分级见[指纹 preset 支持与验证矩阵](presets.md)。
+
+TCP SYN 由运行平台的内核生成。`TcpFingerprint` 可调整部分 socket 参数，但窗口与缩放只能间接影响，MSS 当前仅在 Linux 应用，options 列表不会改写真实 SYN。Windows、Linux、macOS 的逐项支持及代理边界见 [TCP 指纹的平台支持与限制](tcp-fingerprint.md)。

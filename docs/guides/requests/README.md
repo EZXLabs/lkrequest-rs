@@ -112,4 +112,23 @@ Cookie 仍按上述规则排在它们之后。
 - 对带幂等键的 POST，可使用 `idempotency(Idempotency::Idempotent)` 明确声明可重放；声明错误可能造成重复写入。
 - `send_streaming()` 不执行普通 `send()` 的自动 redirect 和 Session retry 流程。
 
+### 显式 HTTP/3 兼容重试
+
+启用 `quic-h3` 后，可以为 Session 选择 `H3RetryMode::Chrome155ProtocolErrors`：
+
+```rust,ignore
+use lkrequest::retry::H3RetryMode;
+
+let session = client.session()
+    .http3_only()
+    .h3_retry_mode(H3RetryMode::Chrome155ProtocolErrors)
+    .build();
+```
+
+此模式在 H3 sender 尚未返回响应头时，对选定的协议错误最多额外重试两次。它适用于无请求体或已缓冲的请求体，包括可能已被服务端处理的 POST，因此可能重复产生服务端副作用。默认 `Safe` 和所有 preset 均不会自动启用它；单次请求的 `Idempotency::NotIdempotent` 可禁止这些额外重试。
+
+内部已经解码但尚未交给请求事务的早期响应头，不等于事务已经收到响应。响应正文或 trailer 阶段的协议错误不会触发此模式，一次性 streaming upload 也不会重放。`send()` 和 `send_streaming()` 都支持上述响应头之前的兼容重试；后者仍不执行普通 redirect 或状态码重试。
+
+严格 H3 请求继续使用 H3。其他请求只有在 `FallbackPolicy::AllowFallback` 且代理路由允许 TCP 时，才会在重试中暂时禁用该 hop 的 H3，并通过 TCP 协商 H1/H2。`NoFallback` 或仅允许网络错误回退的策略不会因此被放宽。重定向的新 hop 恢复原协议配置并获得独立预算，整条重定向链仍共用原总截止时间；外层 `RetryPolicy` 不会再次扩大已由此模式处理的重试链。该模式不改变 POST 的 0-RTT 发送资格，也不等同于 Chrome 的全部重试策略或完整连接选择行为。
+
 请求体和响应读取分别见：[请求体](bodies.md)、[响应处理](responses.md)。

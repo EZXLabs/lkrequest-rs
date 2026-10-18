@@ -20,6 +20,12 @@
   ],
   "extensions": [
     {
+      "extension_type": 2570,
+      "source": {
+        "type": "grease"
+      }
+    },
+    {
       "extension_type": 0,
       "source": {
         "type": "auto"
@@ -98,18 +104,6 @@
       }
     },
     {
-      "extension_type": 2570,
-      "source": {
-        "type": "grease"
-      }
-    },
-    {
-      "extension_type": 2570,
-      "source": {
-        "type": "grease"
-      }
-    },
-    {
       "extension_type": 17613,
       "source": {
         "type": "auto"
@@ -161,6 +155,12 @@
       "extension_type": 65281,
       "source": {
         "type": "auto"
+      }
+    },
+    {
+      "extension_type": 2570,
+      "source": {
+        "type": "grease"
       }
     }
   ],

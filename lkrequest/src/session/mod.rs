@@ -37,6 +37,8 @@ use crate::network_partition::{NetworkPartitionContext, PartitionedSessionStore}
 use crate::protocol::{AcquisitionPolicy, FallbackPolicy, HttpIntent, ProtocolPolicy, RacePolicy};
 use crate::proxy::ProxyConfig;
 use crate::response::HttpVersion;
+#[cfg(feature = "quic-h3")]
+use crate::retry::H3RetryMode;
 use crate::retry::RetryPolicy;
 
 #[cfg(feature = "synthetic-fp")]
@@ -56,7 +58,11 @@ const QUIC_DEFAULT_INITIAL_MTU: u16 = 1200;
 #[cfg(feature = "quic-h3")]
 pub(crate) enum H3ConnectOutcome {
     Handshake(lkh3::H3Connection),
-    ZeroRtt(lkh3::H3ZeroRttConnection),
+    ZeroRtt {
+        connection: lkh3::H3ZeroRttConnection,
+        handshake_started: tokio::time::Instant,
+        handshake_timeout: std::time::Duration,
+    },
 }
 
 #[cfg(feature = "quic-h3")]
@@ -64,7 +70,7 @@ impl H3ConnectOutcome {
     fn into_handshake(self) -> crate::error::Result<lkh3::H3Connection> {
         match self {
             Self::Handshake(connection) => Ok(connection),
-            Self::ZeroRtt(_) => Err(Error::InvalidConfig(
+            Self::ZeroRtt { .. } => Err(Error::InvalidConfig(
                 "internal error: unexpected HTTP/3 0-RTT connection".into(),
             )),
         }
@@ -810,6 +816,9 @@ pub(crate) struct SessionInner {
     /// Optional retry policy for failed requests.
     pub retry_policy: Option<Arc<dyn RetryPolicy>>,
 
+    #[cfg(feature = "quic-h3")]
+    pub h3_retry_mode: H3RetryMode,
+
     /// Per-session ECHConfigList override (raw DER bytes).
     /// Takes precedence over the client's `ech_config`.
     pub ech_config: Option<Vec<u8>>,
@@ -851,18 +860,15 @@ pub(crate) struct SessionInner {
     /// TLS handshake of the same request. See [`HttpsRrHandoff`].
     pub https_rr_handoff: Mutex<HttpsRrHandoff>,
 
-    /// QUIC handshakes currently in-flight, keyed by connection key.
-    ///
-    /// When two concurrent requests target the same origin and neither has
-    /// a pooled H3 connection yet, we want only one of them to run the
-    /// handshake; the other should wait and then reuse the pooled sender
-    /// instead of racing a second full QUIC handshake (and getting its
-    /// connection silently dropped when the pool inserts the first one's
-    /// sender over it). Each entry is an [`Arc<tokio::sync::Notify>`] that
-    /// the handshaking task will `notify_waiters()` on completion.
+    /// Buffered QUIC establishments currently in flight, keyed by connection key.
+    /// The leader owns the channel sender; closing it wakes all waiters, even
+    /// those that have not polled their receiver before establishment completes.
     #[cfg(feature = "quic-h3")]
     pub quic_in_flight: Mutex<
-        std::collections::HashMap<crate::connection_pool::ConnectionKey, Arc<tokio::sync::Notify>>,
+        std::collections::HashMap<
+            crate::connection_pool::ConnectionKey,
+            tokio::sync::watch::Receiver<()>,
+        >,
     >,
 
     /// Outer HTTP/3 connections to MASQUE proxies, one per proxy identity.
@@ -906,6 +912,12 @@ impl Session {
 
     pub fn protocol_policy(&self) -> &ProtocolPolicy {
         &self.inner.protocol_policy
+    }
+
+    /// Returns the session's explicit HTTP/3 protocol-error retry mode.
+    #[cfg(feature = "quic-h3")]
+    pub fn h3_retry_mode(&self) -> H3RetryMode {
+        self.inner.h3_retry_mode
     }
 
     #[cfg(feature = "quic-h3")]
@@ -1189,7 +1201,7 @@ impl Session {
                 return;
             }
         };
-        match cookie_store::RawCookie::parse(set_cookie_header.to_string()) {
+        match cookie_jar::parse_set_cookie(set_cookie_header) {
             Ok(raw) => {
                 // This API takes verbatim `Set-Cookie` header syntax, so it is
                 // the origin-server path: the RFC 6265bis storage rules apply
@@ -2056,6 +2068,16 @@ impl Session {
         }
         transport_config.enable_segmentation_offload(packetization.enable_segmentation_offload);
         transport_config.enable_ecn(packetization.enable_ecn);
+        transport_config.stop_before_matching_reset(packetization.stop_before_matching_reset);
+        transport_config.ack_obligation_only(packetization.ack_obligation_only);
+        transport_config.reset_finished_on_stop(packetization.reset_finished_on_stop);
+        transport_config.pto_single_probe_with_gap(packetization.pto_single_probe_with_gap);
+        transport_config.chrome_pto_timing(packetization.chrome_pto_timing);
+        transport_config.chrome_loss_timing(packetization.chrome_loss_timing);
+        transport_config.reuse_rejected_0rtt_streams(packetization.reuse_rejected_0rtt_streams);
+        transport_config.chrome_rtt_quantization(packetization.chrome_rtt_quantization);
+        transport_config.queue_pto_while_blocked(packetization.queue_pto_while_blocked);
+        transport_config.discard_blocked_close(packetization.discard_blocked_close);
         if let Some(layout) = &packetization.initial_frame_layout {
             transport_config.initial_frame_layout(Some(build_initial_frame_layout_config(layout)));
         }
@@ -2159,12 +2181,14 @@ impl Session {
                         "remote DNS (socks5h) requires a SOCKS5 proxy for QUIC".into(),
                     )
                 })?;
-                let started = {
+                let (started, handshake_started) = {
                     let mut manager = client.quic_endpoint_manager_for(addr).lock().await;
-                    manager
+                    let handshake_started = tokio::time::Instant::now();
+                    let started = manager
                         .start_connect(lkquic::ConnectRequest::new(addr, server_name, quinn_config))
                         .await
-                        .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?
+                        .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?;
+                    (started, handshake_started)
                 };
                 let (connecting, endpoint_guard) = started.into_parts();
 
@@ -2178,7 +2202,7 @@ impl Session {
                                 "session.h3_connect_0rtt_available"
                             );
                             let h3_conn = tokio::time::timeout(
-                                quic_timeout,
+                                quic_timeout.saturating_sub(handshake_started.elapsed()),
                                 lkh3::connect_h3_0rtt(quic_conn, &quic_profile.h3, accepted),
                             )
                             .await
@@ -2197,7 +2221,11 @@ impl Session {
                                     format!("H3 0-RTT control setup: {e}"),
                                 )
                             })?;
-                            return Ok(H3ConnectOutcome::ZeroRtt(h3_conn));
+                            return Ok(H3ConnectOutcome::ZeroRtt {
+                                connection: h3_conn,
+                                handshake_started,
+                                handshake_timeout: quic_timeout,
+                            });
                         }
                         Err(connecting) => {
                             tracing::trace!(
@@ -2205,7 +2233,10 @@ impl Session {
                                 port,
                                 "session.h3_connect_0rtt_unavailable"
                             );
-                            tokio::time::timeout(quic_timeout, connecting)
+                            tokio::time::timeout(
+                                quic_timeout.saturating_sub(handshake_started.elapsed()),
+                                connecting,
+                            )
                                 .await
                                 .map_err(|_| {
                                     Error::timeout(
@@ -2220,7 +2251,10 @@ impl Session {
                         }
                     }
                 } else {
-                    tokio::time::timeout(quic_timeout, connecting)
+                    tokio::time::timeout(
+                        quic_timeout.saturating_sub(handshake_started.elapsed()),
+                        connecting,
+                    )
                         .await
                         .map_err(|_| {
                             Error::timeout(
@@ -2243,7 +2277,7 @@ impl Session {
                     format!(
                         "HTTP/3 control setup to {dial_host}:{dial_port} timed out after {quic_timeout:?}"
                     ),
-                    Some(crate::error::ConnectionPhase::QuicHandshake),
+                    Some(crate::error::ConnectionPhase::H3Negotiation),
                     Some(quic_timeout),
                 )
             })?
@@ -3377,7 +3411,7 @@ impl Default for ChromeLikeProtocolConfig {
 fn apply_legacy_protocol_policy_overrides(
     policy: &mut ProtocolPolicy,
     preferred_http_version: PreferredHttpVersion,
-    protocol_selection_policy: ProtocolSelectionPolicy,
+    protocol_selection_policy: Option<ProtocolSelectionPolicy>,
     chrome_like_protocol_config: ChromeLikeProtocolConfig,
 ) {
     match preferred_http_version {
@@ -3403,14 +3437,14 @@ fn apply_legacy_protocol_policy_overrides(
     }
 
     match protocol_selection_policy {
-        ProtocolSelectionPolicy::Deterministic => {
+        Some(ProtocolSelectionPolicy::Deterministic) => {
             if matches!(policy.acquisition, AcquisitionPolicy::Race(_))
                 && preferred_http_version == PreferredHttpVersion::Auto
             {
                 policy.acquisition = AcquisitionPolicy::EstablishBestAvailable;
             }
         }
-        ProtocolSelectionPolicy::ChromeLike => {
+        Some(ProtocolSelectionPolicy::ChromeLike) => {
             policy.acquisition = AcquisitionPolicy::Race(RacePolicy {
                 enable_tcp: true,
                 enable_quic: true,
@@ -3419,6 +3453,7 @@ fn apply_legacy_protocol_policy_overrides(
                 only_when_h3_advertised: true,
             });
         }
+        None => {}
     }
 }
 
@@ -3430,6 +3465,8 @@ pub struct SessionBuilder {
     https_only: bool,
     hsts_policy: Option<Arc<dyn crate::hsts::HstsPolicy>>,
     retry_policy: Option<Arc<dyn RetryPolicy>>,
+    #[cfg(feature = "quic-h3")]
+    h3_retry_mode: H3RetryMode,
     ech_config: Option<Vec<u8>>,
     middlewares: crate::middleware::MiddlewareStack,
     protocol_policy: Option<ProtocolPolicy>,
@@ -3455,6 +3492,8 @@ impl SessionBuilder {
             https_only: false,
             hsts_policy: None,
             retry_policy: None,
+            #[cfg(feature = "quic-h3")]
+            h3_retry_mode: H3RetryMode::Safe,
             ech_config: None,
             middlewares: Vec::new(),
             protocol_policy: None,
@@ -3581,6 +3620,24 @@ impl SessionBuilder {
     /// [`crate::retry::status_retry_is_replay_safe`] for the exact rules.
     pub fn retry_policy(mut self, policy: impl RetryPolicy + 'static) -> Self {
         self.retry_policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Select HTTP/3 protocol-error retries. Defaults to [`H3RetryMode::Safe`].
+    ///
+    /// `Chrome155ProtocolErrors` permits up to two extra attempts per redirect
+    /// hop for eligible protocol errors before response headers reach the
+    /// request transaction. Only absent or finite buffered request bodies are
+    /// eligible, including POST bodies that the peer may already have applied.
+    /// An explicit [`Idempotency::NotIdempotent`] opts that request out.
+    ///
+    /// The mode does not enable 0-RTT for additional methods, reset existing
+    /// request deadlines, retry response-body failures or status codes, or
+    /// enable redirects for [`RequestBuilder::send_streaming`]. It covers only
+    /// the Chrome 155 protocol-error branch, not all browser retry behavior.
+    #[cfg(feature = "quic-h3")]
+    pub fn h3_retry_mode(mut self, mode: H3RetryMode) -> Self {
+        self.h3_retry_mode = mode;
         self
     }
 
@@ -3711,7 +3768,7 @@ impl SessionBuilder {
 
     /// Set how `Auto` mode chooses between TCP and QUIC when both are viable.
     ///
-    /// The default is [`ProtocolSelectionPolicy::Deterministic`]. Use
+    /// Without an override, the client's protocol policy is inherited. Use
     /// [`ProtocolSelectionPolicy::ChromeLike`] to mimic Chromium's
     /// "main TCP job + alternative QUIC job" racing model when H3 has already
     /// been discovered via Alt-Svc or HTTPS DNS records.
@@ -3862,8 +3919,8 @@ impl SessionBuilder {
 
     /// Build the [`Session`].
     ///
-    /// If no TLS fingerprint was set on the `Client`, Chrome 144 defaults
-    /// are used (TLS + H2 + header order).
+    /// If no TLS fingerprint was set on the `Client`, Chrome 155 TLS/H2
+    /// defaults are used. Header-order overrides remain optional.
     pub fn build(self) -> Session {
         let SessionBuilder {
             client,
@@ -3872,6 +3929,8 @@ impl SessionBuilder {
             https_only,
             hsts_policy,
             retry_policy,
+            #[cfg(feature = "quic-h3")]
+            h3_retry_mode,
             ech_config,
             middlewares,
             protocol_policy: protocol_policy_override,
@@ -3889,8 +3948,9 @@ impl SessionBuilder {
         } = self;
 
         let preferred_http_version = preferred_http_version.unwrap_or(PreferredHttpVersion::Auto);
+        let protocol_selection_override = protocol_selection_policy;
         let protocol_selection_policy =
-            protocol_selection_policy.unwrap_or(ProtocolSelectionPolicy::Deterministic);
+            protocol_selection_override.unwrap_or(ProtocolSelectionPolicy::Deterministic);
         let chrome_like_protocol_config =
             chrome_like_protocol_config.unwrap_or_else(ChromeLikeProtocolConfig::default);
         let protocol_policy = protocol_policy_override.unwrap_or_else(|| {
@@ -3898,7 +3958,7 @@ impl SessionBuilder {
             apply_legacy_protocol_policy_overrides(
                 &mut policy,
                 preferred_http_version,
-                protocol_selection_policy,
+                protocol_selection_override,
                 chrome_like_protocol_config,
             );
             policy
@@ -3934,6 +3994,8 @@ impl SessionBuilder {
                 hsts_policy: hsts_policy.unwrap_or_else(|| Arc::new(crate::hsts::NoHsts)),
                 session_store,
                 retry_policy,
+                #[cfg(feature = "quic-h3")]
+                h3_retry_mode,
                 ech_config,
                 middlewares,
                 protocol_policy,
@@ -4960,6 +5022,155 @@ mod tests {
     }
 
     #[test]
+    fn wreq_cookie_empty_max_age_does_not_override_expires() {
+        for attributes in [
+            "Max-Age=; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=",
+            "Max-Age=; mAx-AgE = \t; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        ] {
+            let session = test_session();
+            let url = "https://example.com/";
+            session.set_cookie_raw(url, "sid=old; Path=/; Max-Age=3600");
+            session.set_cookie_raw(url, &format!("sid=new; Path=/; {attributes}"));
+            assert!(session.get_cookie(url, "sid").is_none(), "{attributes}");
+            assert!(session.cookie_header(url).is_none(), "{attributes}");
+            assert!(session.get_all_cookies().is_empty(), "{attributes}");
+        }
+    }
+
+    #[test]
+    fn wreq_cookie_empty_max_age_keeps_session_attributes_and_host_scope() {
+        let session = test_session();
+        let url = "https://example.com/api/item";
+        session.set_cookie_raw(
+            url,
+            "sid=Max-Age=; Path=/api; Secure; HttpOnly; SameSite=Lax; Max-Age=",
+        );
+        let cookies = session.get_cookies_with_attrs(url);
+        assert_eq!(cookies.len(), 1);
+        let cookie = &cookies[0];
+        assert_eq!(cookie.name, "sid");
+        assert_eq!(cookie.value, "Max-Age=");
+        assert_eq!(cookie.expires_unix, None);
+        assert!(cookie.host_only);
+        assert_eq!(cookie.domain.as_deref(), Some("example.com"));
+        assert_eq!(cookie.path, "/api");
+        assert!(cookie.secure && cookie.http_only);
+        assert_eq!(cookie.same_site.as_deref(), Some("Lax"));
+        assert!(session
+            .cookie_header("https://sub.example.com/api/item")
+            .is_none());
+        assert!(session
+            .cookie_header("http://example.com/api/item")
+            .is_none());
+
+        session.set_cookie_raw("https://example.com/", "Max-Age=value; Path=/; Max-Age=");
+        assert_eq!(
+            session
+                .get_cookie("https://example.com/", "Max-Age")
+                .as_deref(),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn wreq_cookie_empty_max_age_duplicates_keep_the_last_valid_value() {
+        let url = "https://example.com/";
+        for (attributes, seconds) in [
+            ("Max-Age=60; Max-Age=", 60),
+            ("Max-Age=; Max-Age=60", 60),
+            ("Max-Age=60; Max-Age=; Max-Age=120; Max-Age=", 120),
+            ("Max-Age=60; Max-Age=; Max-Age=bogus", 60),
+        ] {
+            let session = test_session();
+            let before = cookie::time::OffsetDateTime::now_utc().unix_timestamp();
+            session.set_cookie_raw(url, &format!("sid=value; Path=/; {attributes}"));
+            let after = cookie::time::OffsetDateTime::now_utc().unix_timestamp();
+            let cookies = session.get_cookies_with_attrs(url);
+            assert_eq!(cookies.len(), 1, "{attributes}");
+            let expires = cookies[0]
+                .expires_unix
+                .expect("valid Max-Age has a deadline");
+            assert!(
+                (before + seconds..=after + seconds).contains(&expires),
+                "{attributes}: unexpected deadline {expires}"
+            );
+        }
+    }
+
+    #[test]
+    fn wreq_cookie_response_headers_share_empty_max_age_policy() {
+        let session = test_session();
+        let url = Url::parse("https://example.com/").unwrap();
+        let mut headers = http::HeaderMap::new();
+        for header in [
+            "expired=gone; Path=/; Max-Age=; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            "session=live; Path=/; Max-Age=; Max-Age=",
+            "valid=live; Path=/; Max-Age=3600; Max-Age=; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            "deleted=gone; Path=/; Max-Age=0; Max-Age=",
+        ] {
+            headers.append(http::header::SET_COOKIE, header.parse().unwrap());
+        }
+        pipeline::store_cookies(&session, &headers, &url);
+        assert!(session.get_cookie(url.as_str(), "expired").is_none());
+        assert!(session.get_cookie(url.as_str(), "deleted").is_none());
+        assert_eq!(
+            session.get_cookie(url.as_str(), "valid").as_deref(),
+            Some("live")
+        );
+        let cookies = session.get_all_cookies();
+        assert_eq!(cookies.len(), 2);
+        let session_cookie = cookies
+            .iter()
+            .find(|cookie| cookie.name == "session")
+            .unwrap();
+        assert_eq!(session_cookie.expires_unix, None);
+        assert!(session_cookie.host_only);
+        assert_eq!(
+            session.cookie_header(url.as_str()).as_deref(),
+            Some("session=live; valid=live")
+        );
+    }
+
+    #[test]
+    fn wreq_cookie_valid_max_age_and_nonempty_malformed_controls() {
+        let url = "https://example.com/";
+        for attributes in [
+            "Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=3600",
+            "Max-Age=3600; Max-Age=invalid",
+        ] {
+            let session = test_session();
+            let before = cookie::time::OffsetDateTime::now_utc().unix_timestamp();
+            session.set_cookie_raw(url, &format!("sid=live; Path=/; {attributes}"));
+            let after = cookie::time::OffsetDateTime::now_utc().unix_timestamp();
+            let cookies = session.get_all_cookies();
+            assert_eq!(cookies.len(), 1, "{attributes}");
+            assert!(
+                (before + 3600..=after + 3600).contains(&cookies[0].expires_unix.unwrap()),
+                "{attributes}"
+            );
+        }
+        for age in ["0", "-1", "-999999999999999999999999999999"] {
+            let session = test_session();
+            session.set_cookie_raw(url, "sid=old; Path=/");
+            session.set_cookie_raw(
+                url,
+                &format!("sid=gone; Path=/; Max-Age={age}; Expires=Fri, 01 Jan 2100 00:00:00 GMT"),
+            );
+            assert!(session.get_cookie(url, "sid").is_none(), "{age}");
+            assert!(session.get_all_cookies().is_empty(), "{age}");
+        }
+        for age in ["9223372036854775807", "999999999999999999999999999999"] {
+            let session = test_session();
+            session.set_cookie_raw(url, &format!("sid=live; Path=/; Max-Age={age}"));
+            let cookies = session.get_all_cookies();
+            assert_eq!(cookies.len(), 1, "{age}");
+            assert_eq!(cookies[0].expires_unix, Some(253_402_300_799), "{age}");
+        }
+    }
+
+    #[test]
     fn cookies_with_attrs_reports_every_attribute() {
         let session = test_session();
         session.set_cookie_raw(
@@ -5466,6 +5677,7 @@ mod tests {
                 lkh3::chrome_152_quic(),
                 lkh3::chrome_153_quic(),
                 lkh3::chrome_154_quic(),
+                lkh3::chrome_155_quic(),
             ] {
                 let mut saw_real_version_first = false;
                 for random_byte in 0..=15 {

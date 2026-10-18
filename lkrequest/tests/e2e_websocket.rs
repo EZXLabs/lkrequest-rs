@@ -11,6 +11,53 @@ use lkrequest::Client;
 use lktls::profile::presets;
 use support::local_wss::start_local_wss_server;
 
+#[tokio::test]
+async fn ws_upgrade_origin_form_preserves_path_and_query() {
+    let wss = start_local_wss_server().await;
+    let session = chrome_client().session().http1_only().build();
+    let url = format!("{}/room%2Fprivate?q=a%2Fb&empty=#not-on-wire", wss.url);
+    let _ws = session
+        .websocket(&url)
+        .connect()
+        .await
+        .expect("WSS connect");
+    let request = wss.next_handshake().await;
+    assert_eq!(
+        request.request_line,
+        "GET /room%2Fprivate?q=a%2Fb&empty= HTTP/1.1"
+    );
+}
+
+#[tokio::test]
+async fn ws_upgrade_host_preserves_nondefault_port() {
+    let wss = start_local_wss_server().await;
+    let session = chrome_client().session().http1_only().build();
+    let _ws = session
+        .websocket(&wss.url)
+        .connect()
+        .await
+        .expect("WSS connect");
+    let request = wss.next_handshake().await;
+    assert_eq!(request.hosts, vec![format!("127.0.0.1:{}", wss.port)]);
+}
+
+#[tokio::test]
+async fn ws_upgrade_ipv6_authority_and_empty_query() {
+    let wss = support::local_wss::start_local_wss_server_on(std::net::IpAddr::V6(
+        std::net::Ipv6Addr::LOCALHOST,
+    ))
+    .await;
+    let session = chrome_client().session().http1_only().build();
+    let _ws = session
+        .websocket(&format!("{}/?", wss.url))
+        .connect()
+        .await
+        .expect("IPv6 WSS connect");
+    let request = wss.next_handshake().await;
+    assert_eq!(request.request_line, "GET /? HTTP/1.1");
+    assert_eq!(request.hosts, vec![format!("[::1]:{}", wss.port)]);
+}
+
 fn chrome_client() -> Client {
     Client::builder()
         .fingerprint(presets::chrome_144())
@@ -29,7 +76,7 @@ async fn ws_local_text_echo() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -57,7 +104,7 @@ async fn ws_local_binary_echo() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -84,7 +131,7 @@ async fn ws_local_multiple_messages() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -111,7 +158,7 @@ async fn ws_local_close_with_code() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -163,7 +210,7 @@ async fn ws_local_send_message_enum() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -189,7 +236,7 @@ async fn ws_local_custom_headers() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .header("X-Custom-WS", "test-value")
         .header("Origin", "https://localhost")
@@ -224,7 +271,7 @@ async fn ws_local_close_rejects_unsendable_codes() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -268,7 +315,7 @@ async fn ws_local_close_rejects_oversized_reason() {
     let client = chrome_client();
     let session = client.session().http1_only().build();
 
-    let mut ws = session
+    let ws = session
         .websocket(&wss.url)
         .connect()
         .await
@@ -344,7 +391,7 @@ async fn ws_public_text_echo() {
     }
     let session = builder.build();
 
-    let mut ws = retry!(
+    let ws = retry!(
         support::MAX_RETRIES,
         session.websocket("wss://ws.postman-echo.com/raw").connect(),
         "WebSocket connect"

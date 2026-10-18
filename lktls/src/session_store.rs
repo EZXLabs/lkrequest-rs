@@ -34,6 +34,24 @@ use crate::crypto::hkdf::HkdfAlgorithm;
 // Session ticket data
 // ---------------------------------------------------------------------------
 
+/// ALPS state associated with the handshake that established a session ticket.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AlpsSessionState {
+    /// Legacy or externally supplied ticket with no recorded ALPS history.
+    /// Retains legacy early-data eligibility without asserting no negotiation.
+    #[default]
+    Unknown,
+    /// The establishing handshake is known not to have negotiated ALPS.
+    NotNegotiated,
+    /// ALPS settings negotiated for the ticket's ALPN protocol.
+    Negotiated {
+        /// Settings sent by the client, including a valid empty payload.
+        client_settings: Vec<u8>,
+        /// Settings received from the server.
+        server_settings: Vec<u8>,
+    },
+}
+
 /// Data stored for a single TLS session ticket.
 ///
 /// Supports both TLS 1.3 (PSK-based) and TLS 1.2 (session ticket) resumption.
@@ -66,6 +84,9 @@ pub struct SessionTicketData {
 
     /// The ALPN protocol negotiated when this ticket was issued.
     pub alpn: Option<String>,
+
+    /// Effective ALPS settings, or an explicit unknown/not-negotiated state.
+    pub alps: AlpsSessionState,
 
     /// The HKDF algorithm for this ticket's cipher suite.
     pub hkdf_algorithm: HkdfAlgorithm,
@@ -372,6 +393,7 @@ pub fn parse_tls13_new_session_ticket(
         age_add,
         received_at: Instant::now(),
         alpn,
+        alps: AlpsSessionState::Unknown,
         hkdf_algorithm,
         aead_algorithm,
         master_secret: Vec::new(),
@@ -444,6 +466,7 @@ pub fn parse_tls12_new_session_ticket(
         age_add: 0,
         received_at: Instant::now(),
         alpn,
+        alps: AlpsSessionState::NotNegotiated,
         hkdf_algorithm: hkdf_alg,
         aead_algorithm: aead_alg,
         master_secret: master_secret.to_vec(),
@@ -470,6 +493,7 @@ mod tests {
             age_add: 12345,
             received_at: Instant::now(),
             alpn: Some("h2".to_string()),
+            alps: AlpsSessionState::Unknown,
             hkdf_algorithm: HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: Vec::new(),
@@ -573,6 +597,7 @@ mod tests {
             age_add: 0xFFFF_0000,
             received_at: Instant::now(),
             alpn: None,
+            alps: AlpsSessionState::Unknown,
             hkdf_algorithm: HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: Vec::new(),
@@ -607,6 +632,7 @@ mod tests {
             age_add: 0,
             received_at: Instant::now(),
             alpn: Some("http/1.1".to_string()),
+            alps: AlpsSessionState::Unknown,
             hkdf_algorithm: HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: vec![0xBB; 48],

@@ -662,27 +662,27 @@ impl WsConnection {
     }
 
     /// Send a text message (blocks).
-    pub fn send_text(&mut self, text: &str) -> Result<()> {
+    pub fn send_text(&self, text: &str) -> Result<()> {
         runtime().block_on(self.inner.send_text(text))
     }
 
     /// Send a binary message (blocks).
-    pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+    pub fn send_binary(&self, data: &[u8]) -> Result<()> {
         runtime().block_on(self.inner.send_binary(data))
     }
 
     /// Send a [`WsMessage`](crate::ws::WsMessage) (blocks).
-    pub fn send(&mut self, msg: crate::ws::WsMessage) -> Result<()> {
+    pub fn send(&self, msg: crate::ws::WsMessage) -> Result<()> {
         runtime().block_on(self.inner.send(msg))
     }
 
     /// Receive the next message (blocks).
-    pub fn recv(&mut self) -> Result<crate::ws::WsMessage> {
+    pub fn recv(&self) -> Result<crate::ws::WsMessage> {
         runtime().block_on(self.inner.recv())
     }
 
     /// Close the WebSocket connection (blocks).
-    pub fn close(&mut self, close_info: Option<(u16, &str)>) -> Result<()> {
+    pub fn close(&self, close_info: Option<(u16, &str)>) -> Result<()> {
         runtime().block_on(self.inner.close(close_info))
     }
 }
@@ -723,6 +723,13 @@ impl RequestBuilder {
     // -------------------------------------------------------------------
     // Builder methods (delegated — already sync)
     // -------------------------------------------------------------------
+
+    /// Override the existing legacy H2 HEADERS wire weight for this request.
+    pub fn h2_priority_weight(self, weight: u8) -> Self {
+        Self {
+            inner: self.inner.h2_priority_weight(weight),
+        }
+    }
 
     /// Add a cookie to this request only.
     pub fn cookie(self, name: &str, value: &str) -> Self {
@@ -1050,8 +1057,7 @@ pub struct SessionPool {
 impl SessionPool {
     /// Create a blocking `SessionPool` from an async [`crate::SessionPool`].
     ///
-    /// Note: The async `SessionPool::builder().build()` must be called inside
-    /// a Tokio context (it spawns a background task). Use
+    /// Pool construction does not require a Tokio context. Use
     /// [`SessionPool::build`] for a convenient blocking builder.
     pub fn new(inner: crate::SessionPool) -> Self {
         Self { inner }
@@ -1059,7 +1065,7 @@ impl SessionPool {
 
     /// Build a `SessionPool` in a blocking context.
     ///
-    /// This handles the runtime requirement for the background maintenance task.
+    /// Maintenance starts when the pool is used inside the blocking runtime.
     pub fn build(builder: crate::session_pool::SessionPoolBuilder) -> Self {
         let inner = runtime().block_on(async { builder.build() });
         Self { inner }

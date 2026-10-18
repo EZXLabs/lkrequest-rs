@@ -21,10 +21,10 @@ be removed in 0.3.0; drop it from your feature list now.
 
 ## Fingerprint safety
 
-`profile::chrome_154_h2()` and `profile::firefox_156_h2()` expose the current
+`profile::chrome_155_h2()` and `profile::firefox_156_h2()` expose the current
 Chrome and Firefox additions. Public captures retain Chrome 153's and Firefox
 147's H2 settings respectively, so these functions reuse those configurations.
-Use `lkrequest::preset::chrome_154()` or `firefox_156()` to pair H2 with the
+Use `lkrequest::preset::chrome_155()` or `firefox_156()` to pair H2 with the
 matching TLS profile and header order. Per-version evidence is listed in the
 [support matrix](../docs/reference/presets.md).
 

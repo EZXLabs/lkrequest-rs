@@ -1,5 +1,6 @@
 {
   "headers_priority": null,
+  "initial_stream_id": 1,
   "priority_frames": [],
   "pseudo_header_order": [
     "method",

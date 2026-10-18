@@ -25,3 +25,15 @@ CLAUDE.md
 
 # Local debugging scratch: contains live proxy credentials, must never be committed.
 /lkrequest/examples/basic_proxy.rs
+
+# Local fingerprint experiments and archived validation evidence.
+/.codex-captures-*/
+/.codex-preserved/
+/.codex-dns-runtime-poc/
+/.local-evidence/
+/captures/
+/design/audits/*.log
+/design/audits/*.jsonl
+
+# Machine-local connector configuration.
+/.mcp.json

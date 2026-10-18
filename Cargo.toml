@@ -81,7 +81,7 @@ bytes = "1"
 thiserror = "2"
 
 # WebSocket
-fastwebsockets = { version = "0.10", features = ["upgrade"] }
+fastwebsockets = { version = "0.10", features = ["upgrade", "unstable-split"] }
 
 # HTTP
 hyper = { version = "1", features = ["client", "http1"] }

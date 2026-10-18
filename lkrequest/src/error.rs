@@ -89,7 +89,9 @@ pub enum ConnectionClosedKind {
     Eof,
     /// HTTP/2 or HTTP/3 GOAWAY told the client to stop using the connection.
     Goaway,
-    /// HTTP/2 refused the stream and the request can be retried elsewhere.
+    /// The request was not processed (REFUSED_STREAM, H3_REQUEST_REJECTED,
+    /// GOAWAY cutoff, or
+    /// local refusal before dispatch) and can be retried elsewhere.
     RefusedStream,
     /// Local write failed because the connection was already closed.
     BrokenPipe,
@@ -251,6 +253,60 @@ impl ProxyError {
 // Top-level Error enum
 // ---------------------------------------------------------------------------
 
+/// The H3 response boundary reached by the caller when an operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3ResponseStage {
+    /// The H3 sender has not returned a response to its caller.
+    AwaitingResponse,
+    /// Final response headers have been consumed and body/trailer processing began.
+    ResponseBody,
+}
+
+/// Typed backend category used by the opt-in H3 protocol-error retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3FailureKind {
+    /// A typed H3 stream/connection protocol failure or peer stateless reset.
+    Protocol,
+    /// A failure outside that protocol-error category.
+    Other,
+}
+
+/// Opt-in H3 provenance that preserves the original error's public classification.
+#[derive(Debug)]
+pub struct H3RequestContext {
+    /// The caller's response boundary, independent of backend header decoding.
+    pub stage: H3ResponseStage,
+    /// Typed backend failure category.
+    pub kind: H3FailureKind,
+    /// Whether the backend had decoded final response headers before failing.
+    pub backend_final_received: bool,
+    /// Peer STOP code for a stopped upload, when present.
+    pub stopped_upload: Option<u64>,
+    /// Whether the typed backend reports termination of the whole connection.
+    pub connection_terminated: bool,
+    /// The error returned by the established H3 mapper.
+    pub source: Box<Error>,
+}
+
+impl fmt::Display for H3RequestContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl H3RequestContext {
+    /// Whether this failure terminates the connection rather than only its request stream.
+    pub fn connection_terminated(&self) -> bool {
+        self.connection_terminated
+    }
+}
+
+impl std::error::Error for H3RequestContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Top-level error type for all lkrequest operations.
 ///
 /// Marked `#[non_exhaustive]` so new variants (e.g. finer-grained transport
@@ -326,6 +382,10 @@ pub enum Error {
     #[error("H3 request failed: {0}")]
     Http3Request(String),
 
+    /// H3 request provenance attached only by an explicitly enabled retry mode.
+    #[error(transparent)]
+    H3RequestContext(Box<H3RequestContext>),
+
     /// A network / I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -389,6 +449,25 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns the H3 caller/backend provenance attached by an opt-in request mode.
+    pub fn h3_request_context(&self) -> Option<&H3RequestContext> {
+        match self {
+            Self::H3RequestContext(context) => Some(context),
+            _ => None,
+        }
+    }
+
+    /// Removes only H3 request-context wrappers for classification and pattern matching.
+    ///
+    /// Other error sources (for example a connection's underlying I/O error) are not unwrapped.
+    pub fn unwrapped(&self) -> &Error {
+        let mut error = self;
+        while let Self::H3RequestContext(context) = error {
+            error = &context.source;
+        }
+        error
+    }
+
     /// Whether a connection was rejected by the client's address-family policy.
     pub fn is_address_family_mismatch(&self) -> bool {
         fn contains(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -403,7 +482,7 @@ impl Error {
             }
             error.source().is_some_and(contains)
         }
-        match self {
+        match self.unwrapped() {
             Self::Io(error) => contains(error),
             Self::Proxy(error) => error
                 .source
@@ -443,7 +522,7 @@ impl Error {
             return false;
         }
         matches!(
-            self,
+            self.unwrapped(),
             Error::Timeout { .. }
                 | Error::Io(_)
                 | Error::Proxy(_)
@@ -456,7 +535,7 @@ impl Error {
                 | Error::H3(_)
                 | Error::Http3Request(_)
                 | Error::Connection(_)
-        ) || matches!(self, Error::Status { status, .. } if status.is_server_error())
+        ) || matches!(self.unwrapped(), Error::Status { status, .. } if status.is_server_error())
     }
 
     /// `true` if this error proves the request was **not processed** by the
@@ -476,7 +555,7 @@ impl Error {
     /// pipeline combines this with the request's method/idempotency via
     /// [`crate::retry::retry_is_replay_safe`].
     pub fn is_safe_to_replay(&self) -> bool {
-        match self {
+        match self.unwrapped() {
             // Connection establishment failed before the request was sent.
             Error::Tls(_) | Error::Proxy(_) | Error::QuicHandshake(_) => true,
             Error::QuicTransport(e) => e.phase == QuicPhase::Handshake,
@@ -499,9 +578,13 @@ impl Error {
         if self.is_address_family_mismatch() {
             return false;
         }
-        match self {
+        match self.unwrapped() {
             Error::QuicHandshake(_) => true,
             Error::QuicTransport(err) => err.phase == QuicPhase::Handshake,
+            Error::Timeout {
+                phase: Some(ConnectionPhase::QuicHandshake),
+                ..
+            } => true,
             // TLS failures over QUIC surface as Tls; the caller only treats
             // them as handshake failures if they happen on the QUIC path,
             // which is the context where this classifier is consulted.
@@ -521,12 +604,12 @@ impl Error {
     /// i.e. a per-request or per-stream failure that should NOT trigger H2
     /// fallback or broken-QUIC tracking.
     pub fn is_h3_request_failure(&self) -> bool {
-        matches!(self, Error::Http3Request(_))
+        matches!(self.unwrapped(), Error::Http3Request(_))
     }
 
     /// Returns the QUIC lifecycle phase, if this error is QUIC-specific.
     pub fn quic_phase(&self) -> Option<QuicPhase> {
-        match self {
+        match self.unwrapped() {
             Error::QuicHandshake(_) => Some(QuicPhase::Handshake),
             Error::Quic(_) => None,
             Error::QuicTransport(err) => Some(err.phase),
@@ -536,12 +619,12 @@ impl Error {
 
     /// Returns `true` if this is a `Status` error.
     pub fn is_status(&self) -> bool {
-        matches!(self, Error::Status { .. })
+        matches!(self.unwrapped(), Error::Status { .. })
     }
 
     /// Returns `true` if this is a `Timeout` error.
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Error::Timeout { .. })
+        matches!(self.unwrapped(), Error::Timeout { .. })
     }
 
     /// Returns `true` if this error occurred during DNS resolution.
@@ -566,7 +649,7 @@ impl Error {
 
     /// Returns the connection phase where the error occurred, if applicable.
     pub fn phase(&self) -> Option<ConnectionPhase> {
-        match self {
+        match self.unwrapped() {
             Error::Connection(ce) => Some(ce.phase),
             Error::Timeout { phase, .. } => *phase,
             Error::Proxy(_) => Some(ConnectionPhase::ProxyTunnel),
@@ -586,7 +669,7 @@ impl Error {
 
     /// Returns the status code if this is a `Status` error.
     pub fn status(&self) -> Option<StatusCode> {
-        match self {
+        match self.unwrapped() {
             Error::Status { status, .. } => Some(*status),
             _ => None,
         }
@@ -594,7 +677,7 @@ impl Error {
 
     /// Returns the TLS alert if this error originated from a TLS alert.
     pub fn as_tls_alert(&self) -> Option<&lktls::error::TlsAlert> {
-        match self {
+        match self.unwrapped() {
             Error::Tls(tls_err) => tls_err.as_alert(),
             _ => None,
         }
@@ -602,7 +685,7 @@ impl Error {
 
     /// Returns the proxy error details if this is a proxy error.
     pub fn as_proxy_error(&self) -> Option<&ProxyError> {
-        match self {
+        match self.unwrapped() {
             Error::Proxy(pe) => Some(pe),
             _ => None,
         }
@@ -621,7 +704,7 @@ impl Error {
     /// when a server closes an idle connection before the client's pool
     /// eviction timeout.
     pub(crate) fn is_connection_closed(&self) -> bool {
-        match self {
+        match self.unwrapped() {
             Error::ConnectionClosed { .. } => true,
             Error::Io(e) => matches!(
                 e.kind(),
@@ -645,7 +728,7 @@ impl Error {
     /// Returns the typed closed-connection category, if this error carries
     /// one or can be classified from a legacy string-only variant.
     pub fn connection_closed_kind(&self) -> Option<ConnectionClosedKind> {
-        match self {
+        match self.unwrapped() {
             Error::ConnectionClosed { kind, .. } => Some(*kind),
             Error::Io(e) => match e.kind() {
                 std::io::ErrorKind::ConnectionReset => Some(ConnectionClosedKind::Reset),
@@ -730,6 +813,154 @@ impl Error {
         }
     }
 
+    /// Preserve hyper's typed I/O cause before its display text loses it.
+    pub(crate) fn from_h1_error(error: hyper::Error, context: &str) -> Self {
+        use std::error::Error as _;
+        let message = format!("{context}: {error}");
+        let kind = if error.is_canceled() || error.is_closed() {
+            Some(ConnectionClosedKind::ChannelClosed)
+        } else if error.is_incomplete_message() {
+            Some(ConnectionClosedKind::Eof)
+        } else if error.is_user() || error.is_parse() {
+            None
+        } else {
+            let mut source = error.source();
+            let mut kind = None;
+            while let Some(cause) = source {
+                if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                    kind = match io.kind() {
+                        std::io::ErrorKind::ConnectionReset => Some(ConnectionClosedKind::Reset),
+                        std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof => Some(ConnectionClosedKind::Eof),
+                        std::io::ErrorKind::BrokenPipe => Some(ConnectionClosedKind::BrokenPipe),
+                        std::io::ErrorKind::NotConnected => {
+                            Some(ConnectionClosedKind::NotConnected)
+                        }
+                        _ => None,
+                    };
+                    if kind.is_some() {
+                        break;
+                    }
+                }
+                source = cause.source();
+            }
+            kind
+        };
+        match kind {
+            Some(kind) => Self::connection_closed(ConnectionPhase::HttpRequest, kind, message),
+            None if error.is_user() || error.is_parse() => Self::Http(message),
+            None => Self::http_or_connection_closed(ConnectionPhase::HttpRequest, message),
+        }
+    }
+
+    /// Attach typed retry provenance without changing the default error mapping.
+    #[cfg(feature = "quic-h3")]
+    pub(crate) fn h3_request_error_with_context(
+        phase: ConnectionPhase,
+        error: lkh3::H3Error,
+        response_started: bool,
+    ) -> Self {
+        let stage = if response_started {
+            H3ResponseStage::ResponseBody
+        } else {
+            H3ResponseStage::AwaitingResponse
+        };
+        let mut backend_final_received = response_started;
+        let mut stopped_upload = None;
+        let mut cause = &error;
+        loop {
+            match cause {
+                lkh3::H3Error::AfterFinalResponse(source) => {
+                    backend_final_received = true;
+                    cause = source;
+                }
+                lkh3::H3Error::StoppedUpload { stop_code, source } => {
+                    stopped_upload = Some(*stop_code);
+                    cause = source;
+                }
+                _ => break,
+            }
+        }
+        let kind = if h3_protocol_failure(cause) {
+            H3FailureKind::Protocol
+        } else {
+            H3FailureKind::Other
+        };
+        let connection_terminated = match cause {
+            lkh3::H3Error::Connection(_) => true,
+            lkh3::H3Error::Stream(error) => error.connection_error().is_some(),
+            _ => false,
+        };
+        Self::H3RequestContext(Box::new(H3RequestContext {
+            stage,
+            kind,
+            backend_final_received,
+            stopped_upload,
+            connection_terminated,
+            source: Box::new(Self::h3_request_error(phase, error, response_started)),
+        }))
+    }
+
+    /// Preserve backend connection closure and request-refusal provenance.
+    #[cfg(feature = "quic-h3")]
+    pub(crate) fn h3_request_error(
+        phase: ConnectionPhase,
+        mut error: lkh3::H3Error,
+        mut response_started: bool,
+    ) -> Self {
+        let mut upload_after_final = false;
+        let mut stopped_upload = None;
+        loop {
+            match error {
+                lkh3::H3Error::AfterFinalResponse(source) => {
+                    response_started = true;
+                    upload_after_final = true;
+                    error = *source;
+                }
+                lkh3::H3Error::StoppedUpload { stop_code, source } => {
+                    stopped_upload = Some(stop_code);
+                    error = *source;
+                }
+                _ => break,
+            }
+        }
+        let kind = match &error {
+            lkh3::H3Error::Connection(_)
+            | lkh3::H3Error::Stream(h3::error::StreamError::ConnectionError { .. }) => {
+                Some(ConnectionClosedKind::Generic)
+            }
+            lkh3::H3Error::Stream(h3::error::StreamError::RemoteTerminate { code, .. })
+                if *code == h3::error::Code::H3_REQUEST_REJECTED =>
+            {
+                Some(if response_started || stopped_upload.is_some() {
+                    ConnectionClosedKind::Reset
+                } else {
+                    ConnectionClosedKind::RefusedStream
+                })
+            }
+            lkh3::H3Error::Stream(error) if error.is_remote_closing() => {
+                Some(ConnectionClosedKind::Goaway)
+            }
+            _ if stopped_upload.is_some() => Some(ConnectionClosedKind::Reset),
+            _ => None,
+        };
+        let error = match stopped_upload {
+            Some(code) => format!("upload stopped by peer (code {code}); {error}"),
+            None => error.to_string(),
+        };
+        let message = if upload_after_final {
+            format!("error uploading request after response headers: {error}")
+        } else if response_started {
+            format!("error reading response body: {error}")
+        } else {
+            error
+        };
+        match kind {
+            Some(kind) => Self::connection_closed(phase, kind, message),
+            None => Self::http3_or_connection_closed(phase, message),
+        }
+    }
+
     /// Helper for HTTP/3 adapters that still receive string-only transport errors.
     #[cfg_attr(not(feature = "quic-h3"), allow(dead_code))]
     pub(crate) fn http3_or_connection_closed(
@@ -769,6 +1000,56 @@ impl Error {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(feature = "quic-h3")]
+fn h3_protocol_failure(error: &lkh3::H3Error) -> bool {
+    use h3::error::StreamError;
+    match error {
+        lkh3::H3Error::Stream(
+            StreamError::StreamError { .. } | StreamError::RemoteTerminate { .. },
+        ) => true,
+        lkh3::H3Error::Connection(error) => h3_connection_protocol_failure(error),
+        lkh3::H3Error::Stream(error) => error
+            .connection_error()
+            .is_some_and(h3_connection_protocol_failure),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "quic-h3")]
+fn h3_connection_protocol_failure(error: &h3::error::ConnectionError) -> bool {
+    use h3::error::{ConnectionError, LocalError};
+    match error {
+        ConnectionError::Local {
+            error: LocalError::Application { .. },
+            ..
+        } => true,
+        _ => error
+            .remote_error()
+            .is_some_and(h3_incoming_connection_protocol_failure),
+    }
+}
+
+#[cfg(feature = "quic-h3")]
+fn h3_incoming_connection_protocol_failure(error: &h3::quic::ConnectionErrorIncoming) -> bool {
+    use h3::quic::ConnectionErrorIncoming;
+    match error {
+        ConnectionErrorIncoming::ApplicationClose { .. } => true,
+        ConnectionErrorIncoming::ConnectionClosed { error_code } => {
+            // QUIC CRYPTO_ERROR carries a TLS alert, not an established H3 protocol failure.
+            !(0x100..=0x1ff).contains(error_code)
+        }
+        ConnectionErrorIncoming::Undefined(error) => {
+            // Quinn also puts local I/O-derived INTERNAL_ERROR and local closes here.
+            // Only a concrete peer stateless reset has the required provenance.
+            matches!(
+                error.as_ref().downcast_ref::<quinn::ConnectionError>(),
+                Some(quinn::ConnectionError::Reset)
+            )
+        }
+        _ => false,
+    }
+}
+
 fn classify_connection_closed_message(message: &str) -> Option<ConnectionClosedKind> {
     let m = message.to_ascii_lowercase();
     if m.contains("refused stream") {
@@ -801,6 +1082,286 @@ fn classify_connection_closed_message(message: &str) -> Option<ConnectionClosedK
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_handshake_timeout_classification_requires_the_exact_phase() {
+        for phase in [
+            None,
+            Some(ConnectionPhase::QuicHandshake),
+            Some(ConnectionPhase::H3Negotiation),
+            Some(ConnectionPhase::HttpRequest),
+            Some(ConnectionPhase::TcpConnect),
+        ] {
+            let error = Error::timeout("phase control", phase, Some(Duration::from_millis(200)));
+            assert_eq!(
+                error.is_quic_handshake_failure(),
+                phase == Some(ConnectionPhase::QuicHandshake)
+            );
+            assert!(
+                !error.is_safe_to_replay(),
+                "fallback classification does not authorize replay"
+            );
+        }
+    }
+
+    fn h3_context_wrap(source: Error) -> Error {
+        Error::H3RequestContext(Box::new(H3RequestContext {
+            stage: H3ResponseStage::AwaitingResponse,
+            kind: H3FailureKind::Other,
+            backend_final_received: false,
+            stopped_upload: None,
+            connection_terminated: false,
+            source: Box::new(source),
+        }))
+    }
+
+    #[test]
+    fn h3_context_delegates_legacy_classification_and_display() {
+        let errors = vec![
+            Error::Http3Request("protocol failed".into()),
+            Error::connection_closed(
+                ConnectionPhase::HttpRequest,
+                ConnectionClosedKind::RefusedStream,
+                "refused",
+            ),
+            Error::timeout(
+                "late",
+                Some(ConnectionPhase::HttpRequest),
+                Some(Duration::from_secs(1)),
+            ),
+            Error::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                url: "https://example.test".into(),
+            },
+            Error::quic(QuicPhase::Handshake, "setup failed"),
+            Error::proxy(ProxyErrorKind::AuthenticationFailed, "proxy failed", None),
+            Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            Error::Tls(lktls::error::TlsError::local_alert(
+                lktls::error::AlertDescription::BadCertificate,
+                "certificate rejected",
+            )),
+        ];
+        for source in errors {
+            let display = source.to_string();
+            let expected = (
+                source.is_retryable(),
+                source.is_safe_to_replay(),
+                source.is_timeout(),
+                source.is_status(),
+                source.is_quic_handshake_failure(),
+                source.is_h3_request_failure(),
+                source.phase(),
+                source.quic_phase(),
+                source.status(),
+                source.connection_closed_kind(),
+                source.is_connection_closed(),
+            );
+            let wrapped = h3_context_wrap(source);
+            assert_eq!(wrapped.to_string(), display);
+            assert_eq!(
+                (
+                    wrapped.is_retryable(),
+                    wrapped.is_safe_to_replay(),
+                    wrapped.is_timeout(),
+                    wrapped.is_status(),
+                    wrapped.is_quic_handshake_failure(),
+                    wrapped.is_h3_request_failure(),
+                    wrapped.phase(),
+                    wrapped.quic_phase(),
+                    wrapped.status(),
+                    wrapped.connection_closed_kind(),
+                    wrapped.is_connection_closed()
+                ),
+                expected
+            );
+            assert_eq!(
+                wrapped.as_proxy_error().map(|error| error.kind),
+                wrapped.unwrapped().as_proxy_error().map(|error| error.kind)
+            );
+            assert_eq!(
+                wrapped.as_tls_alert().map(ToString::to_string),
+                wrapped.unwrapped().as_tls_alert().map(ToString::to_string)
+            );
+            assert_eq!(
+                (
+                    wrapped.is_dns(),
+                    wrapped.is_tcp(),
+                    wrapped.is_tls_handshake(),
+                    wrapped.is_proxy_tunnel()
+                ),
+                (
+                    wrapped.unwrapped().is_dns(),
+                    wrapped.unwrapped().is_tcp(),
+                    wrapped.unwrapped().is_tls_handshake(),
+                    wrapped.unwrapped().is_proxy_tunnel()
+                )
+            );
+            let nested = h3_context_wrap(wrapped);
+            assert_eq!(nested.to_string(), display);
+            assert!(!matches!(nested.unwrapped(), Error::H3RequestContext(_)));
+        }
+    }
+
+    #[test]
+    fn h3_context_preserves_address_family_policy_exclusion() {
+        let io = crate::dns::IpFamily::Ipv4
+            .check("::1".parse().unwrap())
+            .unwrap_err();
+        let wrapped = h3_context_wrap(Error::Io(io));
+        assert!(wrapped.is_address_family_mismatch());
+        assert!(!wrapped.is_retryable());
+        assert!(!wrapped.is_quic_handshake_failure());
+    }
+
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn h3_context_preserves_caller_stage_and_refusal_protection() {
+        // This legacy string case verifies unchanged conversion and safety.
+        // Actual backend RESET classification is covered by local peer tests.
+        let refusal = || lkh3::H3Error::InvalidResponse("refused stream".into());
+        let plain = Error::h3_request_error(ConnectionPhase::HttpRequest, refusal(), false);
+        assert!(matches!(
+            plain,
+            Error::ConnectionClosed {
+                kind: ConnectionClosedKind::RefusedStream,
+                ..
+            }
+        ));
+        assert!(plain.h3_request_context().is_none());
+        let wrapped =
+            Error::h3_request_error_with_context(ConnectionPhase::HttpRequest, refusal(), false);
+        assert!(wrapped.is_safe_to_replay());
+        assert_eq!(
+            wrapped.h3_request_context().unwrap().stage,
+            H3ResponseStage::AwaitingResponse
+        );
+        let backend_final =
+            lkh3::H3Error::AfterFinalResponse(Box::new(lkh3::H3Error::StoppedUpload {
+                stop_code: 268,
+                source: Box::new(refusal()),
+            }));
+        let wrapped = Error::h3_request_error_with_context(
+            ConnectionPhase::HttpRequest,
+            backend_final,
+            false,
+        );
+        let context = wrapped.h3_request_context().unwrap();
+        assert_eq!(context.stage, H3ResponseStage::AwaitingResponse);
+        assert_eq!(context.kind, H3FailureKind::Other);
+        assert!(context.backend_final_received);
+        assert_eq!(context.stopped_upload, Some(268));
+        assert!(!context.connection_terminated());
+        assert!(!wrapped.is_safe_to_replay());
+        assert_eq!(
+            wrapped.connection_closed_kind(),
+            Some(ConnectionClosedKind::Reset)
+        );
+        let body =
+            Error::h3_request_error_with_context(ConnectionPhase::HttpRequest, refusal(), true);
+        assert_eq!(
+            body.h3_request_context().unwrap().stage,
+            H3ResponseStage::ResponseBody
+        );
+        // This legacy string fixture preserves its old classification even at
+        // the body stage; it is not a substitute for a typed peer RESET.
+        let legacy_body = Error::h3_request_error(ConnectionPhase::HttpRequest, refusal(), true);
+        assert_eq!(body.is_safe_to_replay(), legacy_body.is_safe_to_replay());
+    }
+
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn h3_context_classifies_typed_protocol_sources_without_string_matching() {
+        use h3::quic::ConnectionErrorIncoming;
+        let sources = vec![
+            (
+                ConnectionErrorIncoming::ApplicationClose { error_code: 0 },
+                true,
+            ),
+            (
+                ConnectionErrorIncoming::ApplicationClose { error_code: 0x102 },
+                true,
+            ),
+            (
+                ConnectionErrorIncoming::ConnectionClosed { error_code: 0 },
+                true,
+            ),
+            (
+                ConnectionErrorIncoming::ConnectionClosed { error_code: 0x12a },
+                false,
+            ),
+            (
+                ConnectionErrorIncoming::Undefined(std::sync::Arc::new(
+                    quinn::ConnectionError::Reset,
+                )),
+                true,
+            ),
+            (
+                ConnectionErrorIncoming::Undefined(std::sync::Arc::new(
+                    quinn::ConnectionError::LocallyClosed,
+                )),
+                false,
+            ),
+            (
+                ConnectionErrorIncoming::Undefined(std::sync::Arc::new(
+                    quinn::ConnectionError::TransportError(
+                        quinn::TransportErrorCode::INTERNAL_ERROR.into(),
+                    ),
+                )),
+                false,
+            ),
+            (
+                ConnectionErrorIncoming::Undefined(std::sync::Arc::new(
+                    quinn::ReadError::ZeroRttRejected,
+                )),
+                false,
+            ),
+            (
+                ConnectionErrorIncoming::InternalError("peer protocol reset".into()),
+                false,
+            ),
+            (ConnectionErrorIncoming::Timeout, false),
+        ];
+        for (source, protocol) in sources {
+            assert_eq!(
+                h3_incoming_connection_protocol_failure(&source),
+                protocol,
+                "{source:?}"
+            );
+        }
+        for source in [
+            lkh3::H3Error::Upload(std::io::Error::other(
+                "connection reset protocol refused stream",
+            )),
+            lkh3::H3Error::InvalidProfile("connection reset".into()),
+            lkh3::H3Error::InvalidResponse("connection reset".into()),
+        ] {
+            let wrapped =
+                Error::h3_request_error_with_context(ConnectionPhase::HttpRequest, source, false);
+            assert_eq!(
+                wrapped.h3_request_context().unwrap().kind,
+                H3FailureKind::Other,
+                "{wrapped:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn h3_stopped_upload_provenance_overrides_string_refusal_hint() {
+        let source = lkh3::H3Error::StoppedUpload {
+            stop_code: 256,
+            source: Box::new(lkh3::H3Error::InvalidResponse("refused stream".into())),
+        };
+        let error = Error::h3_request_error(ConnectionPhase::HttpRequest, source, false);
+        assert!(!error.is_safe_to_replay());
+        assert!(matches!(
+            error,
+            Error::ConnectionClosed {
+                kind: ConnectionClosedKind::Reset,
+                ..
+            }
+        ));
+    }
 
     // -- ConnectionPhase ---------------------------------------------------
 

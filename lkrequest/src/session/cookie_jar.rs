@@ -16,6 +16,32 @@ use url::Url;
 /// `(domain, path, name)`, exactly as `cookie_store` keys a stored cookie.
 type CookieKey = (String, String, String);
 
+/// Ignore empty Max-Age attributes before cookie 0.18 treats them as overflow.
+pub(super) fn parse_set_cookie(header: &str) -> Result<RawCookie<'_>, cookie::ParseError> {
+    let mut attributes = header.split(';');
+    let cookie_pair = attributes.next().unwrap_or_default();
+    let empty_max_age = |attribute: &str| {
+        attribute.split_once('=').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("max-age") && value.trim().is_empty()
+        })
+    };
+    if !attributes.clone().any(empty_max_age) {
+        return RawCookie::parse(header);
+    }
+
+    // Use the parser's attribute boundaries, preserving the cookie pair and
+    // every other attribute verbatim, including duplicate ordering.
+    let mut normalized = String::with_capacity(header.len());
+    normalized.push_str(cookie_pair);
+    for attribute in attributes {
+        if !empty_max_age(attribute) {
+            normalized.push(';');
+            normalized.push_str(attribute);
+        }
+    }
+    RawCookie::parse(normalized)
+}
+
 fn cookie_key(cookie: &Cookie<'_>) -> CookieKey {
     (
         String::from(&cookie.domain),

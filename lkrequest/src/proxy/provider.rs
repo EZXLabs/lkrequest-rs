@@ -105,7 +105,7 @@ impl ProxyProvider for ProxyRotator {
             RotationStrategy::Random => {
                 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
                 let rng = SystemRandom::new();
-                let mut buf = [0u8; 8];
+                let mut buf = [0u8; std::mem::size_of::<usize>()];
                 rng.fill(&mut buf).expect("system RNG failed");
                 let idx = usize::from_ne_bytes(buf) % self.proxies.len();
                 &self.proxies[idx]

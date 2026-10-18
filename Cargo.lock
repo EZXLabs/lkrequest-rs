@@ -348,9 +348,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
@@ -1722,7 +1722,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "lkh2"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "lkh3"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1764,14 +1764,14 @@ dependencies = [
 
 [[package]]
 name = "lkmasque"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "lkprofile"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "hex",
  "lktls",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "lkquic"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "quinn",
  "quinn-proto",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "lkrequest"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1812,6 +1812,7 @@ dependencies = [
  "flate2",
  "fpverify",
  "futures-core",
+ "h2",
  "h3",
  "h3-quinn",
  "headless_chrome",
@@ -1854,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "lkrequest-ffi"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1876,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "lktls"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -1902,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "lktls-quic"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -1912,6 +1913,7 @@ dependencies = [
  "h3-quinn",
  "http",
  "lkh3",
+ "lkprofile",
  "lktls",
  "quinn",
  "quinn-proto",
@@ -2661,9 +2663,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

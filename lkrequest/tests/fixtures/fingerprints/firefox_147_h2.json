@@ -4,6 +4,7 @@
     "stream_dependency": 0,
     "weight": 42
   },
+  "initial_stream_id": 1,
   "priority_frames": [],
   "pseudo_header_order": [
     "method",

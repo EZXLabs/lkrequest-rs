@@ -1175,7 +1175,7 @@ async fn test_blocking_websocket_text_echo() {
     );
     tokio::task::spawn_blocking(move || {
         let session = client.session().http1_only().build();
-        let mut ws = session.websocket(&wss_url).connect().expect("ws connect");
+        let ws = session.websocket(&wss_url).connect().expect("ws connect");
 
         ws.send_text("blocking hello").expect("send_text");
         let msg = ws.recv().expect("recv");
@@ -1204,7 +1204,7 @@ async fn test_blocking_websocket_binary_echo() {
     );
     tokio::task::spawn_blocking(move || {
         let session = client.session().http1_only().build();
-        let mut ws = session.websocket(&wss_url).connect().expect("ws connect");
+        let ws = session.websocket(&wss_url).connect().expect("ws connect");
 
         let data = vec![0x01, 0x02, 0x03, 0xFF];
         ws.send_binary(&data).expect("send_binary");

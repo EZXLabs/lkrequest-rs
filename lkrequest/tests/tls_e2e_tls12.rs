@@ -10,7 +10,7 @@
 //! handle TLS 1.2 negotiation when it happens. We also test the auto-
 //! negotiation logic.
 //!
-//! Requires network access.
+//! Public probes are ignored; the local regression requires no network access.
 
 mod tls_support;
 use tls_support::{tls_connect_with_retry, MAX_RETRIES};
@@ -18,6 +18,158 @@ use tls_support::{tls_connect_with_retry, MAX_RETRIES};
 use lkrequest::TlsConnector;
 use lktls::profile::presets;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn local_tls12_alpn_full_and_resumed_connections_work() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for negotiate_alpn in [false, true] {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let anchor =
+                lktls::verify::certchain::parse_trust_anchor_from_der(cert.cert.der()).unwrap();
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+            );
+            let mut config = rustls::ServerConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+            if negotiate_alpn {
+                config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            }
+            config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut kinds = Vec::new();
+                for _ in 0..2 {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(tcp).await.unwrap();
+                    assert_eq!(
+                        tls.get_ref().1.protocol_version(),
+                        Some(rustls::ProtocolVersion::TLSv1_2)
+                    );
+                    assert_eq!(
+                        tls.get_ref().1.alpn_protocol(),
+                        negotiate_alpn.then_some(b"http/1.1".as_slice())
+                    );
+                    kinds.push(tls.get_ref().1.handshake_kind().unwrap());
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        tls.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                        assert!(request.len() < 16_384);
+                    }
+                    assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                }
+                kinds
+            });
+            let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+            let connector = TlsConnector::new(presets::chrome_155())
+                .custom_ca_anchors(Arc::new(vec![anchor]))
+                .session_store(store);
+            for resumed in [false, true] {
+                let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+                let mut tls = connector
+                    .connect("localhost", address.port(), tcp)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.negotiated_version(), Some(0x0303));
+                assert_eq!(tls.negotiated_alpn(), negotiate_alpn.then_some("http/1.1"));
+                assert_eq!(tls.peer_certificates().is_empty(), resumed);
+                tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut response = Vec::new();
+                tls.read_to_end(&mut response).await.unwrap();
+                assert_eq!(
+                    response,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                );
+            }
+            assert_eq!(
+                server.await.unwrap(),
+                [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed]
+            );
+        }
+    })
+    .await
+    .expect("local TLS 1.2 ALPN/resumption test timed out");
+}
+
+#[tokio::test]
+async fn local_invalid_tls12_choices_send_precise_alerts() {
+    use lktls::error::{AlertDescription, TlsError};
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for case in 0..5 {
+            let mut profile = presets::chrome_155();
+            let expected = match case {
+                0 => { profile.cipher_suites.retain(|suite| *suite != 0xc02f); AlertDescription::IllegalParameter },
+                1 => AlertDescription::IllegalParameter,
+                2 => { profile.tls_min_version = lktls::profile::types::TlsVersion::Tls13; AlertDescription::ProtocolVersion },
+                3 => AlertDescription::DecodeError,
+                _ => {
+                    profile.extensions.iter_mut().find(|extension| extension.extension_type == 43).unwrap().source = lktls::profile::types::ExtensionSource::RawBytes { data: "020304".into() };
+                    AlertDescription::ProtocolVersion
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut header = [0; 5];
+                tcp.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 22);
+                let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+                assert!(length < 16_384);
+                let mut client_hello = vec![0; length];
+                tcp.read_exact(&mut client_hello).await.unwrap();
+                assert_eq!(client_hello[0], 1);
+                let sid_len = if case == 3 { 33 } else { 0 };
+                let mut body = vec![3, 3];
+                body.extend_from_slice(&[0x55; 32]);
+                body.push(sid_len);
+                body.extend(std::iter::repeat_n(0xa5, sid_len as usize));
+                body.extend_from_slice(&[0xc0, 0x2f, if case == 1 { 1 } else { 0 }]);
+                let mut message = vec![2, 0, 0, body.len() as u8];
+                message.extend_from_slice(&body);
+                let mut record = vec![22, 3, 3];
+                record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                record.extend_from_slice(&message);
+                tcp.write_all(&record).await.unwrap();
+                tcp.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 21, "peer receives a TLS alert");
+                assert_eq!(u16::from_be_bytes([header[3], header[4]]), 2);
+                let mut alert = [0; 2];
+                tcp.read_exact(&mut alert).await.unwrap();
+                alert
+            });
+            let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+            let error = match TlsConnector::new(profile).connect("example.com", address.port(), tcp).await {
+                Ok(_) => panic!("invalid ServerHello cannot produce a connection"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, TlsError::LocalAlert { alert, .. } if alert.description == expected), "case {case}");
+            assert_eq!(peer.await.unwrap(), [2, expected.as_byte()], "case {case} wire alert");
+        }
+    }).await.expect("local TLS 1.2 scalar validation timed out");
+}
 
 /// Test that our TLS engine can complete a handshake with Cloudflare.
 ///

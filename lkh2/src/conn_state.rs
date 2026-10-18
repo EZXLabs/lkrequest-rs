@@ -213,6 +213,13 @@ impl ConnState {
         Self::new(true)
     }
 
+    pub(crate) fn client_with_initial_stream_id(initial_stream_id: u32) -> Self {
+        assert!(crate::profile::valid_initial_stream_id(initial_stream_id));
+        let mut state = Self::client();
+        state.next_stream_id = initial_stream_id;
+        state
+    }
+
     pub fn server() -> Self {
         Self::new(false)
     }
@@ -326,6 +333,9 @@ impl ConnState {
     }
 
     pub fn can_open_stream(&self) -> bool {
+        if self.stream_ids_exhausted() {
+            return false;
+        }
         match self.remote_settings.max_concurrent_streams {
             Some(max) => self.active_stream_count() < max as usize,
             None => true,
@@ -333,6 +343,7 @@ impl ConnState {
     }
 
     pub fn open_stream(&mut self) -> u32 {
+        assert!(!self.stream_ids_exhausted(), "HTTP/2 stream IDs exhausted");
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2;
 
@@ -344,6 +355,10 @@ impl ConnState {
 
         debug!(stream_id, is_client = self.is_client, "opened new stream");
         stream_id
+    }
+
+    pub(crate) fn stream_ids_exhausted(&self) -> bool {
+        self.next_stream_id > crate::profile::MAX_CLIENT_STREAM_ID
     }
 
     pub fn active_stream_count(&self) -> usize {

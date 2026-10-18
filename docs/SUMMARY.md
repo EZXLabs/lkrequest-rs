@@ -32,6 +32,7 @@
 # 规格参考
 
 - [Preset 支持与验证矩阵](reference/presets.md)
+- [TCP 指纹的平台支持与限制](reference/tcp-fingerprint.md)
 - [功能与协议能力](reference/capabilities.md)
 - [兼容性与支持边界](reference/compatibility.md)
 - [当前 benchmark 状态](reference/benchmarks.md)

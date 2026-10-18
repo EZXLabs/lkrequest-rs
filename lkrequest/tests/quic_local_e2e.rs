@@ -11,6 +11,31 @@ use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{mpsc, oneshot};
 
+#[path = "quic_local_e2e/blocked_local_close.rs"]
+mod blocked_local_close;
+#[path = "quic_local_e2e/browser_flow.rs"]
+mod browser_flow;
+#[path = "quic_local_e2e/browser_retry.rs"]
+mod browser_retry;
+#[path = "quic_local_e2e/browser_retry_routing.rs"]
+mod browser_retry_routing;
+#[path = "quic_local_e2e/client_auth.rs"]
+mod client_auth;
+#[path = "quic_local_e2e/completion.rs"]
+mod completion;
+#[path = "quic_local_e2e/early_rejection.rs"]
+mod early_rejection;
+#[path = "quic_local_e2e/incomplete_header.rs"]
+mod incomplete_header;
+#[path = "quic_local_e2e/qpack_completion.rs"]
+mod qpack_completion;
+#[path = "quic_local_e2e/retry_resumption.rs"]
+mod retry_resumption;
+#[path = "quic_local_e2e/stop_completion.rs"]
+mod stop_completion;
+#[path = "quic_local_e2e/upload_completion.rs"]
+mod upload_completion;
+
 fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
 }
@@ -175,6 +200,149 @@ async fn lkrequest_http3_template_injects_default_priority_header() {
     server.wait_idle().await;
 }
 
+// Decode actual QPACK requests at the peer, including requests reusing the
+// connection and uploads that take the H3 streaming sender path.
+async fn observed_h3_priorities(
+    automatic: bool,
+    streaming_response: bool,
+    default_header: bool,
+) -> Vec<Vec<String>> {
+    use bytes::Buf;
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        ensure_rustls_provider();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap())),
+            localhost_addr(0),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let mut h3 =
+                    server::Connection::<_, bytes::Bytes>::new(h3_quinn::Connection::new(conn))
+                        .await
+                        .unwrap();
+                let mut priorities = Vec::new();
+                for _ in 0..4 {
+                    let (request, mut stream) = h3
+                        .accept()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .resolve_request()
+                        .await
+                        .unwrap();
+                    priorities.push(
+                        request
+                            .headers()
+                            .get_all("priority")
+                            .iter()
+                            .map(|value| value.to_str().unwrap().to_owned())
+                            .collect(),
+                    );
+                    let mut body = Vec::new();
+                    while let Some(mut data) = stream.recv_data().await.unwrap() {
+                        body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                    }
+                    assert_eq!(body, b"upload");
+                    stream.send_response(http::Response::new(())).await.unwrap();
+                    stream.send_data(bytes::Bytes::from(body)).await.unwrap();
+                    stream.finish().await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                priorities
+            }
+        });
+
+        let mut preset = lkrequest::preset::chrome_155();
+        preset.h2_profile.priority_config.auto_priority_header = automatic;
+        let mut builder = lkrequest::Client::builder()
+            .preset(preset)
+            .add_ca_cert_der(cert_der.as_ref())
+            .dns_resolver(Arc::new(LocalIpv4Dns));
+        if default_header {
+            builder = builder.default_header("priority", "u=5");
+        }
+        let session = builder.build().session().http3_only().build();
+        let url = format!("https://localhost:{}/priority", addr.port());
+        for index in 0..4 {
+            let mut request = session.post(&url);
+            request = match index {
+                1 => request.priority(lkh2::RequestPriority::custom(4, false)),
+                2 => request.header("priority", "u=7, i"),
+                3 => request.header("sec-fetch-dest", "document"),
+                _ => request,
+            };
+            request = if index < 2 {
+                request.body_reader(&b"upload"[..], Some(6))
+            } else {
+                request.body(bytes::Bytes::from_static(b"upload"))
+            };
+            let body = if streaming_response {
+                let response = request.send_streaming().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                response.bytes().await.unwrap()
+            } else {
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.version(), lkrequest::HttpVersion::H3);
+                bytes::Bytes::copy_from_slice(response.bytes())
+            };
+            assert_eq!(body, "upload");
+        }
+        let priorities = task.await.unwrap();
+        drop(session);
+        server.wait_idle().await;
+        priorities
+    })
+    .await
+    .expect("local H3 priority sequence timed out")
+}
+
+#[tokio::test]
+async fn h3_disabled_auto_priority_preserves_only_supplied_headers() {
+    for streaming in [false, true] {
+        assert_eq!(
+            observed_h3_priorities(false, streaming, false).await,
+            vec![vec![], vec![], vec!["u=7, i".to_owned()], vec![]],
+            "automatic=false, streaming={streaming}",
+        );
+        assert_eq!(
+            observed_h3_priorities(false, streaming, true).await,
+            vec![vec!["u=5"], vec!["u=5"], vec!["u=7, i"], vec!["u=5"]],
+            "default header, streaming={streaming}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn h3_enabled_auto_priority_resolves_without_duplicate_headers() {
+    for streaming in [false, true] {
+        assert_eq!(
+            observed_h3_priorities(true, streaming, false).await,
+            vec![vec!["u=1, i"], vec!["u=4"], vec!["u=7, i"], vec!["u=0, i"]],
+            "automatic=true, streaming={streaming}",
+        );
+        assert_eq!(
+            observed_h3_priorities(true, streaming, true).await,
+            vec![vec!["u=5"], vec!["u=5"], vec!["u=7, i"], vec!["u=5"]],
+            "default header, streaming={streaming}",
+        );
+    }
+}
+
 #[tokio::test]
 async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
     ensure_rustls_provider();
@@ -194,6 +362,11 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
         .unwrap();
     server_tls.alpn_protocols = vec![b"h3".to_vec()];
     server_tls.max_early_data_size = u32::MAX;
+    let mut rejecting_tls = server_tls.clone();
+    rejecting_tls.max_early_data_size = 0;
+    let rejecting_config = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(rejecting_tls).unwrap(),
+    ));
     let server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls).unwrap()));
 
@@ -206,6 +379,11 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
         let server = server.clone();
         async move {
             for idx in 0..3 {
+                if idx == 1 {
+                    // Preserve the server ticket store while explicitly refusing
+                    // early data offered by the resumed QUIC ClientHello.
+                    server.set_server_config(Some(rejecting_config.clone()));
+                }
                 let _ = event_tx.send(format!("accept_wait_{idx}")).await;
                 let incoming = server.accept().await.unwrap();
                 let _ = event_tx.send(format!("incoming_{idx}")).await;
@@ -234,8 +412,12 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
                 };
                 let (request, mut stream) = resolver.resolve_request().await.unwrap();
                 let _ = event_tx.send(format!("request_{idx}")).await;
+                let priority = request
+                    .headers()
+                    .get("priority")
+                    .map(|value| value.to_str().unwrap().to_owned());
                 let _ = stream_tx
-                    .send((idx, request.method().clone(), stream.is_0rtt()))
+                    .send((idx, request.method().clone(), stream.is_0rtt(), priority))
                     .await;
                 let response = http::Response::builder()
                     .status(StatusCode::OK)
@@ -252,9 +434,16 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
         }
     });
 
+    let mut h2_profile = lkh2::profile::chrome_155_h2();
+    h2_profile.priority_config.auto_priority_header = false;
+    // Keep this replacement-path/header-policy control alongside the reuse tests.
+    let mut quic_profile = lkh3::chrome_155_quic();
+    quic_profile.packetization.reuse_rejected_0rtt_streams = false;
     let client = lkrequest::Client::builder()
         .fingerprint(lktls::profile::presets::chrome_144())
-        .quic_profile(lkh3::chrome_quic())
+        .quic_fingerprint(lktls::profile::presets::chrome_155_quic())
+        .h2_profile(h2_profile)
+        .quic_profile(quic_profile)
         .add_ca_cert_der(cert_der.as_ref())
         .dns_resolver(Arc::new(LocalIpv4Dns))
         .build();
@@ -272,6 +461,7 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
         !first_seen.2,
         "first full handshake request must not be 0-RTT"
     );
+    assert_eq!(first_seen.3, None, "automatic priority is disabled");
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     drop(session);
@@ -294,6 +484,7 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
         !second_seen.2,
         "replayed request must be sent after the server rejects 0-RTT"
     );
+    assert_eq!(second_seen.3, None, "replay retains the disabled switch");
 
     server_task.await.unwrap();
     server.wait_idle().await;
@@ -531,32 +722,31 @@ async fn lkrequest_http3_preconnect_is_idempotent() {
 ///     present and precede the PRIORITY_UPDATE (Chrome's order).
 #[tokio::test]
 async fn lkrequest_http3_emits_chrome_control_stream_frames() {
-    for (preset, priority) in [
-        (lkrequest::preset::chrome_144(), "u=1, i"),
-        (lkrequest::preset::chrome_146(), "u=1, i"),
-        (lkrequest::preset::chrome_150(), "u=0, i"),
-        (lkrequest::preset::chrome_151(), "u=0, i"),
-        (lkrequest::preset::chrome_152(), "u=0, i"),
-        (lkrequest::preset::chrome_153(), "u=0, i"),
-        (lkrequest::preset::chrome_154(), "u=0, i"),
+    let mut generic = lkrequest::preset::chrome_144();
+    generic.quic_profile = Some(lkh3::chrome_quic());
+    for (preset, basename) in [
+        (generic, "chrome_generic_quic"),
+        (lkrequest::preset::chrome_144(), "chrome_146_quic"),
+        (lkrequest::preset::chrome_146(), "chrome_146_quic"),
+        (lkrequest::preset::chrome_150(), "chrome_150_quic"),
+        (lkrequest::preset::chrome_151(), "chrome_151_quic"),
+        (lkrequest::preset::chrome_152(), "chrome_152_quic"),
+        (lkrequest::preset::chrome_153(), "chrome_153_quic"),
+        (lkrequest::preset::chrome_154(), "chrome_154_quic"),
+        (lkrequest::preset::chrome_155(), "chrome_155_quic"),
     ] {
-        let mut expected_priority = vec![0];
-        expected_priority.extend_from_slice(priority.as_bytes());
+        let control = captured_h3_control_stream(preset).await;
         assert_eq!(
-            captured_chrome_control_stream(preset, priority).await,
-            (0xF0700, expected_priority),
-            "navigation PRIORITY_UPDATE for {priority}"
+            verify_h3_control_golden(&control, basename),
+            Ok(()),
+            "{basename}"
         );
     }
 }
 
-/// Run one H3 request with `preset` against a local server, validate the
-/// captured control stream's SETTINGS and GREASE frames, and return the
-/// trailing PRIORITY_UPDATE frame as `(frame type, payload)`.
-async fn captured_chrome_control_stream(
-    preset: lkrequest::preset::ClientPreset,
-    priority: &str,
-) -> (u64, Vec<u8>) {
+/// Capture actual decrypted control-stream bytes, without deriving observations
+/// from the profile or calling the sending backend's frame/varint decoder.
+async fn captured_h3_control_stream(preset: lkrequest::preset::ClientPreset) -> Vec<u8> {
     use std::time::Duration;
 
     ensure_rustls_provider();
@@ -592,7 +782,7 @@ async fn captured_chrome_control_stream(
                 let mut buf = [0u8; 256];
                 // The control stream is never closed, so bound the read by size
                 // and a short idle timeout rather than reading to end.
-                while bytes.len() < 64 {
+                while bytes.len() < 65_536 {
                     match tokio::time::timeout(Duration::from_millis(500), recv.read(&mut buf))
                         .await
                     {
@@ -615,23 +805,12 @@ async fn captured_chrome_control_stream(
         .dns_resolver(Arc::new(LocalIpv4Dns))
         .build();
 
-    // Sanity: the template really does carry the PRIORITY_UPDATE we expect on
-    // the wire. If this ever changes, the byte assertions below must too.
-    assert_eq!(
-        client
-            .quic_profile()
-            .expect("captured Chrome preset has a QUIC profile")
-            .h3
-            .priority_updates,
-        vec![(0, priority.to_string())],
-    );
-
     let session = client.session().http3_only().build();
     let url = format!("https://localhost:{}/priority", server_addr.port());
     // The raw server never answers H3, so the request itself will not complete;
     // we only care about the control-stream bytes it wrote during connect.
     let client_task = tokio::spawn(async move {
-        let _ = session.get(&url).send().await;
+        let _ = session.get(&url).header("priority", "u=0, i").send().await;
     });
 
     let control = tokio::time::timeout(Duration::from_secs(8), control_rx)
@@ -639,49 +818,328 @@ async fn captured_chrome_control_stream(
         .expect("server should observe the H3 control stream")
         .expect("control-stream bytes channel");
     client_task.abort();
-
-    use lktls::extensions::quic_transport_params::decode_varint;
-    let read_varint = |input: &mut &[u8]| {
-        let mut length = 0;
-        let value = decode_varint(input, &mut length).expect("complete QUIC varint");
-        *input = &input[length..];
-        value
-    };
-    let mut input = control.as_slice();
-    assert_eq!(read_varint(&mut input), 0, "control stream type");
-    let mut frames = Vec::new();
-    while !input.is_empty() {
-        let frame_type = read_varint(&mut input);
-        let length = read_varint(&mut input) as usize;
-        assert!(length <= input.len(), "complete HTTP/3 frame");
-        frames.push((frame_type, input[..length].to_vec()));
-        input = &input[length..];
-    }
-    assert_eq!(frames.len(), 3, "SETTINGS, GREASE, PRIORITY_UPDATE only");
-    assert_eq!(frames[0].0, 4);
-    let mut settings = frames[0].1.as_slice();
-    let mut entries = Vec::new();
-    while !settings.is_empty() {
-        entries.push((read_varint(&mut settings), read_varint(&mut settings)));
-    }
-    assert_eq!(
-        &entries[..4],
-        &[(1, 65_536), (6, 262_144), (7, 100), (51, 1)]
-    );
-    assert_eq!(entries.len(), 5);
-    let (reserved, value) = entries[4];
-    assert!(reserved >= 33 && (reserved - 33) % 31 == 0);
-    assert!((reserved - 33) / 31 <= u32::MAX as u64);
-    assert!(value <= u32::MAX as u64);
-    let (frame_type, payload) = &frames[1];
-    assert!(*frame_type >= 33 && (*frame_type - 33) % 31 == 0);
-    let random = (*frame_type - 33) / 31;
-    assert!(random <= u32::MAX as u64);
-    assert_eq!(payload.len(), (random % 4) as usize);
+    let _ = client_task.await;
 
     server_task.await.unwrap();
     server.wait_idle().await;
-    frames.swap_remove(2)
+    control
+}
+
+fn verify_h3_control_golden(control: &[u8], basename: &str) -> Result<(), String> {
+    let golden: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fingerprints")
+                .join(format!("{basename}.json")),
+        )
+        .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let parsed = lkprofile::parse_h3_control_stream(control).map_err(|error| error.to_string())?;
+    let reserved = |id: u64| id >= 33 && (id - 33).is_multiple_of(31);
+    let stable: Vec<_> = parsed
+        .settings
+        .iter()
+        .copied()
+        .filter(|(id, _)| !reserved(*id))
+        .collect();
+    let expected: Vec<(u64, u64)> =
+        serde_json::from_value(golden["h3_settings"].clone()).map_err(|error| error.to_string())?;
+    if stable != expected {
+        return Err("ordered H3 SETTINGS mismatch".into());
+    }
+    let grease: Vec<_> = parsed
+        .settings
+        .iter()
+        .copied()
+        .filter(|(id, _)| reserved(*id))
+        .collect();
+    if grease.len() != usize::from(golden["grease_settings"] == true) {
+        return Err("H3 GREASE setting count mismatch".into());
+    }
+    if let Some(&(id, value)) = grease.first() {
+        if parsed.settings.last() != Some(&(id, value))
+            || (id - 33) / 31 > u32::MAX as u64
+            || value > u32::MAX as u64
+        {
+            return Err("H3 GREASE setting position/shape mismatch".into());
+        }
+    }
+    let updates: Vec<(u64, String)> = serde_json::from_value(golden["priority_updates"].clone())
+        .map_err(|error| error.to_string())?;
+    let control_grease = golden["send_control_grease_frame"] == true;
+    let mut index = 1;
+    if control_grease {
+        let frame = parsed
+            .frames
+            .get(index)
+            .ok_or("missing control GREASE frame")?;
+        if !reserved(frame.frame_type) {
+            return Err("control GREASE frame order mismatch".into());
+        }
+        let random = (frame.frame_type - 33) / 31;
+        if random > u32::MAX as u64 || frame.payload.len() != (random % 4) as usize {
+            return Err("Chromium control GREASE shape mismatch".into());
+        }
+        index += 1;
+    }
+    if parsed.frames.len() != index + updates.len()
+        || parsed.priority_updates.len() != updates.len()
+    {
+        return Err("control frame count mismatch".into());
+    }
+    for (offset, (id, value)) in updates.iter().enumerate() {
+        let observed = &parsed.priority_updates[offset];
+        if parsed.frames[index + offset].frame_type != 0xf0700
+            || observed.frame_type != 0xf0700
+            || observed.element_id != *id
+            || observed.field_value != value.as_bytes()
+        {
+            return Err("PRIORITY_UPDATE type/target/payload mismatch".into());
+        }
+    }
+    Ok(())
+}
+
+async fn dynamic_h3_control_sequence(
+    streaming: bool,
+    concurrent: bool,
+    automatic: bool,
+) -> (Vec<u8>, Vec<u64>) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        ensure_rustls_provider();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut config =
+            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(16u32.into());
+        config.transport_config(Arc::new(transport));
+        let server = Endpoint::server(config, localhost_addr(0)).unwrap();
+        let addr = server.local_addr().unwrap();
+        let count = if concurrent { 8 } else { 4 };
+        let (prelude_tx, prelude_rx) = oneshot::channel();
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let control_conn = conn.clone();
+                let control_task = tokio::spawn(async move {
+                    let mut recv = control_conn.accept_uni().await.unwrap();
+                    assert_eq!(u64::from(recv.id()), 2, "single client control stream");
+                    let mut bytes = Vec::new();
+                    let mut prelude_tx = Some(prelude_tx);
+                    let mut buffer = [0u8; 1024];
+                    loop {
+                        let length = recv.read(&mut buffer).await.unwrap().unwrap();
+                        bytes.extend_from_slice(&buffer[..length]);
+                        if let Ok(parsed) = lkprofile::parse_h3_control_stream(&bytes) {
+                            if let Some(tx) = prelude_tx.take() {
+                                let _ = tx.send(parsed.priority_updates.len());
+                            }
+                            if parsed.priority_updates.len() == count {
+                                break;
+                            }
+                        }
+                        assert!(bytes.len() < 65_536, "bounded control prefix");
+                    }
+                    (bytes, recv)
+                });
+                let mut ids = Vec::new();
+                for _ in 0..count {
+                    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                    ids.push(u64::from(recv.id()));
+                    let bytes = recv.read_to_end(65_536).await.unwrap();
+                    assert!(!bytes.is_empty(), "request emitted HEADERS and upload");
+                    // Literal stateless QPACK :status=200 and a DATA response.
+                    send.write_all(b"\x01\x03\x00\x00\xd9\x00\x05hello")
+                        .await
+                        .unwrap();
+                    send.finish().unwrap();
+                }
+                let (control, _control_recv) = control_task.await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                (control, ids)
+            }
+        });
+        let mut preset = lkrequest::preset::chrome_155();
+        preset.h2_profile.priority_config.auto_priority_header = automatic;
+        let client = lkrequest::Client::builder()
+            .preset(preset)
+            .add_ca_cert_der(cert_der.as_ref())
+            .dns_resolver(Arc::new(LocalIpv4Dns))
+            .default_header("sec-fetch-dest", "document")
+            .build();
+        let session = client.session().http3_only().build();
+        let url = format!("https://localhost:{}/priority", addr.port());
+        session.preconnect(&url).await.unwrap();
+        assert_eq!(
+            prelude_rx.await.unwrap(),
+            0,
+            "preconnect must not prioritize an unallocated request"
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..count {
+            let session = session.clone();
+            let url = url.clone();
+            let task = async move {
+                let request = session.post(&url);
+                let request = if concurrent {
+                    request.priority(lkh2::RequestPriority::custom(3, false))
+                } else {
+                    match index {
+                        0 => request.priority(lkh2::RequestPriority::custom(4, false)),
+                        1 => request.header("priority", "u=1, i"),
+                        2 => request,
+                        _ => request.priority(lkh2::RequestPriority::custom(2, true)),
+                    }
+                };
+                let request = if index % 2 == 0 {
+                    request.body_reader(&b"upload"[..], Some(6))
+                } else {
+                    request.body(bytes::Bytes::from_static(b"upload"))
+                };
+                let body = if streaming {
+                    let response = request.send_streaming().await.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    response.bytes().await.unwrap()
+                } else {
+                    let response = request.send().await.unwrap();
+                    assert_eq!(response.version(), lkrequest::HttpVersion::H3);
+                    assert_eq!(response.status(), StatusCode::OK);
+                    bytes::Bytes::copy_from_slice(response.bytes())
+                };
+                assert_eq!(body, "hello");
+            };
+            if concurrent {
+                tasks.spawn(task);
+            } else {
+                task.await;
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        let result = server_task.await.unwrap();
+        drop(session);
+        server.wait_idle().await;
+        result
+    })
+    .await
+    .expect("dynamic H3 control sequence timed out")
+}
+
+#[tokio::test]
+async fn h3_updates_follow_actual_streams_for_both_response_modes() {
+    for (streaming, automatic) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (bytes, ids) = dynamic_h3_control_sequence(streaming, false, automatic).await;
+        assert_eq!(ids, [0, 4, 8, 12]);
+        let parsed = lkprofile::parse_h3_control_stream(&bytes).unwrap();
+        assert_eq!(parsed.frames.len(), 6, "SETTINGS, GREASE and four updates");
+        let updates: Vec<_> = parsed
+            .priority_updates
+            .iter()
+            .map(|update| {
+                (
+                    update.element_id,
+                    std::str::from_utf8(update.field_value).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            updates,
+            [(0, "u=4"), (4, "u=1, i"), (8, "u=0, i"), (12, "u=2, i")]
+        );
+    }
+}
+
+#[tokio::test]
+async fn h3_concurrent_sender_clones_prioritize_allocated_streams_once() {
+    for streaming in [false, true] {
+        let (bytes, mut ids) = dynamic_h3_control_sequence(streaming, true, false).await;
+        ids.sort_unstable();
+        assert_eq!(ids, [0, 4, 8, 12, 16, 20, 24, 28]);
+        let parsed = lkprofile::parse_h3_control_stream(&bytes).unwrap();
+        assert_eq!(parsed.priority_updates.len(), ids.len());
+        let mut targets: Vec<_> = parsed
+            .priority_updates
+            .iter()
+            .map(|update| {
+                assert_eq!(update.field_value, b"u=3");
+                update.element_id
+            })
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets, ids,
+            "no predicted IDs, missing or duplicate updates"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h3_control_golden_rejects_wire_mutations() {
+    use lktls::extensions::quic_transport_params::encode_varint;
+
+    let control = captured_h3_control_stream(lkrequest::preset::chrome_155()).await;
+    assert_eq!(
+        verify_h3_control_golden(&control, "chrome_155_quic"),
+        Ok(())
+    );
+    let parsed = lkprofile::parse_h3_control_stream(&control).unwrap();
+    let frames: Vec<_> = parsed
+        .frames
+        .iter()
+        .map(|frame| (frame.frame_type, frame.payload.to_vec()))
+        .collect();
+    let emit = |frames: &[(u64, Vec<u8>)]| {
+        let mut bytes = vec![0];
+        for (kind, payload) in frames {
+            encode_varint(*kind, &mut bytes);
+            encode_varint(payload.len() as u64, &mut bytes);
+            bytes.extend_from_slice(payload);
+        }
+        bytes
+    };
+    let mut mutations = Vec::new();
+    let mut changed = frames.clone();
+    changed.pop();
+    mutations.push(("missing update", emit(&changed)));
+    let mut changed = frames.clone();
+    changed.swap(1, 2);
+    mutations.push(("wrong frame order", emit(&changed)));
+    let mut changed = frames.clone();
+    let field_value = changed[2].1[1..].to_vec();
+    changed[2].1.extend_from_slice(&field_value);
+    mutations.push(("duplicated priority payload", emit(&changed)));
+    let mut changed = frames.clone();
+    changed[2].1[0] = 4;
+    mutations.push(("wrong request target", emit(&changed)));
+    let mut settings = parsed.settings.clone();
+    settings.swap(0, 1);
+    let mut changed = frames.clone();
+    changed[0].1.clear();
+    for (id, value) in settings {
+        encode_varint(id, &mut changed[0].1);
+        encode_varint(value, &mut changed[0].1);
+    }
+    mutations.push(("wrong SETTINGS order", emit(&changed)));
+    let mut truncated = control.clone();
+    truncated.pop();
+    mutations.push(("truncated frame", truncated));
+    for (name, bytes) in mutations {
+        assert!(
+            verify_h3_control_golden(&bytes, "chrome_155_quic").is_err(),
+            "{name}"
+        );
+    }
 }
 
 /// Resolver that advertises H3 at a **different** hostname than the origin, the

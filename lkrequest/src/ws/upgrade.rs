@@ -41,7 +41,7 @@ fn compute_accept(key: &str) -> String {
 /// `WsConnection` wrapping the upgraded stream.
 pub(crate) async fn ws_upgrade_h1<S>(
     tls_stream: S,
-    host: &str,
+    authority: &str,
     path: &str,
     builder: &WsBuilder,
     default_headers: &http::HeaderMap,
@@ -52,14 +52,11 @@ where
     let ws_key = generate_ws_key();
     let expected_accept = compute_accept(&ws_key);
 
-    // Build the HTTP/1.1 Upgrade request
-    let authority = host.to_string();
-    let uri = format!("https://{authority}{path}");
-
+    // The stream is already connected to the origin, including through CONNECT.
     let mut req_builder = Request::builder()
         .method("GET")
-        .uri(&uri)
-        .header(HOST, &authority)
+        .uri(path)
+        .header(HOST, authority)
         .header(CONNECTION, "Upgrade")
         .header(UPGRADE, "websocket")
         .header("Sec-WebSocket-Version", "13")

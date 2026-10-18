@@ -196,6 +196,16 @@ fn chrome_154_quic_profile() -> Option<QuicProfile> {
     None
 }
 
+#[cfg(feature = "quic-h3")]
+fn chrome_155_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_155_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_155_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
 /// Chrome 131 client preset.
 ///
 /// QUIC/H3 currently uses the shared generic Chromium profile.
@@ -409,6 +419,24 @@ pub fn chrome_154() -> ClientPreset {
         quic_tls_profile: Some(lktls::profile::presets::chrome_154_quic()),
         h2_profile: crate::h2::profile::chrome_154_h2(),
         quic_profile: chrome_154_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
+/// Chrome 155 client preset, captured from 155.0.8059.40 on Windows.
+///
+/// Public captures verify TCP TLS/H2 and completed QUIC/H3 navigation. Header
+/// values remain caller supplied; the preset configures their sending order.
+pub fn chrome_155() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_155(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_155_quic()),
+        h2_profile: crate::h2::profile::chrome_155_h2(),
+        quic_profile: chrome_155_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
         tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
@@ -667,6 +695,35 @@ mod tests {
     }
 
     #[test]
+    fn chrome_155_preset_applies_the_complete_chromium_bundle() {
+        let preset = chrome_155();
+        assert_eq!(preset.tls_profile.name, "Chrome 155");
+        assert!(preset.tls_profile.grease.signature_algorithms);
+        let quic_tls = preset.quic_tls_profile.as_ref().unwrap();
+        assert_eq!(quic_tls.name, "Chrome 155 QUIC");
+        assert!(!quic_tls.grease.signature_algorithms);
+        assert_eq!(quic_tls.signature_algorithms.last(), Some(&0x0201));
+        assert_eq!(preset.h2_profile.window_update, 15_663_105);
+        assert_eq!(preset.h2_profile.settings.len(), 4);
+        assert_eq!(
+            preset.tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Chromium
+        );
+        assert_eq!(
+            preset.default_protocol_policy,
+            Some(ProtocolPolicy::chrome_standard())
+        );
+        #[cfg(feature = "quic-h3")]
+        assert_eq!(preset.quic_profile, Some(lkh3::chrome_155_quic()));
+        #[cfg(not(feature = "quic-h3"))]
+        assert!(preset.quic_profile.is_none());
+
+        let client = crate::Client::builder().preset(preset).build();
+        assert_eq!(client.tls_profile().name, "Chrome 155");
+        assert!(client.default_headers().is_empty());
+    }
+
+    #[test]
     fn firefox_156_preset_uses_capture_profiles_without_claiming_h3() {
         let preset = firefox_156();
         assert_eq!(preset.tls_profile.name, "Firefox 156");
@@ -757,6 +814,7 @@ mod tests {
             chrome_152(),
             chrome_153(),
             chrome_154(),
+            chrome_155(),
             firefox_133(),
             firefox_147(),
             firefox_156(),

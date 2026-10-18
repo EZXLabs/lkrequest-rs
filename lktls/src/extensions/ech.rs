@@ -31,7 +31,8 @@
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
 use super::Extension;
-use crate::profile::types::EchGreaseConfig;
+use crate::crypto::kx::{generate_key_pair, KxGroup};
+use crate::profile::types::{EchGreaseConfig, TlsClientHelloStyle};
 
 /// ECH extension type code-point (0xFE0D = 65037).
 const ECH_EXTENSION_TYPE: u16 = 0xFE0D;
@@ -50,6 +51,7 @@ pub struct EchGreaseExtension {
     config_id: u8,
     /// Target payload length, randomly chosen per connection.
     payload_length: u16,
+    client_hello_style: TlsClientHelloStyle,
 }
 
 impl EchGreaseExtension {
@@ -65,7 +67,13 @@ impl EchGreaseExtension {
             enc_length: config.enc_length,
             config_id,
             payload_length,
+            client_hello_style: TlsClientHelloStyle::Generic,
         }
+    }
+
+    pub(crate) fn with_client_hello_style(mut self, style: TlsClientHelloStyle) -> Self {
+        self.client_hello_style = style;
+        self
     }
 }
 
@@ -82,16 +90,37 @@ impl Extension for EchGreaseExtension {
 
         // cipher_suite: kdf_id (2 bytes) + aead_id (2 bytes)
         buf.extend_from_slice(&self.kdf_id.to_be_bytes());
-        buf.extend_from_slice(&self.aead_id.to_be_bytes());
+        let aead_id = if self.client_hello_style == TlsClientHelloStyle::FirefoxNss {
+            let mut choice = [0u8; 1];
+            rng.fill(&mut choice).expect("system RNG failed");
+            // NSS selects from its pseudorandom GREASE byte stream's low bit.
+            if choice[0] & 1 != 0 {
+                1u16
+            } else {
+                3u16
+            }
+        } else {
+            self.aead_id
+        };
+        buf.extend_from_slice(&aead_id.to_be_bytes());
 
         // config_id: from per-connection GREASE seed
         buf.push(self.config_id);
 
-        // enc: length (2 bytes) + random bytes
+        // BoringSSL uses X25519_keypair for GREASE too; NSS uses pseudorandom
+        // enc bytes instead. Preserve the browser-specific distributions.
         buf.extend_from_slice(&self.enc_length.to_be_bytes());
-        let enc_start = buf.len();
-        buf.resize(enc_start + self.enc_length as usize, 0);
-        rng.fill(&mut buf[enc_start..]).expect("system RNG failed");
+        if self.client_hello_style == TlsClientHelloStyle::ChromiumBoringssl
+            && self.enc_length == 32
+        {
+            let key_pair = generate_key_pair(KxGroup::X25519)
+                .expect("ECH GREASE X25519 key generation failed");
+            buf.extend_from_slice(&key_pair.public_key);
+        } else {
+            let enc_start = buf.len();
+            buf.resize(enc_start + self.enc_length as usize, 0);
+            rng.fill(&mut buf[enc_start..]).expect("system RNG failed");
+        }
 
         // payload: length (2 bytes) + random bytes
         buf.extend_from_slice(&self.payload_length.to_be_bytes());
@@ -296,6 +325,108 @@ mod tests {
         EchGreaseExtension::new(&config, "example.com", 0x01).encode(&mut buf2);
 
         assert_ne!(buf1, buf2);
+    }
+
+    #[test]
+    fn test_ech_grease_enc_is_canonical_x25519_public_key() {
+        let config = chrome_grease_config();
+        for _ in 0..64 {
+            let mut wire = Vec::new();
+            EchGreaseExtension::new(&config, "example.com", 0x42)
+                .with_client_hello_style(TlsClientHelloStyle::ChromiumBoringssl)
+                .encode(&mut wire);
+            let enc_len = u16::from_be_bytes([wire[10], wire[11]]) as usize;
+            assert_eq!(enc_len, 32);
+            let enc = &wire[12..12 + enc_len];
+            assert_eq!(
+                enc[31] & 0x80,
+                0,
+                "BoringSSL ECH GREASE uses a generated X25519 public key, not arbitrary bytes"
+            );
+            let mut modulus = [0xff; 32];
+            modulus[0] = 0xed;
+            modulus[31] = 0x7f;
+            assert!(enc.iter().rev().cmp(modulus.iter().rev()).is_lt());
+            assert!(enc.iter().any(|&byte| byte != 0));
+        }
+    }
+
+    #[test]
+    fn test_ech_grease_preserves_custom_enc_lengths() {
+        for enc_length in [0, 16, 64] {
+            let mut config = chrome_grease_config();
+            config.enc_length = enc_length;
+            let mut wire = Vec::new();
+            EchGreaseExtension::new(&config, "example.com", 0x42)
+                .with_client_hello_style(TlsClientHelloStyle::ChromiumBoringssl)
+                .encode(&mut wire);
+            assert_eq!(u16::from_be_bytes([wire[10], wire[11]]), enc_length);
+            let payload_offset = 12 + enc_length as usize;
+            let payload_length =
+                u16::from_be_bytes([wire[payload_offset], wire[payload_offset + 1]]) as usize;
+            assert_eq!(wire.len(), payload_offset + 2 + payload_length);
+        }
+    }
+
+    #[test]
+    fn test_nss_and_generic_grease_enc_remain_pseudorandom() {
+        for style in [
+            TlsClientHelloStyle::FirefoxNss,
+            TlsClientHelloStyle::Generic,
+        ] {
+            let config = firefox_grease_config();
+            let mut high_bits = std::collections::HashSet::new();
+            for _ in 0..64 {
+                let mut wire = Vec::new();
+                EchGreaseExtension::new(&config, "example.com", 0x42)
+                    .with_client_hello_style(style)
+                    .encode(&mut wire);
+                assert_eq!(u16::from_be_bytes([wire[10], wire[11]]), 32);
+                high_bits.insert(wire[43] & 0x80);
+            }
+            assert_eq!(
+                high_bits.len(),
+                2,
+                "NSS and generic enc are not X25519 public keys"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nss_ech_grease_varies_aead_per_handshake() {
+        let config = firefox_grease_config();
+        let mut aeads = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let mut wire = Vec::new();
+            EchGreaseExtension::new(&config, "www.cloudflare.com", 0x42)
+                .with_client_hello_style(TlsClientHelloStyle::FirefoxNss)
+                .encode(&mut wire);
+            assert_eq!(u16::from_be_bytes([wire[5], wire[6]]), 1);
+            let aead = u16::from_be_bytes([wire[7], wire[8]]);
+            assert!([1, 3].contains(&aead));
+            aeads.insert(aead);
+        }
+        assert_eq!(aeads.into_iter().collect::<Vec<_>>(), [1, 3]);
+    }
+
+    #[test]
+    fn test_non_nss_styles_preserve_configured_aead() {
+        for style in [
+            TlsClientHelloStyle::Generic,
+            TlsClientHelloStyle::ChromiumBoringssl,
+        ] {
+            for aead_id in [1, 3] {
+                let mut config = chrome_grease_config();
+                config.aead_id = aead_id;
+                for _ in 0..8 {
+                    let mut wire = Vec::new();
+                    EchGreaseExtension::new(&config, "example.com", 0x42)
+                        .with_client_hello_style(style)
+                        .encode(&mut wire);
+                    assert_eq!(u16::from_be_bytes([wire[7], wire[8]]), aead_id);
+                }
+            }
+        }
     }
 
     #[test]

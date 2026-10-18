@@ -355,6 +355,17 @@ pub fn compare_collected_fingerprints(
     );
     compare_optional_field(
         &mut comparison,
+        "h2.initial_stream_id",
+        left.h2
+            .as_ref()
+            .and_then(|h2| h2.profile.initial_stream_id.map(|id| id.to_string())),
+        right
+            .h2
+            .as_ref()
+            .and_then(|h2| h2.profile.initial_stream_id.map(|id| id.to_string())),
+    );
+    compare_optional_field(
+        &mut comparison,
         "quic.transport_hash",
         left.quic.as_ref().map(|quic| quic.transport_hash.clone()),
         right.quic.as_ref().map(|quic| quic.transport_hash.clone()),
@@ -882,6 +893,7 @@ mod tests {
             .with_tls(collect_tls_fingerprint_from_bytes(&sample_client_hello()).unwrap())
             .with_h2(H2Fingerprint {
                 profile: H2ProfileData {
+                    initial_stream_id: Some(1),
                     settings: vec![H2Setting {
                         id: H2SettingId::HeaderTableSize,
                         value: 65_536,
@@ -972,5 +984,26 @@ mod tests {
             field.field == "quic.transport_parameter_order"
                 && field.status == FingerprintFieldStatus::Mismatch
         }));
+    }
+
+    #[test]
+    fn initial_h2_stream_difference_is_visible_when_akamai_hash_matches() {
+        let mut wire = vec![0, 0, 1, 1, 5, 0, 0, 0, 1, 0x82];
+        let first = crate::h2::h2_fingerprint_from_frames_no_preface(&wire).unwrap();
+        wire[8] = 3;
+        let third = crate::h2::h2_fingerprint_from_frames_no_preface(&wire).unwrap();
+        assert_eq!(first.akamai_hash, third.akamai_hash);
+        let left = CollectedFingerprint::default().with_h2(first);
+        let right = CollectedFingerprint::default().with_h2(third);
+        let comparison = compare_collected_fingerprints(&left, &right);
+        assert!(!comparison.is_match());
+        let difference = comparison
+            .fields
+            .iter()
+            .find(|field| field.field == "h2.initial_stream_id")
+            .expect("raw stream ID difference is reported");
+        assert_eq!(difference.left.as_deref(), Some("1"));
+        assert_eq!(difference.right.as_deref(), Some("3"));
+        assert_eq!(difference.status, FingerprintFieldStatus::Mismatch);
     }
 }

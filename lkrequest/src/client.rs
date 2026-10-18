@@ -80,7 +80,8 @@ type SharedQuicEndpointManager =
 /// ```
 #[derive(Debug, Clone)]
 pub struct TimeoutConfig {
-    /// DNS resolution timeout.
+    /// Per-query DNS timeout, applied to address and HTTPS record lookups,
+    /// including custom resolvers. `None` adds no client-level DNS deadline.
     pub dns_timeout: Option<Duration>,
     /// TCP connection timeout (SYN → SYN-ACK).
     pub tcp_connect_timeout: Option<Duration>,
@@ -396,7 +397,7 @@ impl Default for FallbackConfig {
 ///
 /// # Zero-config usage
 ///
-/// `Client` implements `Default`, producing a Chrome 144 TLS + H2 fingerprint
+/// `Client` implements `Default`, producing a Chrome 155 TLS + H2 fingerprint
 /// — ready to use out of the box for HTTP/1.1 and HTTP/2.
 ///
 /// QUIC/HTTP3 is **opt-in**: set a QUIC profile via [`ClientBuilder::quic_profile`]
@@ -444,7 +445,7 @@ pub struct Client {
 }
 
 impl Default for Client {
-    /// Creates a `Client` with Chrome 144 TLS + H2 defaults.
+    /// Creates a `Client` with Chrome 155 TLS + H2 defaults.
     ///
     /// QUIC/HTTP3 is not enabled by default. Use [`Client::builder()`] with
     /// [`ClientBuilder::quic_profile`] or [`ClientBuilder::preset`] to enable it.
@@ -1029,7 +1030,7 @@ impl ClientBuilder {
 
     /// Set the TLS fingerprint profile.
     ///
-    /// If not set, defaults to Chrome 144.
+    /// If not set, defaults to Chrome 155.
     pub fn fingerprint(mut self, profile: TlsProfile) -> Self {
         self.tls_profile = Some(profile);
         self
@@ -1060,7 +1061,7 @@ impl ClientBuilder {
     /// Set the HTTP/2 fingerprint profile.
     ///
     /// Controls SETTINGS order, pseudo-header order, WINDOW_UPDATE, etc.
-    /// If not set, defaults to Chrome 144 H2 profile.
+    /// If not set, defaults to Chrome 155 H2 profile.
     pub fn h2_profile(mut self, profile: H2Profile) -> Self {
         self.h2_profile = Some(profile);
         self
@@ -1526,21 +1527,23 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the TCP fingerprint for JA4T anti-detection.
+    /// Set optional TCP socket overrides for a target JA4T fingerprint.
     ///
-    /// Configures TCP socket parameters (Window Size, MSS, Window Scale,
-    /// TTL, etc.) to match the JA4T fingerprint of a target browser.
-    /// Parameters are applied to the socket **before** `connect()`, so they
-    /// influence the SYN packet.
+    /// Supported parameters are applied **before** `connect()`. Window size
+    /// and scale only influence the receive buffer; MSS is applied only on
+    /// Linux, and TCP options are descriptive only. The host kernel generates
+    /// the SYN, so a full JA4T match is not guaranteed. See
+    /// [`tcp_fingerprint`](crate::tcp_fingerprint) for platform limits.
     ///
-    /// This is **optional** — most users behind a proxy do not need this,
-    /// since the proxy's own TCP stack determines the JA4T seen by the
-    /// target server. TCP fingerprint is only applied to **direct**
-    /// connections by default.
+    /// Applies to new direct TCP connections and the TCP connection to the
+    /// first HTTP/SOCKS5 proxy. The target sees the final proxy's TCP stack,
+    /// which this setting cannot configure. Reused connections and QUIC data
+    /// are unaffected. Browser presets do not enable this setting implicitly;
+    /// the transport defaults to `TCP_NODELAY=true` even without it.
     ///
     /// # Examples
     ///
-    /// Using a browser preset (auto-detects OS):
+    /// Using a TCP template selected by the compile-time OS:
     ///
     /// ```rust,no_run
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1790,7 +1793,7 @@ impl ClientBuilder {
         if let Some(ref mut profile) = self.tls_profile {
             profile.session_resumption = config;
         } else {
-            let mut profile = lktls::profile::presets::chrome_144();
+            let mut profile = lktls::profile::presets::chrome_155();
             profile.session_resumption = config;
             self.tls_profile = Some(profile);
         }
@@ -1985,15 +1988,17 @@ impl ClientBuilder {
     /// Build the `Client`.
     ///
     /// If no TLS fingerprint was set via [`.fingerprint()`](Self::fingerprint),
-    /// Chrome 144 is used as the default.  HTTP/2 profile and header order
-    /// also default to Chrome 144 when not explicitly configured.
+    /// Chrome 155 is used as the default. The HTTP/2 profile also defaults to
+    /// Chrome 155 when not explicitly configured; header-order overrides
+    /// remain optional.
     ///
     /// This means `Client::builder().build()` produces a fully functional
-    /// client with Chrome 144 fingerprints out of the box.
+    /// client with Chrome 155 TLS/H2 fingerprints out of the box. QUIC/H3
+    /// remains opt-in through a complete preset or an explicit QUIC profile.
     pub fn build(self) -> Client {
         let mut tls_profile = self
             .tls_profile
-            .unwrap_or_else(lktls::profile::presets::chrome_144);
+            .unwrap_or_else(lktls::profile::presets::chrome_155);
         // Apply the randomization policy to the resolved TLS profile. Tier 1
         // (ExtensionOrder) forces per-connection extension-order permutation;
         // Tier 0 (Off) leaves the preset's own behavior untouched.
@@ -2005,10 +2010,10 @@ impl ClientBuilder {
         }
         let quic_tls_profile = self.quic_tls_profile.unwrap_or(None);
 
-        // Default to Chrome 144 H2 profile if not explicitly set
+        // Default to Chrome 155 H2 profile if not explicitly set
         let mut h2_profile = self
             .h2_profile
-            .unwrap_or_else(crate::h2::profile::chrome_144_h2);
+            .unwrap_or_else(crate::h2::profile::chrome_155_h2);
         if let Some(max_payload) = self.h2_data_frame_policy.payload_override() {
             let behavior = h2_profile
                 .behavior()
@@ -2031,6 +2036,12 @@ impl ClientBuilder {
             resolver = Arc::new(crate::dns::FamilyResolver {
                 inner: resolver,
                 family: self.ip_family,
+            });
+        }
+        if let Some(timeout) = self.timeouts.dns_timeout {
+            resolver = Arc::new(crate::dns::TimeoutResolver {
+                inner: resolver,
+                timeout,
             });
         }
         let default_protocol_policy = self.protocol_policy.unwrap_or_default();
@@ -2467,10 +2478,20 @@ mod tests {
     }
 
     #[test]
-    fn client_default_is_chrome_144_without_quic() {
+    fn client_default_is_chrome_155_without_quic() {
         let client = Client::default();
-        assert_eq!(client.tls_profile().name, "Chrome 144");
+        assert_eq!(client.tls_profile().name, "Chrome 155");
+        assert_eq!(
+            serde_json::to_value(client.tls_profile()).unwrap(),
+            serde_json::to_value(lktls::profile::presets::chrome_155()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(client.h2_profile()).unwrap(),
+            serde_json::to_value(crate::h2::profile::chrome_155_h2()).unwrap()
+        );
         assert!(client.quic_profile().is_none());
+        assert!(client.quic_tls_profile().is_none());
+        assert!(client.default_headers().is_empty());
     }
 
     // -- Timeouts ----------------------------------------------------------
@@ -2713,8 +2734,8 @@ mod tests {
         let client = Client::builder()
             .session_resumption(SessionResumptionConfig::disabled())
             .build();
-        // No fingerprint set → falls back to the Chrome 144 default.
-        assert_eq!(client.tls_profile().name, "Chrome 144");
+        // Configuring resumption without a preset still uses Chrome 155.
+        assert_eq!(client.tls_profile().name, "Chrome 155");
     }
 
     // -- DNS resolver setters ----------------------------------------------
@@ -2731,7 +2752,7 @@ mod tests {
         let client2 = Client::builder()
             .dns_resolver(std::sync::Arc::new(SystemDns))
             .build();
-        assert_eq!(client2.tls_profile().name, "Chrome 144");
+        assert_eq!(client2.tls_profile().name, "Chrome 155");
         let _ = client2.resolver();
 
         let cached = Client::builder()
@@ -2759,6 +2780,6 @@ mod tests {
         let _ = client.head("https://example.com/");
         let _ = client.patch("https://example.com/");
         let _ = client.options("https://example.com/");
-        assert_eq!(client.tls_profile().name, "Chrome 144");
+        assert_eq!(client.tls_profile().name, "Chrome 155");
     }
 }

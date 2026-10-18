@@ -9,11 +9,12 @@
 
 use super::{
     RecordHeader, Tls12RecordCipher, MAX_CIPHERTEXT_EXPANSION, MAX_RECORD_PAYLOAD,
-    MAX_TLS13_INNER_PLAINTEXT, RECORD_HEADER_SIZE,
+    MAX_TLS12_CIPHERTEXT_EXPANSION, MAX_TLS13_INNER_PLAINTEXT, RECORD_HEADER_SIZE,
 };
 use crate::crypto::aead::Aead;
 use crate::error::{AlertDescription, Result, TlsError};
 use crate::handshake::content_type;
+use crate::profile::types::TlsClientHelloStyle;
 
 /// A decrypted TLS record.
 #[derive(Debug)]
@@ -43,6 +44,12 @@ pub struct RecordReader {
     /// `None` — the case for every profile that does not send the extension,
     /// Chrome included — means only the protocol maximum applies.
     own_record_size_limit: Option<u16>,
+    /// Browser-specific alert mapping for invalid TLS 1.3 CCS records.
+    client_style: TlsClientHelloStyle,
+    tls13_selected: bool,
+    tls13_handshake_complete: bool,
+    consecutive_empty_records: u8,
+    nss_ccs_received_with_keys: bool,
 }
 
 impl RecordReader {
@@ -56,7 +63,41 @@ impl RecordReader {
             aead: None,
             tls12_cipher: None,
             own_record_size_limit: None,
+            client_style: TlsClientHelloStyle::Generic,
+            tls13_selected: false,
+            tls13_handshake_complete: false,
+            consecutive_empty_records: 0,
+            nss_ccs_received_with_keys: false,
         }
+    }
+
+    pub(crate) fn set_client_style(&mut self, style: TlsClientHelloStyle) {
+        self.client_style = style;
+    }
+
+    pub(crate) fn select_tls13(&mut self) {
+        self.tls13_selected = true;
+    }
+
+    pub(crate) fn finish_tls13_handshake(&mut self) {
+        self.tls13_handshake_complete = true;
+    }
+
+    fn count_empty_record(&mut self, empty: bool) -> Result<()> {
+        if self.tls13_selected && self.client_style == TlsClientHelloStyle::ChromiumBoringssl {
+            if empty {
+                self.consecutive_empty_records = self.consecutive_empty_records.saturating_add(1);
+                if self.consecutive_empty_records > 32 {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::UnexpectedMessage,
+                        "too many consecutive empty TLS records or compatibility CCS records",
+                    ));
+                }
+            } else {
+                self.consecutive_empty_records = 0;
+            }
+        }
+        Ok(())
     }
 
     /// Enforce the RFC 8449 `record_size_limit` **we** advertised.
@@ -131,6 +172,7 @@ impl RecordReader {
         self.aead = Some(aead);
         self.tls12_cipher = None;
         self.seq_num = 0;
+        self.select_tls13();
     }
 
     /// Install TLS 1.2 decryption keys. All subsequent records will be decrypted.
@@ -139,6 +181,10 @@ impl RecordReader {
         self.tls12_cipher = Some(cipher);
         self.aead = None;
         self.seq_num = 0;
+        self.tls13_selected = false;
+        self.tls13_handshake_complete = false;
+        self.consecutive_empty_records = 0;
+        self.nss_ccs_received_with_keys = false;
     }
 
     /// Feed raw bytes from the transport into the reader.
@@ -165,11 +211,22 @@ impl RecordReader {
 
         let payload_len = header.length as usize;
         let is_encrypted = self.aead.is_some() || self.tls12_cipher.is_some();
+        if is_encrypted
+            && self.client_style == TlsClientHelloStyle::ChromiumBoringssl
+            && header.version != 0x0303
+        {
+            return Err(TlsError::local_alert(
+                AlertDescription::ProtocolVersion,
+                "record version differs from the selected TLS record version",
+            ));
+        }
         // RFC 8446 §5.1 / RFC 5246 §6.2.1: plaintext records are limited to
-        // 2^14 bytes; encrypted records may add up to 256 bytes of overhead.
+        // 2^14 bytes; TLS 1.3 ciphertext may add 256 bytes, TLS 1.2 2048 bytes.
         // Either way the required response is a fatal `record_overflow`
         // (RFC 8446 §5.1, §5.2).
-        let max_len = if is_encrypted {
+        let max_len = if self.tls12_cipher.is_some() {
+            MAX_RECORD_PAYLOAD + MAX_TLS12_CIPHERTEXT_EXPANSION
+        } else if is_encrypted {
             MAX_RECORD_PAYLOAD + MAX_CIPHERTEXT_EXPANSION
         } else {
             MAX_RECORD_PAYLOAD
@@ -198,12 +255,19 @@ impl RecordReader {
             // The content type in the header is the real content type.
             // AAD = seq_num(8) + content_type(1) + version(2) + plaintext_length(2)
 
+            let authentication_failure = || {
+                TlsError::local_alert(
+                    AlertDescription::BadRecordMac,
+                    "TLS 1.2 record authentication failed",
+                )
+            };
+
             let plaintext = match tls12_cipher {
                 Tls12RecordCipher::Gcm(gcm) => {
                     // GCM: raw_payload = explicit_nonce(8) + ciphertext + tag(16)
                     // Plaintext length = record payload length - 8 - 16
                     if raw_payload.len() < 8 + 16 {
-                        return Err(TlsError::CryptoError("TLS 1.2 GCM record too short".into()));
+                        return Err(authentication_failure());
                     }
                     let plaintext_len = raw_payload.len() - 8 - 16;
                     let mut aad = [0u8; 13];
@@ -214,14 +278,13 @@ impl RecordReader {
                     aad[11] = (plaintext_len >> 8) as u8;
                     aad[12] = plaintext_len as u8;
 
-                    gcm.decrypt(&aad, &raw_payload)?
+                    gcm.decrypt(&aad, &raw_payload)
+                        .map_err(|_| authentication_failure())?
                 }
                 Tls12RecordCipher::Chacha20(chacha) => {
                     // ChaCha20: raw_payload = ciphertext + tag(16), no explicit nonce
                     if raw_payload.len() < 16 {
-                        return Err(TlsError::CryptoError(
-                            "TLS 1.2 ChaCha20 record too short".into(),
-                        ));
+                        return Err(authentication_failure());
                     }
                     let plaintext_len = raw_payload.len() - 16;
                     let mut aad = [0u8; 13];
@@ -232,7 +295,9 @@ impl RecordReader {
                     aad[11] = (plaintext_len >> 8) as u8;
                     aad[12] = plaintext_len as u8;
 
-                    chacha.decrypt(self.seq_num, &aad, &raw_payload)?
+                    chacha
+                        .decrypt(self.seq_num, &aad, &raw_payload)
+                        .map_err(|_| authentication_failure())?
                 }
                 Tls12RecordCipher::Cbc(cbc) => {
                     // CBC: raw_payload = iv(16) + encrypted(plaintext + mac + padding)
@@ -249,7 +314,8 @@ impl RecordReader {
                     aad[11] = (rpl >> 8) as u8;
                     aad[12] = rpl as u8;
 
-                    cbc.decrypt(&aad, &raw_payload)?
+                    cbc.decrypt(&aad, &raw_payload)
+                        .map_err(|_| authentication_failure())?
                 }
             };
             self.seq_num = self.seq_num.checked_add(1).ok_or_else(|| {
@@ -270,10 +336,34 @@ impl RecordReader {
         // Step 4b: TLS 1.3 decryption — only APPLICATION_DATA records
         if let Some(ref aead) = self.aead {
             if header.content_type == content_type::APPLICATION_DATA {
+                // NSS rejects impossible ciphertext sizes and mismatched versions
+                // before authentication, while BoringSSL checks the version above.
+                if self.client_style == TlsClientHelloStyle::FirefoxNss {
+                    let maximum = self.max_protected_plaintext() + aead.algorithm().tag_len();
+                    if raw_payload.len() > maximum {
+                        return Err(TlsError::local_alert(
+                            AlertDescription::RecordOverflow,
+                            "TLS 1.3 ciphertext exceeds the cipher-specific receive limit",
+                        ));
+                    }
+                    if header.version != 0x0303 {
+                        return Err(TlsError::local_alert(
+                            AlertDescription::BadRecordMac,
+                            "TLS 1.3 record version differs from the selected record version",
+                        ));
+                    }
+                }
                 // TLS 1.3: encrypted records use content_type APPLICATION_DATA on the wire.
                 // AAD = the 5-byte record header (with the encrypted length).
                 let aad = header.to_bytes();
-                let plaintext = aead.decrypt(self.seq_num, &aad, &raw_payload)?;
+                let plaintext = aead
+                    .decrypt(self.seq_num, &aad, &raw_payload)
+                    .map_err(|_| {
+                        TlsError::local_alert(
+                            AlertDescription::BadRecordMac,
+                            "TLS 1.3 record authentication failed",
+                        )
+                    })?;
                 self.seq_num = self.seq_num.checked_add(1).ok_or_else(|| {
                     TlsError::UnexpectedMessage("record sequence number overflow".to_string())
                 })?;
@@ -286,8 +376,38 @@ impl RecordReader {
 
                 // TLS 1.3: the last non-zero byte of the decrypted payload is the
                 // inner content type. Strip trailing zeros and the content type byte.
-                let (inner_ct, inner_payload) = strip_inner_content_type(&plaintext)?;
+                let (inner_ct, inner_payload) =
+                    strip_inner_content_type(&plaintext).map_err(|_| {
+                        TlsError::local_alert(
+                            if self.client_style == TlsClientHelloStyle::ChromiumBoringssl {
+                                AlertDescription::DecryptError
+                            } else {
+                                AlertDescription::UnexpectedMessage
+                            },
+                            "decrypted TLS 1.3 record has no inner content type",
+                        )
+                    })?;
                 check_content_type(inner_ct)?;
+                if inner_ct == content_type::CHANGE_CIPHER_SPEC {
+                    // Protected CCS is never the TLS 1.3 compatibility message.
+                    // NSS validates its body before rejecting the record type.
+                    let description = if self.client_style == TlsClientHelloStyle::FirefoxNss {
+                        if inner_payload.len() != 1 {
+                            AlertDescription::DecodeError
+                        } else if inner_payload != [1] {
+                            AlertDescription::IllegalParameter
+                        } else {
+                            AlertDescription::UnexpectedMessage
+                        }
+                    } else {
+                        AlertDescription::UnexpectedMessage
+                    };
+                    return Err(TlsError::local_alert(
+                        description,
+                        "protected TLS 1.3 ChangeCipherSpec",
+                    ));
+                }
+                self.count_empty_record(inner_payload.is_empty())?;
 
                 return Ok(Some(PlaintextRecord {
                     content_type: inner_ct,
@@ -315,7 +435,41 @@ impl RecordReader {
             ));
         }
 
+        if self.aead.is_some()
+            && header.content_type == content_type::CHANGE_CIPHER_SPEC
+            && (raw_payload != [1] || self.tls13_handshake_complete)
+        {
+            return Err(TlsError::local_alert(
+                if self.client_style == TlsClientHelloStyle::ChromiumBoringssl {
+                    AlertDescription::BadRecordMac
+                } else {
+                    AlertDescription::UnexpectedMessage
+                },
+                "unexpected plaintext ChangeCipherSpec in the current TLS 1.3 epoch",
+            ));
+        }
+
         check_content_type(header.content_type)?;
+
+        if self.tls13_selected
+            && header.content_type == content_type::CHANGE_CIPHER_SPEC
+            && raw_payload == [1]
+        {
+            // BoringSSL counts compatibility CCS with empty records. NSS only
+            // permits one CCS once handshake read keys have been installed.
+            self.count_empty_record(true)?;
+            if self.client_style == TlsClientHelloStyle::FirefoxNss && self.aead.is_some() {
+                if self.nss_ccs_received_with_keys {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::UnexpectedMessage,
+                        "repeated compatibility ChangeCipherSpec after TLS 1.3 key installation",
+                    ));
+                }
+                self.nss_ccs_received_with_keys = true;
+            }
+        } else {
+            self.count_empty_record(raw_payload.is_empty())?;
+        }
 
         Ok(Some(PlaintextRecord {
             content_type: header.content_type,
@@ -560,11 +714,25 @@ mod tests {
     /// A TLS 1.3 record protecting `inner`, which is a complete
     /// `TLSInnerPlaintext` (content ‖ inner content type ‖ padding).
     fn tls13_record(inner: &[u8]) -> Vec<u8> {
+        tls13_record_at_sequence(inner, 0)
+    }
+
+    fn tls13_record_at_sequence(inner: &[u8], sequence: u64) -> Vec<u8> {
+        tls13_record_at_version(inner, sequence, 0x0303)
+    }
+
+    fn tls13_record_at_version(inner: &[u8], sequence: u64, version: u16) -> Vec<u8> {
         let ct_len = inner.len() + 16; // AEAD tag
-        let header: [u8; 5] = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
+        let header: [u8; 5] = [
+            0x17,
+            (version >> 8) as u8,
+            version as u8,
+            (ct_len >> 8) as u8,
+            ct_len as u8,
+        ];
         let aead = Aead::new(AeadAlgorithm::Aes128Gcm, &TEST_KEY, &TEST_IV).unwrap();
         let mut record = header.to_vec();
-        record.extend_from_slice(&aead.encrypt(0, &header, inner).unwrap());
+        record.extend_from_slice(&aead.encrypt(sequence, &header, inner).unwrap());
         record
     }
 
@@ -647,6 +815,154 @@ mod tests {
         assert_eq!(protected.payload, b"handshake data");
     }
 
+    #[test]
+    fn protected_ccs_is_not_a_compatibility_message() {
+        let mut reader = tls13_reader();
+        reader.feed(&tls13_record(&[1, content_type::CHANGE_CIPHER_SPEC]));
+        assert_eq!(
+            alert_of(reader.next_record()),
+            Some(AlertDescription::UnexpectedMessage)
+        );
+    }
+
+    #[test]
+    fn malformed_plaintext_ccs_after_keys_is_rejected() {
+        for payload in [&[][..], &[2][..], &[1, 1][..]] {
+            let mut reader = tls13_reader();
+            reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, payload));
+            assert_eq!(
+                alert_of(reader.next_record()),
+                Some(AlertDescription::UnexpectedMessage)
+            );
+        }
+    }
+
+    #[test]
+    fn chromium_ccs_budget_resets_only_on_nonempty_records() {
+        for encrypted in [false, true] {
+            let mut reader = if encrypted {
+                tls13_reader()
+            } else {
+                RecordReader::new()
+            };
+            reader.set_client_style(TlsClientHelloStyle::ChromiumBoringssl);
+            reader.select_tls13();
+            for _ in 0..32 {
+                reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+                assert!(reader.next_record().unwrap().is_some());
+            }
+            let record = if encrypted {
+                tls13_record(&[8, 0, 0, 2, 0, 0, content_type::HANDSHAKE])
+            } else {
+                plaintext_record(content_type::HANDSHAKE, &[2, 0, 0, 0])
+            };
+            reader.feed(&record);
+            assert!(!reader.next_record().unwrap().unwrap().payload.is_empty());
+            for _ in 0..32 {
+                reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+                assert!(reader.next_record().unwrap().is_some());
+            }
+            reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+            assert_eq!(
+                alert_of(reader.next_record()),
+                Some(AlertDescription::UnexpectedMessage)
+            );
+        }
+    }
+
+    #[test]
+    fn chromium_empty_records_share_the_compatibility_ccs_budget() {
+        let mut reader = tls13_reader();
+        reader.set_client_style(TlsClientHelloStyle::ChromiumBoringssl);
+        for _ in 0..31 {
+            reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+            assert!(reader.next_record().unwrap().is_some());
+        }
+        reader.feed(&tls13_record(&[content_type::HANDSHAKE]));
+        assert!(reader.next_record().unwrap().unwrap().payload.is_empty());
+        reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+        assert_eq!(
+            alert_of(reader.next_record()),
+            Some(AlertDescription::UnexpectedMessage)
+        );
+    }
+
+    #[test]
+    fn nss_ccs_budget_starts_with_keys_and_survives_nonempty_records() {
+        let mut reader = RecordReader::new();
+        reader.set_client_style(TlsClientHelloStyle::FirefoxNss);
+        reader.select_tls13();
+        for _ in 0..33 {
+            reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+            assert!(reader.next_record().unwrap().is_some());
+        }
+        reader.set_keys(Aead::new(AeadAlgorithm::Aes128Gcm, &TEST_KEY, &TEST_IV).unwrap());
+        reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+        assert!(reader.next_record().unwrap().is_some());
+        reader.feed(&tls13_record(&[8, 0, 0, 2, 0, 0, content_type::HANDSHAKE]));
+        assert!(!reader.next_record().unwrap().unwrap().payload.is_empty());
+        reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+        assert_eq!(
+            alert_of(reader.next_record()),
+            Some(AlertDescription::UnexpectedMessage)
+        );
+    }
+
+    #[test]
+    fn finished_closes_ccs_compatibility_even_after_key_updates() {
+        for style in [
+            TlsClientHelloStyle::Generic,
+            TlsClientHelloStyle::ChromiumBoringssl,
+            TlsClientHelloStyle::FirefoxNss,
+        ] {
+            for previous_ccs in [false, true] {
+                for key_update in [false, true] {
+                    let mut reader = tls13_reader();
+                    reader.set_client_style(style);
+                    if previous_ccs {
+                        reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+                        assert!(reader.next_record().unwrap().is_some());
+                    }
+                    reader.finish_tls13_handshake();
+                    if key_update {
+                        reader.set_keys(
+                            Aead::new(AeadAlgorithm::Aes128Gcm, &TEST_KEY, &TEST_IV).unwrap(),
+                        );
+                    }
+                    reader.feed(&plaintext_record(content_type::CHANGE_CIPHER_SPEC, &[1]));
+                    let expected = if style == TlsClientHelloStyle::ChromiumBoringssl {
+                        AlertDescription::BadRecordMac
+                    } else {
+                        AlertDescription::UnexpectedMessage
+                    };
+                    assert_eq!(alert_of(reader.next_record()), Some(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finished_keeps_the_chromium_empty_application_record_budget() {
+        let mut reader = tls13_reader();
+        reader.set_client_style(TlsClientHelloStyle::ChromiumBoringssl);
+        reader.finish_tls13_handshake();
+        for sequence in 0..32 {
+            reader.feed(&tls13_record_at_sequence(
+                &[content_type::APPLICATION_DATA],
+                sequence,
+            ));
+            assert!(reader.next_record().unwrap().unwrap().payload.is_empty());
+        }
+        reader.feed(&tls13_record_at_sequence(
+            &[content_type::APPLICATION_DATA],
+            32,
+        ));
+        assert_eq!(
+            alert_of(reader.next_record()),
+            Some(AlertDescription::UnexpectedMessage)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // B-10 — RFC 8446 §5.1: an unknown content type aborts the connection
     // -----------------------------------------------------------------------
@@ -680,6 +996,313 @@ mod tests {
             Some(AlertDescription::UnexpectedMessage),
             "an unknown TLS 1.3 inner content type must abort the connection"
         );
+    }
+
+    #[test]
+    fn record_failure_authentication_uses_bad_record_mac_for_each_tls13_cipher() {
+        for algorithm in [
+            AeadAlgorithm::Aes128Gcm,
+            AeadAlgorithm::Aes256Gcm,
+            AeadAlgorithm::Chacha20Poly1305,
+        ] {
+            let key = vec![0x42; algorithm.key_len()];
+            let cipher = Aead::new(algorithm, &key, &TEST_IV).unwrap();
+            for case in ["valid", "bad_tag", "short_tag", "wrong_nonce"] {
+                let mut record = if case == "short_tag" {
+                    plaintext_record(content_type::APPLICATION_DATA, &[0; 15])
+                } else {
+                    let header = [23, 3, 3, 0, 18];
+                    let mut record = header.to_vec();
+                    record.extend_from_slice(
+                        &cipher
+                            .encrypt(u64::from(case == "wrong_nonce"), &header, &[0x42, 23])
+                            .unwrap(),
+                    );
+                    record
+                };
+                if case == "bad_tag" {
+                    *record.last_mut().unwrap() ^= 1;
+                }
+                let mut reader = RecordReader::new();
+                reader.set_keys(Aead::new(algorithm, &key, &TEST_IV).unwrap());
+                reader.feed(&record);
+                if case == "valid" {
+                    let plain = reader.next_record().unwrap().unwrap();
+                    assert_eq!(plain.content_type, content_type::APPLICATION_DATA);
+                    assert_eq!(plain.payload, [0x42]);
+                } else {
+                    assert_eq!(
+                        alert_of(reader.next_record()),
+                        Some(AlertDescription::BadRecordMac)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn record_failure_missing_type_matches_browser_alerts() {
+        for style in [
+            TlsClientHelloStyle::Generic,
+            TlsClientHelloStyle::ChromiumBoringssl,
+            TlsClientHelloStyle::FirefoxNss,
+        ] {
+            for inner in [&[][..], &[0][..], &[0; 20][..]] {
+                let mut reader = tls13_reader();
+                reader.set_client_style(style);
+                reader.feed(&tls13_record(inner));
+                let expected = if style == TlsClientHelloStyle::ChromiumBoringssl {
+                    AlertDescription::DecryptError
+                } else {
+                    AlertDescription::UnexpectedMessage
+                };
+                assert_eq!(alert_of(reader.next_record()), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn record_failure_authentication_precedes_inner_plaintext_validation() {
+        for style in [
+            TlsClientHelloStyle::ChromiumBoringssl,
+            TlsClientHelloStyle::FirefoxNss,
+        ] {
+            let mut reader = tls13_reader();
+            reader.set_client_style(style);
+            let mut record = tls13_record(&[0; 20]);
+            *record.last_mut().unwrap() ^= 1;
+            reader.feed(&record);
+            assert_eq!(
+                alert_of(reader.next_record()),
+                Some(AlertDescription::BadRecordMac)
+            );
+        }
+    }
+
+    fn tls12_test_cipher(kind: usize) -> Tls12RecordCipher {
+        use crate::crypto::tls12_cipher::{CbcMacAlgorithm, Tls12CbcCipher, Tls12Chacha20Cipher};
+        match kind {
+            0 => Tls12RecordCipher::Gcm(Tls12GcmCipher::new(&[0x42; 16], &[1; 4], false).unwrap()),
+            1 => Tls12RecordCipher::Gcm(Tls12GcmCipher::new(&[0x42; 32], &[1; 4], true).unwrap()),
+            2 => Tls12RecordCipher::Chacha20(
+                Tls12Chacha20Cipher::new(&[0x42; 32], &[1; 12]).unwrap(),
+            ),
+            3 => Tls12RecordCipher::Cbc(Tls12CbcCipher::new(
+                &[0x42; 16],
+                &[0x24; 20],
+                CbcMacAlgorithm::HmacSha1,
+            )),
+            4 => Tls12RecordCipher::Cbc(Tls12CbcCipher::new(
+                &[0x42; 16],
+                &[0x24; 32],
+                CbcMacAlgorithm::HmacSha256,
+            )),
+            5 => Tls12RecordCipher::Cbc(Tls12CbcCipher::new(
+                &[0x42; 32],
+                &[0x24; 48],
+                CbcMacAlgorithm::HmacSha384,
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tls12_record_authentication_failures_are_fatal_bad_record_mac() {
+        use crate::record::writer::RecordWriter;
+        for kind in 0..6 {
+            for scenario in ["normal", "corrupt_tail", "short_record"] {
+                let mut writer = RecordWriter::new();
+                writer.mark_post_initial();
+                writer.set_tls12_keys(tls12_test_cipher(kind));
+                let mut record = writer
+                    .write_record(content_type::APPLICATION_DATA, b"record-data")
+                    .unwrap();
+                if scenario == "corrupt_tail" {
+                    *record.last_mut().unwrap() ^= 1;
+                }
+                if scenario == "short_record" {
+                    let short = if kind <= 1 {
+                        23
+                    } else if kind == 2 {
+                        15
+                    } else {
+                        31
+                    };
+                    record.truncate(5);
+                    record[3..5].copy_from_slice(&(short as u16).to_be_bytes());
+                    record.resize(5 + short, 0);
+                }
+                let mut reader = RecordReader::new();
+                reader.set_tls12_keys(tls12_test_cipher(kind));
+                reader.feed(&record);
+                if scenario == "normal" {
+                    assert_eq!(
+                        reader.next_record().unwrap().unwrap().payload,
+                        b"record-data"
+                    );
+                } else {
+                    let error = reader.next_record().unwrap_err();
+                    assert!(matches!(error, TlsError::LocalAlert { alert, .. }
+                        if alert.level == crate::error::AlertLevel::Fatal && alert.description == AlertDescription::BadRecordMac));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tls12_ciphertext_limit_is_distinct_from_tls13() {
+        let long_cbc_header = [23, 3, 3, 0x41, 0x20]; // 16672: 16384 content + CBC MAC/IV/long padding.
+        let mut tls12 = RecordReader::new();
+        tls12.set_tls12_keys(tls12_test_cipher(3));
+        tls12.feed(&long_cbc_header);
+        assert!(tls12.next_record().unwrap().is_none());
+        let mut tls13 = tls13_reader();
+        tls13.feed(&long_cbc_header);
+        assert_eq!(
+            alert_of(tls13.next_record()),
+            Some(AlertDescription::RecordOverflow)
+        );
+        let mut tls12 = RecordReader::new();
+        tls12.set_tls12_keys(tls12_test_cipher(3));
+        tls12.feed(&[23, 3, 3, 0x48, 0x01]); // 18433: above the TLS 1.2 ciphertext ceiling.
+        assert_eq!(
+            alert_of(tls12.next_record()),
+            Some(AlertDescription::RecordOverflow)
+        );
+    }
+
+    #[test]
+    fn tls13_record_version_policy_is_browser_specific() {
+        for style in [
+            TlsClientHelloStyle::Generic,
+            TlsClientHelloStyle::ChromiumBoringssl,
+            TlsClientHelloStyle::FirefoxNss,
+        ] {
+            for version in [0x0301, 0x0303, 0x0304, 0x0403] {
+                let mut reader = tls13_reader();
+                reader.set_client_style(style);
+                reader.feed(&tls13_record_at_version(&[0x42, 23], 0, version));
+                if version == 0x0303 || style == TlsClientHelloStyle::Generic {
+                    assert_eq!(reader.next_record().unwrap().unwrap().payload, [0x42]);
+                } else {
+                    let expected = if style == TlsClientHelloStyle::ChromiumBoringssl {
+                        AlertDescription::ProtocolVersion
+                    } else {
+                        AlertDescription::BadRecordMac
+                    };
+                    assert_eq!(alert_of(reader.next_record()), Some(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tls12_record_versions_keep_nss_authenticated_compatibility() {
+        for kind in 0..6 {
+            for style in [
+                TlsClientHelloStyle::Generic,
+                TlsClientHelloStyle::ChromiumBoringssl,
+                TlsClientHelloStyle::FirefoxNss,
+            ] {
+                for version in [0x0301u16, 0x0303, 0x0304, 0x0403] {
+                    let mut aad = [0; 13];
+                    aad[8] = 23;
+                    aad[9..11].copy_from_slice(&version.to_be_bytes());
+                    aad[12] = 1;
+                    let encrypted = match tls12_test_cipher(kind) {
+                        Tls12RecordCipher::Gcm(cipher) => cipher.encrypt(0, &aad, &[0x42]).unwrap(),
+                        Tls12RecordCipher::Chacha20(cipher) => {
+                            cipher.encrypt(0, &aad, &[0x42]).unwrap()
+                        }
+                        Tls12RecordCipher::Cbc(cipher) => cipher.encrypt(0, &aad, &[0x42]).unwrap(),
+                    };
+                    let mut record = vec![23];
+                    record.extend_from_slice(&version.to_be_bytes());
+                    record.extend_from_slice(&(encrypted.len() as u16).to_be_bytes());
+                    record.extend_from_slice(&encrypted);
+                    let mut reader = RecordReader::new();
+                    reader.set_client_style(style);
+                    reader.set_tls12_keys(tls12_test_cipher(kind));
+                    reader.feed(&record);
+                    if style == TlsClientHelloStyle::ChromiumBoringssl && version != 0x0303 {
+                        assert_eq!(
+                            alert_of(reader.next_record()),
+                            Some(AlertDescription::ProtocolVersion)
+                        );
+                    } else {
+                        assert_eq!(reader.next_record().unwrap().unwrap().payload, [0x42]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn record_version_and_size_precedence_matches_browser_policy() {
+        for tls12 in [false, true] {
+            for style in [
+                TlsClientHelloStyle::ChromiumBoringssl,
+                TlsClientHelloStyle::FirefoxNss,
+            ] {
+                let mut reader = tls13_reader();
+                if tls12 {
+                    reader.set_tls12_keys(tls12_test_cipher(0));
+                }
+                reader.set_client_style(style);
+                reader.feed(&[23, 4, 3, 0xff, 0xff]);
+                let expected = if style == TlsClientHelloStyle::ChromiumBoringssl {
+                    AlertDescription::ProtocolVersion
+                } else {
+                    AlertDescription::RecordOverflow
+                };
+                assert_eq!(alert_of(reader.next_record()), Some(expected));
+            }
+        }
+        for version in [0x0301u16, 0x0303] {
+            for length in [80u16, 81] {
+                let mut reader = tls13_reader();
+                reader.set_client_style(TlsClientHelloStyle::FirefoxNss);
+                reader.set_own_record_size_limit(Some(64));
+                let mut record = vec![23];
+                record.extend_from_slice(&version.to_be_bytes());
+                record.extend_from_slice(&length.to_be_bytes());
+                record.resize(5 + length as usize, 0);
+                reader.feed(&record);
+                let expected = if length == 81 {
+                    AlertDescription::RecordOverflow
+                } else {
+                    AlertDescription::BadRecordMac
+                };
+                assert_eq!(alert_of(reader.next_record()), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_ccs_version_policy_does_not_consume_aead_sequence() {
+        for style in [
+            TlsClientHelloStyle::ChromiumBoringssl,
+            TlsClientHelloStyle::FirefoxNss,
+        ] {
+            for version in [0x0301u16, 0x0403] {
+                let mut reader = tls13_reader();
+                reader.set_client_style(style);
+                let mut record = vec![20];
+                record.extend_from_slice(&version.to_be_bytes());
+                record.extend_from_slice(&[0, 1, 1]);
+                record.extend_from_slice(&tls13_record(&[0x42, 23]));
+                reader.feed(&record);
+                if style == TlsClientHelloStyle::ChromiumBoringssl {
+                    assert_eq!(
+                        alert_of(reader.next_record()),
+                        Some(AlertDescription::ProtocolVersion)
+                    );
+                } else {
+                    assert_eq!(reader.next_record().unwrap().unwrap().payload, [1]);
+                    assert_eq!(reader.next_record().unwrap().unwrap().payload, [0x42]);
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

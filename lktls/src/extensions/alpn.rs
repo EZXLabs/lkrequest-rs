@@ -38,16 +38,9 @@ impl Extension for Alpn {
 ///
 /// The server ALPN extension contains a single selected protocol in the
 /// format: `protocol_name_list_length(2) + protocol_name_length(1) + name`.
+/// Returns `None` for malformed framing or a non-UTF-8 identifier.
 pub fn parse_server_alpn(data: &[u8]) -> Option<String> {
-    if data.len() < 4 {
-        return None;
-    }
-    // protocol_name_list_length (2 bytes) — we skip it, just use inner length
-    let name_len = data[2] as usize;
-    if 3 + name_len > data.len() {
-        return None;
-    }
-    std::str::from_utf8(&data[3..3 + name_len])
+    std::str::from_utf8(parse_server_alpn_bytes(data)?)
         .ok()
         .map(|s| s.to_string())
 }
@@ -55,12 +48,27 @@ pub fn parse_server_alpn(data: &[u8]) -> Option<String> {
 /// Parse all ALPN protocols from a client or server extension payload.
 ///
 /// The payload format is: `list_length(2) + (name_length(1) + name)*`.
+/// Returns `None` if framing is malformed or any identifier is non-UTF-8.
 pub fn parse_alpn_list(data: &[u8]) -> Option<Vec<String>> {
+    parse_alpn_list_bytes(data)?
+        .into_iter()
+        .map(|name| std::str::from_utf8(name).ok().map(str::to_string))
+        .collect()
+}
+
+pub(crate) fn parse_server_alpn_bytes(data: &[u8]) -> Option<&[u8]> {
+    let protocols = parse_alpn_list_bytes(data)?;
+    (protocols.len() == 1).then(|| protocols[0])
+}
+
+// ALPN identifiers are opaque bytes. Validate framing before interpreting
+// them as strings; never skip an invalid entry or accept trailing data.
+pub(crate) fn parse_alpn_list_bytes(data: &[u8]) -> Option<Vec<&[u8]>> {
     if data.len() < 2 {
         return None;
     }
     let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    if 2 + list_len > data.len() {
+    if list_len < 2 || 2 + list_len != data.len() {
         return None;
     }
 
@@ -70,12 +78,10 @@ pub fn parse_alpn_list(data: &[u8]) -> Option<Vec<String>> {
     while pos < end {
         let name_len = data[pos] as usize;
         pos += 1;
-        if pos + name_len > end {
+        if name_len == 0 || pos + name_len > end {
             return None;
         }
-        if let Ok(name) = std::str::from_utf8(&data[pos..pos + name_len]) {
-            protocols.push(name.to_string());
-        }
+        protocols.push(&data[pos..pos + name_len]);
         pos += name_len;
     }
     Some(protocols)
@@ -129,5 +135,33 @@ mod tests {
         ];
         let protos = parse_alpn_list(&data).unwrap();
         assert_eq!(protos, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn server_selection_requires_exactly_one_nonempty_framed_name() {
+        for payload in [
+            vec![],
+            vec![0, 0],
+            vec![0, 2, 0, 0],
+            vec![0, 2, 2, b'h', b'2'],
+            vec![0, 3, 2, b'h', b'2', 0],
+            vec![0, 6, 2, b'h', b'2', 2, b'h', b'3'],
+        ] {
+            assert!(parse_server_alpn_bytes(&payload).is_none(), "{payload:x?}");
+            assert!(parse_server_alpn(&payload).is_none());
+        }
+        assert_eq!(parse_server_alpn_bytes(&[0, 2, 1, 0]), Some(&[0][..]));
+    }
+
+    #[test]
+    fn opaque_protocols_are_not_lossily_matched_or_silently_skipped() {
+        let payload = [0, 5, 2, b'h', b'2', 1, 0x80];
+        assert_eq!(
+            parse_alpn_list_bytes(&payload).unwrap(),
+            [&b"h2"[..], &[0x80][..]]
+        );
+        assert!(parse_alpn_list(&payload).is_none());
+        assert_eq!(parse_server_alpn_bytes(&[0, 2, 1, 0x80]), Some(&[0x80][..]));
+        assert!(parse_server_alpn(&[0, 2, 1, 0x80]).is_none());
     }
 }

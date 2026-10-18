@@ -13,8 +13,11 @@ header = """
  * Threading / lifetime notes:
  * - Client / Session / Op handles may be shared across threads.
  * - Request / StreamingResponse are single-owner handles and must not be driven concurrently.
- * - Borrowed pointers returned by getters remain valid until the owning handle is freed, or until
- *   the next mutating stream read for lk_streaming_response_t chunk views.
+ * - Borrowed pointers are owned by their handle. Except for cookie and streaming chunk views,
+ *   they remain valid until that handle is freed.
+ * - Streaming chunk views are invalidated by the next mutating stream read, close, or free.
+ * - Session cookie views are invalidated when their query is repeated or a cookie setter,
+ *   removal, or clear runs. Copy them before such calls and synchronize reads with those calls.
  * - All handles must be released with their matching free function.
  */
 """
@@ -33,6 +36,7 @@ typedef struct lk_response_t lk_response_t;
 typedef struct lk_streaming_response_t lk_streaming_response_t;
 typedef struct lk_error_t lk_error_t;
 typedef struct lk_op_t lk_op_t;
+typedef struct lk_proxy_config_t lk_proxy_config_t;
 typedef struct lk_proxy_pool_t lk_proxy_pool_t;
 typedef struct lk_proxy_pool_builder_t lk_proxy_pool_builder_t;
 typedef struct lk_proxy_guard_t lk_proxy_guard_t;
@@ -41,6 +45,7 @@ typedef struct lk_session_pool_t lk_session_pool_t;
 typedef struct lk_session_pool_builder_t lk_session_pool_builder_t;
 typedef struct lk_session_pool_guard_t lk_session_pool_guard_t;
 typedef struct lk_multipart_t lk_multipart_t;
+typedef struct lk_masque_config_t lk_masque_config_t;
 
 typedef struct lk_bytes_view_t {
   const uint8_t* ptr;
@@ -68,6 +73,7 @@ exclude = [
   "lk_streaming_response_t",
   "lk_error_t",
   "lk_op_t",
+  "lk_proxy_config_t",
   "lk_proxy_pool_t",
   "lk_proxy_pool_builder_t",
   "lk_proxy_guard_t",
@@ -76,5 +82,6 @@ exclude = [
   "lk_session_pool_builder_t",
   "lk_session_pool_guard_t",
   "lk_multipart_t",
+  "lk_masque_config_t",
   "lk_bytes_view_t",
 ]

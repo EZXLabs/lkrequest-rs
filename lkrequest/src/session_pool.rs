@@ -28,14 +28,14 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 use crate::client::Client;
 use crate::proxy::{ProxyConfig, ProxyProvider, RotationStrategy};
-use crate::proxy_pool::{ProxyGuard, ProxyPool, ProxyPoolBuilder};
+use crate::proxy_pool::{PoolMaintenance, ProxyGuard, ProxyPool, ProxyPoolBuilder};
 use crate::session::Session;
 
 // Re-export from proxy_pool for backward compatibility.
@@ -119,8 +119,8 @@ struct SessionPoolInner {
     /// How long a Session can sit idle before being evicted.
     idle_timeout: Duration,
 
-    /// Signal for the idle-eviction background task to stop.
-    shutdown: AtomicBool,
+    available: Notify,
+    maintenance: PoolMaintenance,
 }
 
 /// Snapshot of session pool statistics.
@@ -149,44 +149,52 @@ impl SessionPool {
     /// to the pool when dropped.
     pub async fn acquire(&self) -> SessionGuard {
         tracing::trace!("session_pool.acquiring");
-
-        // 1. Try to take an idle Session (skip expired ones).
-        //    Idle entries hold ProxyGuards, so no semaphore wait needed.
-        let idle_entry = {
-            let mut idle = self.inner.idle.lock().await;
-            let timeout = self.inner.idle_timeout;
-            let now = Instant::now();
-            loop {
-                match idle.pop_front() {
-                    Some(entry) if now.duration_since(entry.returned_at) < timeout => {
-                        break Some(entry);
+        Self::spawn_maintenance_task(Arc::clone(&self.inner));
+        self.inner.proxy_pool.ensure_maintenance();
+        loop {
+            let returned = self.inner.available.notified();
+            tokio::pin!(returned);
+            returned.as_mut().enable();
+            // Idle sessions retain their proxy permits. Register the wakeup
+            // before inspecting the queue so a return can interrupt permit wait.
+            let idle_entry = {
+                let mut idle = self.inner.idle.lock().unwrap();
+                let timeout = self.inner.idle_timeout;
+                let now = Instant::now();
+                loop {
+                    match idle.pop_front() {
+                        Some(entry)
+                            if now.duration_since(entry.returned_at) < timeout
+                                && entry.proxy_guard.is_usable() =>
+                        {
+                            break Some(entry);
+                        }
+                        Some(_expired_or_unusable) => continue,
+                        None => break None,
                     }
-                    // Expired: drop entry (ProxyGuard drops → permit released)
-                    Some(_expired) => continue,
-                    None => break None,
                 }
-            }
-        };
-
-        match idle_entry {
-            Some(entry) => {
+            };
+            if let Some(entry) = idle_entry {
                 tracing::debug!(reused = true, "session_pool.acquired");
-                SessionGuard {
+                return SessionGuard {
                     session: Some(entry.session),
                     proxy_guard: Some(entry.proxy_guard),
                     pool: Arc::clone(&self.inner),
-                }
+                    invalid: AtomicBool::new(false),
+                };
             }
-            None => {
-                // 2. No idle Session — acquire proxy permit + create new Session.
-                let proxy_guard = self.inner.proxy_pool.acquire().await;
-                let session = Self::create_session(&self.inner.client, &proxy_guard);
-
-                tracing::debug!(reused = false, "session_pool.acquired");
-                SessionGuard {
-                    session: Some(session),
-                    proxy_guard: Some(proxy_guard),
-                    pool: Arc::clone(&self.inner),
+            tokio::select! {
+                biased;
+                _ = &mut returned => {},
+                proxy_guard = self.inner.proxy_pool.acquire() => {
+                    let session = Self::create_session(&self.inner.client, &proxy_guard);
+                    tracing::debug!(reused = false, "session_pool.acquired");
+                    return SessionGuard {
+                        session: Some(session),
+                        proxy_guard: Some(proxy_guard),
+                        pool: Arc::clone(&self.inner),
+                        invalid: AtomicBool::new(false),
+                    };
                 }
             }
         }
@@ -198,9 +206,10 @@ impl SessionPool {
     /// For **static** providers (fixed proxy lists), this feeds the sliding-window
     /// failure counter that triggers cooldown / permanent removal.
     ///
-    /// For **dynamic** providers (closure-based), this is a no-op because each
-    /// session has a unique, ephemeral proxy identity.
+    /// The marked Session is discarded on return for all provider types.
+    /// Dynamic providers do not retain per-proxy failure history.
     pub fn mark_bad(&self, session_guard: &SessionGuard) {
+        session_guard.invalid.store(true, Ordering::Relaxed);
         if let Some(session) = session_guard.session.as_ref() {
             if let Some(proxy) = &session.inner.proxy {
                 self.inner.proxy_pool.mark_bad_proxy(&proxy.identity());
@@ -217,10 +226,12 @@ impl SessionPool {
         builder.build()
     }
 
-    /// Acquire a fresh Session with a different proxy (for retry scenarios).
+    /// Discard a failed Session on return and acquire another Session.
     ///
-    /// Marks the current session's proxy as bad and acquires a new session
-    /// with a different proxy. Useful for retry-on-failure with proxy switching.
+    /// Marks the current session's proxy as bad before selecting again. Static
+    /// providers may select the same address below the failure threshold.
+    /// The old guard still holds its permit; at full capacity, drop the marked
+    /// guard and call `acquire()` instead.
     pub async fn acquire_fresh(&self, bad_guard: &SessionGuard) -> SessionGuard {
         self.mark_bad(bad_guard);
         self.acquire().await
@@ -233,7 +244,7 @@ impl SessionPool {
 
     /// Return a snapshot of session pool statistics.
     pub async fn stats(&self) -> SessionPoolStats {
-        let idle = self.inner.idle.lock().await.len();
+        let idle = self.inner.idle.lock().unwrap().len();
         SessionPoolStats {
             idle_sessions: idle,
             max_sessions: self.inner.proxy_pool.max_concurrent(),
@@ -247,24 +258,26 @@ impl SessionPool {
     fn spawn_maintenance_task(inner: Arc<SessionPoolInner>) {
         let check_interval = (inner.idle_timeout / 2).max(Duration::from_secs(5));
         let idle_timeout = inner.idle_timeout;
-
-        tokio::spawn(async move {
+        let weak = Arc::downgrade(&inner);
+        inner.maintenance.start(async move {
             let mut interval = tokio::time::interval(check_interval);
             loop {
                 interval.tick().await;
 
-                if inner.shutdown.load(Ordering::Relaxed) {
-                    tracing::debug!("session_pool.maintenance_task_shutdown");
+                let Some(inner) = weak.upgrade() else {
                     break;
-                }
+                };
 
                 // Evict idle Sessions.
                 // Dropped IdleEntry's ProxyGuard releases its semaphore permit.
                 {
-                    let mut idle = inner.idle.lock().await;
+                    let mut idle = inner.idle.lock().unwrap();
                     let now = Instant::now();
                     let before = idle.len();
-                    idle.retain(|entry| now.duration_since(entry.returned_at) < idle_timeout);
+                    idle.retain(|entry| {
+                        now.duration_since(entry.returned_at) < idle_timeout
+                            && entry.proxy_guard.is_usable()
+                    });
                     let evicted = before - idle.len();
                     if evicted > 0 {
                         tracing::info!(evicted = evicted, "session_pool.evicted_idle_sessions");
@@ -283,14 +296,6 @@ impl Clone for SessionPool {
     }
 }
 
-impl Drop for SessionPool {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) <= 2 {
-            self.inner.shutdown.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SessionGuard — RAII auto-return
 // ---------------------------------------------------------------------------
@@ -305,6 +310,7 @@ pub struct SessionGuard {
     session: Option<Session>,
     proxy_guard: Option<ProxyGuard>,
     pool: Arc<SessionPoolInner>,
+    invalid: AtomicBool,
 }
 
 impl std::ops::Deref for SessionGuard {
@@ -319,28 +325,21 @@ impl std::ops::Deref for SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        if self.invalid.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(session) = self.session.take() {
             if let Some(proxy_guard) = self.proxy_guard.take() {
-                tracing::trace!("session_pool.released");
-                let pool = Arc::clone(&self.pool);
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => {
-                        handle.spawn(async move {
-                            let mut idle = pool.idle.lock().await;
-                            idle.push_back(IdleEntry {
-                                session,
-                                proxy_guard,
-                                returned_at: Instant::now(),
-                            });
-                        });
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "session_pool.drop_outside_runtime — \
-                             session not returned to pool"
-                        );
-                    }
+                if !proxy_guard.is_usable() {
+                    return;
                 }
+                tracing::trace!("session_pool.released");
+                self.pool.idle.lock().unwrap().push_back(IdleEntry {
+                    session,
+                    proxy_guard,
+                    returned_at: Instant::now(),
+                });
+                self.pool.available.notify_one();
             }
         }
     }
@@ -486,6 +485,9 @@ impl SessionPoolBuilder {
 
     /// Build the `SessionPool`.
     ///
+    /// Can be called outside a Tokio runtime. Maintenance starts in the current
+    /// runtime when available, otherwise on the first acquisition.
+    ///
     /// # Panics
     ///
     /// Panics if no client was set.
@@ -501,7 +503,8 @@ impl SessionPoolBuilder {
             proxy_pool,
             idle: Mutex::new(VecDeque::new()),
             idle_timeout: self.idle_timeout,
-            shutdown: AtomicBool::new(false),
+            available: Notify::new(),
+            maintenance: PoolMaintenance::default(),
         });
 
         SessionPool::spawn_maintenance_task(Arc::clone(&inner));

@@ -1,7 +1,8 @@
-//! # lkprofile — TLS + HTTP/2 Fingerprint Profile Parser
+//! # lkprofile — TLS + HTTP/2 + HTTP/3 Fingerprint Profile Parser
 //!
 //! Parse raw TLS ClientHello bytes and HTTP/2 frame data into fingerprint
-//! profiles usable by `lktls` and `lkrequest`.
+//! profiles usable by `lktls` and `lkrequest`. Inspect decrypted, reassembled
+//! HTTP/3 control-stream prefixes with [`parse_h3_control_stream`].
 //!
 //! ## Quick Start
 //!
@@ -52,6 +53,7 @@ pub mod client_hello;
 pub mod error;
 pub mod fingerprint;
 pub mod h2;
+pub mod h3;
 
 // Re-export primary types and functions
 pub use client_hello::{
@@ -70,6 +72,7 @@ pub use h2::{
     H2HeadersPriority, H2PriorityConfig, H2PriorityFrame, H2ProfileData, H2PseudoHeaderId,
     H2Setting, H2SettingId, H2StreamDepPolicy,
 };
+pub use h3::{parse_h3_control_stream, H3ControlFrame, H3ControlStream, H3PriorityUpdate};
 
 // Re-export extension extractors for advanced use
 pub use client_hello::{

@@ -1019,8 +1019,7 @@ impl TunnelDriver {
                 continue;
             }
 
-            let total = header.header_len + header.length as usize;
-            if self.stream_buf.len() < total {
+            if header.length > (self.stream_buf.len() - header.header_len) as u64 {
                 // Reassembling, and bounded: `header.length <= limit`, so this
                 // holds at most `limit` plus one capsule header.
                 break;
@@ -1962,6 +1961,26 @@ mod tests {
         };
         assert_eq!(delivered.capsule_type, 0x4242);
         assert_eq!(delivered.value, b"abc");
+    }
+
+    #[test]
+    fn capsule_length_at_32_bit_limit_waits_for_remaining_bytes() {
+        let config = config().with_max_stream_buffer(u32::MAX as usize);
+        let mut tunnel = TunnelDriver::new(config, QuarterStreamId::new(1), MDS).unwrap();
+        tunnel.start().unwrap();
+        tunnel
+            .feed_response(200, [("capsule-protocol", "?1")])
+            .unwrap();
+        let mut header = Vec::new();
+        encode_varint(0x1234, &mut header).unwrap();
+        encode_varint(u32::MAX as u64, &mut header).unwrap();
+        tunnel.feed_stream(&header).unwrap();
+        assert!(tunnel.is_open());
+        assert_eq!(tunnel.stats().capsules_received, 0);
+        assert!(matches!(
+            tunnel.feed_stream_end(),
+            Err(TunnelError::MalformedCapsule(_))
+        ));
     }
 
     /// The same byte sequence must give the same result however the peer chops

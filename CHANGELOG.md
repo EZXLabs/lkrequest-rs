@@ -6,40 +6,176 @@ All important changes to this project will be documented in this file.
 
 ## Unreleased
 
+## lkrequest 0.2.4
+
 ### Features
 
-- Add Rust `ClientBuilder::ip_family(IpFamily::{Any, Ipv4, Ipv6})` for local
-  TCP/QUIC candidate filtering, with explicit address-family errors that do not
-  trigger proxy-to-direct fallback. Add `connect_to(host, port, address)` to
-  override a dial target while preserving the origin's TLS and HTTP identity,
-  including through HTTP CONNECT. The family restriction is local-only:
-  DNS/DoH query transport and proxy-resolved target addresses are not constrained.
-  A remote-DNS proxy can still connect to IPv6 targets with `Ipv4` selected;
-  `connect_to` is an optional caller-maintained IP mapping for those targets.
-  Python and C ABI configuration are unchanged.
+- Add FFI `lk_session_get_cookies_with_attrs_json` and
+  `lk_session_get_all_cookies_json` for URL-scoped and all-domain cookie
+  snapshots, preserving path, HttpOnly, Secure, SameSite, host-only status and
+  expiry. Existing name/value-only cookie APIs remain compatible.
 
-- **Chrome 154 fingerprint preset** — Adds `chrome_154` across TLS, H2,
-  QUIC/H3, the high-level Rust preset, FFI, synthesis, profile collection, and
-  fingerprint regression fixtures. Public Cloudflare captures from Chrome
-  154.0.8037.58 on Windows verify that TCP TLS, H2, QUIC TLS, QUIC transport
-  parameters, and Chromium Initial packetization retain Chrome 153's stable
-  shape. H3 application settings retain the completed Chrome 153 navigation
-  baseline because the current public capture path received no QUIC response.
+- **Chrome 155 fingerprint preset**: Adds `chrome_155` to Rust, FFI, TLS,
+  H2, QUIC/H3, synthesis, and profile collection. Passive captures of Chrome
+  155.0.8059.40 on Windows confirm stable TLS/H2/QUIC fields matching 154
+  and directly observe H3 SETTINGS and a successful public H3 response.
+  Browser-derived TLS/H2 fixtures and live library packet comparisons cover
+  fresh navigation; application header values remain caller supplied.
 
-- **Firefox 156 fingerprint preset** — Adds capture-verified `firefox_156`
-  TLS and H2 profiles to the Rust and FFI APIs. Firefox 156.0.1 removes two
-  ECDSA CBC suites and both FFDHE groups from Firefox 147 and switches ECH
-  GREASE to AES-128-GCM; its H2 fingerprint remains unchanged. QUIC/H3 stays
-  disabled because the current stack cannot yet reproduce several observed
-  Firefox transport and Initial-packet fields exactly.
+- Change the default Rust TLS/H2 fingerprint and FFI default preset/`default`
+  alias to Chrome 155. Rust QUIC/H3 remains opt-in; FFI retains the complete
+  preset with feature-gated QUIC/H3. Explicit `chrome_144` remains available.
 
 ### Fixes
 
-- Preserve MASQUE tunnel errors and retry eligibility after temporary datagram
-  capacity failures in streaming requests and preconnect, matching buffered
-  requests. Streaming requests no longer attempt TCP fallback through a MASQUE
-  proxy. Fix IPv4 target selection in the FFI MASQUE relay fixture and stabilize
-  the PMTU regression tests with a bounded probe gate.
+- Restore 32-bit builds and validate encoded lengths before narrowing or
+  allocating in QUIC transport parameters, MASQUE, and fingerprint parsing.
+  Generate C error constants without a platform-dependent enum-size assumption.
+
+- Keep sensitive client-default headers filtered throughout cross-origin and
+  HTTPS-to-HTTP redirect chains, while rebuilding destination cookies. Accept
+  valid raw UTF-8 Location values without changing redirect policy.
+
+- Preserve grouped HeaderMap values and their field positions. Treat empty
+  cookie Max-Age consistently in explicit and response-ingested cookies, and
+  preserve HTTP CONNECT failure status codes for retry policies.
+
+- Bound deflate format detection for buffered and streaming responses, including
+  raw deflate streams whose first bytes resemble a zlib header.
+
+- Send illegal_parameter for ServerHello ECH acceptance reversal after an
+  accepted HRR before key agreement or handshake-key installation. Commit PSK
+  acceptance only after ECH and peer key-share validation have succeeded.
+
+- Extend captured Chromium/NSS agreement-failure alerts to X25519MLKEM768
+  and verify the hybrid wire/secret component order with real encapsulation.
+
+- Match captured Chromium/NSS X25519 agreement-failure alerts for invalid
+  peer values while preserving cryptographic rejection and valid key agreement.
+
+- Validate ServerHello supported_versions payloads before protocol dispatch,
+  including Chromium/NSS alert and early record-version differences. Reject
+  use of the extension to select TLS 1.2 and prevent TLS 1.2 fallback after HRR.
+
+- Queue normal Chromium/NSS TLS 1.3 compatibility CCS until the final client
+  handshake flight, instead of flushing it immediately after ServerHello.
+  Preserve Chromium's queued CCS on local failure and avoid duplicates after HRR.
+
+- Match captured Chrome/Firefox TCP failure flights for missing or unoffered
+  TLS 1.3 key shares. Chromium now sends compatibility CCS before qualifying
+  first-SH/HRR local alerts; NSS sends the alert directly, with no extra CCS
+  after HRR. Missing shares send missing_extension and unoffered groups send
+  illegal_parameter.
+
+- Send illegal_parameter for unsupported/unoffered TLS 1.3 ciphers and for
+  ServerHello cipher changes after HRR, before deriving handshake secrets.
+
+- Remove hash-incompatible PSKs from ClientHello2 after HRR, as Chromium and
+  NSS do, and refresh extension admission from the actual retry offer. ECH
+  observation uses the current inner hello so removed PSKs cannot remain eligible.
+
+- Emit fatal alerts for invalid TLS 1.3 PSK selections: Chromium uses
+  unknown_psk_identity for an unavailable identity, NSS uses illegal_parameter,
+  and a cipher/PSK hash mismatch uses illegal_parameter before deriving keys.
+
+- Reject truncated or padded TLS 1.3 ServerHello key_share and PSK identity
+  payloads before installing keys. Preserve Chromium/NSS alert differences
+  and the rejection priority of unsolicited extensions.
+
+- Reject ordinary ServerHello trailing bytes and incomplete extension headers
+  with decode_error, matching the strict extension-container checks already
+  used for HRR. Legacy TLS messages may still omit the extensions vector.
+
+- Match Firefox/NSS TLS 1.3 fixed-field alerts: reject SSL 3.0 legacy version
+  with protocol_version, and non-null compression, bad session-ID echoes or
+  legacy versions at TLS 1.3 and above with illegal_parameter. HRR uses the
+  negotiated supported_version rather than requiring a TLS 1.2 legacy field.
+
+- Match Chromium/BoringSSL rejection of TLS 1.3 ServerHello and HRR fixed
+  fields: invalid legacy version, compression, or session-ID echo now sends
+  decode_error before deriving keys or emitting a retry ClientHello.
+
+- Validate TLS 1.3 ServerHello and HelloRetryRequest version selections against
+  the serialized ClientHello, including raw supported_versions overrides over
+  QUIC. Reject unoffered selections before emitting handshake keys or CH2.
+
+- Preserve real-ECH rejection state when the server selects TLS 1.2: authenticate
+  the ECH public name, send encrypted `ech_required` after Finished, and return
+  no usable connection or frontend ticket. Real ECH also skips cached TLS 1.2
+  origin-ticket offers; ordinary GREASE/resumption behavior remains supported.
+
+- Reject unoffered TLS 1.2 cipher/compression selections and oversized server
+  session IDs. Enforce configured TLS version bounds and actual supported-version
+  offers before routing the TCP handshake to TLS 1.2 or TLS 1.3.
+
+- Validate TLS 1.2 ALPN selections against the emitted ClientHello, including
+  raw overrides, and reject malformed ServerHello extension/list framing in
+  full and ticket-resumption handshakes. Missing ALPN remains supported.
+
+- Validate TLS 1.3 server ALPN selection against actual emitted offer bytes,
+  reject malformed lists, and close QUIC with `no_application_protocol` when
+  an offered ALPN goes unnegotiated. TCP without selected ALPN still supports
+  the existing HTTP/1.1 path; low-level out-of-band QUIC negotiation remains
+  available when no ALPN was offered.
+
+- Map authenticated QUIC ECH rejection to `CRYPTO_ERROR(ech_required)` (0x179)
+  instead of `PROTOCOL_VIOLATION`, preserving retry-config diagnostics and
+  keeping rejected connections and tickets unavailable to callers.
+
+- Treat a nonmatching ECH HRR acceptance signal as rejection and continue the
+  authenticated outer handshake. Preserve CH1's ECH extension and public SNI
+  on retry, omit inner PSKs, and send the final `ech_required` alert under the
+  post-Finished record keys without returning a connection or caching tickets.
+
+- Echo HelloRetryRequest cookies into real ECH ClientHelloInner, using Chromium
+  outer-extension compression or the configured generic encoding. Reject empty,
+  oversized or conflicting cookie sources before emitting malformed extensions.
+- Include the TLS 1.3 synthetic `message_hash` in ECH HelloRetryRequest acceptance
+  confirmation verification, allowing conforming SHA-256 and SHA-384 peers to
+  continue the accepted inner handshake.
+
+- Preserve the first ClientHello's trust-anchor identifier ordering across
+  cookie and key-share HelloRetryRequest retries on TCP and QUIC. Fresh
+  connections retain randomized ordering; ECH inner serialization reuses the
+  same resolved anchor bytes.
+
+- Send Chrome 155 H3 `PRIORITY_UPDATE` for each allocated request stream before
+  HEADERS, including pooled/concurrent requests and streaming uploads. Resolve
+  control priority independently of automatic HTTP header generation, and defer
+  updates until requests exist after preconnect.
+
+- Honor `auto_priority_header` on HTTP/3 buffered and streaming requests,
+  including uploads and the shared buffered 0-RTT request builder. Disabling
+  automatic generation preserves explicitly supplied request/default headers.
+
+- Apply request/default-header/resource priority consistently to H2 streaming
+  responses as well as buffered responses. Add independent per-request raw H2
+  weight control through Rust/blocking `h2_priority_weight` and C
+  `lk_request_set_h2_priority_weight`, allowing Firefox resource contexts with
+  distinct RFC 9218 urgency and legacy HEADERS weight.
+
+- Model the initial H2 client stream ID explicitly. Firefox 156 now starts
+  requests at stream 3, matching current browser captures, while older JSON
+  profiles default to stream 1. Invalid IDs are rejected and exhausted stream
+  IDs drain the connection rather than wrapping or leaving requests queued.
+
+- Use an active, priority-ordered H2 dependency chain for Chrome presets,
+  removing completed/reset streams from parent selection. Explicit `chain`
+  configurations retain their existing linear behavior; Chrome presets use
+  the new `priority_chain` strategy.
+- Resolve first H2 request priority from the same request/client headers and
+  fetch destination rules used on pooled connections, preserving navigation
+  priority on fresh connections as well as reused ones.
+- Preserve explicit per-request H2 raw priority weights on the first buffered
+  or streaming request, matching subsequent requests on the same connection.
+
+- Match Firefox/NSS ECH GREASE's per-handshake choice between AES-128-GCM
+  and ChaCha20Poly1305, and correct Firefox 156 navigation HEADERS priority
+  to wire weight 41 (semantic weight 42).
+
+- Generate the ECH GREASE `enc` field from an X25519 key pair for Chromium
+  fingerprints, matching BoringSSL's public-key distribution. Firefox/NSS
+  and generic fingerprints retain their pseudorandom `enc` behavior.
 
 ## lkrequest 0.2.3
 

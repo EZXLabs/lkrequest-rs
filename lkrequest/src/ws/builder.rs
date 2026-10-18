@@ -130,11 +130,8 @@ impl WsBuilder {
 
             let default_port = if is_tls { 443 } else { 80 };
             let port = parsed.port().unwrap_or(default_port);
-            let path = if parsed.query().is_some() {
-                format!("{}?{}", parsed.path(), parsed.query().unwrap())
-            } else {
-                parsed.path().to_string()
-            };
+            let authority = &parsed[url::Position::BeforeHost..url::Position::AfterPort];
+            let path = &parsed[url::Position::BeforePath..url::Position::AfterQuery];
 
             if !is_tls {
                 return Err(Error::Http(
@@ -162,8 +159,8 @@ impl WsBuilder {
             let default_headers = client.default_headers();
             ws_upgrade_h1(
                 conn.into_tcp_stream()?,
-                &host,
-                &path,
+                authority,
+                path,
                 &self,
                 default_headers,
             )

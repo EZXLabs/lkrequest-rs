@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "HTTP client with fine-grained TLS fingerprint control"
 license.workspace = true
@@ -36,12 +36,12 @@ bench-internals = []
 synthetic-fp = ["dep:rand_chacha", "dep:rand_core"]
 
 [dependencies]
-lktls = { path = "../lktls", version = "0.2.3" }
-lktls-quic = { path = "../lktls-quic", version = "0.2.3", optional = true }
-lkh2 = { path = "../lkh2", version = "0.2.3", default-features = false }
-lkh3 = { path = "../lkh3", version = "0.2.3", optional = true }
-lkquic = { path = "../lkquic", version = "0.2.3", optional = true }
-lkmasque = { path = "../lkmasque", version = "0.2.3", optional = true }
+lktls = { path = "../lktls", version = "0.2.4" }
+lktls-quic = { path = "../lktls-quic", version = "0.2.4", optional = true }
+lkh2 = { path = "../lkh2", version = "0.2.4", default-features = false }
+lkh3 = { path = "../lkh3", version = "0.2.4", optional = true }
+lkquic = { path = "../lkquic", version = "0.2.4", optional = true }
+lkmasque = { path = "../lkmasque", version = "0.2.4", optional = true }
 quinn = { workspace = true, optional = true, features = ["runtime-tokio", "ring", "rustls"] }
 # The MASQUE bridge speaks the outer HTTP/3 connection directly: it must issue
 # an extended CONNECT with `:protocol = connect-udp` and read datagrams off the
@@ -84,6 +84,7 @@ fastwebsockets = { workspace = true }
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
+h2 = { workspace = true }
 lkprofile = { path = "../lkprofile" }
 fpverify = { path = "../tools/fpverify" }
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -163,6 +164,10 @@ required-features = ["quic-h3"]
 [[test]]
 name = "quic_network_e2e"
 required-features = ["quic-h3", "network-e2e"]
+
+[[test]]
+name = "fingerprint_precision_network"
+required-features = ["network-e2e"]
 
 [[test]]
 name = "streaming_upload_h3"

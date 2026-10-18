@@ -1,4 +1,4 @@
-﻿//! Customisation traits for the h2-native engine.
+//! Customisation traits for the h2-native engine.
 //!
 //! Four layers of control over HTTP/2 wire behaviour that affect
 //! deep-inspection fingerprinting beyond the Akamai H2 hash:
@@ -45,6 +45,13 @@ pub trait FrameWritePolicy: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Emit a final NO_ERROR GOAWAY on peer GOAWAY/EOF shutdown, even if
+    /// an individual response was truncated. Local protocol errors keep
+    /// their own error GOAWAY instead.
+    fn send_goaway_on_close(&self) -> bool {
+        false
+    }
+
     /// Clone into a boxed trait object.
     fn box_clone(&self) -> Box<dyn FrameWritePolicy>;
 }
@@ -62,6 +69,10 @@ impl FrameWritePolicy for DataFramePayloadOverridePolicy {
 
     fn max_data_frame_payload(&self) -> Option<usize> {
         self.max_data_frame_payload
+    }
+
+    fn send_goaway_on_close(&self) -> bool {
+        self.inner.send_goaway_on_close()
     }
 
     fn box_clone(&self) -> Box<dyn FrameWritePolicy> {
@@ -87,6 +98,7 @@ pub struct ConfigurableWritePolicy {
     split_headers: bool,
     split_data: bool,
     max_data_frame_payload: Option<usize>,
+    send_goaway_on_close: bool,
 }
 
 impl ConfigurableWritePolicy {
@@ -95,6 +107,7 @@ impl ConfigurableWritePolicy {
             split_headers,
             split_data,
             max_data_frame_payload: None,
+            send_goaway_on_close: false,
         }
     }
 
@@ -115,6 +128,12 @@ impl ConfigurableWritePolicy {
     /// Safari: only DATA isolated, HEADERS batched with control frames.
     pub fn safari() -> Self {
         Self::new(false, true)
+    }
+
+    /// Select the captured Firefox close flight independently of grouping.
+    pub fn with_goaway_on_close(mut self, enabled: bool) -> Self {
+        self.send_goaway_on_close = enabled;
+        self
     }
 }
 
@@ -155,6 +174,10 @@ impl FrameWritePolicy for ConfigurableWritePolicy {
 
     fn max_data_frame_payload(&self) -> Option<usize> {
         self.max_data_frame_payload
+    }
+
+    fn send_goaway_on_close(&self) -> bool {
+        self.send_goaway_on_close
     }
 
     fn box_clone(&self) -> Box<dyn FrameWritePolicy> {
@@ -493,7 +516,9 @@ impl H2Behavior {
     /// Firefox-like behaviour.
     pub fn firefox() -> Self {
         Self {
-            write_policy: Box::new(ConfigurableWritePolicy::new(true, true)),
+            write_policy: Box::new(
+                ConfigurableWritePolicy::new(true, true).with_goaway_on_close(true),
+            ),
             flow_control: Box::new(ThresholdFlowControl::firefox()),
             hpack_policy: Box::new(FirefoxHpackPolicy),
         }
@@ -524,6 +549,18 @@ impl Clone for H2Behavior {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_flight_policy_survives_clone_and_data_payload_override() {
+        assert!(!H2Behavior::default_behavior()
+            .write_policy
+            .send_goaway_on_close());
+        assert!(!H2Behavior::chrome().write_policy.send_goaway_on_close());
+        let behavior = H2Behavior::firefox().with_max_data_frame_payload(Some(2048));
+        assert!(behavior.write_policy.send_goaway_on_close());
+        assert!(behavior.clone().write_policy.send_goaway_on_close());
+        assert_eq!(behavior.write_policy.max_data_frame_payload(), Some(2048));
+    }
 
     fn make_settings() -> H2Frame {
         H2Frame::Settings(crate::frame::SettingsFrame {

@@ -33,6 +33,20 @@ use crate::proxy::ProxyConfig;
 use super::ChromeLikeProtocolConfig;
 use super::{PreferredHttpVersion, Session};
 
+#[path = "request_head.rs"]
+mod request_head;
+#[cfg(feature = "quic-h3")]
+pub(crate) use request_head::prepare_h3_request;
+pub(crate) use request_head::{
+    prepare_h2_request, H2RequestKind, PreparedH2Request, RequestHeadInput,
+};
+
+#[cfg(feature = "quic-h3")]
+#[path = "protocol_race.rs"]
+mod protocol_race;
+#[cfg(feature = "quic-h3")]
+pub(crate) use protocol_race::{run_protocol_race, RaceEvent, RaceFailureStage};
+
 // ---------------------------------------------------------------------------
 // URL parsing
 // ---------------------------------------------------------------------------
@@ -821,7 +835,7 @@ pub(crate) fn store_cookies(session: &Session, resp_headers: &HeaderMap, parsed_
         session.inner.cookie_jar.rcu(move |old| {
             let mut new_jar = (**old).clone();
             for raw_cookie in &set_cookies {
-                if let Ok(set_cookie) = cookie_store::RawCookie::parse(raw_cookie.as_str()) {
+                if let Ok(set_cookie) = super::cookie_jar::parse_set_cookie(raw_cookie.as_str()) {
                     // RFC 6265bis: a `Secure` cookie that did not arrive over a
                     // secure channel (§5.6 step 15), or a `__Secure-` /
                     // `__Host-` cookie that does not satisfy its name prefix
@@ -926,6 +940,15 @@ pub(crate) async fn acquire_pooled(
     policy: &ProtocolPolicy,
     proxy: Option<&ProxyConfig>,
 ) -> (Option<AcquiredConnection>, Option<QuicDiscovery>) {
+    // An explicit TCP intent with automatic ALPN still permits H1 and H2,
+    // but must not reuse the H3 entry selected by the generic Auto pool path.
+    if policy.intent == HttpIntent::H2Only && http_version == PreferredHttpVersion::Auto {
+        let mut pool = session.inner.pool.lock();
+        let pooled = pool
+            .try_acquire_h2_pooled_internal(conn_key)
+            .or_else(|| pool.try_acquire_h1_pooled_internal(conn_key));
+        return (pooled, None);
+    }
     let pooled = try_acquire_pooled(session, conn_key, http_version);
     if pooled.is_some() || http_version != PreferredHttpVersion::Http3WithFallback {
         return (pooled, None);
@@ -949,6 +972,75 @@ pub(crate) async fn acquire_pooled(
         None
     };
     (pooled, Some(discovery))
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn h3_request_error(
+    session: &Session,
+    error: lkh3::H3Error,
+    response_started: bool,
+) -> Error {
+    if session.h3_retry_mode() == crate::retry::H3RetryMode::Chrome155ProtocolErrors {
+        Error::h3_request_error_with_context(
+            crate::error::ConnectionPhase::HttpRequest,
+            error,
+            response_started,
+        )
+    } else {
+        Error::h3_request_error(
+            crate::error::ConnectionPhase::HttpRequest,
+            error,
+            response_started,
+        )
+    }
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn chrome_h3_retry_route(
+    policy: &ProtocolPolicy,
+    version: PreferredHttpVersion,
+    proxy: Option<&ProxyConfig>,
+) -> Option<ProtocolDecision> {
+    if policy.intent == HttpIntent::H3Only || version == PreferredHttpVersion::Http3Only {
+        return Some(ProtocolDecision::Quic);
+    }
+    if policy.fallback != FallbackPolicy::AllowFallback
+        || proxy.is_some_and(ProxyConfig::forbids_direct_fallback)
+    {
+        return None;
+    }
+    Some(ProtocolDecision::Tcp)
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn chrome_h3_retry_tcp_policy() -> ProtocolPolicy {
+    ProtocolPolicy::new(
+        HttpIntent::H2Only,
+        AcquisitionPolicy::ReuseExistingFirst,
+        UpgradePolicy::Off,
+        FallbackPolicy::NoFallback,
+    )
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) async fn finish_closed_h3_attempt(
+    session: &Session,
+    key: &ConnectionKey,
+    token: &crate::connection_pool::PoolToken,
+    cleanup: &Arc<tokio::task::JoinHandle<()>>,
+    error: &Error,
+) {
+    if !crate::retry::chrome_h3_owns_error(session.h3_retry_mode(), error)
+        || !error
+            .h3_request_context()
+            .is_some_and(|context| context.connection_terminated())
+    {
+        return;
+    }
+    while !cleanup.is_finished() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    session.inner.pool.lock().remove_acquired(key, token);
 }
 
 /// Try to acquire a pooled connection, filtering by HTTP version preference.

@@ -24,8 +24,9 @@ impl ProxyConfig {
     ///
     /// If `tcp_fingerprint` is provided, the TCP socket parameters (TTL, window
     /// size, MSS, etc.) are configured before the SYN packet is sent to the proxy
-    /// server. This ensures the JA4T fingerprint is consistent even when connecting
-    /// through a proxy.
+    /// server, subject to the platform limits of [`crate::tcp_fingerprint`].
+    /// This affects only the client-to-first-proxy TCP connection. The target
+    /// sees the final proxy's TCP stack; a matching JA4T is not guaranteed.
     pub async fn connect(
         &self,
         target_host: &str,
@@ -378,9 +379,24 @@ impl ProxyConfig {
                     }
 
                     tracing::warn!(status = retry_code, "proxy.407_retry_failed");
+                    let (kind, message) = if retry_code == 407 {
+                        (
+                            ProxyErrorKind::AuthenticationFailed,
+                            format!("proxy authentication failed after retry (status {retry_code})"),
+                        )
+                    } else {
+                        (
+                            ProxyErrorKind::TunnelRefused {
+                                status_code: retry_code,
+                            },
+                            format!(
+                                "proxy CONNECT failed after authentication retry (status {retry_code})"
+                            ),
+                        )
+                    };
                     return Err(Error::proxy(
-                        ProxyErrorKind::AuthenticationFailed,
-                        format!("proxy authentication failed after retry (status {retry_code})"),
+                        kind,
+                        message,
                         None,
                     ));
                 }

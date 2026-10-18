@@ -4,6 +4,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef LK_EXPECT_POINTER_BITS
+_Static_assert(sizeof(void*) * 8 == LK_EXPECT_POINTER_BITS, "unexpected pointer width");
+#endif
+_Static_assert(sizeof(size_t) == sizeof(void*), "size_t must match pointer width");
+_Static_assert(sizeof(lk_status_t) == 4, "status must use the 32-bit C ABI");
+_Static_assert(sizeof(lk_bytes_view_t) == 2 * sizeof(void*), "unexpected byte view layout");
+
 int main(void) {
     if (lk_abi_version() != 1) {
         fprintf(stderr, "unexpected abi version\n");
@@ -23,6 +30,21 @@ int main(void) {
     if (lk_session_new(client, &session, &error) != LK_OK) {
         fprintf(stderr, "lk_session_new failed\n");
         lk_client_free(client);
+        return 1;
+    }
+
+    const char* cookies = NULL;
+    size_t cookies_len = 0;
+    if (lk_session_get_all_cookies_json(session, &cookies, &cookies_len, &error) != LK_OK ||
+        cookies == NULL || cookies_len != 2 || strcmp(cookies, "[]") != 0) {
+        fprintf(stderr, "all-cookie JSON ABI failed\n");
+        return 1;
+    }
+    const char* cookie_url = "https://example.test/";
+    if (lk_session_get_cookies_with_attrs_json(
+            session, cookie_url, strlen(cookie_url), &cookies, &cookies_len, &error) != LK_OK ||
+        cookies == NULL || cookies_len != 2 || strcmp(cookies, "[]") != 0) {
+        fprintf(stderr, "cookie-attribute JSON ABI failed\n");
         return 1;
     }
 
@@ -65,6 +87,7 @@ int main(void) {
     }
 
     printf("abi=%u\n", (unsigned)lk_abi_version());
+    printf("pointer_bits=%u\n", (unsigned)(sizeof(void*) * 8));
     printf("library=%s\n", lk_library_version());
     printf("expected error: %.*s\n", (int)msg_len, msg_ptr);
 

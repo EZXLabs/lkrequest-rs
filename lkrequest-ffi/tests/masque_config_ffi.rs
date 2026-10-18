@@ -56,14 +56,16 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use h3::ext::Protocol;
 use http::{Method, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 use lkrequest_ffi::{
     lk_client_builder_build, lk_client_builder_free, lk_client_builder_new,
@@ -73,17 +75,18 @@ use lkrequest_ffi::{
     lk_masque_config_add_ca_certs_pem, lk_masque_config_free, lk_masque_config_new,
     lk_masque_config_set_max_idle_tunnels, lk_masque_config_set_server_name,
     lk_masque_config_set_tunnel_idle_timeout, lk_masque_config_set_use_native_certs,
-    lk_masque_config_set_verify, lk_masque_config_t, lk_proxy_config_free,
-    lk_proxy_config_identity, lk_proxy_config_parse, lk_proxy_config_t, lk_proxy_guard_free,
-    lk_proxy_guard_t, lk_proxy_guard_url, lk_proxy_pool_acquire,
-    lk_proxy_pool_builder_add_proxy_config, lk_proxy_pool_builder_build,
-    lk_proxy_pool_builder_free, lk_proxy_pool_builder_new,
+    lk_masque_config_set_verify, lk_masque_config_t, lk_op_cancel, lk_op_free, lk_op_state_t,
+    lk_op_t, lk_op_take_proxy_guard, lk_op_wait, lk_proxy_config_free, lk_proxy_config_identity,
+    lk_proxy_config_parse, lk_proxy_config_t, lk_proxy_guard_free, lk_proxy_guard_t,
+    lk_proxy_guard_url, lk_proxy_pool_acquire_async, lk_proxy_pool_builder_add_proxy_config,
+    lk_proxy_pool_builder_build, lk_proxy_pool_builder_free, lk_proxy_pool_builder_new,
     lk_proxy_pool_builder_set_bad_proxy_config, lk_proxy_pool_builder_set_health_check,
-    lk_proxy_pool_builder_set_masque_tunnel_probe, lk_proxy_pool_free, lk_proxy_pool_mark_bad,
-    lk_proxy_pool_t, lk_request_free, lk_request_new, lk_request_send, lk_response_free,
-    lk_response_status, lk_response_t, lk_response_text, lk_session_builder_build,
-    lk_session_builder_free, lk_session_builder_new, lk_session_builder_set_http3_only,
-    lk_session_builder_set_proxy_config, lk_session_free, lk_session_t, lk_status_t,
+    lk_proxy_pool_builder_set_masque_tunnel_probe, lk_proxy_pool_builder_set_rotation,
+    lk_proxy_pool_free, lk_proxy_pool_mark_bad, lk_proxy_pool_t, lk_request_free, lk_request_new,
+    lk_request_send, lk_response_free, lk_response_status, lk_response_t, lk_response_text,
+    lk_rotation_strategy_t, lk_session_builder_build, lk_session_builder_free,
+    lk_session_builder_new, lk_session_builder_set_http3_only, lk_session_builder_set_proxy_config,
+    lk_session_free, lk_session_t, lk_status_t,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,9 +104,9 @@ const ORIGIN_BODY: &str = "hello-through-masque-ffi";
 
 /// Bound on a single health-check probe. Also what an unreachable proxy costs.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long to let the pool's first (immediate) health-check round finish.
+/// Bound for the witness that follows the pool's first health-check probe.
 const SETTLE: Duration = Duration::from_secs(4);
-/// How long to wait for a `mark_bad` to be reflected in the pool.
+/// Bound on an acquisition; expiry is a test failure, never a health verdict.
 const MARK_BAD_SETTLE: Duration = Duration::from_secs(2);
 
 fn localhost_addr(port: u16) -> SocketAddr {
@@ -1049,6 +1052,148 @@ enum Verdict {
     NotBlamed,
 }
 
+struct HealthCheckWitness {
+    runtime: Runtime,
+    proxy_url: String,
+    task: JoinHandle<()>,
+}
+
+impl HealthCheckWitness {
+    fn start() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime.block_on(async {
+            tokio::net::TcpListener::bind(localhost_addr(0))
+                .await
+                .unwrap()
+        });
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = runtime.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192, "oversized witness CONNECT request");
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"CONNECT target.test:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        Self {
+            runtime,
+            proxy_url,
+            task,
+        }
+    }
+
+    fn wait(&mut self) {
+        // The preceding target's probe and bookkeeping complete before this
+        // second proxy is contacted by the serial health-check loop.
+        let task = &mut self.task;
+        self.runtime.block_on(async {
+            tokio::time::timeout(SETTLE, task)
+                .await
+                .expect("health check did not reach the witness after the target")
+                .expect("health-check witness failed");
+        });
+    }
+
+    unsafe fn add_to_pool(&self, builder: *mut lkrequest_ffi::lk_proxy_pool_builder_t) -> String {
+        let proxy = parse_proxy_config(&self.proxy_url);
+        let identity = proxy_identity(proxy);
+        assert_eq!(
+            lk_proxy_pool_builder_add_proxy_config(builder, proxy),
+            lk_status_t::LK_OK
+        );
+        lk_proxy_config_free(proxy);
+        assert_eq!(
+            lk_proxy_pool_builder_set_rotation(
+                builder,
+                lk_rotation_strategy_t::LK_ROTATION_ROUND_ROBIN
+            ),
+            lk_status_t::LK_OK
+        );
+        identity
+    }
+}
+
+impl Drop for HealthCheckWitness {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct AcquireOperation(*mut lk_op_t);
+
+impl Drop for AcquireOperation {
+    fn drop(&mut self) {
+        lk_op_cancel(self.0);
+        lk_op_free(self.0);
+    }
+}
+
+unsafe fn acquired_proxy_identity(pool: *const lk_proxy_pool_t) -> String {
+    let mut op = ptr::null_mut();
+    let mut err = ptr::null_mut::<lk_error_t>();
+    assert_eq!(
+        lk_proxy_pool_acquire_async(pool, &mut op, &mut err),
+        lk_status_t::LK_OK
+    );
+    assert!(!op.is_null());
+    let op = AcquireOperation(op);
+    assert_eq!(
+        lk_op_wait(op.0, MARK_BAD_SETTLE.as_millis() as u64),
+        lk_op_state_t::LK_OP_COMPLETED_OK,
+        "the witness must remain acquirable during target cooldown"
+    );
+    let mut guard = ptr::null_mut::<lk_proxy_guard_t>();
+    assert_eq!(
+        lk_op_take_proxy_guard(op.0, &mut guard, &mut err),
+        lk_status_t::LK_OK
+    );
+    assert!(!guard.is_null());
+    let mut ptr_out = ptr::null();
+    let mut len_out = 0usize;
+    let status = lk_proxy_guard_url(guard, &mut ptr_out, &mut len_out);
+    let url = if status == lk_status_t::LK_OK {
+        view_string(ptr_out, len_out)
+    } else {
+        String::new()
+    };
+    lk_proxy_guard_free(guard);
+    assert_eq!(
+        status,
+        lk_status_t::LK_OK,
+        "a configured fixed pool must never return a direct lease"
+    );
+    let proxy = parse_proxy_config(&url);
+    let identity = proxy_identity(proxy);
+    lk_proxy_config_free(proxy);
+    identity
+}
+
+unsafe fn observed_verdict(pool: *const lk_proxy_pool_t, target: &str, witness: &str) -> Verdict {
+    let mut target_seen = false;
+    for _ in 0..2 {
+        let identity = acquired_proxy_identity(pool);
+        assert!(
+            identity == target || identity == witness,
+            "pool returned an unconfigured proxy"
+        );
+        target_seen |= identity == target;
+    }
+    if target_seen {
+        Verdict::NotBlamed
+    } else {
+        Verdict::Blamed
+    }
+}
+
 /// Read the pool's verdict back out through the C ABI.
 ///
 /// A failed health check only appends to the pool's sliding failure window; it
@@ -1056,13 +1201,15 @@ enum Verdict {
 /// little arithmetic: with `failure_threshold: 2`, one `lk_proxy_pool_mark_bad`
 /// afterwards reaches the threshold *only if* the health check already blamed
 /// the proxy. A proxy that then stops being acquirable was judged unhealthy;
-/// one that stays acquirable was judged healthy, or skipped.
+/// one that stays acquirable was judged healthy, or skipped. A second CONNECT
+/// proxy witnesses completion of that probe and keeps acquisitions available.
 unsafe fn health_check_verdict(
     proxy_url: &str,
     masque_probe: Option<*const lk_masque_config_t>,
 ) -> Verdict {
     let proxy = parse_proxy_config(proxy_url);
     let identity = proxy_identity(proxy);
+    let mut witness = HealthCheckWitness::start();
 
     let builder = lk_proxy_pool_builder_new();
     assert!(!builder.is_null());
@@ -1071,6 +1218,7 @@ unsafe fn health_check_verdict(
         lk_status_t::LK_OK
     );
     lk_proxy_config_free(proxy);
+    let witness_identity = witness.add_to_pool(builder);
 
     assert_eq!(
         lk_proxy_pool_builder_set_bad_proxy_config(builder, 2, 600_000, 600_000, 5),
@@ -1107,43 +1255,16 @@ unsafe fn health_check_verdict(
     lk_proxy_pool_builder_free(builder);
     assert!(!pool.is_null());
 
-    std::thread::sleep(SETTLE);
+    witness.wait();
     let identity_c = cstring(&identity);
     assert_eq!(
         lk_proxy_pool_mark_bad(pool, identity_c.as_ptr(), identity.len()),
         lk_status_t::LK_OK
     );
 
-    let deadline = Instant::now() + MARK_BAD_SETTLE;
-    let mut verdict = Verdict::NotBlamed;
-    while Instant::now() < deadline {
-        if !acquired_a_proxy(pool) {
-            verdict = Verdict::Blamed;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-
+    let verdict = observed_verdict(pool, &identity, &witness_identity);
     lk_proxy_pool_free(pool);
     verdict
-}
-
-/// One `acquire`: `true` if the guard carried a proxy, `false` if the pool had
-/// none left to give (every proxy in cooldown).
-unsafe fn acquired_a_proxy(pool: *const lk_proxy_pool_t) -> bool {
-    let mut guard = ptr::null_mut::<lk_proxy_guard_t>();
-    let mut err = ptr::null_mut::<lk_error_t>();
-    assert_eq!(
-        lk_proxy_pool_acquire(pool, &mut guard, &mut err),
-        lk_status_t::LK_OK
-    );
-    assert!(!guard.is_null());
-
-    let mut ptr_out = ptr::null();
-    let mut len_out = 0usize;
-    let status = lk_proxy_guard_url(guard, &mut ptr_out, &mut len_out);
-    lk_proxy_guard_free(guard);
-    status == lk_status_t::LK_OK
 }
 
 /// **The motivating test.** A healthy MASQUE proxy fronted by a private CA is
@@ -1325,6 +1446,7 @@ fn a_probe_without_a_health_check_fails_the_build() {
 #[test]
 fn the_probe_survives_a_later_set_health_check() {
     let doubles = Doubles::start(ProxyMode::Refuse, false);
+    let mut witness = HealthCheckWitness::start();
     unsafe {
         let masque = private_ca_config(&doubles);
         let proxy = parse_proxy_config(&doubles.proxy_url());
@@ -1333,6 +1455,7 @@ fn the_probe_survives_a_later_set_health_check() {
             lk_proxy_pool_builder_add_proxy_config(builder, proxy),
             lk_status_t::LK_OK
         );
+        let witness_identity = witness.add_to_pool(builder);
         assert_eq!(
             lk_proxy_pool_builder_set_bad_proxy_config(builder, 2, 600_000, 600_000, 5),
             lk_status_t::LK_OK
@@ -1368,26 +1491,19 @@ fn the_probe_survives_a_later_set_health_check() {
         );
         lk_proxy_pool_builder_free(builder);
 
-        std::thread::sleep(SETTLE);
+        witness.wait();
         let identity_c = cstring(&identity);
         assert_eq!(
             lk_proxy_pool_mark_bad(pool, identity_c.as_ptr(), identity.len()),
             lk_status_t::LK_OK
         );
 
-        let deadline = Instant::now() + MARK_BAD_SETTLE;
-        let mut blamed = false;
-        while Instant::now() < deadline {
-            if !acquired_a_proxy(pool) {
-                blamed = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let verdict = observed_verdict(pool, &identity, &witness_identity);
         lk_proxy_pool_free(pool);
 
-        assert!(
-            blamed,
+        assert_eq!(
+            verdict,
+            Verdict::Blamed,
             "the probe set before set_health_check must still have run"
         );
     }

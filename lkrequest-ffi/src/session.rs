@@ -4,12 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::abi::lk_status_t;
-use crate::conv::{clear_out_len, clear_out_ptr, read_string_parts, set_string_out};
+use crate::conv::{
+    clear_out_len, clear_out_ptr, read_string_parts, require_out_len, require_out_ptr,
+    set_string_out,
+};
 use crate::error::FfiError;
 use crate::handles::{
     box_into_handle, handle_drop, lk_client_t, lk_error_t, lk_op_t, lk_session_builder_t,
-    lk_session_t, require_handle, require_handle_mut, ClientHandle, OpHandle, OpResult,
-    SessionBuilderState, SessionHandle, SessionHttpVersionPreference, SessionRetryPolicy,
+    lk_session_t, require_handle, require_handle_mut, ClientHandle, CookieJsonCacheKey, OpHandle,
+    OpResult, SessionBuilderState, SessionHandle, SessionHttpVersionPreference, SessionRetryPolicy,
     SessionShared,
 };
 use crate::panic::{catch_status, catch_value, null_error_out};
@@ -564,17 +567,118 @@ pub extern "C" fn lk_session_get_cookies_json(
         )
         .map_err(|err| FfiError::new(crate::abi::lk_error_code_t::LK_ERR_HTTP, err.to_string()))?;
         encoded.push(0);
-        let cache_key = url.clone();
         let ptr = {
             let mut cache = session.cookie_json_cache.lock();
-            cache.insert(cache_key.clone(), encoded.into_boxed_slice());
-            cache
-                .get(&cache_key)
-                .expect("just inserted cookie json cache")
-                .as_ptr()
+            let bytes = cache
+                .entry(CookieJsonCacheKey::NameValues(url))
+                .or_default();
+            *bytes = encoded.into_boxed_slice();
+            bytes.as_ptr()
         };
         *out_json_ptr = ptr.cast::<c_char>();
         Ok(())
+    })
+}
+
+unsafe fn set_cookie_attrs_json(
+    session: &SessionHandle,
+    cache_key: CookieJsonCacheKey,
+    cookies: Vec<lkrequest::session::CookieInfo>,
+    out_json_ptr: *mut *const c_char,
+    out_json_len: *mut usize,
+) -> Result<(), FfiError> {
+    let values: Vec<_> = cookies
+        .into_iter()
+        .map(|cookie| {
+            serde_json::json!({
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "host_only": cookie.host_only,
+                "path": cookie.path,
+                "secure": cookie.secure,
+                "http_only": cookie.http_only,
+                "same_site": cookie.same_site,
+                "expires_unix": cookie.expires_unix,
+            })
+        })
+        .collect();
+    let mut encoded = serde_json::to_vec(&values)
+        .map_err(|err| FfiError::new(crate::abi::lk_error_code_t::LK_ERR_HTTP, err.to_string()))?;
+    encoded.push(0);
+    let mut cache = session.cookie_json_cache.lock();
+    let bytes = cache.entry(cache_key).or_default();
+    *bytes = encoded.into_boxed_slice();
+    set_string_out(&bytes[..bytes.len() - 1], out_json_ptr, out_json_len)
+}
+
+/// Return unexpired cookies matching the URL as a JSON array with attributes.
+/// Fields: name, value, domain, host_only, path, secure, http_only, same_site,
+/// expires_unix. Missing optional attributes are null; expiry is Unix seconds.
+/// Order is longest path first, then oldest creation first. Invalid URLs and
+/// URLs with no matching cookies return an empty array, as in the Rust API.
+///
+/// Both output parameters are required. The borrowed JSON is NUL-terminated;
+/// out_json_len excludes the terminator. Its buffer is invalidated by repeating
+/// this query, a cookie setter/removal/clear, or freeing the session handle.
+/// Synchronize those operations with reads of the buffer; do not free it.
+/// On failure, provided outputs are reset to NULL/0. out_err is optional.
+#[no_mangle]
+pub extern "C" fn lk_session_get_cookies_with_attrs_json(
+    session: *const lk_session_t,
+    url_ptr: *const c_char,
+    url_len: usize,
+    out_json_ptr: *mut *const c_char,
+    out_json_len: *mut usize,
+    out_err: *mut *mut lk_error_t,
+) -> lk_status_t {
+    catch_status(out_err, || unsafe {
+        clear_out_ptr(out_json_ptr);
+        clear_out_len(out_json_len);
+        require_out_ptr(out_json_ptr, "out_json_ptr")?;
+        require_out_len(out_json_len, "out_json_len")?;
+        let session = require_handle::<SessionHandle, lk_session_t>(session.cast_mut())?;
+        let url = read_string_parts(url_ptr, url_len, "url")?;
+        let cookies = session.shared.session.get_cookies_with_attrs(&url);
+        set_cookie_attrs_json(
+            session,
+            CookieJsonCacheKey::WithAttrs(url),
+            cookies,
+            out_json_ptr,
+            out_json_len,
+        )
+    })
+}
+
+/// Return every unexpired cookie in the session across all domains and paths.
+/// Includes HttpOnly and Secure cookies, ordered by creation time (oldest first).
+/// The JSON array has the same fields as lk_session_get_cookies_with_attrs_json.
+///
+/// Both output parameters are required. The borrowed JSON is NUL-terminated;
+/// out_json_len excludes the terminator. Its buffer is invalidated by another
+/// call to this getter, a cookie setter/removal/clear, or freeing the session.
+/// Synchronize those operations with reads of the buffer; do not free it.
+/// On failure, provided outputs are reset to NULL/0. out_err is optional.
+#[no_mangle]
+pub extern "C" fn lk_session_get_all_cookies_json(
+    session: *const lk_session_t,
+    out_json_ptr: *mut *const c_char,
+    out_json_len: *mut usize,
+    out_err: *mut *mut lk_error_t,
+) -> lk_status_t {
+    catch_status(out_err, || unsafe {
+        clear_out_ptr(out_json_ptr);
+        clear_out_len(out_json_len);
+        require_out_ptr(out_json_ptr, "out_json_ptr")?;
+        require_out_len(out_json_len, "out_json_len")?;
+        let session = require_handle::<SessionHandle, lk_session_t>(session.cast_mut())?;
+        set_cookie_attrs_json(
+            session,
+            CookieJsonCacheKey::AllWithAttrs,
+            session.shared.session.get_all_cookies(),
+            out_json_ptr,
+            out_json_len,
+        )
     })
 }
 

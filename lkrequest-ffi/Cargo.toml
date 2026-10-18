@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest-ffi"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Stable C ABI for the lkrequest HTTP client"
 license.workspace = true
@@ -35,7 +35,7 @@ synthetic-fp = ["lkrequest/synthetic-fp"]
 telemetry = ["lkrequest/telemetry"]
 
 [dependencies]
-lkrequest = { path = "../lkrequest", version = "0.2.3" }
+lkrequest = { path = "../lkrequest", version = "0.2.4" }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 http = { workspace = true }

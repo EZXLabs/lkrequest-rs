@@ -37,11 +37,13 @@ use crate::error::{AlertDescription, Result, TlsError};
 use crate::extensions::pre_shared_key::{self, PskIdentity};
 use crate::extensions::quic_transport_params::{decode_transport_params, QuicTransportParams};
 use crate::extensions::record_size_limit::parse_peer_record_size_limit;
-use crate::handshake::client_hello::{ClientHelloBuilder, EchRetryState};
+use crate::handshake::client_hello::{
+    extract_ech_extension, profile_offers_alps_protocol, ClientHelloBuilder, EchRetryState,
+};
 use crate::handshake::handshake_type;
 use crate::handshake::server_hello::{self, ServerHello};
 use crate::profile::types::{ext_type, ExtensionSource, ExtensionSpec, TlsProfile, TlsVersion};
-use crate::session_store::SessionTicketData;
+use crate::session_store::{AlpsSessionState, SessionTicketData};
 use crate::verify::policy::VerificationPolicy;
 
 use crate::crypto::to_hex;
@@ -143,8 +145,10 @@ pub enum HandshakeAction {
     ContinueReading,
 
     /// The handshake is complete. The caller should:
-    /// 1. Send `client_finished` encrypted with the handshake write key.
-    /// 2. Install the application traffic keys.
+    /// 1. Send any TCP `client_end_of_early_data` with its early write key.
+    /// 2. Send optional client handshake messages and `client_finished` with
+    ///    the handshake write key.
+    /// 3. Install the application traffic keys.
     Complete(Box<HandshakeComplete>),
 
     /// HelloRetryRequest received. Send this new ClientHello (plaintext).
@@ -172,9 +176,26 @@ pub struct HandshakeKeys {
     pub client_iv: Vec<u8>,
 }
 
+/// TCP EndOfEarlyData message and its early-epoch write keys.
+#[derive(Debug)]
+pub struct EndOfEarlyDataFlight {
+    /// Empty EndOfEarlyData handshake message, included before client Finished.
+    pub message: Vec<u8>,
+    /// AEAD selected by the resumed ticket.
+    pub aead_algorithm: AeadAlgorithm,
+    /// Client early-data write key.
+    pub client_key: Vec<u8>,
+    /// Client early-data write IV.
+    pub client_iv: Vec<u8>,
+}
+
 /// Data returned when the handshake completes.
 #[derive(Debug)]
 pub struct HandshakeComplete {
+    /// TCP-only early-data end marker, sent before the handshake-key flight.
+    /// The driver sends no early application data, so this uses early sequence 0.
+    /// Always `None` for QUIC, HRR, or rejected early data.
+    pub client_end_of_early_data: Option<EndOfEarlyDataFlight>,
     /// Optional Client EncryptedExtensions message (ALPS).
     /// Must be sent *before* `client_finished`, encrypted with handshake keys.
     /// `None` if ALPS was not negotiated.
@@ -190,6 +211,8 @@ pub struct HandshakeComplete {
     /// The ALPN protocol negotiated by the server (from EncryptedExtensions).
     /// `None` if the server didn't include ALPN in EncryptedExtensions.
     pub negotiated_alpn: Option<String>,
+    /// Effective ALPS state, including settings inherited on accepted 0-RTT.
+    pub alps: AlpsSessionState,
     /// The server's RFC 8449 `record_size_limit` from EncryptedExtensions.
     ///
     /// `None` if the server did not send the extension, in which case records
@@ -233,6 +256,8 @@ pub struct HandshakeComplete {
     pub peer_quic_transport_params: Option<QuicTransportParams>,
     /// Whether the server accepted early data (0-RTT).
     pub early_data_accepted: bool,
+    /// Whether the verified handshake selected an offered resumption PSK.
+    pub session_resumed: bool,
 }
 
 /// Traffic encryption keys derived at the end of the handshake.
@@ -268,9 +293,10 @@ fn cipher_suite_info(suite: u16) -> Result<(HkdfAlgorithm, AeadAlgorithm)> {
         0x1301 => Ok((HkdfAlgorithm::Sha256, AeadAlgorithm::Aes128Gcm)),
         0x1302 => Ok((HkdfAlgorithm::Sha384, AeadAlgorithm::Aes256Gcm)),
         0x1303 => Ok((HkdfAlgorithm::Sha256, AeadAlgorithm::Chacha20Poly1305)),
-        _ => Err(TlsError::HandshakeFailure(format!(
-            "unsupported cipher suite: 0x{suite:04x}"
-        ))),
+        _ => Err(TlsError::local_alert(
+            AlertDescription::IllegalParameter,
+            format!("unsupported cipher suite: 0x{suite:04x}"),
+        )),
     }
 }
 
@@ -303,6 +329,9 @@ pub(crate) fn client_hello_extensions(message: &[u8]) -> Option<Vec<(u16, &[u8])
     pos = pos.checked_add(2)?.checked_add(cipher_suites_len)?;
     let compression_len = *body.get(pos)? as usize;
     pos = pos.checked_add(1)?.checked_add(compression_len)?;
+    if pos == body.len() {
+        return Some(Vec::new()); // TLS 1.2 may omit the extension block.
+    }
     let extensions_len = u16::from_be_bytes([*body.get(pos)?, *body.get(pos + 1)?]) as usize;
     pos += 2;
     let extensions_end = pos.checked_add(extensions_len)?;
@@ -336,6 +365,36 @@ pub(crate) fn client_hello_offered_extensions(message: &[u8]) -> Option<Vec<u16>
             .map(|(extension_type, _)| extension_type)
             .collect(),
     )
+}
+
+pub(crate) fn client_hello_legacy_offer(message: &[u8]) -> Option<(Vec<u16>, Vec<u8>)> {
+    if message.first() != Some(&handshake_type::CLIENT_HELLO) {
+        return None;
+    }
+    let body = message.get(4..)?;
+    let session_id_len = *body.get(34)? as usize;
+    let mut offset = 35 + session_id_len;
+    let length = u16::from_be_bytes([*body.get(offset)?, *body.get(offset + 1)?]) as usize;
+    offset += 2;
+    if length < 2 || !length.is_multiple_of(2) {
+        return None;
+    }
+    let suites = body
+        .get(offset..offset + length)?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_be_bytes)
+        .collect();
+    offset += length;
+    let compression_len = *body.get(offset)? as usize;
+    offset += 1;
+    if compression_len == 0 {
+        return None;
+    }
+    let compression = body.get(offset..offset + compression_len)?.to_vec();
+    Some((suites, compression))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +444,12 @@ pub struct Tls13Handshake {
     /// (or was not parseable), in which case there is nothing to compare
     /// against and the unsolicited-extension check is skipped.
     offered_extensions: Option<Vec<u16>>,
+    /// Actual ALPN identifiers from the active emitted ClientHello, including
+    /// RawBytes overrides; absent until a ClientHello has been recorded.
+    offered_alpn_protocols: Option<Vec<Vec<u8>>>,
+    /// Active serialized supported_versions payload, retained after HRR consumes
+    /// the ClientHello transcript buffer. None when the extension is absent.
+    offered_supported_versions: Option<Vec<u8>>,
     /// Complete fake ECH extension from CH1, reused byte-for-byte in CH2.
     ech_grease_extension: Option<Vec<u8>>,
 
@@ -450,6 +515,8 @@ pub struct Tls13Handshake {
 
     /// Whether the server accepted early data in EncryptedExtensions.
     early_data_accepted: bool,
+    /// Prepared TCP end marker and keys from the actual initial PSK offer.
+    client_end_of_early_data: Option<EndOfEarlyDataFlight>,
 
     /// Whether real ECH was offered in the ClientHello.
     ech_offered: bool,
@@ -513,6 +580,8 @@ impl Tls13Handshake {
             grease_values: None,
             extension_order: None,
             offered_extensions: None,
+            offered_alpn_protocols: None,
+            offered_supported_versions: None,
             ech_grease_extension: None,
             cipher_suite: None,
             hkdf_algorithm: None,
@@ -533,6 +602,7 @@ impl Tls13Handshake {
             peer_quic_transport_params: None,
             quic_mode: false,
             early_data_accepted: false,
+            client_end_of_early_data: None,
             ech_offered: false,
             ech_accepted: false,
             ech_inner_hello: None,
@@ -558,6 +628,76 @@ impl Tls13Handshake {
     /// Returns whether this handshake has processed a HelloRetryRequest.
     pub(crate) fn has_received_hrr(&self) -> bool {
         self.hrr_received
+    }
+
+    pub(crate) fn early_data_offer(&self) -> Option<(&SessionTicketData, &[u8])> {
+        if self.state != Tls13State::WaitServerHello || self.hrr_received {
+            return None;
+        }
+        let ticket = self.psk_ticket.as_ref()?;
+        if ticket.max_early_data_size == 0 {
+            return None;
+        }
+        let hello = if self.ech_offered {
+            self.ech_inner_hello.as_deref()?
+        } else {
+            self.buffered_client_hello.as_deref()?
+        };
+        let extensions = client_hello_extensions(hello)?;
+        let (_, early_data) = extensions
+            .iter()
+            .find(|(kind, _)| *kind == ext_type::EARLY_DATA)?;
+        if !early_data.is_empty() {
+            return None;
+        }
+        let (_, psk) = extensions
+            .iter()
+            .find(|(kind, _)| *kind == ext_type::PRE_SHARED_KEY)?;
+        let identities_len = u16::from_be_bytes(psk.get(..2)?.try_into().ok()?) as usize;
+        let identities = psk.get(2..2 + identities_len)?;
+        let identity_len = u16::from_be_bytes(identities.get(..2)?.try_into().ok()?) as usize;
+        if identity_len == 0
+            || identities.get(2..2 + identity_len)? != ticket.ticket
+            || identities.len() < 2 + identity_len + 4
+        {
+            return None;
+        }
+        Some((ticket, hello))
+    }
+
+    fn alps_allows_early_data(&self, ticket: &SessionTicketData) -> bool {
+        match &ticket.alps {
+            // Unknown preserves legacy compatibility without inventing prior
+            // settings. Explicit absence also does not restrict early data.
+            AlpsSessionState::Unknown | AlpsSessionState::NotNegotiated => true,
+            AlpsSessionState::Negotiated {
+                client_settings, ..
+            } => {
+                self.alps_payload.as_deref() == Some(client_settings.as_slice())
+                    && ticket.alpn.as_deref().is_some_and(|protocol| {
+                        profile_offers_alps_protocol(&self.profile, protocol.as_bytes())
+                    })
+            }
+        }
+    }
+
+    fn effective_alps_state(&self) -> AlpsSessionState {
+        if self.early_data_accepted {
+            return self
+                .psk_ticket
+                .as_ref()
+                .map_or(AlpsSessionState::Unknown, |ticket| ticket.alps.clone());
+        }
+        match (&self.server_alps_data, &self.alps_payload) {
+            (Some(server_settings), Some(client_settings)) => AlpsSessionState::Negotiated {
+                client_settings: client_settings.clone(),
+                server_settings: server_settings.clone(),
+            },
+            (None, _) => AlpsSessionState::NotNegotiated,
+            // A raw profile can advertise ALPS without configuring its client
+            // settings. Do not record fabricated settings for such a profile.
+            (Some(_), None) => AlpsSessionState::Unknown,
+        }
     }
 
     /// Set optional ALPS payload (pre-encoded H2 SETTINGS bytes).
@@ -751,6 +891,17 @@ impl Tls13Handshake {
                 );
             }
         }
+        let alps_compatible = self
+            .psk_ticket
+            .as_ref()
+            .is_none_or(|ticket| self.alps_allows_early_data(ticket));
+        if !alps_compatible {
+            // Remove the source as well as the Auto flag: RawBytes early_data
+            // must not bypass a known settings mismatch.
+            profile_for_ch
+                .extensions
+                .retain(|extension| extension.extension_type != ext_type::EARLY_DATA);
+        }
         let mut ch_builder = ClientHelloBuilder::new(&profile_for_ch, &self.hostname);
         if let Some(ref ech_config) = self.ech_config_list {
             ch_builder = ch_builder.with_ech_config(ech_config.clone());
@@ -761,10 +912,11 @@ impl Tls13Handshake {
         if let Some(ref params) = self.quic_transport_parameters {
             ch_builder = ch_builder.with_quic_transport_parameters(params.clone());
         }
-        if self
-            .psk_ticket
-            .as_ref()
-            .is_some_and(|ticket| ticket.max_early_data_size > 0)
+        if alps_compatible
+            && self
+                .psk_ticket
+                .as_ref()
+                .is_some_and(|ticket| ticket.max_early_data_size > 0)
         {
             ch_builder = ch_builder.with_early_data();
         }
@@ -838,16 +990,46 @@ impl Tls13Handshake {
         self.record_offered_extensions(&final_msg);
 
         self.state = Tls13State::WaitServerHello;
+        if !self.quic_mode {
+            if let Some((ticket, hello)) = self.early_data_offer() {
+                let mut early_transcript = TranscriptHash::new(ticket.hkdf_algorithm);
+                early_transcript.update(hello);
+                let early_secret = pre_shared_key::compute_early_secret(
+                    ticket.hkdf_algorithm,
+                    &ticket.resumption_psk,
+                )?;
+                let traffic_secret =
+                    early_secret.derive_secret("c e traffic", &early_transcript.current_hash())?;
+                let flight = EndOfEarlyDataFlight {
+                    message: vec![5, 0, 0, 0],
+                    aead_algorithm: ticket.aead_algorithm,
+                    client_key: hkdf_expand_label(
+                        ticket.hkdf_algorithm,
+                        &traffic_secret,
+                        "key",
+                        &[],
+                        ticket.aead_algorithm.key_len(),
+                    )?,
+                    client_iv: hkdf_expand_label(
+                        ticket.hkdf_algorithm,
+                        &traffic_secret,
+                        "iv",
+                        &[],
+                        ticket.aead_algorithm.nonce_len(),
+                    )?,
+                };
+                self.client_end_of_early_data = Some(flight);
+            }
+        }
         Ok(final_msg)
     }
 
     /// Remember which extension types the ClientHello we just sent carried.
     ///
-    /// Additive across ClientHellos: CH2 after a HelloRetryRequest re-offers CH1's
-    /// extensions plus `cookie`, and with real ECH the server answers the inner
-    /// ClientHello, so the union is the set the server may legitimately respond to.
+    /// Replace CH1's offer with CH2's actual offer after HRR. Eligible current
+    /// ECH inner fields join the outer set until rejection selects the outer.
     fn record_offered_extensions(&mut self, client_hello: &[u8]) {
-        let Some(offered) = client_hello_offered_extensions(client_hello) else {
+        let Some(extensions) = client_hello_extensions(client_hello) else {
             // The message came from our own builder, so this is a local bug, not
             // a peer protocol violation — say so loudly but do not fail the
             // handshake on it. The check simply has nothing to compare against.
@@ -856,13 +1038,31 @@ impl Tls13Handshake {
             );
             return;
         };
-        let known = self.offered_extensions.get_or_insert_with(Vec::new);
+        self.offered_alpn_protocols = Some(
+            extensions
+                .iter()
+                .find(|(kind, _)| *kind == ext_type::ALPN)
+                .and_then(|(_, payload)| crate::extensions::alpn::parse_alpn_list_bytes(payload))
+                .map(|protocols| protocols.into_iter().map(ToOwned::to_owned).collect())
+                .unwrap_or_default(),
+        );
+        self.offered_supported_versions = extensions
+            .iter()
+            .find(|(kind, _)| *kind == ext_type::SUPPORTED_VERSIONS)
+            .map(|(_, payload)| payload.to_vec());
+        let offered = extensions.into_iter().map(|(kind, _)| kind);
+        let known = self.offered_extensions.insert(Vec::new());
         for extension_type in offered {
             if !known.contains(&extension_type) {
                 known.push(extension_type);
             }
         }
-        if let Some(inner) = self.ech_inner_hello.clone() {
+        let inner = if self.hrr_received {
+            self.hrr_inner_ch2.clone()
+        } else {
+            self.ech_inner_hello.clone()
+        };
+        if let Some(inner) = inner.filter(|_| self.ech_hrr_accepted != Some(false)) {
             if let Some(inner_types) = client_hello_offered_extensions(&inner) {
                 let known = self.offered_extensions.get_or_insert_with(Vec::new);
                 for extension_type in inner_types {
@@ -1152,13 +1352,118 @@ impl Tls13Handshake {
     // ServerHello processing
     // =======================================================================
 
+    fn check_server_hello_payload_lengths(&self, payload: &[u8], sh: &ServerHello) -> Result<()> {
+        // Container bounds are established by parse_server_hello. Validate
+        // payloads after offer checks so an unsolicited extension keeps priority.
+        let mut block = payload.get(40 + sh.session_id.len()..).unwrap_or_default();
+        let nss = self.profile.tls_client_hello_style
+            == crate::profile::types::TlsClientHelloStyle::FirefoxNss;
+        while !block.is_empty() {
+            let kind = u16::from_be_bytes([block[0], block[1]]);
+            let length = u16::from_be_bytes([block[2], block[3]]) as usize;
+            let data = &block[4..4 + length];
+            block = &block[4 + length..];
+            let alert = match kind {
+                ext_type::KEY_SHARE if data.len() < 4 => Some(if nss {
+                    AlertDescription::IllegalParameter
+                } else {
+                    AlertDescription::DecodeError
+                }),
+                ext_type::KEY_SHARE => {
+                    let expected = 4 + u16::from_be_bytes([data[2], data[3]]) as usize;
+                    if expected > data.len() {
+                        Some(if nss {
+                            AlertDescription::IllegalParameter
+                        } else {
+                            AlertDescription::DecodeError
+                        })
+                    } else if expected < data.len() {
+                        Some(if nss {
+                            AlertDescription::HandshakeFailure
+                        } else {
+                            AlertDescription::DecodeError
+                        })
+                    } else {
+                        None
+                    }
+                }
+                ext_type::PRE_SHARED_KEY if data.len() != 2 => Some(if nss && data.len() > 2 {
+                    AlertDescription::HandshakeFailure
+                } else {
+                    AlertDescription::DecodeError
+                }),
+                _ => None,
+            };
+            if let Some(alert) = alert {
+                return Err(TlsError::local_alert(
+                    alert,
+                    format!("ServerHello extension 0x{kind:04x} has invalid payload length"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn process_server_hello(&mut self, full_msg: &[u8], payload: &[u8]) -> Result<HandshakeAction> {
+        let (version, selected_extension) = server_hello::detect_version_for_style(
+            full_msg,
+            self.profile.tls_client_hello_style,
+            self.hrr_received,
+        )?;
         let sh = server_hello::parse_server_hello(payload)?;
 
-        if !sh.is_tls13() {
-            return Err(TlsError::HandshakeFailure(
-                "server did not negotiate TLS 1.3".to_string(),
+        if version != 0x0304 || !selected_extension {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "server did not select TLS 1.3 with supported_versions",
             ));
+        }
+
+        // Browser stacks use different legacy-field rules for both SH and HRR.
+        let session_id_mismatch = self
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| sh.session_id != session_id);
+        let field_alert = match self.profile.tls_client_hello_style {
+            crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl => {
+                (sh.legacy_version != 0x0303 || sh.compression_method != 0 || session_id_mismatch)
+                    .then_some(AlertDescription::DecodeError)
+            }
+            crate::profile::types::TlsClientHelloStyle::FirefoxNss => {
+                if sh.legacy_version >= 0x0304 || sh.compression_method != 0 {
+                    Some(AlertDescription::IllegalParameter)
+                } else if sh.legacy_version == 0x0300 {
+                    Some(AlertDescription::ProtocolVersion)
+                } else {
+                    session_id_mismatch.then_some(AlertDescription::IllegalParameter)
+                }
+            }
+            _ => None,
+        };
+        if let Some(alert) = field_alert {
+            return Err(TlsError::local_alert(
+                alert,
+                "TLS 1.3 ServerHello has invalid browser-stack fixed fields",
+            ));
+        }
+
+        // Check the serialized offer before deriving keys or answering HRR.
+        // RawBytes may override the versions generated from the profile.
+        if self.offered_extensions.is_some() {
+            let versions = self.offered_supported_versions.as_deref().ok_or_else(|| {
+                TlsError::local_alert(
+                    AlertDescription::UnsupportedExtension,
+                    "server selected supported_versions without a client offer",
+                )
+            })?;
+            if !crate::extensions::supported_versions::parse_client_versions(versions)
+                .is_some_and(|versions| versions.contains(&sh.negotiated_version()))
+            {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    "server selected a TLS version absent from the actual ClientHello offer",
+                ));
+            }
         }
 
         // RFC 8446 §4.1.3: compression_method MUST be 0
@@ -1183,20 +1488,26 @@ impl Tls13Handshake {
 
         // RFC 8446 §4.2.1: server MUST select a cipher suite from the client's list
         if !self.profile.cipher_suites.contains(&sh.cipher_suite) {
-            return Err(TlsError::HandshakeFailure(format!(
-                "server selected cipher suite 0x{:04x} not offered by client",
-                sh.cipher_suite,
-            )));
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                format!(
+                    "server selected cipher suite 0x{:04x} not offered by client",
+                    sh.cipher_suite,
+                ),
+            ));
         }
 
         // RFC 8446 §4.1.4: after HRR, cipher suite MUST be retained
         if self.hrr_received {
             if let Some(prev_suite) = self.cipher_suite {
                 if prev_suite != sh.cipher_suite {
-                    return Err(TlsError::HandshakeFailure(format!(
-                        "ServerHello cipher suite 0x{:04x} differs from HRR 0x{:04x}",
-                        sh.cipher_suite, prev_suite,
-                    )));
+                    return Err(TlsError::local_alert(
+                        AlertDescription::IllegalParameter,
+                        format!(
+                            "ServerHello cipher suite 0x{:04x} differs from HRR 0x{:04x}",
+                            sh.cipher_suite, prev_suite,
+                        ),
+                    ));
                 }
             }
         }
@@ -1211,7 +1522,14 @@ impl Tls13Handshake {
 
         // RFC 8446 §4.1.3 / §4.2: the ServerHello may only carry the extensions
         // that establish the cryptographic context, and only ones we offered.
+        if self.ech_hrr_accepted == Some(false) && sh.extensions.selected_psk_identity.is_some() {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "ECH-rejected outer handshake cannot select an inner PSK",
+            ));
+        }
         self.check_server_hello_extensions(&sh)?;
+        self.check_server_hello_payload_lengths(payload, &sh)?;
 
         // Check if server accepted our PSK
         if let Some(selected_identity) = sh.extensions.selected_psk_identity {
@@ -1219,23 +1537,31 @@ impl Tls13Handshake {
                 // RFC 8446 §4.2.11: PSK cipher suite hash MUST be compatible
                 if let Some(ref ticket) = self.psk_ticket {
                     if ticket.hkdf_algorithm != hkdf_algo {
-                        return Err(TlsError::HandshakeFailure(format!(
-                            "server selected PSK but cipher suite hash {:?} does not match \
+                        return Err(TlsError::local_alert(
+                            AlertDescription::IllegalParameter,
+                            format!(
+                                "server selected PSK but cipher suite hash {:?} does not match \
                              ticket hash {:?}",
-                            hkdf_algo, ticket.hkdf_algorithm,
-                        )));
+                                hkdf_algo, ticket.hkdf_algorithm,
+                            ),
+                        ));
                     }
                 }
-                self.psk_accepted = true;
-                tracing::debug!(
-                    cipher_suite = format_args!("0x{:04x}", sh.cipher_suite),
-                    "tls13.psk_accepted — session resumption",
-                );
             } else {
-                return Err(TlsError::HandshakeFailure(format!(
-                    "server selected PSK identity {} but we only offered 1",
-                    selected_identity,
-                )));
+                let alert = if self.profile.tls_client_hello_style
+                    == crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl
+                {
+                    AlertDescription::UnknownPskIdentity
+                } else {
+                    AlertDescription::IllegalParameter
+                };
+                return Err(TlsError::local_alert(
+                    alert,
+                    format!(
+                        "server selected unavailable PSK identity {}",
+                        selected_identity,
+                    ),
+                ));
             }
         }
 
@@ -1262,23 +1588,21 @@ impl Tls13Handshake {
             self.buffered_client_hello = None;
         }
 
-        // Perform ECDH key exchange
-        let shared_secret = self.compute_shared_secret(&sh)?;
-
         // --- ECH acceptance detection (RFC 9849 Section 7.2) ---
         //
         // If real ECH was offered, check if the server accepted it by
         // verifying that ServerHello.random[24..32] matches the ECH
         // accept_confirmation computed with the inner CH transcript.
-        if self.ech_offered {
+        if self.ech_offered && self.ech_hrr_accepted != Some(false) {
             if let Some(ref inner_hello) = self.ech_inner_hello {
                 let accepted =
                     self.check_ech_acceptance(hkdf_algo, inner_hello, full_msg, &sh.random)?;
 
                 if let Some(hrr_accepted) = self.ech_hrr_accepted {
                     if accepted != hrr_accepted {
-                        return Err(TlsError::HandshakeFailure(
-                            "server changed ECH acceptance across HelloRetryRequest".to_string(),
+                        return Err(TlsError::local_alert(
+                            AlertDescription::IllegalParameter,
+                            "server changed ECH acceptance across HelloRetryRequest",
                         ));
                     }
                 }
@@ -1316,8 +1640,34 @@ impl Tls13Handshake {
             }
         }
 
+        if self.ech_accepted {
+            if let Some(active) = self
+                .hrr_inner_ch2
+                .as_ref()
+                .or(self.ech_inner_hello.as_ref())
+                .cloned()
+            {
+                self.record_offered_extensions(&active);
+            }
+        }
+
         // If ECH was not accepted (or not offered), transcript is already set
         // from the outer CH above.
+        if self.ech_offered && !self.ech_accepted && sh.extensions.selected_psk_identity.is_some() {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "ECH-rejected outer handshake cannot resume an inner PSK",
+            ));
+        }
+
+        let shared_secret = self.compute_shared_secret(&sh)?;
+        self.psk_accepted = sh.extensions.selected_psk_identity.is_some();
+        if self.psk_accepted {
+            tracing::debug!(
+                cipher_suite = format_args!("0x{:04x}", sh.cipher_suite),
+                "tls13.psk_accepted - session resumption"
+            );
+        }
 
         // Derive handshake keys via TLS 1.3 key schedule
         // If PSK was accepted, use the cached Early Secret from the PSK
@@ -1344,7 +1694,10 @@ impl Tls13Handshake {
             ));
         }
 
-        if sh.legacy_version != 0x0303 {
+        if sh.legacy_version != 0x0303
+            && self.profile.tls_client_hello_style
+                != crate::profile::types::TlsClientHelloStyle::FirefoxNss
+        {
             return Err(TlsError::local_alert(
                 AlertDescription::IllegalParameter,
                 format!(
@@ -1368,17 +1721,16 @@ impl Tls13Handshake {
                         "real ECH was offered without a saved inner ClientHello",
                     )
                 })?;
-                if !self.check_ech_hrr_acceptance(hkdf_algo, inner_hello, full_msg, &expected)? {
-                    return Err(TlsError::local_alert(
-                        AlertDescription::IllegalParameter,
-                        "ECH HRR accept confirmation mismatch",
-                    ));
-                }
-                true
+                self.check_ech_hrr_acceptance(hkdf_algo, inner_hello, full_msg, &expected)?
             } else {
                 false
             };
             self.ech_hrr_accepted = Some(accepted);
+            if !accepted {
+                self.psk_ticket = None;
+                self.early_secret_from_psk = None;
+                self.offered_extensions = None;
+            }
         } else if sh.extensions.ech_confirmation.is_some() {
             return Err(TlsError::local_alert(
                 AlertDescription::UnsupportedExtension,
@@ -1386,7 +1738,19 @@ impl Tls13Handshake {
             ));
         }
 
+        // Both BoringSSL and NSS omit incompatible PSKs from CH2. Discard the
+        // cached secret as well so only the selected hash drives the retry.
+        if self
+            .psk_ticket
+            .as_ref()
+            .is_some_and(|ticket| ticket.hkdf_algorithm != hkdf_algo)
+        {
+            self.psk_ticket = None;
+            self.early_secret_from_psk = None;
+        }
+
         self.hrr_received = true;
+        self.client_end_of_early_data = None;
         self.hrr_raw_bytes = Some(full_msg.to_vec());
         tracing::debug!(
             "HRR received: selected_group={:?}, cookie={}",
@@ -1511,7 +1875,15 @@ impl Tls13Handshake {
                 );
             }
         }
-        let mut builder = ClientHelloBuilder::new(&profile_for_ch, &self.hostname)
+        let ech_rejected = self.ech_hrr_accepted == Some(false);
+        let retry_hostname = if ech_rejected {
+            self.ech_rejection_public_name().ok_or_else(|| {
+                TlsError::HandshakeFailure("missing ECH public_name for outer retry".into())
+            })?
+        } else {
+            self.hostname.clone()
+        };
+        let mut builder = ClientHelloBuilder::new(&profile_for_ch, &retry_hostname)
             .with_random(random)
             .with_session_id(session_id);
 
@@ -1524,7 +1896,12 @@ impl Tls13Handshake {
         if let Some(ref ech_grease_extension) = self.ech_grease_extension {
             builder = builder.with_ech_grease_extension(ech_grease_extension.clone());
         }
-        if let Some(ref ech_config) = self.ech_config_list {
+        if ech_rejected {
+            let first = self.buffered_client_hello.as_deref().ok_or_else(|| {
+                TlsError::HandshakeFailure("missing outer CH1 for ECH rejection".into())
+            })?;
+            builder = builder.with_ech_grease_extension(extract_ech_extension(first)?);
+        } else if let Some(ref ech_config) = self.ech_config_list {
             builder = builder.with_ech_config(ech_config.clone());
         }
         if let Some(ref ticket_data) = self.tls12_session_ticket_data {
@@ -1536,7 +1913,7 @@ impl Tls13Handshake {
         if let Some(ref cookie_data) = cookie {
             builder = builder.with_cookie(cookie_data.clone());
         }
-        if self.ech_retry_state.is_some() {
+        if !ech_rejected && self.ech_retry_state.is_some() {
             if let Some(ticket) = self.psk_ticket.as_ref() {
                 let inner_client_hello = self.ech_inner_hello.as_deref().ok_or_else(|| {
                     TlsError::HandshakeFailure(
@@ -1563,11 +1940,15 @@ impl Tls13Handshake {
             }
         }
 
-        let output = if replace_key_share {
-            builder.build_retry_with_key_pairs(&self.key_pairs, self.ech_retry_state.as_mut())?
+        let ech_retry = if ech_rejected {
+            None
         } else {
-            builder
-                .build_cookie_retry_with_key_pairs(&self.key_pairs, self.ech_retry_state.as_mut())?
+            self.ech_retry_state.as_mut()
+        };
+        let output = if replace_key_share {
+            builder.build_retry_with_key_pairs(&self.key_pairs, ech_retry)?
+        } else {
+            builder.build_cookie_retry_with_key_pairs(&self.key_pairs, ech_retry)?
         };
 
         let ech_offered = output.ech_offered;
@@ -1614,15 +1995,17 @@ impl Tls13Handshake {
         // Parse EncryptedExtensions
         // Format: extensions_length (2 bytes) + extensions
         if payload.len() < 2 {
-            return Err(TlsError::UnexpectedMessage(
-                "EncryptedExtensions too short".to_string(),
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "EncryptedExtensions too short",
             ));
         }
 
         let ext_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        if 2 + ext_len > payload.len() {
-            return Err(TlsError::UnexpectedMessage(
-                "EncryptedExtensions length mismatch".to_string(),
+        if 2 + ext_len != payload.len() {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "EncryptedExtensions length mismatch",
             ));
         }
 
@@ -1630,13 +2013,24 @@ impl Tls13Handshake {
         let mut pos = 2;
         let ext_end = 2 + ext_len;
         let mut saw_quic_transport_params = false;
+        let mut saw_early_data = false;
+        let mut selected_alpn = None;
         let mut seen_extensions: Vec<u16> = Vec::new();
-        while pos + 4 <= ext_end {
+        while pos < ext_end {
+            if pos + 4 > ext_end {
+                return Err(TlsError::local_alert(
+                    AlertDescription::DecodeError,
+                    "truncated EncryptedExtensions extension header",
+                ));
+            }
             let extension_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
             let ext_data_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
             pos += 4;
             if pos + ext_data_len > ext_end {
-                break;
+                return Err(TlsError::local_alert(
+                    AlertDescription::DecodeError,
+                    "truncated EncryptedExtensions extension payload",
+                ));
             }
 
             // RFC 8446 §4.2: at most one extension of each type per block, and
@@ -1654,17 +2048,33 @@ impl Tls13Handshake {
 
             match extension_type {
                 // ALPN (0x0010): extract the server's selected protocol
-                0x0010
-                    // Format: protocol_name_list_length(2) + protocol_name_length(1) + name
-                    if ext_data.len() >= 4 => {
-                        let name_len = ext_data[2] as usize;
-                        if 3 + name_len <= ext_data.len() {
-                            let proto =
-                                String::from_utf8_lossy(&ext_data[3..3 + name_len]).to_string();
-                            tracing::debug!("Server negotiated ALPN: {proto}");
-                            self.negotiated_alpn = Some(proto);
-                        }
+                ext_type::ALPN => {
+                    let selected = crate::extensions::alpn::parse_server_alpn_bytes(ext_data)
+                        .ok_or_else(|| {
+                            TlsError::local_alert(
+                                AlertDescription::DecodeError,
+                                "invalid server ALPN protocol list",
+                            )
+                        })?;
+                    let offered = match &self.offered_alpn_protocols {
+                        Some(protocols) => protocols
+                            .iter()
+                            .any(|protocol| protocol.as_slice() == selected),
+                        None => self
+                            .profile
+                            .alpn_protocols
+                            .iter()
+                            .any(|protocol| protocol.as_bytes() == selected),
+                    };
+                    if !offered {
+                        return Err(TlsError::local_alert(
+                            AlertDescription::IllegalParameter,
+                            "server selected an unoffered ALPN protocol",
+                        ));
                     }
+                    selected_alpn = Some(selected);
+                    self.negotiated_alpn = Some(String::from_utf8_lossy(selected).into_owned());
+                }
                 // ALPS: application_settings (old code point 0x4469, new 0x44CD)
                 0x4469 | 0x44CD => {
                     tracing::debug!(
@@ -1679,9 +2089,30 @@ impl Tls13Handshake {
                     tracing::debug!("Server sent ECH retry_configs (len={})", ext_data.len());
                     self.ech_retry_configs = Some(ext_data.to_vec());
                 }
-                0x002a => {
-                    self.early_data_accepted = true;
-                    tracing::debug!("Server accepted TLS early_data");
+                ext_type::EARLY_DATA => {
+                    let nss = self.profile.tls_client_hello_style
+                        == crate::profile::types::TlsClientHelloStyle::FirefoxNss;
+                    if !ext_data.is_empty() {
+                        return Err(TlsError::local_alert(
+                            if nss {
+                                AlertDescription::HandshakeFailure
+                            } else {
+                                AlertDescription::DecodeError
+                            },
+                            "server early_data extension must be empty",
+                        ));
+                    }
+                    if !self.psk_accepted {
+                        return Err(TlsError::local_alert(
+                            if nss {
+                                AlertDescription::IllegalParameter
+                            } else {
+                                AlertDescription::UnsupportedExtension
+                            },
+                            "server accepted early_data without resuming the offered PSK",
+                        ));
+                    }
+                    saw_early_data = true;
                 }
                 // record_size_limit (0x001c) — RFC 8449. The server's receive
                 // limit bounds the records *we* send once traffic keys are in
@@ -1707,10 +2138,60 @@ impl Tls13Handshake {
             pos += ext_data_len;
         }
 
+        // Early data uses the ticket's complete parameters, whereas ordinary
+        // PSK resumption only requires a compatible cipher-suite hash.
+        if saw_early_data {
+            let ticket = self.psk_ticket.as_ref().ok_or_else(|| {
+                TlsError::local_alert(
+                    AlertDescription::UnsupportedExtension,
+                    "server accepted early_data without an offered session ticket",
+                )
+            })?;
+            if self.cipher_suite != Some(ticket.cipher_suite) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    "server changed the cipher suite while accepting early_data",
+                ));
+            }
+            if ticket.alpn.as_deref().map(str::as_bytes) != selected_alpn {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    "server changed ALPN while accepting early_data",
+                ));
+            }
+            if self.server_alps_data.is_some() {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    "server renegotiated ALPS while accepting early_data",
+                ));
+            }
+        }
+
+        let used_alpn = self
+            .offered_extensions
+            .as_ref()
+            .map_or(!self.profile.alpn_protocols.is_empty(), |offered| {
+                offered.contains(&ext_type::ALPN)
+            });
+        if self.quic_mode && used_alpn && self.negotiated_alpn.is_none() {
+            return Err(TlsError::local_alert(
+                AlertDescription::NoApplicationProtocol,
+                "QUIC server did not negotiate the offered ALPN protocols",
+            ));
+        }
+
         if self.quic_mode && !saw_quic_transport_params {
             return Err(TlsError::HandshakeFailure(
                 "server did not provide QUIC transport parameters".to_string(),
             ));
+        }
+
+        self.early_data_accepted = saw_early_data;
+        if !saw_early_data {
+            self.client_end_of_early_data = None;
+        }
+        if saw_early_data {
+            tracing::debug!("Server accepted TLS early_data");
         }
 
         // When PSK is accepted, the server skips Certificate/CertificateVerify
@@ -1936,7 +2417,7 @@ impl Tls13Handshake {
     /// Returns `None` whenever the true hostname is the right identity: ECH was
     /// not offered, ECH was accepted (the server answered the *inner*
     /// ClientHello), or the config that would name it is unavailable.
-    fn ech_rejection_public_name(&self) -> Option<String> {
+    pub(crate) fn ech_rejection_public_name(&self) -> Option<String> {
         if !self.ech_offered || self.ech_accepted {
             return None;
         }
@@ -2055,6 +2536,18 @@ impl Tls13Handshake {
             aead_algo.nonce_len(),
         )?;
 
+        // TCP closes the early-key epoch before the handshake-key client flight.
+        // QUIC signals this transition through packet encryption levels instead.
+        let client_end_of_early_data = if self.early_data_accepted && !self.quic_mode {
+            let flight = self.client_end_of_early_data.take().ok_or_else(|| {
+                TlsError::HandshakeFailure("missing TCP early-data write keys".into())
+            })?;
+            self.transcript.as_mut().unwrap().update(&flight.message);
+            Some(flight)
+        } else {
+            None
+        };
+
         // --- Build Client EncryptedExtensions (ALPS) ---
         // If the server negotiated ALPS, we must send a Client EE message
         // *before* the client Finished, and include it in the transcript.
@@ -2084,7 +2577,7 @@ impl Tls13Handshake {
             TlsError::HandshakeFailure("missing client_hs_traffic_secret".to_string())
         })?;
 
-        // Transcript for client Finished = CH..SF[..CEE][..Certificate].
+        // Transcript for client Finished = CH..SF[..EOED][..CEE][..Certificate].
         let transcript_for_cf = self.transcript.as_ref().unwrap().current_hash();
         let client_verify_data =
             compute_finished_verify_data(hkdf_algo, client_hs_secret, &transcript_for_cf)?;
@@ -2109,6 +2602,7 @@ impl Tls13Handshake {
 
         self.state = Tls13State::Connected;
         Ok(HandshakeAction::Complete(Box::new(HandshakeComplete {
+            client_end_of_early_data,
             client_encrypted_extensions: client_ee,
             client_certificate,
             client_finished,
@@ -2124,6 +2618,7 @@ impl Tls13Handshake {
                 exporter_master_secret,
             },
             negotiated_alpn: self.negotiated_alpn.clone(),
+            alps: self.effective_alps_state(),
             peer_record_size_limit: self.peer_record_size_limit,
             resumption_master_secret,
             negotiated_cipher_suite: self.cipher_suite.unwrap_or(0x1301),
@@ -2133,6 +2628,7 @@ impl Tls13Handshake {
             ech_offered: self.ech_offered,
             peer_quic_transport_params: self.peer_quic_transport_params.clone(),
             early_data_accepted: self.early_data_accepted,
+            session_resumed: self.psk_accepted,
         })))
     }
 
@@ -2243,6 +2739,7 @@ impl Tls13Handshake {
         Self::zero_hrr_ech_confirmation(&mut modified_hrr)?;
         let mut transcript = TranscriptHash::new(hkdf_algo);
         transcript.update(inner_hello);
+        transcript.replace_with_message_hash();
         transcript.update(&modified_hrr);
 
         let zero_salt = vec![0u8; hkdf_algo.hash_len()];
@@ -2307,7 +2804,10 @@ impl Tls13Handshake {
     fn compute_shared_secret(&mut self, sh: &ServerHello) -> Result<Vec<u8>> {
         let (server_group, server_public_key) =
             sh.extensions.key_share.as_ref().ok_or_else(|| {
-                TlsError::HandshakeFailure("ServerHello missing key_share extension".to_string())
+                TlsError::local_alert(
+                    AlertDescription::MissingExtension,
+                    "ServerHello missing key_share extension",
+                )
             })?;
         tracing::debug!(
             "Server selected key_share group=0x{:04x}, server_pub_len={}",
@@ -2321,14 +2821,40 @@ impl Tls13Handshake {
             .iter()
             .position(|kp| kp.group.code_point() == *server_group)
             .ok_or_else(|| {
-                TlsError::HandshakeFailure(format!(
-                    "server selected group 0x{server_group:04x} but we don't have a key for it"
-                ))
+                TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!(
+                        "server selected group 0x{server_group:04x} but we don't have a key for it"
+                    ),
+                )
             })?;
 
         // Take ownership of the key pair (consumed by ECDH)
         let kp = self.key_pairs.swap_remove(kp_idx);
-        kx::compute_shared_secret(kp, server_public_key)
+        let group = kp.group;
+        kx::compute_shared_secret(kp, server_public_key).map_err(|error| {
+            // Preserve the crypto rejection; only map the captured X25519/hybrid
+            // failure behavior of these browser stacks to a wire alert.
+            let alert = if matches!(group, KxGroup::X25519 | KxGroup::X25519MlKem768)
+                && matches!(&error, TlsError::CryptoError(_))
+            {
+                match self.profile.tls_client_hello_style {
+                    crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl => {
+                        Some(AlertDescription::InternalError)
+                    }
+                    crate::profile::types::TlsClientHelloStyle::FirefoxNss => {
+                        Some(AlertDescription::IllegalParameter)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match alert {
+                Some(alert) => TlsError::local_alert(alert, error.to_string()),
+                None => error,
+            }
+        })
     }
 
     /// Derive handshake traffic keys from the shared secret.
@@ -2694,6 +3220,705 @@ mod tests {
         message
     }
 
+    #[test]
+    fn chromium_fixed_serverhello_fields_fail_before_keys_or_retry_on_tcp_and_quic() {
+        for quic in [false, true] {
+            for retry in [false, true] {
+                for field in 0..3 {
+                    let mut handshake =
+                        Tls13Handshake::new(crate::profile::presets::chrome_155(), "localhost");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(Vec::new());
+                    }
+                    handshake.build_client_hello().unwrap();
+                    let mut session_id = handshake.session_id.clone().unwrap();
+                    if field == 2 {
+                        if session_id.is_empty() {
+                            session_id.push(0xa5);
+                        } else {
+                            session_id[0] ^= 1;
+                        }
+                    }
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                    let share = if retry {
+                        vec![0, 24]
+                    } else {
+                        let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+                        let mut share = vec![0, 29];
+                        share.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                        share.extend_from_slice(&key.public_key);
+                        share
+                    };
+                    extensions.extend_from_slice(&(share.len() as u16).to_be_bytes());
+                    extensions.extend_from_slice(&share);
+                    let mut message = build_hrr(&session_id, 0x1301, &extensions);
+                    if !retry {
+                        message[6..38].fill(0x55);
+                    }
+                    if field == 0 {
+                        message[5] = 2;
+                    } else if field == 1 {
+                        message[41 + session_id.len()] = 1;
+                    }
+                    let result = handshake.process_handshake_record(&message);
+                    assert!(
+                        matches!(&result,
+                            Err(TlsError::LocalAlert { alert, .. })
+                            if alert.description == AlertDescription::DecodeError),
+                        "quic={quic} retry={retry} field={field} keys={} ch2={} error={:?}",
+                        matches!(&result, Ok(HandshakeAction::InstallHandshakeKeys(_))),
+                        matches!(&result, Ok(HandshakeAction::RetryClientHello(_))),
+                        result.as_ref().err(),
+                    );
+                    assert_eq!(handshake.state, Tls13State::WaitServerHello);
+                    assert!(!handshake.hrr_received);
+                    assert!(handshake.client_hs_traffic_secret.is_none());
+                    assert!(handshake.server_hs_traffic_secret.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn firefox_nss_retry_uses_supported_version_not_legacy_version() {
+        let mut handshake =
+            Tls13Handshake::new(crate::profile::presets::firefox_156(), "localhost");
+        handshake.build_client_hello().unwrap();
+        let mut message = build_hrr(
+            handshake.session_id.as_ref().unwrap(),
+            0x1301,
+            &[0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 24],
+        );
+        message[5] = 2;
+        let result = handshake.process_handshake_record(&message);
+        assert!(
+            matches!(&result, Ok(HandshakeAction::RetryClientHello(_))),
+            "NSS must answer this HRR: {:?}",
+            result.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn firefox_nss_fixed_fields_follow_stack_alerts_on_tcp_and_quic() {
+        for quic in [false, true] {
+            for retry in [false, true] {
+                for field in 0..7 {
+                    let mut handshake =
+                        Tls13Handshake::new(crate::profile::presets::firefox_156(), "localhost");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(Vec::new());
+                    }
+                    handshake.build_client_hello().unwrap();
+                    let mut session_id = handshake.session_id.clone().unwrap();
+                    if field == 3 {
+                        if session_id.is_empty() {
+                            session_id.push(0xa5);
+                        } else {
+                            session_id[0] ^= 1;
+                        }
+                    }
+                    let share = if retry {
+                        vec![0, 24]
+                    } else {
+                        let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+                        let mut share = vec![0, 29];
+                        share.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                        share.extend_from_slice(&key.public_key);
+                        share
+                    };
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                    extensions.extend_from_slice(&(share.len() as u16).to_be_bytes());
+                    extensions.extend_from_slice(&share);
+                    let mut message = build_hrr(&session_id, 0x1301, &extensions);
+                    if !retry {
+                        message[6..38].fill(0x55);
+                    }
+                    message[5] = match field {
+                        0 => 0,
+                        1 => 4,
+                        4 => 1,
+                        5 => 2,
+                        _ => 3,
+                    };
+                    if field == 2 {
+                        message[41 + session_id.len()] = 1;
+                    }
+                    let result = handshake.process_handshake_record(&message);
+                    if field < 4 {
+                        let expected = if field == 0 {
+                            AlertDescription::ProtocolVersion
+                        } else {
+                            AlertDescription::IllegalParameter
+                        };
+                        assert!(
+                            matches!(&result, Err(TlsError::LocalAlert { alert, .. })
+                            if alert.description == expected),
+                            "quic={quic} retry={retry} field={field} keys={} error={:?}",
+                            matches!(&result, Ok(HandshakeAction::InstallHandshakeKeys(_))),
+                            result.as_ref().err()
+                        );
+                        assert!(!handshake.hrr_received);
+                        assert!(handshake.client_hs_traffic_secret.is_none());
+                        assert!(handshake.server_hs_traffic_secret.is_none());
+                    } else if retry {
+                        assert!(matches!(result, Ok(HandshakeAction::RetryClientHello(_))));
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Ok(HandshakeAction::InstallHandshakeKeys(_))
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn firefox_nss_legacy_version_is_ignored_when_supported_versions_selects_tls13() {
+        let mut handshake =
+            Tls13Handshake::new(crate::profile::presets::firefox_156(), "localhost");
+        handshake.build_client_hello().unwrap();
+        let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+        let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+        extensions.extend_from_slice(&((4 + key.public_key.len()) as u16).to_be_bytes());
+        extensions.extend_from_slice(&[0, 29]);
+        extensions.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&key.public_key);
+        let mut message = build_hrr(handshake.session_id.as_ref().unwrap(), 0x1301, &extensions);
+        message[5] = 2;
+        message[6..38].fill(0x55);
+        assert!(matches!(
+            handshake.process_handshake_record(&message),
+            Ok(HandshakeAction::InstallHandshakeKeys(_))
+        ));
+    }
+
+    fn test_psk_ticket(sha384: bool) -> SessionTicketData {
+        SessionTicketData {
+            ticket: b"local-payload-test".to_vec(),
+            resumption_psk: vec![0xa5; if sha384 { 48 } else { 32 }],
+            tls_version: crate::session_store::TicketTlsVersion::Tls13,
+            cipher_suite: if sha384 { 0x1302 } else { 0x1301 },
+            lifetime_secs: 3600,
+            age_add: 0,
+            received_at: std::time::Instant::now(),
+            alpn: None,
+            alps: AlpsSessionState::Unknown,
+            hkdf_algorithm: if sha384 {
+                HkdfAlgorithm::Sha384
+            } else {
+                HkdfAlgorithm::Sha256
+            },
+            aead_algorithm: if sha384 {
+                AeadAlgorithm::Aes256Gcm
+            } else {
+                AeadAlgorithm::Aes128Gcm
+            },
+            master_secret: Vec::new(),
+            max_early_data_size: 0,
+            peer_transport_parameters: None,
+            used_extended_master_secret: None,
+        }
+    }
+
+    fn serverhello_cipher_alert_matrix(cases: &[usize]) -> Vec<Vec<Option<AlertDescription>>> {
+        let mut rows = Vec::new();
+        for profile in [
+            crate::profile::presets::chrome_155(),
+            crate::profile::presets::firefox_156(),
+        ] {
+            for quic in [false, true] {
+                let mut row = Vec::new();
+                for &case in cases {
+                    let mut configured = profile.clone();
+                    if case == 0 {
+                        configured.cipher_suites.retain(|suite| *suite != 0x1301);
+                    }
+                    let mut handshake = Tls13Handshake::new(configured, "localhost");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(Vec::new());
+                    }
+                    let ch1 = handshake.build_client_hello().unwrap();
+                    let cipher = match case {
+                        1 => 0xc02f,
+                        2 => 0xffff,
+                        3 => 0x1303,
+                        4 => 0x1302,
+                        6 | 9 => 0x1302,
+                        7 | 10 => 0x1303,
+                        _ => 0x1301,
+                    };
+                    let retry = matches!(case, 3 | 4 | 8 | 9 | 10);
+                    let offered = client_hello_legacy_offer(&ch1).unwrap().0;
+                    if case < 3 {
+                        assert_eq!(offered.contains(&cipher), case == 1);
+                    }
+                    if retry {
+                        let first_cipher = if case < 5 { 0x1301 } else { cipher };
+                        let hrr = build_hrr(
+                            handshake.session_id.as_ref().unwrap(),
+                            first_cipher,
+                            &[0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 24],
+                        );
+                        assert!(matches!(
+                            handshake.process_handshake_record(&hrr).unwrap(),
+                            HandshakeAction::RetryClientHello(_)
+                        ));
+                    }
+                    let group = if retry {
+                        KxGroup::Secp384r1
+                    } else {
+                        KxGroup::X25519
+                    };
+                    let key = kx::generate_key_pair(group).unwrap();
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                    extensions
+                        .extend_from_slice(&((4 + key.public_key.len()) as u16).to_be_bytes());
+                    extensions.extend_from_slice(&group.code_point().to_be_bytes());
+                    extensions.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                    extensions.extend_from_slice(&key.public_key);
+                    let mut sh =
+                        build_hrr(handshake.session_id.as_ref().unwrap(), cipher, &extensions);
+                    sh[6..38].fill(0x55);
+                    match handshake.process_handshake_record(&sh) {
+                        Ok(HandshakeAction::InstallHandshakeKeys(_)) => {
+                            assert!(case >= 5, "invalid cipher choice installed keys");
+                            row.push(None);
+                        }
+                        Err(TlsError::LocalAlert { alert, .. }) => {
+                            assert!(handshake.client_hs_traffic_secret.is_none());
+                            assert!(handshake.server_hs_traffic_secret.is_none());
+                            row.push(Some(alert.description));
+                        }
+                        Err(error) => panic!("case={case} quic={quic}: {error:?}"),
+                        _ => panic!("unexpected handshake action"),
+                    }
+                }
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn missing_and_unoffered_key_share_errors_match_captured_browser_alerts() {
+        for profile in [
+            crate::profile::presets::chrome_155(),
+            crate::profile::presets::firefox_156(),
+        ] {
+            for quic in [false, true] {
+                for missing in [true, false] {
+                    let mut handshake = Tls13Handshake::new(profile.clone(), "localhost");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(Vec::new());
+                    }
+                    handshake.build_client_hello().unwrap();
+                    assert!(!handshake
+                        .key_pairs
+                        .iter()
+                        .any(|pair| pair.group == KxGroup::Secp384r1));
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                    if !missing {
+                        let key = kx::generate_key_pair(KxGroup::Secp384r1).unwrap();
+                        extensions.extend_from_slice(&[0, 51]);
+                        extensions
+                            .extend_from_slice(&((4 + key.public_key.len()) as u16).to_be_bytes());
+                        extensions.extend_from_slice(&[0, 24]);
+                        extensions.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                        extensions.extend_from_slice(&key.public_key);
+                    }
+                    let mut sh =
+                        build_hrr(handshake.session_id.as_ref().unwrap(), 0x1301, &extensions);
+                    sh[6..38].fill(0x55);
+                    let expected = if missing {
+                        AlertDescription::MissingExtension
+                    } else {
+                        AlertDescription::IllegalParameter
+                    };
+                    assert!(
+                        matches!(handshake.process_handshake_record(&sh), Err(TlsError::LocalAlert { alert, .. })
+                        if alert.description == expected)
+                    );
+                    assert!(handshake.client_hs_traffic_secret.is_none());
+                    assert!(handshake.server_hs_traffic_secret.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serverhello_cipher_selection_emits_illegal_parameter() {
+        let expected = vec![Some(AlertDescription::IllegalParameter); 3]
+            .into_iter()
+            .chain([None; 3])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serverhello_cipher_alert_matrix(&[0, 1, 2, 5, 6, 7]),
+            [
+                expected.clone(),
+                expected.clone(),
+                expected.clone(),
+                expected
+            ]
+        );
+    }
+
+    #[test]
+    fn hrr_cipher_changes_emit_illegal_parameter_and_retained_ciphers_work() {
+        let expected = vec![Some(AlertDescription::IllegalParameter); 2]
+            .into_iter()
+            .chain([None; 3])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serverhello_cipher_alert_matrix(&[3, 4, 8, 9, 10]),
+            [
+                expected.clone(),
+                expected.clone(),
+                expected.clone(),
+                expected
+            ]
+        );
+    }
+
+    #[test]
+    fn hrr_psk_offer_tracks_selected_hash_and_latest_client_hello() {
+        for profile in [
+            crate::profile::presets::chrome_155(),
+            crate::profile::presets::firefox_156(),
+        ] {
+            for quic in [false, true] {
+                for ticket_sha384 in [false, true] {
+                    for hrr_sha384 in [true, false] {
+                        for select_psk in [false, true] {
+                            let mut handshake = Tls13Handshake::new(profile.clone(), "localhost");
+                            if quic {
+                                handshake.enable_quic_mode();
+                                handshake.set_quic_transport_parameters(Vec::new());
+                            }
+                            handshake.set_psk_ticket(test_psk_ticket(ticket_sha384));
+                            let ch1 = handshake.build_client_hello().unwrap();
+                            assert!(client_hello_extension(&ch1, 41).is_some());
+                            let cipher = if hrr_sha384 { 0x1302 } else { 0x1301 };
+                            let hrr = build_hrr(
+                                handshake.session_id.as_ref().unwrap(),
+                                cipher,
+                                &[0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 24],
+                            );
+                            let HandshakeAction::RetryClientHello(ch2) =
+                                handshake.process_handshake_record(&hrr).unwrap()
+                            else {
+                                panic!("HRR must emit CH2");
+                            };
+                            let compatible = ticket_sha384 == hrr_sha384;
+                            assert_eq!(
+                                client_hello_extension(&ch2, 41).is_some(),
+                                compatible,
+                                "CH2 must omit PSKs with a different hash"
+                            );
+                            assert_eq!(
+                                handshake.offered_extensions.as_ref().unwrap().contains(&41),
+                                compatible
+                            );
+                            let key = kx::generate_key_pair(KxGroup::Secp384r1).unwrap();
+                            let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                            extensions.extend_from_slice(
+                                &((4 + key.public_key.len()) as u16).to_be_bytes(),
+                            );
+                            extensions.extend_from_slice(&[0, 24]);
+                            extensions
+                                .extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                            extensions.extend_from_slice(&key.public_key);
+                            if select_psk {
+                                extensions.extend_from_slice(&[0, 41, 0, 2, 0, 0]);
+                            }
+                            let mut sh = build_hrr(
+                                handshake.session_id.as_ref().unwrap(),
+                                cipher,
+                                &extensions,
+                            );
+                            sh[6..38].fill(0x55);
+                            let result = handshake.process_handshake_record(&sh);
+                            if select_psk && !compatible {
+                                assert!(matches!(result, Err(TlsError::LocalAlert { alert, .. })
+                                    if alert.description == AlertDescription::UnsupportedExtension));
+                                assert!(handshake.client_hs_traffic_secret.is_none());
+                            } else {
+                                assert!(matches!(
+                                    result,
+                                    Ok(HandshakeAction::InstallHandshakeKeys(_))
+                                ));
+                                assert_eq!(handshake.psk_accepted, select_psk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn serverhello_payload_alert_matrix(
+        kind: u16,
+        cases: &[usize],
+    ) -> Vec<Vec<Option<AlertDescription>>> {
+        let mut rows = Vec::new();
+        for profile in [
+            crate::profile::presets::chrome_155(),
+            crate::profile::presets::firefox_156(),
+        ] {
+            for quic in [false, true] {
+                let mut row = Vec::new();
+                for &case in cases {
+                    let mut handshake = Tls13Handshake::new(profile.clone(), "localhost");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(Vec::new());
+                    }
+                    if kind == 41 && case != 4 {
+                        let sha384 = matches!(case, 7 | 8);
+                        handshake.set_psk_ticket(test_psk_ticket(sha384));
+                    }
+                    handshake.build_client_hello().unwrap();
+                    let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+                    let mut share = vec![0, 29];
+                    share.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                    share.extend_from_slice(&key.public_key);
+                    if kind == 51 {
+                        match case {
+                            0 => share.push(0xa5),
+                            1 => share.truncate(3),
+                            2 => {
+                                share.truncate(4);
+                                share[3] = 1;
+                            }
+                            4 | 6 => {
+                                share[4..].fill(0);
+                                if case == 6 {
+                                    share[4] = 1;
+                                }
+                            }
+                            5 => {
+                                share[4..].fill(0);
+                                share.truncate(35);
+                                share[3] = 31;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                    extensions.extend_from_slice(&(share.len() as u16).to_be_bytes());
+                    extensions.extend_from_slice(&share);
+                    if kind == 41 {
+                        let identity: &[u8] = match case {
+                            0 | 4 => &[0, 0, 0xa5],
+                            1 => &[],
+                            2 => &[0],
+                            5 => &[0, 1],
+                            _ => &[0, 0],
+                        };
+                        extensions.extend_from_slice(&[0, 41]);
+                        extensions.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+                        extensions.extend_from_slice(identity);
+                    }
+                    let cipher = if kind == 41 && matches!(case, 6 | 7) {
+                        0x1302
+                    } else {
+                        0x1301
+                    };
+                    let mut message =
+                        build_hrr(handshake.session_id.as_ref().unwrap(), cipher, &extensions);
+                    message[6..38].fill(0x55);
+                    match handshake.process_handshake_record(&message) {
+                        Ok(HandshakeAction::InstallHandshakeKeys(_)) => {
+                            assert!(
+                                matches!(case, 3 | 7),
+                                "malformed kind={kind} quic={quic} installed handshake keys"
+                            );
+                            assert_eq!(handshake.psk_accepted, kind == 41);
+                            row.push(None);
+                        }
+                        Err(TlsError::LocalAlert { alert, .. }) => {
+                            assert!(!handshake.psk_accepted);
+                            assert!(handshake.client_hs_traffic_secret.is_none());
+                            assert!(handshake.server_hs_traffic_secret.is_none());
+                            row.push(Some(alert.description));
+                        }
+                        Err(error) => panic!("kind={kind} case={case} quic={quic}: {error:?}"),
+                        _ => panic!("unexpected handshake action"),
+                    }
+                }
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn hybrid_key_values_use_browser_alerts_and_valid_encapsulation_works() {
+        for (profile, nss) in [
+            (crate::profile::presets::chrome_155(), false),
+            (crate::profile::presets::firefox_156(), true),
+        ] {
+            for quic in [false, true] {
+                for case in 0..4 {
+                    let mut handshake = Tls13Handshake::new(profile.clone(), "localhost");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(Vec::new());
+                    }
+                    handshake.build_client_hello().unwrap();
+                    let client = &handshake
+                        .key_pairs
+                        .iter()
+                        .find(|key| key.group == KxGroup::X25519MlKem768)
+                        .unwrap()
+                        .public_key;
+                    let kem = aws_lc_rs::kem::EncapsulationKey::new(
+                        &aws_lc_rs::kem::ML_KEM_768,
+                        &client[..1184],
+                    )
+                    .unwrap();
+                    let (ciphertext, _) = kem.encapsulate().unwrap();
+                    let server = kx::generate_key_pair(KxGroup::X25519).unwrap();
+                    let mut public = if case == 3 {
+                        let mut value = ciphertext.as_ref().to_vec();
+                        value.extend_from_slice(&server.public_key);
+                        value
+                    } else {
+                        vec![0; if case == 0 { 1119 } else { 1120 }]
+                    };
+                    if case == 2 {
+                        public[1088] = 1;
+                    }
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                    extensions.extend_from_slice(&((4 + public.len()) as u16).to_be_bytes());
+                    extensions.extend_from_slice(&[0x11, 0xec]);
+                    extensions.extend_from_slice(&(public.len() as u16).to_be_bytes());
+                    extensions.extend_from_slice(&public);
+                    let mut sh =
+                        build_hrr(handshake.session_id.as_ref().unwrap(), 0x1301, &extensions);
+                    sh[6..38].fill(0x55);
+                    let result = handshake.process_handshake_record(&sh);
+                    if case == 3 {
+                        assert!(matches!(
+                            result,
+                            Ok(HandshakeAction::InstallHandshakeKeys(_))
+                        ));
+                    } else {
+                        let expected = if nss {
+                            AlertDescription::IllegalParameter
+                        } else {
+                            AlertDescription::InternalError
+                        };
+                        assert!(
+                            matches!(&result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == expected),
+                            "nss={nss} quic={quic} case={case}: {:?}",
+                            result.as_ref().err()
+                        );
+                        assert!(handshake.client_hs_traffic_secret.is_none());
+                        assert!(handshake.server_hs_traffic_secret.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_x25519_values_use_captured_browser_alerts() {
+        let chrome = vec![
+            Some(AlertDescription::InternalError),
+            Some(AlertDescription::InternalError),
+            Some(AlertDescription::InternalError),
+            None,
+        ];
+        let firefox = vec![
+            Some(AlertDescription::IllegalParameter),
+            Some(AlertDescription::IllegalParameter),
+            Some(AlertDescription::IllegalParameter),
+            None,
+        ];
+        assert_eq!(
+            serverhello_payload_alert_matrix(51, &[4, 5, 6, 3]),
+            [chrome.clone(), chrome, firefox.clone(), firefox]
+        );
+    }
+
+    #[test]
+    fn serverhello_key_share_payload_length_uses_browser_alerts() {
+        use AlertDescription::{DecodeError, HandshakeFailure, IllegalParameter};
+        let chromium = vec![
+            Some(DecodeError),
+            Some(DecodeError),
+            Some(DecodeError),
+            None,
+        ];
+        let nss = vec![
+            Some(HandshakeFailure),
+            Some(IllegalParameter),
+            Some(IllegalParameter),
+            None,
+        ];
+        assert_eq!(
+            serverhello_payload_alert_matrix(51, &[0, 1, 2, 3]),
+            [chromium.clone(), chromium, nss.clone(), nss]
+        );
+    }
+
+    #[test]
+    fn serverhello_psk_payload_length_preserves_unsolicited_extension_precedence() {
+        use AlertDescription::{DecodeError, HandshakeFailure, UnsupportedExtension};
+        let chromium = vec![
+            Some(DecodeError),
+            Some(DecodeError),
+            Some(DecodeError),
+            None,
+            Some(UnsupportedExtension),
+        ];
+        let nss = vec![
+            Some(HandshakeFailure),
+            Some(DecodeError),
+            Some(DecodeError),
+            None,
+            Some(UnsupportedExtension),
+        ];
+        assert_eq!(
+            serverhello_payload_alert_matrix(41, &[0, 1, 2, 3, 4]),
+            [chromium.clone(), chromium, nss.clone(), nss]
+        );
+    }
+
+    #[test]
+    fn serverhello_psk_index_uses_browser_alerts() {
+        use AlertDescription::{IllegalParameter, UnknownPskIdentity};
+        assert_eq!(
+            serverhello_payload_alert_matrix(41, &[5]),
+            [
+                vec![Some(UnknownPskIdentity)],
+                vec![Some(UnknownPskIdentity)],
+                vec![Some(IllegalParameter)],
+                vec![Some(IllegalParameter)],
+            ]
+        );
+    }
+
+    #[test]
+    fn serverhello_psk_hash_mismatch_and_sha384_resumption() {
+        use AlertDescription::IllegalParameter;
+        let expected = vec![Some(IllegalParameter), Some(IllegalParameter), None];
+        assert_eq!(
+            serverhello_payload_alert_matrix(41, &[6, 8, 7]),
+            [
+                expected.clone(),
+                expected.clone(),
+                expected.clone(),
+                expected,
+            ]
+        );
+    }
+
     fn client_hello_extension(message: &[u8], target: u16) -> Option<Vec<u8>> {
         let body = message.get(4..)?;
         let sid_len = *body.get(34)? as usize;
@@ -2896,6 +4121,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hrr_preserves_trust_anchor_order_on_tcp_and_quic() {
+        for profile in [
+            crate::profile::presets::chrome_152(),
+            crate::profile::presets::chrome_153(),
+            crate::profile::presets::chrome_154(),
+            crate::profile::presets::chrome_155(),
+        ] {
+            for quic in [false, true] {
+                for replace_key_share in [false, true] {
+                    let cipher_suite = profile
+                        .cipher_suites
+                        .iter()
+                        .copied()
+                        .find(|value| *value == 0x1301)
+                        .unwrap();
+                    let mut handshake = Tls13Handshake::new(profile.clone(), "example.com");
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(vec![1, 1, 0]);
+                    }
+                    let ch1 = handshake.build_client_hello().unwrap();
+                    let session_id = handshake.session_id.clone().unwrap();
+                    let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+                    if replace_key_share {
+                        extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x02, 0x00, 0x18]);
+                    } else {
+                        extensions.extend_from_slice(&[0x00, 0x2c, 0x00, 0x03, 0x00, 0x01, 0xa5]);
+                    }
+                    let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+                    let HandshakeAction::RetryClientHello(ch2) =
+                        handshake.process_handshake_record(&hrr).unwrap()
+                    else {
+                        panic!("expected retry ClientHello");
+                    };
+                    let original =
+                        client_hello_extension(&ch1, 0xca34).expect("Chrome trust anchors");
+                    assert_eq!(
+                        client_hello_extension(&ch2, 0xca34).unwrap(),
+                        original,
+                        "trust anchor order changed: quic={quic}, key-share HRR={replace_key_share}",
+                    );
+                }
+            }
+        }
+    }
+
     /// RFC 8446 §4.4.3: the server must sign CertificateVerify with an
     /// algorithm the client advertised. Completing on one we never offered is a
     /// protocol violation, and for a client whose purpose is to look like a
@@ -3010,6 +4282,760 @@ mod tests {
         assert!(
             handshake.check_encrypted_extension_offered(offered).is_ok(),
             "an extension we offered (0x{offered:04x}) must be accepted"
+        );
+    }
+
+    #[test]
+    fn encrypted_extensions_reject_unoffered_alpn_protocol() {
+        let mut profile = crate::profile::presets::chrome_155();
+        profile.alpn_protocols = vec!["h2".into()];
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+        let message = encrypted_extensions_message(&[(ext_type::ALPN, vec![0, 3, 2, b'h', b'3'])]);
+        assert!(
+            matches!(handshake.process_encrypted_extensions(&message, &message[4..]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
+        );
+    }
+
+    fn early_data_test_handshake(quic: bool) -> Tls13Handshake {
+        early_data_test_handshake_with_profile(quic, crate::profile::presets::chrome_155_quic())
+    }
+
+    fn early_data_test_handshake_with_profile(
+        quic: bool,
+        mut profile: TlsProfile,
+    ) -> Tls13Handshake {
+        profile.alpn_protocols = vec!["h3".into(), "h2".into()];
+        if !profile
+            .extensions
+            .iter()
+            .any(|extension| extension.extension_type == ext_type::EARLY_DATA)
+        {
+            profile.extensions.push(ExtensionSpec {
+                extension_type: ext_type::EARLY_DATA,
+                source: ExtensionSource::Auto,
+            });
+        }
+        if !quic {
+            profile.extensions.retain(|extension| {
+                extension.extension_type != ext_type::QUIC_TRANSPORT_PARAMETERS
+            });
+        }
+        let mut handshake = Tls13Handshake::new(profile, "localhost");
+        if quic {
+            handshake.enable_quic_mode();
+            handshake.set_quic_transport_parameters(Vec::new());
+        }
+        let mut ticket = test_psk_ticket(false);
+        ticket.alpn = Some("h3".into());
+        ticket.max_early_data_size = u32::MAX;
+        handshake.set_psk_ticket(ticket);
+        let hello = handshake.build_client_hello().unwrap();
+        assert_eq!(
+            client_hello_extension(&hello, ext_type::EARLY_DATA),
+            Some(Vec::new())
+        );
+        handshake
+    }
+
+    fn early_data_test_server_hello(handshake: &mut Tls13Handshake, cipher: u16, psk: bool) {
+        let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+        let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+        extensions.extend_from_slice(&((4 + key.public_key.len()) as u16).to_be_bytes());
+        extensions.extend_from_slice(&[0, 29]);
+        extensions.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&key.public_key);
+        if psk {
+            extensions.extend_from_slice(&[0, 41, 0, 2, 0, 0]);
+        }
+        let mut hello = build_hrr(handshake.session_id.as_ref().unwrap(), cipher, &extensions);
+        hello[6..38].fill(0x55);
+        assert!(matches!(
+            handshake.process_handshake_record(&hello).unwrap(),
+            HandshakeAction::InstallHandshakeKeys(_)
+        ));
+    }
+
+    fn early_data_test_extensions(
+        quic: bool,
+        alpn: Option<&str>,
+        early_data: Option<Vec<u8>>,
+        early_data_first: bool,
+    ) -> Vec<u8> {
+        let mut extensions = Vec::new();
+        if let Some(alpn) = alpn {
+            let mut data = ((alpn.len() + 1) as u16).to_be_bytes().to_vec();
+            data.push(alpn.len() as u8);
+            data.extend_from_slice(alpn.as_bytes());
+            extensions.push((ext_type::ALPN, data));
+        }
+        if quic {
+            extensions.push((ext_type::QUIC_TRANSPORT_PARAMETERS, Vec::new()));
+        }
+        if let Some(data) = early_data {
+            if early_data_first {
+                extensions.insert(0, (ext_type::EARLY_DATA, data));
+            } else {
+                extensions.push((ext_type::EARLY_DATA, data));
+            }
+        }
+        encrypted_extensions_message(&extensions)
+    }
+
+    #[test]
+    fn early_data_offer_uses_the_complete_psk_client_hello_transcript() {
+        for ech in [false, true] {
+            let mut handshake = Tls13Handshake::new(
+                crate::profile::presets::chrome_155_quic(),
+                "private.example.com",
+            );
+            handshake.enable_quic_mode();
+            handshake.set_quic_transport_parameters(Vec::new());
+            if ech {
+                handshake.set_ech_config(build_test_ech_config_list());
+            }
+            let mut ticket = test_psk_ticket(false);
+            ticket.alpn = Some("h3".into());
+            ticket.max_early_data_size = u32::MAX;
+            handshake.set_psk_ticket(ticket);
+            assert!(handshake.early_data_offer().is_none());
+            let outer = handshake.build_client_hello().unwrap();
+            let (ticket, transcript) = handshake.early_data_offer().unwrap();
+            if ech {
+                assert_eq!(transcript, handshake.ech_inner_hello.as_deref().unwrap());
+                assert_ne!(transcript, outer);
+                assert!(client_hello_extension(&outer, ext_type::PRE_SHARED_KEY).is_none());
+            } else {
+                assert_eq!(transcript, outer);
+            }
+            let psk = client_hello_extension(transcript, ext_type::PRE_SHARED_KEY).unwrap();
+            let binder = psk_binder(&psk);
+            let truncated_len = transcript.len()
+                - pre_shared_key::binders_size(1, ticket.hkdf_algorithm.hash_len());
+            let mut hash = TranscriptHash::new(ticket.hkdf_algorithm);
+            hash.update(&transcript[..truncated_len]);
+            assert_eq!(
+                binder,
+                pre_shared_key::compute_psk_binder(
+                    ticket.hkdf_algorithm,
+                    &ticket.resumption_psk,
+                    &hash.current_hash(),
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn early_data_offer_requires_a_serialized_empty_extension_and_ticket() {
+        for case in 0..4 {
+            let mut profile = crate::profile::presets::chrome_155_quic();
+            if case == 2 {
+                profile
+                    .extensions
+                    .retain(|extension| extension.extension_type != ext_type::EARLY_DATA);
+            } else if case == 3 {
+                profile
+                    .extensions
+                    .iter_mut()
+                    .find(|extension| extension.extension_type == ext_type::EARLY_DATA)
+                    .unwrap()
+                    .source = ExtensionSource::RawBytes { data: "00".into() };
+            }
+            let mut handshake = Tls13Handshake::new(profile, "localhost");
+            handshake.enable_quic_mode();
+            handshake.set_quic_transport_parameters(Vec::new());
+            if case != 0 {
+                let mut ticket = test_psk_ticket(false);
+                ticket.max_early_data_size = if case == 1 { 0 } else { u32::MAX };
+                handshake.set_psk_ticket(ticket);
+            }
+            handshake.build_client_hello().unwrap();
+            assert!(handshake.early_data_offer().is_none(), "case={case}");
+        }
+    }
+
+    #[test]
+    fn alps_ticket_state_changed_settings_remove_early_data_from_both_ech_hellos() {
+        let mut handshake = Tls13Handshake::new(
+            crate::profile::presets::chrome_155_quic(),
+            "private.example.com",
+        );
+        handshake.enable_quic_mode();
+        handshake.set_quic_transport_parameters(Vec::new());
+        handshake.set_ech_config(build_test_ech_config_list());
+        handshake.set_alps_payload(vec![6, 0x40, 0x80]);
+        let mut ticket = test_psk_ticket(false);
+        ticket.alpn = Some("h3".into());
+        ticket.max_early_data_size = u32::MAX;
+        ticket.alps = AlpsSessionState::Negotiated {
+            client_settings: vec![6, 0x40, 0x40],
+            server_settings: vec![6, 0x41, 0],
+        };
+        handshake.set_psk_ticket(ticket);
+        let outer = handshake.build_client_hello().unwrap();
+        let inner = handshake.ech_inner_hello.as_deref().unwrap();
+        assert!(client_hello_extension(&outer, ext_type::EARLY_DATA).is_none());
+        assert!(client_hello_extension(inner, ext_type::EARLY_DATA).is_none());
+        assert!(client_hello_extension(inner, ext_type::PRE_SHARED_KEY).is_some());
+        assert!(handshake.early_data_offer().is_none());
+    }
+
+    #[test]
+    fn early_data_acceptance_rejects_nonempty_payload() {
+        for quic in [false, true] {
+            for payload in [vec![0], vec![0, 0, 0, 0]] {
+                let mut handshake = early_data_test_handshake(quic);
+                early_data_test_server_hello(&mut handshake, 0x1301, true);
+                let message = early_data_test_extensions(quic, Some("h3"), Some(payload), true);
+                let result = handshake.process_handshake_record(&message);
+                assert!(
+                    matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError),
+                    "quic={quic}: nonempty early_data must be decode_error"
+                );
+                assert!(!handshake.early_data_accepted);
+            }
+        }
+    }
+
+    #[test]
+    fn early_data_acceptance_requires_selected_psk() {
+        for quic in [false, true] {
+            let mut handshake = early_data_test_handshake(quic);
+            early_data_test_server_hello(&mut handshake, 0x1301, false);
+            let message = early_data_test_extensions(quic, Some("h3"), Some(Vec::new()), true);
+            let result = handshake.process_handshake_record(&message);
+            assert!(
+                matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::UnsupportedExtension),
+                "quic={quic}: early_data without resumed PSK must be unsupported_extension"
+            );
+            assert!(!handshake.early_data_accepted);
+        }
+    }
+
+    #[test]
+    fn early_data_nss_acceptance_rejects_nonempty_payload_with_handshake_failure() {
+        for quic in [false, true] {
+            let mut handshake = early_data_test_handshake_with_profile(
+                quic,
+                crate::profile::presets::firefox_156(),
+            );
+            early_data_test_server_hello(&mut handshake, 0x1301, true);
+            let message = early_data_test_extensions(quic, Some("h3"), Some(vec![0]), true);
+            let result = handshake.process_handshake_record(&message);
+            assert!(
+                matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::HandshakeFailure),
+                "quic={quic}: NSS reports nonempty early_data with handshake_failure"
+            );
+            assert!(!handshake.early_data_accepted);
+        }
+    }
+
+    #[test]
+    fn early_data_nss_acceptance_requires_selected_psk_with_illegal_parameter() {
+        for quic in [false, true] {
+            let mut handshake = early_data_test_handshake_with_profile(
+                quic,
+                crate::profile::presets::firefox_156(),
+            );
+            early_data_test_server_hello(&mut handshake, 0x1301, false);
+            let message = early_data_test_extensions(quic, Some("h3"), Some(Vec::new()), true);
+            let result = handshake.process_handshake_record(&message);
+            assert!(
+                matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter),
+                "quic={quic}: NSS reports accepted early_data without PSK with illegal_parameter"
+            );
+            assert!(!handshake.early_data_accepted);
+        }
+    }
+
+    #[test]
+    fn early_data_acceptance_requires_original_cipher_suite() {
+        for quic in [false, true] {
+            let mut handshake = early_data_test_handshake(quic);
+            early_data_test_server_hello(&mut handshake, 0x1303, true);
+            let message = early_data_test_extensions(quic, Some("h3"), Some(Vec::new()), true);
+            let result = handshake.process_handshake_record(&message);
+            assert!(
+                matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter),
+                "quic={quic}: equal PSK hashes do not permit an early_data cipher change"
+            );
+            assert!(!handshake.early_data_accepted);
+        }
+    }
+
+    #[test]
+    fn early_data_acceptance_requires_original_alpn() {
+        for quic in [false, true] {
+            for alpn in [Some("h2"), None] {
+                for early_data_first in [false, true] {
+                    let mut handshake = early_data_test_handshake(quic);
+                    early_data_test_server_hello(&mut handshake, 0x1301, true);
+                    let message =
+                        early_data_test_extensions(quic, alpn, Some(Vec::new()), early_data_first);
+                    let result = handshake.process_handshake_record(&message);
+                    assert!(
+                        matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter),
+                        "quic={quic} alpn={alpn:?}: accepted early_data must retain the ticket ALPN"
+                    );
+                    assert!(!handshake.early_data_accepted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_data_acceptance_retains_valid_acceptance_and_rejection() {
+        for quic in [false, true] {
+            for early_data_first in [false, true] {
+                let mut handshake = early_data_test_handshake(quic);
+                early_data_test_server_hello(&mut handshake, 0x1301, true);
+                let message = early_data_test_extensions(
+                    quic,
+                    Some("h3"),
+                    Some(Vec::new()),
+                    early_data_first,
+                );
+                assert!(matches!(
+                    handshake.process_handshake_record(&message).unwrap(),
+                    HandshakeAction::ContinueReading
+                ));
+                assert!(handshake.early_data_accepted);
+                assert_eq!(handshake.state(), Tls13State::WaitFinished);
+            }
+            for resumed in [false, true] {
+                let mut handshake = early_data_test_handshake(quic);
+                early_data_test_server_hello(&mut handshake, 0x1303, resumed);
+                let message = early_data_test_extensions(quic, Some("h2"), None, false);
+                assert!(matches!(
+                    handshake.process_handshake_record(&message).unwrap(),
+                    HandshakeAction::ContinueReading
+                ));
+                assert!(!handshake.early_data_accepted);
+                assert_eq!(
+                    handshake.state(),
+                    if resumed {
+                        Tls13State::WaitFinished
+                    } else {
+                        Tls13State::WaitCertificate
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn early_data_end_of_flight_uses_tcp_acceptance_in_finished_transcript() {
+        for quic in [false, true] {
+            for accepted in [false, true] {
+                let mut handshake = early_data_test_handshake(quic);
+                early_data_test_server_hello(&mut handshake, 0x1301, true);
+                let encrypted_extensions =
+                    early_data_test_extensions(quic, Some("h3"), accepted.then(Vec::new), true);
+                handshake
+                    .process_handshake_record(&encrypted_extensions)
+                    .unwrap();
+                let mut expected_transcript = handshake.transcript.clone().unwrap();
+                let client_hs_secret = handshake.client_hs_traffic_secret.clone().unwrap();
+                let server_verify = compute_finished_verify_data(
+                    HkdfAlgorithm::Sha256,
+                    handshake.server_hs_traffic_secret.as_ref().unwrap(),
+                    &expected_transcript.current_hash(),
+                )
+                .unwrap();
+                let mut server_finished =
+                    vec![handshake_type::FINISHED, 0, 0, server_verify.len() as u8];
+                server_finished.extend_from_slice(&server_verify);
+                expected_transcript.update(&server_finished);
+                if accepted && !quic {
+                    expected_transcript.update(&[5, 0, 0, 0]);
+                }
+                let expected_client_verify = compute_finished_verify_data(
+                    HkdfAlgorithm::Sha256,
+                    &client_hs_secret,
+                    &expected_transcript.current_hash(),
+                )
+                .unwrap();
+                let HandshakeAction::Complete(complete) = handshake
+                    .process_handshake_record(&server_finished)
+                    .unwrap()
+                else {
+                    panic!("valid server Finished must complete the handshake");
+                };
+                assert_eq!(
+                    complete.client_end_of_early_data.is_some(),
+                    accepted && !quic
+                );
+                if let Some(early) = complete.client_end_of_early_data {
+                    assert_eq!(early.message, [5, 0, 0, 0]);
+                    assert_eq!(early.client_key.len(), 16);
+                    assert_eq!(early.client_iv.len(), 12);
+                }
+                assert_eq!(&complete.client_finished[4..], expected_client_verify);
+            }
+        }
+    }
+
+    fn early_flight_combination_start(quic: bool, alps_code_point: u16) -> Tls13Handshake {
+        let mut profile = if quic {
+            crate::profile::presets::chrome_155_quic()
+        } else {
+            crate::profile::presets::chrome_155()
+        };
+        let alpn = if quic { "h3" } else { "h2" };
+        profile.alpn_protocols = vec![alpn.into()];
+        profile.alps_protocols = Some(vec![alpn.into()]);
+        profile.extensions.retain(|extension| {
+            !matches!(
+                extension.extension_type,
+                0x4469 | 0x44cd | ext_type::EARLY_DATA
+            )
+        });
+        profile.extensions.extend([
+            ExtensionSpec {
+                extension_type: alps_code_point,
+                source: ExtensionSource::Auto,
+            },
+            ExtensionSpec {
+                extension_type: ext_type::EARLY_DATA,
+                source: ExtensionSource::Auto,
+            },
+        ]);
+        let mut handshake = Tls13Handshake::new(profile, "localhost");
+        handshake.set_alps_payload(Vec::new());
+        if quic {
+            handshake.enable_quic_mode();
+            handshake.set_quic_transport_parameters(Vec::new());
+        }
+        let mut ticket = test_psk_ticket(false);
+        ticket.alpn = Some(alpn.into());
+        ticket.max_early_data_size = if quic { u32::MAX } else { 16_384 };
+        handshake.set_psk_ticket(ticket);
+        let hello = handshake.build_client_hello().unwrap();
+        assert!(client_hello_extension(&hello, alps_code_point).is_some());
+        assert_eq!(
+            client_hello_extension(&hello, ext_type::EARLY_DATA),
+            Some(Vec::new())
+        );
+        handshake
+    }
+
+    fn early_flight_combination_ee(
+        quic: bool,
+        alps_code_point: u16,
+        accept_early: bool,
+        early_first: bool,
+    ) -> Vec<u8> {
+        let mut extensions = vec![
+            (
+                ext_type::ALPN,
+                vec![0, 3, 2, b'h', if quic { b'3' } else { b'2' }],
+            ),
+            (alps_code_point, Vec::new()),
+        ];
+        if quic {
+            extensions.push((ext_type::QUIC_TRANSPORT_PARAMETERS, Vec::new()));
+        }
+        if accept_early {
+            let early = (ext_type::EARLY_DATA, Vec::new());
+            if early_first {
+                extensions.insert(0, early);
+            } else {
+                extensions.push(early);
+            }
+        }
+        encrypted_extensions_message(&extensions)
+    }
+
+    fn early_flight_combination_message(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut message = vec![kind];
+        message.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        message.extend_from_slice(payload);
+        message
+    }
+
+    #[test]
+    fn early_flight_combination_rejects_fresh_alps_with_accepted_early_data() {
+        let mut mismatches = Vec::new();
+        for quic in [false, true] {
+            for alps in [0x4469, 0x44cd] {
+                for early_first in [false, true] {
+                    let mut handshake = early_flight_combination_start(quic, alps);
+                    early_data_test_server_hello(&mut handshake, 0x1301, true);
+                    let message = early_flight_combination_ee(quic, alps, true, early_first);
+                    let result = handshake.process_handshake_record(&message);
+                    let alert = match result.as_ref().err() {
+                        Some(TlsError::LocalAlert { alert, .. }) => Some(alert.description),
+                        _ => None,
+                    };
+                    if alert != Some(AlertDescription::IllegalParameter) {
+                        mismatches.push(format!(
+                            "quic={quic} alps=0x{alps:04x} early_first={early_first} accepted={} alert={alert:?}",
+                            result.is_ok(),
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn early_flight_combination_psk_acceptance_rejects_main_handshake_certificate_request() {
+        for quic in [false, true] {
+            let mut handshake = early_data_test_handshake(quic);
+            early_data_test_server_hello(&mut handshake, 0x1301, true);
+            let ee = early_data_test_extensions(quic, Some("h3"), Some(Vec::new()), true);
+            handshake.process_handshake_record(&ee).unwrap();
+            let request = early_flight_combination_message(
+                handshake_type::CERTIFICATE_REQUEST,
+                &[0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3],
+            );
+            assert!(matches!(
+                handshake.process_handshake_record(&request),
+                Err(TlsError::UnexpectedMessage(_))
+            ));
+            assert!(handshake.client_certificate_request_context.is_none());
+        }
+    }
+
+    #[test]
+    fn early_flight_combination_rejected_psk_keeps_alps_and_certificate_transcript_order() {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&signing_key)
+            .unwrap();
+        let anchor = crate::verify::certchain::parse_trust_anchor_from_der(cert.der()).unwrap();
+        let signer = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+            &signing_key.serialize_der(),
+        )
+        .unwrap();
+
+        for quic in [false, true] {
+            for alps in [0x4469, 0x44cd] {
+                let mut handshake = early_flight_combination_start(quic, alps);
+                handshake.set_custom_ca_anchors(Arc::new(vec![anchor.clone()]));
+                early_data_test_server_hello(&mut handshake, 0x1301, false);
+                let ee = early_flight_combination_ee(quic, alps, false, false);
+                handshake.process_handshake_record(&ee).unwrap();
+                let request = early_flight_combination_message(
+                    handshake_type::CERTIFICATE_REQUEST,
+                    &[0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3],
+                );
+                handshake.process_handshake_record(&request).unwrap();
+
+                let cert_der = cert.der().as_ref();
+                let mut certificate = vec![0];
+                certificate.extend_from_slice(&((cert_der.len() + 5) as u32).to_be_bytes()[1..]);
+                certificate.extend_from_slice(&(cert_der.len() as u32).to_be_bytes()[1..]);
+                certificate.extend_from_slice(cert_der);
+                certificate.extend_from_slice(&[0, 0]);
+                handshake
+                    .process_handshake_record(&early_flight_combination_message(
+                        handshake_type::CERTIFICATE,
+                        &certificate,
+                    ))
+                    .unwrap();
+                let mut signed = vec![0x20; 64];
+                signed.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
+                signed.extend_from_slice(&handshake.transcript.as_ref().unwrap().current_hash());
+                let signature = signer.sign(&SystemRandom::new(), &signed).unwrap();
+                let mut verify = vec![4, 3];
+                verify.extend_from_slice(&(signature.as_ref().len() as u16).to_be_bytes());
+                verify.extend_from_slice(signature.as_ref());
+                handshake
+                    .process_handshake_record(&early_flight_combination_message(
+                        handshake_type::CERTIFICATE_VERIFY,
+                        &verify,
+                    ))
+                    .unwrap();
+
+                let mut expected_transcript = handshake.transcript.clone().unwrap();
+                let server_verify = compute_finished_verify_data(
+                    HkdfAlgorithm::Sha256,
+                    handshake.server_hs_traffic_secret.as_ref().unwrap(),
+                    &expected_transcript.current_hash(),
+                )
+                .unwrap();
+                let server_finished =
+                    early_flight_combination_message(handshake_type::FINISHED, &server_verify);
+                let expected_cee = encrypted_extensions_message(&[(alps, Vec::new())]);
+                let expected_certificate = vec![handshake_type::CERTIFICATE, 0, 0, 4, 0, 0, 0, 0];
+                expected_transcript.update(&server_finished);
+                expected_transcript.update(&expected_cee);
+                expected_transcript.update(&expected_certificate);
+                let expected_client_verify = compute_finished_verify_data(
+                    HkdfAlgorithm::Sha256,
+                    handshake.client_hs_traffic_secret.as_ref().unwrap(),
+                    &expected_transcript.current_hash(),
+                )
+                .unwrap();
+                let HandshakeAction::Complete(complete) = handshake
+                    .process_handshake_record(&server_finished)
+                    .unwrap()
+                else {
+                    panic!("valid certificate-authenticated handshake must complete");
+                };
+                assert!(!complete.early_data_accepted);
+                assert!(complete.client_end_of_early_data.is_none());
+                assert_eq!(
+                    complete.client_encrypted_extensions.as_ref(),
+                    Some(&expected_cee)
+                );
+                assert_eq!(
+                    complete.client_certificate.as_ref(),
+                    Some(&expected_certificate)
+                );
+                assert_eq!(&complete.client_finished[4..], expected_client_verify);
+            }
+        }
+    }
+
+    #[test]
+    fn early_data_acceptance_is_unsolicited_after_hello_retry_request() {
+        for quic in [false, true] {
+            let mut handshake = early_data_test_handshake(quic);
+            assert!(handshake.early_data_offer().is_some());
+            assert_eq!(handshake.client_end_of_early_data.is_some(), !quic);
+            let retry = build_hrr(
+                handshake.session_id.as_ref().unwrap(),
+                0x1301,
+                &[0, 43, 0, 2, 3, 4, 0, 44, 0, 3, 0, 1, 0xa5],
+            );
+            let HandshakeAction::RetryClientHello(hello) =
+                handshake.process_handshake_record(&retry).unwrap()
+            else {
+                panic!("expected cookie-only HelloRetryRequest");
+            };
+            assert!(handshake.early_data_offer().is_none());
+            assert!(handshake.client_end_of_early_data.is_none());
+            assert!(client_hello_extension(&hello, ext_type::EARLY_DATA).is_none());
+            early_data_test_server_hello(&mut handshake, 0x1301, true);
+            let message = early_data_test_extensions(quic, Some("h3"), Some(Vec::new()), true);
+            assert!(matches!(
+                handshake.process_handshake_record(&message),
+                Err(TlsError::LocalAlert { alert, .. })
+                    if alert.description == AlertDescription::UnsupportedExtension
+            ));
+            assert!(!handshake.early_data_accepted);
+        }
+    }
+
+    #[test]
+    fn missing_alpn_is_allowed_on_tcp_but_not_after_a_quic_offer() {
+        for quic in [false, true] {
+            let mut profile = crate::profile::presets::chrome_155();
+            profile.alpn_protocols = vec!["h3".into()];
+            let mut handshake = Tls13Handshake::new(profile, "example.com");
+            if quic {
+                handshake.enable_quic_mode();
+                handshake.set_quic_transport_parameters(Vec::new());
+            }
+            handshake.build_client_hello().unwrap();
+            let fields = if quic {
+                vec![(ext_type::QUIC_TRANSPORT_PARAMETERS, Vec::new())]
+            } else {
+                Vec::new()
+            };
+            let message = encrypted_extensions_message(&fields);
+            let result = handshake.process_encrypted_extensions(&message, &message[4..]);
+            if quic {
+                assert!(
+                    matches!(result, Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::NoApplicationProtocol)
+                );
+            } else {
+                assert!(matches!(result.unwrap(), HandshakeAction::ContinueReading));
+                assert!(handshake.negotiated_alpn.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn quic_without_an_alpn_offer_allows_out_of_band_negotiation() {
+        let mut profile = crate::profile::presets::chrome_155();
+        profile.alpn_protocols.clear();
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.enable_quic_mode();
+        handshake.set_quic_transport_parameters(Vec::new());
+        handshake.build_client_hello().unwrap();
+        let message =
+            encrypted_extensions_message(&[(ext_type::QUIC_TRANSPORT_PARAMETERS, Vec::new())]);
+        assert!(matches!(
+            handshake
+                .process_encrypted_extensions(&message, &message[4..])
+                .unwrap(),
+            HandshakeAction::ContinueReading
+        ));
+        assert!(handshake.negotiated_alpn.is_none());
+    }
+
+    #[test]
+    fn malformed_server_alpn_is_decode_error() {
+        for payload in [
+            vec![],
+            vec![0, 0],
+            vec![0, 2, 0, 0],
+            vec![0, 2, 2, b'h', b'2'],
+            vec![0, 4, 2, b'h', b'2', 0],
+            vec![0, 6, 2, b'h', b'2', 2, b'h', b'3'],
+        ] {
+            let mut handshake =
+                Tls13Handshake::new(crate::profile::presets::chrome_155(), "example.com");
+            handshake.build_client_hello().unwrap();
+            let message = encrypted_extensions_message(&[(ext_type::ALPN, payload)]);
+            assert!(
+                matches!(handshake.process_encrypted_extensions(&message, &message[4..]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_extensions_invalid_framing_is_decode_error() {
+        for message in [
+            vec![8, 0, 0, 0],
+            vec![8, 0, 0, 1, 0],
+            vec![8, 0, 0, 3, 0, 0, 0],
+            vec![8, 0, 0, 4, 0, 2, 0, 16],
+            vec![8, 0, 0, 6, 0, 4, 0, 16, 0, 5],
+        ] {
+            let mut handshake =
+                Tls13Handshake::new(crate::profile::presets::chrome_155(), "example.com");
+            handshake.build_client_hello().unwrap();
+            assert!(
+                matches!(handshake.process_encrypted_extensions(&message, &message[4..]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
+            );
+        }
+    }
+
+    #[test]
+    fn alpn_selection_matches_actual_raw_offer_bytes() {
+        let mut profile = crate::profile::presets::chrome_155();
+        profile.alpn_protocols = vec!["h2".into()];
+        profile
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.extension_type == ext_type::ALPN)
+            .unwrap()
+            .source = ExtensionSource::RawBytes {
+            data: "00020180".into(),
+        };
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+        let message = encrypted_extensions_message(&[(ext_type::ALPN, vec![0, 2, 1, 0x80])]);
+        assert!(matches!(
+            handshake
+                .process_encrypted_extensions(&message, &message[4..])
+                .unwrap(),
+            HandshakeAction::ContinueReading
+        ));
+        assert_eq!(
+            handshake.offered_alpn_protocols.as_ref().unwrap(),
+            &vec![vec![0x80]]
         );
     }
 
@@ -3213,6 +5239,7 @@ mod tests {
             age_add: 0x1020_3040,
             received_at: Instant::now(),
             alpn: Some("h2".to_string()),
+            alps: AlpsSessionState::Unknown,
             hkdf_algorithm: HkdfAlgorithm::Sha256,
             aead_algorithm: AeadAlgorithm::Aes128Gcm,
             master_secret: Vec::new(),
@@ -3247,12 +5274,29 @@ mod tests {
         let session_id = handshake.session_id.clone().unwrap();
         let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
         extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x02, 0x00, 0x18]);
-        let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+        extensions.extend_from_slice(&[0xfe, 0x0d, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut hrr = build_hrr(&session_id, cipher_suite, &extensions);
+        let first_hash = digest::digest(&digest::SHA256, &ch1_inner);
+        let mut confirmation_hash = digest::Context::new(&digest::SHA256);
+        confirmation_hash.update(&[0xfe, 0, 0, 32]);
+        confirmation_hash.update(first_hash.as_ref());
+        confirmation_hash.update(&hrr);
+        let secret = hkdf_extract(HkdfAlgorithm::Sha256, &[0; 32], &ch1_inner[6..38]).unwrap();
+        let signal = secret
+            .expand_label(
+                "hrr ech accept confirmation",
+                confirmation_hash.finish().as_ref(),
+                8,
+            )
+            .unwrap();
+        let signal_offset = hrr.len() - 8;
+        hrr[signal_offset..].copy_from_slice(&signal);
         let action = handshake.process_handshake_record(&hrr).unwrap();
         let HandshakeAction::RetryClientHello(ch2_outer) = action else {
             panic!("expected retry ClientHello");
         };
         let ch2_inner = handshake.hrr_inner_ch2.clone().expect("ECH inner CH2");
+        assert_eq!(handshake.ech_hrr_accepted, Some(true));
 
         assert!(client_hello_extension(&ch2_outer, ext_type::PRE_SHARED_KEY).is_none());
         assert!(client_hello_extension(&ch2_outer, ext_type::EARLY_DATA).is_none());
@@ -3277,6 +5321,309 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ch2_binder, expected_ch2_binder);
+    }
+
+    #[test]
+    fn accepted_ech_hrr_cookie_uses_message_hash_and_reaches_inner_ch2() {
+        for (cipher_suite, hkdf_algo, hash_algorithm) in [
+            (0x1301, HkdfAlgorithm::Sha256, &digest::SHA256),
+            (0x1302, HkdfAlgorithm::Sha384, &digest::SHA384),
+        ] {
+            for quic in [false, true] {
+                for ticket_mode in 0..3 {
+                    for final_accepts in [false, true] {
+                        let mut handshake = Tls13Handshake::new(
+                            crate::profile::presets::chrome_155(),
+                            "secret.example.com",
+                        );
+                        if quic {
+                            handshake.enable_quic_mode();
+                            handshake.set_quic_transport_parameters(vec![1, 1, 0]);
+                        }
+                        handshake.set_ech_config(build_test_ech_config_list());
+                        if ticket_mode != 0 {
+                            let sha384 = if ticket_mode == 1 {
+                                cipher_suite == 0x1302
+                            } else {
+                                cipher_suite != 0x1302
+                            };
+                            handshake.set_psk_ticket(test_psk_ticket(sha384));
+                        }
+                        handshake.build_client_hello().unwrap();
+                        let inner1 = handshake.ech_inner_hello.clone().unwrap();
+                        let cookie = b"accepted-ech-cookie";
+                        let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                        extensions.extend_from_slice(&ext_type::COOKIE.to_be_bytes());
+                        extensions.extend_from_slice(&((2 + cookie.len()) as u16).to_be_bytes());
+                        extensions.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+                        extensions.extend_from_slice(cookie);
+                        extensions.extend_from_slice(&[0xfe, 0x0d, 0, 8]);
+                        extensions.extend_from_slice(&[0; 8]);
+                        let mut hrr = build_hrr(
+                            handshake.session_id.as_ref().unwrap(),
+                            cipher_suite,
+                            &extensions,
+                        );
+
+                        // Construct the peer's transcript explicitly, independently of the
+                        // client's confirmation checker: message_hash(CH1) || zeroed HRR.
+                        let hash1 = digest::digest(hash_algorithm, &inner1);
+                        let mut context = digest::Context::new(hash_algorithm);
+                        context.update(&[0xfe, 0, 0, hash1.as_ref().len() as u8]);
+                        context.update(hash1.as_ref());
+                        context.update(&hrr);
+                        let secret =
+                            hkdf_extract(hkdf_algo, &vec![0; hkdf_algo.hash_len()], &inner1[6..38])
+                                .unwrap();
+                        let confirmation = secret
+                            .expand_label(
+                                "hrr ech accept confirmation",
+                                context.finish().as_ref(),
+                                8,
+                            )
+                            .unwrap();
+                        let offset = hrr.len() - 8;
+                        hrr[offset..].copy_from_slice(&confirmation);
+                        let mut corrupted: [u8; 8] = confirmation.as_slice().try_into().unwrap();
+                        corrupted[0] ^= 1;
+                        assert!(!handshake
+                            .check_ech_hrr_acceptance(hkdf_algo, &inner1, &hrr, &corrupted)
+                            .unwrap());
+                        let action = handshake
+                            .process_handshake_record(&hrr)
+                            .expect("valid peer ECH acceptance must be recognized");
+                        assert!(matches!(action, HandshakeAction::RetryClientHello(_)));
+                        assert_eq!(handshake.ech_hrr_accepted, Some(true));
+                        let inner2 = handshake.hrr_inner_ch2.as_ref().unwrap();
+                        assert_eq!(
+                            client_hello_extension(inner2, ext_type::PRE_SHARED_KEY).is_some(),
+                            ticket_mode == 1
+                        );
+                        assert_eq!(
+                            handshake
+                                .offered_extensions
+                                .as_ref()
+                                .unwrap()
+                                .contains(&ext_type::PRE_SHARED_KEY),
+                            ticket_mode == 1
+                        );
+                        let expected = [&(cookie.len() as u16).to_be_bytes()[..], cookie].concat();
+                        assert_eq!(
+                            client_hello_extension(inner2, ext_type::COOKIE),
+                            Some(expected)
+                        );
+                        assert_eq!(&inner1[6..38], &inner2[6..38]);
+                        let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+                        let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                        extensions
+                            .extend_from_slice(&((4 + key.public_key.len()) as u16).to_be_bytes());
+                        extensions.extend_from_slice(&[0, 29]);
+                        extensions.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                        extensions.extend_from_slice(&key.public_key);
+                        if ticket_mode == 1 {
+                            extensions.extend_from_slice(&[0, 41, 0, 2, 0, 0]);
+                        }
+                        let mut sh = build_hrr(
+                            handshake.session_id.as_ref().unwrap(),
+                            cipher_suite,
+                            &extensions,
+                        );
+                        sh[6..38].fill(0x55);
+                        sh[30..38].fill(0);
+                        let mut final_context = digest::Context::new(hash_algorithm);
+                        final_context.update(&[0xfe, 0, 0, hash1.as_ref().len() as u8]);
+                        final_context.update(hash1.as_ref());
+                        final_context.update(&hrr);
+                        final_context.update(inner2);
+                        final_context.update(&sh);
+                        let final_confirmation = secret
+                            .expand_label(
+                                "ech accept confirmation",
+                                final_context.finish().as_ref(),
+                                8,
+                            )
+                            .unwrap();
+                        sh[30..38].copy_from_slice(&final_confirmation);
+                        if !final_accepts {
+                            sh[30] ^= 1;
+                        }
+                        let result = handshake.process_handshake_record(&sh);
+                        if final_accepts {
+                            assert!(
+                                matches!(&result, Ok(HandshakeAction::InstallHandshakeKeys(_))),
+                                "valid final ECH confirmation: {:?}",
+                                result.as_ref().err()
+                            );
+                            assert!(handshake.ech_accepted);
+                            assert_eq!(handshake.psk_accepted, ticket_mode == 1);
+                        } else {
+                            assert!(
+                                matches!(&result, Err(TlsError::LocalAlert { alert, .. })
+                            if alert.description == AlertDescription::IllegalParameter),
+                                "accepted HRR cannot become rejected ECH: installed_keys={} error={:?}",
+                                matches!(&result, Ok(HandshakeAction::InstallHandshakeKeys(_))), result.as_ref().err()
+                            );
+                            assert!(!handshake.psk_accepted);
+                            assert!(handshake.client_hs_traffic_secret.is_none());
+                            assert!(handshake.server_hs_traffic_secret.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_ech_rejection_never_commits_inner_psk_acceptance() {
+        for profile in [
+            crate::profile::presets::chrome_155(),
+            crate::profile::presets::firefox_156(),
+        ] {
+            for quic in [false, true] {
+                let mut handshake = Tls13Handshake::new(profile.clone(), "secret.example.com");
+                if quic {
+                    handshake.enable_quic_mode();
+                    handshake.set_quic_transport_parameters(Vec::new());
+                }
+                handshake.set_ech_config(build_test_ech_config_list());
+                handshake.set_psk_ticket(test_psk_ticket(false));
+                let outer = handshake.build_client_hello().unwrap();
+                assert!(client_hello_extension(&outer, 41).is_none());
+                assert!(
+                    client_hello_extension(handshake.ech_inner_hello.as_ref().unwrap(), 41)
+                        .is_some()
+                );
+                let key = kx::generate_key_pair(KxGroup::X25519).unwrap();
+                let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51];
+                extensions.extend_from_slice(&((4 + key.public_key.len()) as u16).to_be_bytes());
+                extensions.extend_from_slice(&[0, 29]);
+                extensions.extend_from_slice(&(key.public_key.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&key.public_key);
+                extensions.extend_from_slice(&[0, 41, 0, 2, 0, 0]);
+                let mut sh = build_hrr(handshake.session_id.as_ref().unwrap(), 0x1301, &extensions);
+                sh[6..38].fill(0x55);
+                assert!(
+                    matches!(handshake.process_handshake_record(&sh), Err(TlsError::LocalAlert { alert, .. })
+                    if alert.description == AlertDescription::IllegalParameter)
+                );
+                assert!(!handshake.ech_accepted);
+                assert!(!handshake.psk_accepted);
+                assert!(handshake.client_hs_traffic_secret.is_none());
+                assert!(handshake.server_hs_traffic_secret.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn hrr_ech_confirmation_mismatch_is_rejection() {
+        let mut handshake =
+            Tls13Handshake::new(crate::profile::presets::chrome_155(), "secret.example.com");
+        handshake.set_ech_config(build_test_ech_config_list());
+        handshake.build_client_hello().unwrap();
+        let extensions = [
+            0, 43, 0, 2, 3, 4, 0, 44, 0, 3, 0, 1, 0xa5, 0xfe, 0x0d, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let hrr = build_hrr(handshake.session_id.as_ref().unwrap(), 0x1301, &extensions);
+        let action = handshake
+            .process_handshake_record(&hrr)
+            .expect("nonmatching ECH signal selects outer rejection handshake");
+        assert!(matches!(action, HandshakeAction::RetryClientHello(_)));
+        assert_eq!(handshake.ech_hrr_accepted, Some(false));
+    }
+
+    #[test]
+    fn ech_rejected_hrr_forbids_server_psk_selection_with_illegal_parameter() {
+        let mut handshake =
+            Tls13Handshake::new(crate::profile::presets::chrome_155(), "secret.example.com");
+        handshake.set_ech_config(build_test_ech_config_list());
+        handshake.build_client_hello().unwrap();
+        let session_id = handshake.session_id.clone().unwrap();
+        let hrr = build_hrr(
+            &session_id,
+            0x1301,
+            &[0, 43, 0, 2, 3, 4, 0, 44, 0, 3, 0, 1, 0xa5],
+        );
+        assert!(matches!(
+            handshake.process_handshake_record(&hrr).unwrap(),
+            HandshakeAction::RetryClientHello(_)
+        ));
+        let mut server_hello =
+            build_hrr(&session_id, 0x1301, &[0, 43, 0, 2, 3, 4, 0, 41, 0, 2, 0, 0]);
+        server_hello[6..38].fill(0x55);
+        assert!(
+            matches!(handshake.process_handshake_record(&server_hello), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
+        );
+    }
+
+    #[test]
+    fn rejected_ech_hrr_reuses_outer_bytes_without_disclosing_inner_psk() {
+        for quic in [false, true] {
+            for use_psk in [false, true] {
+                for key_share_retry in [false, true] {
+                    let mut handshake = Tls13Handshake::new(
+                        crate::profile::presets::chrome_155(),
+                        "secret.example.com",
+                    );
+                    if quic {
+                        handshake.enable_quic_mode();
+                        handshake.set_quic_transport_parameters(vec![1, 1, 0]);
+                    }
+                    handshake.set_ech_config(build_test_ech_config_list());
+                    if use_psk {
+                        handshake.set_psk_ticket(SessionTicketData {
+                            ticket: b"private-inner-ticket".to_vec(),
+                            resumption_psk: vec![0xa5; 32],
+                            tls_version: crate::session_store::TicketTlsVersion::Tls13,
+                            cipher_suite: 0x1301,
+                            lifetime_secs: 3600,
+                            age_add: 0,
+                            received_at: std::time::Instant::now(),
+                            alpn: Some("h2".into()),
+                            alps: AlpsSessionState::Unknown,
+                            hkdf_algorithm: HkdfAlgorithm::Sha256,
+                            aead_algorithm: AeadAlgorithm::Aes128Gcm,
+                            master_secret: Vec::new(),
+                            max_early_data_size: 0,
+                            peer_transport_parameters: None,
+                            used_extended_master_secret: None,
+                        });
+                    }
+                    let ch1 = handshake.build_client_hello().unwrap();
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                    if key_share_retry {
+                        extensions.extend_from_slice(&[0, 51, 0, 2, 0, 24]);
+                    } else {
+                        extensions.extend_from_slice(&[0, 44, 0, 3, 0, 1, 0xa5]);
+                    }
+                    let hrr =
+                        build_hrr(handshake.session_id.as_ref().unwrap(), 0x1301, &extensions);
+                    let HandshakeAction::RetryClientHello(ch2) =
+                        handshake.process_handshake_record(&hrr).unwrap()
+                    else {
+                        panic!("expected outer CH2");
+                    };
+                    assert_eq!(handshake.ech_hrr_accepted, Some(false));
+                    assert_eq!(
+                        client_hello_extension(&ch2, ext_type::ENCRYPTED_CLIENT_HELLO),
+                        client_hello_extension(&ch1, ext_type::ENCRYPTED_CLIENT_HELLO)
+                    );
+                    assert_eq!(
+                        client_hello_extension(&ch2, ext_type::SNI),
+                        client_hello_extension(&ch1, ext_type::SNI),
+                        "public name stays on outer retry"
+                    );
+                    assert!(client_hello_extension(&ch2, ext_type::PRE_SHARED_KEY).is_none());
+                    assert!(
+                        handshake.hrr_inner_ch2.is_none(),
+                        "no new inner after rejection"
+                    );
+                    assert_eq!(
+                        handshake.ech_rejection_public_name().as_deref(),
+                        Some("public.example.com")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

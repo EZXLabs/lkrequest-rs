@@ -18,24 +18,35 @@ use crate::shape::TlsShapeSpec;
 /// Return a copy of `fp` with extension order canonicalized per `shape`.
 ///
 /// When the profile shuffles extensions, the shuffleable extensions are sorted
-/// into a stable order and the `pinned_last` extensions are appended (also in a
-/// stable order), so two shuffled instances of the *same* ClientHello
-/// canonicalize identically. When it does not shuffle, order is left as-is.
+/// into a stable order within the non-anchored slots. GREASE and `pinned_last`
+/// extensions retain their observed positions, so canonicalization cannot hide
+/// a misplaced bookend or repair a PSK that was not emitted last. When the
+/// profile does not shuffle, order is left as-is.
 pub fn canonicalize_tls(
     fp: &CanonicalTlsFingerprint,
     shape: &TlsShapeSpec,
 ) -> CanonicalTlsFingerprint {
     let mut out = fp.clone();
     if shape.extensions_shuffled {
-        let (mut pinned, mut shuffleable): (Vec<CanonicalExtension>, Vec<CanonicalExtension>) = fp
+        let anchored = |e: &CanonicalExtension| {
+            matches!(e.source, CanonicalExtSource::Grease)
+                || shape.pinned_last.contains(&e.extension_type)
+        };
+        let mut shuffleable: Vec<CanonicalExtension> = fp
             .extensions
             .iter()
+            .filter(|e| !anchored(e))
             .cloned()
-            .partition(|e| shape.pinned_last.contains(&e.extension_type));
+            .collect();
         shuffleable.sort_by(ext_order);
-        pinned.sort_by(ext_order);
-        shuffleable.extend(pinned);
-        out.extensions = shuffleable;
+        let mut sorted = shuffleable.into_iter();
+        for extension in &mut out.extensions {
+            if !anchored(extension) {
+                *extension = sorted
+                    .next()
+                    .expect("one sorted extension per unanchored slot");
+            }
+        }
     }
     out
 }
@@ -205,7 +216,7 @@ mod tests {
     fn shuffled_order_difference_is_not_a_mismatch() {
         let a = fp_with_extensions(vec![grease(), auto(0x0000), auto(0x002b), auto(0x0033)]);
         // Same SET, different order (shuffle).
-        let b = fp_with_extensions(vec![auto(0x0033), auto(0x0000), grease(), auto(0x002b)]);
+        let b = fp_with_extensions(vec![grease(), auto(0x0033), auto(0x0000), auto(0x002b)]);
         let shape = TlsShapeSpec::shuffled(vec![0x0029]);
         assert!(
             diff_tls(&a, &b, &shape).is_empty(),
@@ -235,16 +246,45 @@ mod tests {
     }
 
     #[test]
-    fn pinned_last_extension_is_appended_after_shuffleable() {
+    fn misplaced_pinned_extension_is_a_mismatch() {
         let psk = auto(0x0029);
-        let fp = fp_with_extensions(vec![psk.clone(), auto(0x0033), grease(), auto(0x0000)]);
+        let golden = fp_with_extensions(vec![grease(), auto(0x0033), auto(0x0000), psk.clone()]);
+        let current = fp_with_extensions(vec![grease(), psk, auto(0x0000), auto(0x0033)]);
         let shape = TlsShapeSpec::shuffled(vec![0x0029]);
-        let c = canonicalize_tls(&fp, &shape);
-        assert_eq!(
-            c.extensions.last().unwrap().extension_type,
-            0x0029,
-            "pinned_last must end up last after canonicalization"
+        assert!(
+            !diff_tls(&golden, &current, &shape).is_empty(),
+            "canonicalization must not repair misplaced PSK extensions"
         );
+    }
+
+    #[test]
+    fn moved_grease_bookend_is_a_mismatch() {
+        let golden = fp_with_extensions(vec![grease(), auto(0x0000), auto(0x0033), grease()]);
+        let current = fp_with_extensions(vec![auto(0x0000), grease(), auto(0x0033), grease()]);
+        assert!(
+            !diff_tls(&golden, &current, &TlsShapeSpec::shuffled(vec![0x0029])).is_empty(),
+            "GREASE values vary, but their anchored positions must remain observable"
+        );
+    }
+
+    #[test]
+    fn shuffled_extensions_preserve_both_bookends_and_psk() {
+        let golden = fp_with_extensions(vec![
+            grease(),
+            auto(0x0033),
+            auto(0x0000),
+            grease(),
+            auto(0x0029),
+        ]);
+        let mut current = golden.clone();
+        current.extensions.swap(1, 2);
+        let shape = TlsShapeSpec::shuffled(vec![0x0029]);
+        let canonical = canonicalize_tls(&current, &shape);
+        assert!(diff_tls(&golden, &current, &shape).is_empty());
+        assert_eq!(canonical.extensions[0], grease());
+        assert_eq!(canonical.extensions[3], grease());
+        assert_eq!(canonical.extensions[4], auto(0x0029));
+        assert_eq!(canonicalize_tls(&canonical, &shape), canonical);
     }
 
     #[test]

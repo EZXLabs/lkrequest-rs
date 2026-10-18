@@ -61,6 +61,13 @@ pub struct H2Fingerprint {
 /// produces JSON that `lkrequest::h2::H2Profile` can deserialize from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct H2ProfileData {
+    /// First observed client HEADERS stream ID; absent when not observed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_initial_stream_id"
+    )]
+    pub initial_stream_id: Option<u32>,
     /// Ordered SETTINGS parameters.
     pub settings: Vec<H2Setting>,
     /// Connection-level WINDOW_UPDATE increment.
@@ -80,6 +87,19 @@ pub struct H2ProfileData {
     /// When `None`, the profile uses default priority behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_config: Option<H2PriorityConfig>,
+}
+
+fn deserialize_initial_stream_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let id = Option::<u32>::deserialize(deserializer)?;
+    if id.is_none_or(|id| id != 0 && id <= 0x7fff_ffff && id % 2 == 1) {
+        Ok(id)
+    } else {
+        Err(serde::de::Error::custom(
+            "initial_stream_id must be a nonzero odd 31-bit client stream ID",
+        ))
+    }
 }
 
 /// Per-browser priority strategy, schema-compatible with
@@ -131,6 +151,8 @@ pub enum H2StreamDepPolicy {
     Flat,
     /// Each new stream depends on the previous client stream (Chrome style).
     Chain,
+    /// Priority-ordered active-stream chain used by current Chrome presets.
+    PriorityChain,
 }
 
 /// A single HTTP/2 SETTINGS parameter.
@@ -383,37 +405,31 @@ fn hpack_static_pseudo_header(index: usize) -> Option<&'static str> {
 }
 
 /// Decode an HPACK integer with the given prefix bit width.
-fn decode_hpack_integer(data: &[u8], prefix_bits: u8) -> (usize, usize) {
-    if data.is_empty() {
-        return (0, 0);
-    }
+fn decode_hpack_integer(data: &[u8], prefix_bits: u8) -> Option<(usize, usize)> {
     let mask = (1u16 << prefix_bits) - 1;
-    let value = (data[0] & mask as u8) as usize;
+    let value = (*data.first()? & mask as u8) as usize;
     if value < mask as usize {
-        return (value, 1);
+        return Some((value, 1));
     }
     let mut result = mask as usize;
-    let mut shift = 0usize;
-    let mut i = 1;
-    while i < data.len() {
-        let b = data[i];
-        result += ((b & 0x7f) as usize) << shift;
-        shift += 7;
-        i += 1;
+    let mut shift = 0u32;
+    for (offset, &b) in data[1..].iter().enumerate() {
+        let chunk = ((b & 0x7f) as usize).checked_mul(1usize.checked_shl(shift)?)?;
+        result = result.checked_add(chunk)?;
         if b & 0x80 == 0 {
-            break;
+            return Some((result, offset + 2));
         }
+        shift += 7;
     }
-    (result, i)
+    None
 }
 
 /// Skip over an HPACK string (Huffman or raw).
-fn skip_hpack_string(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    let (length, header_bytes) = decode_hpack_integer(data, 7);
-    header_bytes + length
+fn skip_hpack_string(data: &[u8]) -> Option<usize> {
+    let (length, header_bytes) = decode_hpack_integer(data, 7)?;
+    let end = header_bytes.checked_add(length)?;
+    data.get(..end)?;
+    Some(end)
 }
 
 /// Extract pseudo-header order from HPACK-encoded header block data.
@@ -426,7 +442,9 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<H2PseudoHeaderId> {
 
         if byte & 0x80 != 0 {
             // Indexed header field (1xxxxxxx)
-            let (index, consumed) = decode_hpack_integer(&hpack_data[pos..], 7);
+            let Some((index, consumed)) = decode_hpack_integer(&hpack_data[pos..], 7) else {
+                break;
+            };
             pos += consumed;
             if let Some(name) = hpack_static_pseudo_header(index) {
                 if let Some(id) = pseudo_header_name_to_id(name) {
@@ -437,7 +455,9 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<H2PseudoHeaderId> {
             }
         } else if byte & 0xc0 == 0x40 {
             // Literal with incremental indexing (01xxxxxx)
-            let (name_index, consumed) = decode_hpack_integer(&hpack_data[pos..], 6);
+            let Some((name_index, consumed)) = decode_hpack_integer(&hpack_data[pos..], 6) else {
+                break;
+            };
             pos += consumed;
             if name_index > 0 {
                 if let Some(name) = hpack_static_pseudo_header(name_index) {
@@ -452,10 +472,13 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<H2PseudoHeaderId> {
             } else {
                 // Literal name — peek to check if it's a pseudo-header
                 if pos < hpack_data.len() {
-                    let (str_len, str_header) = decode_hpack_integer(&hpack_data[pos..], 7);
+                    let Some((str_len, str_header)) = decode_hpack_integer(&hpack_data[pos..], 7)
+                    else {
+                        break;
+                    };
                     let is_huffman = hpack_data[pos] & 0x80 != 0;
                     let name_start = pos + str_header;
-                    if !is_huffman && name_start + str_len <= hpack_data.len() {
+                    if !is_huffman && str_len <= hpack_data.len() - name_start {
                         if let Ok(name) =
                             std::str::from_utf8(&hpack_data[name_start..name_start + str_len])
                         {
@@ -467,18 +490,27 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<H2PseudoHeaderId> {
                         }
                     }
                 }
-                let name_consumed = skip_hpack_string(&hpack_data[pos..]);
+                let Some(name_consumed) = skip_hpack_string(&hpack_data[pos..]) else {
+                    break;
+                };
                 pos += name_consumed;
             }
             // Skip value string
-            pos += skip_hpack_string(&hpack_data[pos..]);
+            let Some(consumed) = skip_hpack_string(&hpack_data[pos..]) else {
+                break;
+            };
+            pos += consumed;
         } else if byte & 0xe0 == 0x20 {
             // Dynamic table size update (001xxxxx)
-            let (_, consumed) = decode_hpack_integer(&hpack_data[pos..], 5);
+            let Some((_, consumed)) = decode_hpack_integer(&hpack_data[pos..], 5) else {
+                break;
+            };
             pos += consumed;
         } else {
             // Literal without indexing (0000xxxx) or never indexed (0001xxxx)
-            let (name_index, consumed) = decode_hpack_integer(&hpack_data[pos..], 4);
+            let Some((name_index, consumed)) = decode_hpack_integer(&hpack_data[pos..], 4) else {
+                break;
+            };
             pos += consumed;
             if name_index > 0 {
                 if let Some(name) = hpack_static_pseudo_header(name_index) {
@@ -493,7 +525,10 @@ fn extract_pseudo_header_order(hpack_data: &[u8]) -> Vec<H2PseudoHeaderId> {
             } else {
                 break;
             }
-            pos += skip_hpack_string(&hpack_data[pos..]);
+            let Some(consumed) = skip_hpack_string(&hpack_data[pos..]) else {
+                break;
+            };
+            pos += consumed;
         }
     }
 
@@ -691,6 +726,7 @@ pub fn h2_fingerprint_from_frames(data: &[u8]) -> Result<H2Fingerprint, ParseErr
     let mut pseudo_header_order = Vec::new();
     let mut headers_priority = None;
     let mut first_headers_seen = false;
+    let mut initial_stream_id = None;
 
     // Extended capture: collect priority info from multiple HEADERS frames
     // to infer PriorityConfig fields.
@@ -726,6 +762,12 @@ pub fn h2_fingerprint_from_frames(data: &[u8]) -> Result<H2Fingerprint, ParseErr
                 let hpack_block = extract_hpack_block(&frame.payload, frame.flags);
 
                 if !first_headers_seen {
+                    if frame.stream_id == 0 || frame.stream_id % 2 == 0 {
+                        return Err(ParseError::UnexpectedValue(
+                            "first client HEADERS stream ID must be nonzero and odd".into(),
+                        ));
+                    }
+                    initial_stream_id = Some(frame.stream_id);
                     headers_priority = hp.clone();
                     pseudo_header_order = extract_pseudo_header_order(hpack_block);
                     first_headers_seen = true;
@@ -757,6 +799,7 @@ pub fn h2_fingerprint_from_frames(data: &[u8]) -> Result<H2Fingerprint, ParseErr
     );
 
     let profile = H2ProfileData {
+        initial_stream_id,
         settings,
         window_update,
         pseudo_header_order,
@@ -817,6 +860,7 @@ mod tests {
     #[test]
     fn test_akamai_fingerprint_computation() {
         let profile = H2ProfileData {
+            initial_stream_id: Some(1),
             settings: vec![
                 H2Setting {
                     id: H2SettingId::HeaderTableSize,
@@ -903,9 +947,21 @@ mod tests {
 
     #[test]
     fn test_hpack_integer_decode() {
-        assert_eq!(decode_hpack_integer(&[0x82], 7), (2, 1));
-        assert_eq!(decode_hpack_integer(&[0x41], 6), (1, 1));
-        assert_eq!(decode_hpack_integer(&[0xff, 0x00], 7), (127, 2));
+        assert_eq!(decode_hpack_integer(&[0x82], 7), Some((2, 1)));
+        assert_eq!(decode_hpack_integer(&[0x41], 6), Some((1, 1)));
+        assert_eq!(decode_hpack_integer(&[0xff, 0x00], 7), Some((127, 2)));
+    }
+
+    #[test]
+    fn oversized_hpack_lengths_do_not_panic_or_fabricate_headers() {
+        for data in [
+            &[0x3f, 0xe1, 0xff, 0xff, 0xff, 0x0f][..],
+            &[0x40, 0x7f, 0x80, 0xff, 0xff, 0xff, 0x0f],
+            &[0x40, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            &[0x40, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        ] {
+            assert!(extract_pseudo_header_order(data).is_empty());
+        }
     }
 
     #[test]
@@ -1069,4 +1125,22 @@ mod tests {
         let without = b"\x82\x84\x00\x0auser-agenttest";
         assert!(!super::hpack_block_contains_priority_header(without));
     }
+}
+#[test]
+fn first_client_stream_id_is_extracted_and_invalid_ids_are_rejected() {
+    let mut wire = vec![0, 0, 1, 1, 5, 0, 0, 0, 3, 0x82];
+    let parsed = h2_fingerprint_from_frames_no_preface(&wire).unwrap();
+    assert_eq!(parsed.profile.initial_stream_id, Some(3));
+    for id in [0u32, 2] {
+        wire[5..9].copy_from_slice(&id.to_be_bytes());
+        assert!(h2_fingerprint_from_frames_no_preface(&wire).is_err());
+    }
+    let only_settings =
+        h2_fingerprint_from_frames_no_preface(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).unwrap();
+    assert!(only_settings.profile.initial_stream_id.is_none());
+    assert!(!serde_json::to_value(only_settings.profile)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("initial_stream_id"));
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lkh3"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "HTTP/3 and QUIC fingerprint profiles for lkrequest"
 license.workspace = true

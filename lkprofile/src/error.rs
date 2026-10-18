@@ -1,6 +1,6 @@
 //! Error types for profile parsing.
 
-/// Errors that can occur while parsing TLS or HTTP/2 data.
+/// Errors that can occur while parsing TLS, HTTP/2 or HTTP/3 data.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     /// The input data is too short or truncated.

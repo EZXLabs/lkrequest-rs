@@ -115,7 +115,7 @@ fn generate_classical_key_pair(group: KxGroup) -> Result<EphemeralKeyPair> {
 /// Generate a hybrid X25519 + ML-KEM-768 key pair.
 ///
 /// The public key is the concatenation (per draft-ietf-tls-ecdhe-mlkem):
-///   X25519_public_key (32 bytes) || ML-KEM-768_encapsulation_key (1184 bytes)
+///   ML-KEM-768_encapsulation_key (1184 bytes) || X25519_public_key (32 bytes)
 /// Total: 1216 bytes.
 fn generate_hybrid_key_pair() -> Result<EphemeralKeyPair> {
     let rng = SystemRandom::new();
@@ -181,7 +181,7 @@ pub fn compute_shared_secret(our_key: EphemeralKeyPair, peer_public_key: &[u8]) 
 /// Compute the hybrid X25519 + ML-KEM-768 shared secret.
 ///
 /// Server's key_share (per draft-ietf-tls-ecdhe-mlkem):
-///   X25519_server_public_key (32 bytes) || ML-KEM-768_ciphertext (1088 bytes)
+///   ML-KEM-768_ciphertext (1088 bytes) || X25519_server_public_key (32 bytes)
 /// Total: 1120 bytes.
 ///
 /// Shared secret:
@@ -198,7 +198,7 @@ fn compute_hybrid_shared_secret(
     );
     // Server key_share format (per draft-ietf-tls-ecdhe-mlkem):
     //   ML-KEM-768 ciphertext (1088 bytes) || X25519 public key (32 bytes)
-    // Note: server sends ML-KEM FIRST, then ECDHE (opposite of client order!)
+    // Both client and server place the ML-KEM component before X25519.
     const MLKEM768_CT_LEN: usize = 1088;
     const X25519_PUB_LEN: usize = 32;
     if server_share.len() != MLKEM768_CT_LEN + X25519_PUB_LEN {
@@ -212,7 +212,7 @@ fn compute_hybrid_shared_secret(
     let mlkem_ciphertext = &server_share[..MLKEM768_CT_LEN];
     let x25519_server_pub = &server_share[MLKEM768_CT_LEN..];
 
-    // X25519 key agreement (first 32 bytes of server_share)
+    // X25519 key agreement (last 32 bytes of server_share)
     let x25519_peer = agreement::UnparsedPublicKey::new(&agreement::X25519, x25519_server_pub);
     let x25519_secret = agreement::agree_ephemeral(
         x25519_priv,
@@ -274,6 +274,28 @@ mod tests {
         // order itself is gated on the wire by the ClientHello fingerprint
         // tests; here the components aren't exposed separately to split.)
         assert_eq!(kp.public_key.len(), 1184 + 32);
+    }
+
+    #[test]
+    fn hybrid_shared_secret_matches_independent_server_encapsulation() {
+        let client = generate_key_pair(KxGroup::X25519MlKem768).unwrap();
+        let server = generate_key_pair(KxGroup::X25519).unwrap();
+        let server_public = server.public_key.clone();
+        let kem = aws_lc_rs::kem::EncapsulationKey::new(
+            &aws_lc_rs::kem::ML_KEM_768,
+            &client.public_key[..1184],
+        )
+        .unwrap();
+        let (ciphertext, kem_secret) = kem.encapsulate().unwrap();
+        let x_secret = compute_shared_secret(server, &client.public_key[1184..]).unwrap();
+        let mut wire = ciphertext.as_ref().to_vec();
+        wire.extend_from_slice(&server_public);
+        assert_eq!(wire.len(), 1120);
+        let combined = compute_shared_secret(client, &wire).unwrap();
+        let mut expected = kem_secret.as_ref().to_vec();
+        expected.extend_from_slice(&x_secret);
+        assert_eq!(combined, expected);
+        assert_eq!(combined.len(), 64);
     }
 
     #[test]

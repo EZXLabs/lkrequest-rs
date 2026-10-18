@@ -1,30 +1,17 @@
-//! Tier-0: TLS 1.3 early data (0-RTT) — why the missing `EndOfEarlyData` is
-//! currently unreachable, and the guard that keeps it that way.
+//! Tier-0: TLS 1.3 early-data offers and transport-specific completion.
 //!
-//! `lktls` never sends an `EndOfEarlyData` message. RFC 8446 §4.5 requires one
-//! once a server accepts early data: encrypted under
-//! `client_early_traffic_secret` rather than the handshake keys, and folded into
-//! the transcript the client Finished is computed over. Omitting it would fail
-//! the server's Finished check on every accepted 0-RTT resumption.
+//! Built-in TCP profiles omit extension 42, so their normal resumption does
+//! not negotiate early data. Custom TCP profiles can include an Auto early_data
+//! extension. When a server accepts that valid offer, the client sends an empty
+//! EndOfEarlyData with early write keys and includes it in the Finished transcript.
+//! This completes a zero-byte early phase; there is no TCP early-application-data
+//! sending API.
 //!
-//! It is unreachable today, for two different reasons on the two transports:
-//!
-//! - **TCP** — `Tls13Handshake` calls `ClientHelloBuilder::with_early_data()`
-//!   whenever the resumption ticket allows 0-RTT, which reads like an offer. But
-//!   ClientHello extensions are emitted from the profile's extension list, and
-//!   no TCP profile lists extension 42, so the flag never reaches the wire. The
-//!   server never sees an offer and never accepts.
-//! - **QUIC** — the QUIC profiles *do* offer extension 42, matching real Chrome.
-//!   No `EndOfEarlyData` is owed there: RFC 9001 §8.3 states a QUIC client "MUST
-//!   NOT send the EndOfEarlyData message", since the end of 0-RTT is signalled
-//!   by the change of packet number space.
-//!
-//! So the gap only becomes real if a *TCP* profile starts offering early data.
-//! These tests pin that: resumption against an early-data-capable server does
-//! not negotiate early data, no TCP profile lists extension 42, and the QUIC
-//! profiles still do.
+//! QUIC templates retain their early-data offer but never emit EndOfEarlyData,
+//! as required by RFC 9001 section 8.3. The child fixture verifies accepted and
+//! rejected custom TCP offers against a real peer, including its Finished check.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use lkrequest::TlsConnector;
 use lktls::profile::presets;
@@ -35,6 +22,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+
+#[path = "tls_e2e_early_data/tcp_offer.rs"]
+mod tcp_offer;
 
 /// TLS 1.3 `early_data` extension type.
 const EXT_EARLY_DATA: u16 = 42;
@@ -68,15 +58,25 @@ fn early_data_acceptor(cert: &CertifiedKey<KeyPair>) -> TlsAcceptor {
 /// Serve `connections` TLS sessions, writing a short greeting on each so the
 /// client has something to read — which is also what drives it to consume the
 /// post-handshake `NewSessionTicket`.
-async fn serve(listener: TcpListener, acceptor: TlsAcceptor, connections: usize) {
+async fn serve(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    connections: usize,
+    reports: tokio::sync::mpsc::UnboundedSender<(Option<rustls::HandshakeKind>, bool)>,
+) {
     for _ in 0..connections {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
         let acceptor = acceptor.clone();
+        let reports = reports.clone();
         tokio::spawn(async move {
             match acceptor.accept(tcp).await {
                 Ok(mut tls) => {
+                    let peer = &mut tls.get_mut().1;
+                    reports
+                        .send((peer.handshake_kind(), peer.early_data().is_some()))
+                        .unwrap();
                     let _ = tls.write_all(b"hello").await;
                     let _ = tls.flush().await;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -87,60 +87,10 @@ async fn serve(listener: TcpListener, acceptor: TlsAcceptor, connections: usize)
     }
 }
 
-/// Capture `tracing` messages so the test can assert what the handshake actually
-/// negotiated, rather than inferring it from success alone.
-fn capture_logs() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::Layer;
-
-    struct LogCapture {
-        logs: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl<S: tracing::Subscriber> Layer<S> for LogCapture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            if let Ok(mut logs) = self.logs.lock() {
-                logs.push(visitor.0);
-            }
-        }
-    }
-
-    struct MessageVisitor(String);
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            } else {
-                if !self.0.is_empty() {
-                    self.0.push(' ');
-                }
-                self.0.push_str(&format!("{}={:?}", field.name(), value));
-            }
-        }
-    }
-
-    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::registry().with(LogCapture { logs: logs.clone() });
-    let guard = tracing::subscriber::set_default(subscriber);
-    (logs, guard)
-}
-
 /// PSK resumption against a server that *would* accept 0-RTT: the handshake
-/// completes, and early data is not negotiated because we never offer it.
-///
-/// If a future change makes the client offer `early_data`, the server here will
-/// accept it and this test's early-data assertion flips — which is the signal
-/// that `EndOfEarlyData` must be implemented before that change can ship.
+/// completes, and the built-in TCP profile does not negotiate early data.
 #[tokio::test]
 async fn resumption_does_not_negotiate_early_data() {
-    let (logs, _guard) = capture_logs();
-
     let cert =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
             .expect("rcgen self-signed");
@@ -148,7 +98,8 @@ async fn resumption_does_not_negotiate_early_data() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let server = tokio::spawn(serve(listener, acceptor, 2));
+    let (report_tx, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(serve(listener, acceptor, 2, report_tx));
 
     let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
 
@@ -167,6 +118,11 @@ async fn resumption_does_not_negotiate_early_data() {
     let mut buf = [0u8; 64];
     let n = tls.read(&mut buf).await.expect("read greeting");
     assert_eq!(&buf[..n], b"hello");
+    let first = reports.recv().await.expect("full handshake report");
+    assert!(first
+        .0
+        .is_some_and(|kind| kind != rustls::HandshakeKind::Resumed));
+    assert!(!first.1);
     drop(tls);
 
     // The server must have issued a 0-RTT-capable ticket, otherwise the
@@ -188,29 +144,19 @@ async fn resumption_does_not_negotiate_early_data() {
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect 2");
-    let resumed = TlsConnector::new(presets::chrome_144())
+    let mut resumed = TlsConnector::new(presets::chrome_144())
         .insecure_skip_verify(true)
         .session_store(store.clone())
         .connect("127.0.0.1", addr.port(), tcp)
-        .await;
-
+        .await
+        .expect("resumed handshake");
+    let n = resumed.read(&mut buf).await.expect("resumed greeting");
+    assert_eq!(&buf[..n], b"hello");
+    let second = reports.recv().await.expect("resumed handshake report");
+    assert_eq!(second.0, Some(rustls::HandshakeKind::Resumed));
     assert!(
-        resumed.is_ok(),
-        "resumed handshake must succeed, got {:?}",
-        resumed.err()
-    );
-
-    let joined = logs.lock().expect("log mutex").join("\n");
-    assert!(
-        joined.contains("psk_accepted"),
-        "the second connection must actually resume via PSK; logs:\n{joined}"
-    );
-    assert!(
-        !joined.contains("Server accepted TLS early_data"),
-        "early data was negotiated, but lktls never sends the EndOfEarlyData \
-         message RFC 8446 §4.5 requires (encrypted under \
-         client_early_traffic_secret and folded into the client Finished \
-         transcript). Implement it before offering early_data; logs:\n{joined}"
+        !second.1,
+        "the built-in TCP profile must not negotiate early data"
     );
 
     server.abort();
@@ -223,14 +169,9 @@ fn offers_early_data(profile: &lktls::profile::types::TlsProfile) -> bool {
         .any(|ext| ext.extension_type == EXT_EARLY_DATA)
 }
 
-/// No **TCP** profile offers `early_data`, so the missing `EndOfEarlyData`
-/// support is unreachable there.
-///
-/// Adding extension 42 to a TCP profile turns that gap into a handshake failure
-/// on every accepted 0-RTT resumption, so this fails loudly rather than letting
-/// the profile change ship on its own.
+/// Built-in TCP offers remain unchanged by support for custom early-data offers.
 #[test]
-fn no_tcp_profile_offers_early_data_while_end_of_early_data_is_unimplemented() {
+fn built_in_tcp_profiles_do_not_offer_early_data() {
     let tcp_profiles: Vec<(&str, lktls::profile::types::TlsProfile)> = vec![
         ("chrome_131", presets::chrome_131()),
         ("chrome_144", presets::chrome_144()),
@@ -244,6 +185,7 @@ fn no_tcp_profile_offers_early_data_while_end_of_early_data_is_unimplemented() {
         ("chrome_152", presets::chrome_152()),
         ("chrome_153", presets::chrome_153()),
         ("chrome_154", presets::chrome_154()),
+        ("chrome_155", presets::chrome_155()),
         ("firefox_133", presets::firefox_133()),
         ("firefox_147", presets::firefox_147()),
         ("firefox_156", presets::firefox_156()),
@@ -254,13 +196,7 @@ fn no_tcp_profile_offers_early_data_while_end_of_early_data_is_unimplemented() {
     for (name, profile) in tcp_profiles {
         assert!(
             !offers_early_data(&profile),
-            "TCP profile `{name}` lists extension {EXT_EARLY_DATA} (early_data), \
-             but lktls does not send the EndOfEarlyData message RFC 8446 §4.5 \
-             requires when a server accepts 0-RTT. Every accepted early-data \
-             resumption would fail the client Finished check. Implement \
-             EndOfEarlyData — encrypted under client_early_traffic_secret and \
-             appended to the transcript after the server Finished, before the \
-             client Finished — before shipping this profile."
+            "unexpected extension {EXT_EARLY_DATA} (early_data) in built-in TCP profile `{name}`"
         );
     }
 }
@@ -282,6 +218,7 @@ fn quic_profiles_offer_early_data_and_owe_no_end_of_early_data() {
         ("chrome_152_quic", presets::chrome_152_quic()),
         ("chrome_153_quic", presets::chrome_153_quic()),
         ("chrome_154_quic", presets::chrome_154_quic()),
+        ("chrome_155_quic", presets::chrome_155_quic()),
     ] {
         assert!(
             offers_early_data(&profile),

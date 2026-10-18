@@ -100,9 +100,13 @@ pub(crate) fn build_request_builder(
         header_order,
         h3_header_order,
         cookie_order,
+        h2_priority_weight,
     } = config;
 
     let mut builder = session.request(method, &url);
+    if let Some(weight) = h2_priority_weight {
+        builder = builder.h2_priority_weight(weight);
+    }
 
     for (name, value) in &headers {
         builder = builder.header(name, value);
@@ -264,6 +268,28 @@ pub extern "C" fn lk_request_add_header(
             state.config.accept_encoding_header_present = true;
         }
         state.config.headers.push((name, value));
+        Ok(())
+    })
+}
+
+/// Set raw legacy H2 HEADERS weight (0..255), independently of HTTP priority.
+/// Does not enable legacy priority for profiles that omit it; ignored on H1/H3.
+#[no_mangle]
+pub extern "C" fn lk_request_set_h2_priority_weight(
+    request: *mut lk_request_t,
+    weight: u32,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let request = require_handle_mut::<RequestHandle, lk_request_t>(request)?;
+        let weight = u8::try_from(weight)
+            .map_err(|_| FfiError::invalid_argument("H2 wire weight must be between 0 and 255"))?;
+        let mut state = request.state.lock();
+        if matches!(state.lifecycle, RequestLifecycle::Consumed) {
+            return Err(FfiError::invalid_argument(
+                "request has already been consumed",
+            ));
+        }
+        state.config.h2_priority_weight = Some(weight);
         Ok(())
     })
 }

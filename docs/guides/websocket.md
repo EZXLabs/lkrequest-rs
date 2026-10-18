@@ -11,7 +11,7 @@ use lkrequest::ws::WsMessage;
 
 let session = client.session().http1_only().build();
 
-let mut ws = session.websocket("wss://echo.example.com/socket").connect().await?;
+let ws = session.websocket("wss://echo.example.com/socket").connect().await?;
 
 ws.send_text("hello").await?;
 match ws.recv().await? {
@@ -31,7 +31,7 @@ ws.close(None).await?;
 | `extension(name)` | 追加 `Sec-WebSocket-Extensions` |
 
 ```rust,ignore
-let mut ws = session
+let ws = session
     .websocket("wss://api.example.com/stream")
     .header("authorization", format!("Bearer {token}"))
     .protocol("json.v2")
@@ -50,6 +50,10 @@ let mut ws = session
   超长或使用了端点不允许发送的状态码时，`close()` 会直接返回错误且**不向线路写入任何字节**。
 
 `WsMessage` 有 `Text`、`Binary`、`Ping`、`Pong` 和 `Close` 五种变体。
+
+收发方法接受共享引用。等待 `recv()` 时可并行调用 `send()` 或 `close()`，也可通过 `Arc<WsConnection<_>>` 在任务间共享；同一方向的多次调用按序执行。发送关闭帧后仍可继续等待对端的关闭回复。
+
+底层解析器在接收到部分帧后不保证取消安全。并行发送时应保留正在执行的 `recv()`，不要反复取消并重新开始接收。
 
 ## 协议限制
 

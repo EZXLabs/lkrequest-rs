@@ -45,7 +45,7 @@ use crate::crypto::tls12_cipher::{Tls12CipherSuite, Tls12KeyExchange};
 use crate::error::{AlertDescription, Result, TlsError};
 use crate::extensions::record_size_limit::parse_peer_record_size_limit;
 use crate::handshake::handshake_type;
-use crate::handshake::tls13::client_hello_extensions;
+use crate::handshake::tls13::{client_hello_extensions, client_hello_legacy_offer};
 use crate::profile::types::ext_type;
 use crate::verify::policy::VerificationPolicy;
 
@@ -400,6 +400,10 @@ pub struct Tls12Handshake {
     /// which case there is nothing to compare against and the
     /// unsolicited-extension check is skipped.
     offered_extensions: Option<Vec<u16>>,
+    /// Protocol identifiers from the actual ClientHello, including raw overrides.
+    offered_alpn_protocols: Option<Vec<Vec<u8>>>,
+    offered_cipher_suites: Option<Vec<u16>>,
+    offered_compression_methods: Option<Vec<u8>>,
 }
 
 /// The signature algorithms a server may assume when the ClientHello carried no
@@ -461,6 +465,9 @@ impl Tls12Handshake {
             offered_groups: None,
             offered_signature_algorithms: None,
             offered_extensions: None,
+            offered_alpn_protocols: None,
+            offered_cipher_suites: None,
+            offered_compression_methods: None,
         }
     }
 
@@ -583,6 +590,9 @@ impl Tls12Handshake {
             self.offered_groups = None;
             self.offered_signature_algorithms = None;
             self.offered_extensions = None;
+            self.offered_alpn_protocols = None;
+            self.offered_cipher_suites = None;
+            self.offered_compression_methods = None;
             return;
         };
         let body = |target: u16| {
@@ -591,6 +601,19 @@ impl Tls12Handshake {
                 .find(|(extension_type, _)| *extension_type == target)
                 .map(|(_, body)| *body)
         };
+        if let Some((suites, compression)) = client_hello_legacy_offer(ch_bytes) {
+            self.offered_cipher_suites = Some(suites);
+            self.offered_compression_methods = Some(compression);
+        } else {
+            self.offered_cipher_suites = None;
+            self.offered_compression_methods = None;
+        }
+        self.offered_alpn_protocols = Some(
+            body(ext_type::ALPN)
+                .and_then(crate::extensions::alpn::parse_alpn_list_bytes)
+                .map(|protocols| protocols.into_iter().map(ToOwned::to_owned).collect())
+                .unwrap_or_default(),
+        );
 
         // supported_groups: NamedGroupList<2..2^16-1> — a 2-byte length then
         // 2-byte code points (RFC 8422 §5.1.1). Absent means the client stated
@@ -1136,28 +1159,68 @@ impl Tls12Handshake {
         full_msg: &[u8],
     ) -> Result<Tls12HandshakeAction> {
         if body.len() < 38 {
-            return Err(TlsError::HandshakeFailure("ServerHello too short".into()));
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "TLS 1.2 ServerHello too short",
+            ));
         }
 
         // server_version (2) + random (32) + session_id_len (1) + ...
-        let _server_version = u16::from_be_bytes([body[0], body[1]]);
+        let server_version = u16::from_be_bytes([body[0], body[1]]);
+        if server_version != 0x0303 {
+            return Err(TlsError::local_alert(
+                AlertDescription::ProtocolVersion,
+                "TLS 1.2 ServerHello has an unsupported server_version",
+            ));
+        }
         self.server_random.copy_from_slice(&body[2..34]);
 
         let session_id_len = body[34] as usize;
+        if session_id_len > 32 {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "TLS 1.2 ServerHello session ID exceeds 32 bytes",
+            ));
+        }
         let offset = 35 + session_id_len;
 
         if offset + 3 > body.len() {
-            return Err(TlsError::HandshakeFailure("ServerHello truncated".into()));
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "TLS 1.2 ServerHello truncated",
+            ));
         }
 
         let cipher_suite_code = u16::from_be_bytes([body[offset], body[offset + 1]]);
-        let _compression_method = body[offset + 2];
+        let compression = body[offset + 2];
+        if compression != 0
+            || self
+                .offered_compression_methods
+                .as_ref()
+                .is_some_and(|offered| !offered.contains(&compression))
+        {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "TLS 1.2 server selected unsupported or unoffered compression",
+            ));
+        }
+        if self
+            .offered_cipher_suites
+            .as_ref()
+            .is_some_and(|offered| !offered.contains(&cipher_suite_code))
+        {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "TLS 1.2 server selected an unoffered cipher suite",
+            ));
+        }
 
         // Resolve cipher suite
         let suite = Tls12CipherSuite::from_code_point(cipher_suite_code).ok_or_else(|| {
-            TlsError::HandshakeFailure(format!(
-                "unsupported TLS 1.2 cipher suite: 0x{cipher_suite_code:04x}"
-            ))
+            TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                format!("unsupported TLS 1.2 cipher suite: 0x{cipher_suite_code:04x}"),
+            )
         })?;
 
         tracing::debug!(
@@ -1171,21 +1234,42 @@ impl Tls12Handshake {
 
         // Parse extensions (if present) to extract ALPN, etc.
         let ext_start = offset + 3; // after cipher_suite(2) + compression(1)
+        if body.len() == ext_start + 1 {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "truncated TLS 1.2 ServerHello extension length",
+            ));
+        }
         if ext_start + 2 <= body.len() {
             let extensions_len =
                 u16::from_be_bytes([body[ext_start], body[ext_start + 1]]) as usize;
             let mut ext_offset = ext_start + 2;
             let ext_end = ext_offset + extensions_len;
+            if ext_end != body.len() {
+                return Err(TlsError::local_alert(
+                    AlertDescription::DecodeError,
+                    "TLS 1.2 ServerHello extension length mismatch",
+                ));
+            }
             let mut seen_extensions: Vec<u16> = Vec::new();
 
-            while ext_offset + 4 <= ext_end && ext_offset + 4 <= body.len() {
+            while ext_offset < ext_end {
+                if ext_offset + 4 > ext_end {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::DecodeError,
+                        "truncated TLS 1.2 ServerHello extension header",
+                    ));
+                }
                 let ext_type = u16::from_be_bytes([body[ext_offset], body[ext_offset + 1]]);
                 let ext_len =
                     u16::from_be_bytes([body[ext_offset + 2], body[ext_offset + 3]]) as usize;
                 ext_offset += 4;
 
-                if ext_offset + ext_len > body.len() {
-                    break;
+                if ext_offset + ext_len > ext_end {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::DecodeError,
+                        "truncated TLS 1.2 ServerHello extension payload",
+                    ));
                 }
 
                 // RFC 5246 §7.4.1.4: "There MUST NOT be more than one extension
@@ -1226,18 +1310,28 @@ impl Tls12Handshake {
                 }
 
                 // ALPN extension (type 0x0010)
-                if ext_type == 0x0010 && ext_len >= 2 {
+                if ext_type == ext_type::ALPN {
                     let alpn_data = &body[ext_offset..ext_offset + ext_len];
-                    let alpn_list_len = u16::from_be_bytes([alpn_data[0], alpn_data[1]]) as usize;
-                    if alpn_list_len > 0 && 2 < alpn_data.len() {
-                        let proto_len = alpn_data[2] as usize;
-                        if 3 + proto_len <= alpn_data.len() {
-                            if let Ok(proto) = std::str::from_utf8(&alpn_data[3..3 + proto_len]) {
-                                tracing::debug!("TLS 1.2 ALPN negotiated: {}", proto);
-                                self.negotiated_alpn = Some(proto.to_string());
-                            }
-                        }
+                    let selected = crate::extensions::alpn::parse_server_alpn_bytes(alpn_data)
+                        .ok_or_else(|| {
+                            TlsError::local_alert(
+                                AlertDescription::DecodeError,
+                                "invalid TLS 1.2 server ALPN protocol list",
+                            )
+                        })?;
+                    if self.offered_alpn_protocols.as_ref().is_some_and(|offered| {
+                        !offered
+                            .iter()
+                            .any(|protocol| protocol.as_slice() == selected)
+                    }) {
+                        return Err(TlsError::local_alert(
+                            AlertDescription::IllegalParameter,
+                            "TLS 1.2 server selected an unoffered ALPN protocol",
+                        ));
                     }
+                    let protocol = String::from_utf8_lossy(selected).into_owned();
+                    tracing::debug!("TLS 1.2 ALPN negotiated: {}", protocol);
+                    self.negotiated_alpn = Some(protocol);
                 }
 
                 ext_offset += ext_len;
@@ -1688,21 +1782,8 @@ const TLS_EMPTY_RENEGOTIATION_INFO_SCSV: u16 = 0x00ff;
 /// Returns `false` for anything that is not a parseable ClientHello — the
 /// caller has already given up on the offer by that point.
 fn client_hello_offers_renegotiation_scsv(ch_bytes: &[u8]) -> bool {
-    // Handshake header (4) + legacy_version (2) + random (32) = the `body`
-    // offsets that `client_hello_extensions` uses.
-    let Some(body) = ch_bytes.get(4..) else {
-        return false;
-    };
-    let Some(&session_id_len) = body.get(34) else {
-        return false;
-    };
-    // `cipher_suites` is a 2-byte-length-prefixed list of 2-byte code points,
-    // exactly the shape `parse_u16_list` reads.
-    let Some(cipher_suites) = body.get(35 + session_id_len as usize..) else {
-        return false;
-    };
-    parse_u16_list(cipher_suites)
-        .is_some_and(|suites| suites.contains(&TLS_EMPTY_RENEGOTIATION_INFO_SCSV))
+    client_hello_legacy_offer(ch_bytes)
+        .is_some_and(|(suites, _)| suites.contains(&TLS_EMPTY_RENEGOTIATION_INFO_SCSV))
 }
 
 /// Build a TLS handshake message: type(1) + length(3) + body.
@@ -2528,6 +2609,143 @@ mod tests {
         let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
         hs.process_handshake_record(&record).unwrap();
         assert_eq!(hs.negotiated_alpn(), Some("h2"));
+    }
+
+    #[test]
+    fn tls12_rejects_alpn_not_in_the_actual_offer() {
+        for resuming in [false, true] {
+            let mut profile = crate::profile::presets::chrome_155();
+            profile.alpn_protocols = vec!["h2".into()];
+            let mut handshake = handshake_after_real_client_hello(&profile);
+            if resuming {
+                handshake.set_session_ticket_master_secret(vec![0xa5; 48]);
+            }
+            let body = make_server_hello_body_with_alpn(0xc02f, &[0x55; 32], "h3");
+            assert!(
+                matches!(handshake.process_server_hello(&body, &[]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
+            );
+        }
+    }
+
+    #[test]
+    fn tls12_rejects_malformed_server_alpn_list() {
+        for payload in [
+            vec![],
+            vec![0, 0],
+            vec![0, 2, 0, 0],
+            vec![0, 3, 2, b'h', b'2', 0],
+            vec![0, 6, 2, b'h', b'2', 2, b'h', b'3'],
+        ] {
+            let mut handshake =
+                handshake_after_real_client_hello(&crate::profile::presets::chrome_155());
+            let mut body = make_server_hello_body(0xc02f, &[0x55; 32]);
+            body.extend_from_slice(&((4 + payload.len()) as u16).to_be_bytes());
+            body.extend_from_slice(&[0, 16]);
+            body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            body.extend_from_slice(&payload);
+            assert!(
+                matches!(handshake.process_server_hello(&body, &[]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
+            );
+        }
+    }
+
+    #[test]
+    fn tls12_alpn_uses_wire_offer_and_accepts_missing_selection() {
+        for resuming in [false, true] {
+            for selected in [None, Some("h2"), Some("http/1.1")] {
+                let profile = crate::profile::presets::chrome_155();
+                let mut handshake = handshake_after_real_client_hello(&profile);
+                if resuming {
+                    handshake.set_session_ticket_master_secret(vec![0xa5; 48]);
+                }
+                let body = match selected {
+                    Some(protocol) => {
+                        make_server_hello_body_with_alpn(0xc02f, &[0x55; 32], protocol)
+                    }
+                    None => make_server_hello_body(0xc02f, &[0x55; 32]),
+                };
+                feed_server_hello(&mut handshake, &body).unwrap();
+                assert_eq!(handshake.negotiated_alpn(), selected);
+            }
+        }
+        let mut profile = crate::profile::presets::chrome_155();
+        profile.alpn_protocols = vec!["h2".into()];
+        profile
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.extension_type == ext_type::ALPN)
+            .unwrap()
+            .source = crate::profile::types::ExtensionSource::RawBytes {
+            data: "000908687474702f312e31".into(),
+        };
+        let mut handshake = handshake_after_real_client_hello(&profile);
+        let body = make_server_hello_body_with_alpn(0xc02f, &[0x55; 32], "http/1.1");
+        feed_server_hello(&mut handshake, &body).unwrap();
+        assert_eq!(handshake.negotiated_alpn(), Some("http/1.1"));
+    }
+
+    #[test]
+    fn tls12_server_hello_extension_framing_is_strict() {
+        for extra in [
+            vec![0],
+            vec![0, 0, 0],
+            vec![0, 2, 0, 16],
+            vec![0, 4, 0, 16, 0, 5],
+        ] {
+            let mut handshake =
+                handshake_after_real_client_hello(&crate::profile::presets::chrome_155());
+            let mut body = make_server_hello_body(0xc02f, &[0x55; 32]);
+            body.extend_from_slice(&extra);
+            assert!(
+                matches!(feed_server_hello(&mut handshake, &body), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
+            );
+        }
+    }
+
+    #[test]
+    fn tls12_offer_constraints_apply_to_full_and_resumption_states() {
+        for resuming in [false, true] {
+            for bad_compression in [false, true] {
+                let mut profile = crate::profile::presets::chrome_155();
+                if !bad_compression {
+                    profile.cipher_suites.retain(|suite| *suite != 0xc02f);
+                }
+                let mut handshake = handshake_after_real_client_hello(&profile);
+                if resuming {
+                    handshake.set_session_ticket_master_secret(vec![0xa5; 48]);
+                }
+                let mut body = make_server_hello_body(0xc02f, &[0x55; 32]);
+                if bad_compression {
+                    body[37] = 1;
+                }
+                assert!(
+                    matches!(feed_server_hello(&mut handshake, &body), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn valid_legacy_client_without_extensions_still_tracks_cipher_offer() {
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[0x42; 32]);
+        body.extend_from_slice(&[0, 0, 2, 0xc0, 0x2f, 1, 0]);
+        let mut hello = vec![1, 0, 0, body.len() as u8];
+        hello.extend_from_slice(&body);
+        let mut handshake = new_test_handshake();
+        handshake.feed_client_hello(&hello);
+        assert_eq!(
+            handshake.offered_cipher_suites.as_deref(),
+            Some(&[0xc02f][..])
+        );
+        assert_eq!(
+            handshake.offered_compression_methods.as_deref(),
+            Some(&[0][..])
+        );
+        let server = make_server_hello_body(0xc013, &[0x55; 32]);
+        assert!(
+            matches!(feed_server_hello(&mut handshake, &server), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
+        );
     }
 
     #[test]

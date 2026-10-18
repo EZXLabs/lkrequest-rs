@@ -21,6 +21,22 @@ Most users should enable `lkrequest`'s `quic-h3` feature. Use `lkh3` directly wh
 
 Browser presets may contain a mix of directly captured and explicitly inherited fields. A valid profile is not automatically proof that every layer was independently captured.
 
+`chrome_155_quic()` and `chrome_155_h3()` have direct public Cloudflare
+capture evidence from Windows Chrome 155.0.8059.40, including decrypted H3
+SETTINGS and a successful H3 navigation. Stable fields match the previous model.
+
+Chrome 155 also emits a control-stream `PRIORITY_UPDATE` for each allocated
+request stream before HEADERS, including pooled requests and streaming uploads.
+Preconnect sends SETTINGS and GREASE without targeting an unallocated request.
+`H3Profile::request_priority_updates` selects this mode; older serialized and
+custom profiles default to their existing startup `priority_updates` list.
+
+For direct `H3Sender` integration, provide a `RequestPriorityUpdate` request
+extension or a `priority` HTTP header. An unannotated request falls back to the
+first profile priority value (or `u=3` if absent). The high-level `lkrequest`
+client resolves priority from `.priority()`, request/default headers and resource
+destination, independently of whether automatic HTTP header generation is on.
+
 `chrome_154_quic()` provides the Chrome 154 QUIC/H3 profile. Its outgoing QUIC
 fields were captured directly; H3 SETTINGS and navigation priority inherit the
 completed Chrome 153 capture. The library does not provide Firefox 156 or Safari

@@ -2,8 +2,9 @@
 //!
 //! Modern WAFs (e.g. Cloudflare, Akamai) inspect TCP-level parameters from the
 //! SYN packet to fingerprint the client OS and detect non-browser traffic.
-//! This module allows configuring these parameters to match real browser TCP
-//! fingerprints.
+//! This module requests socket settings that can influence some of these
+//! parameters. The host kernel still generates TCP packets; a configured JA4T
+//! string is a target description, not a guarantee of the observed fingerprint.
 //!
 //! # JA4T Format
 //!
@@ -24,14 +25,28 @@
 //!
 //! # Platform notes
 //!
-//! - **TTL** and **TCP_NODELAY**: supported on all platforms.
-//! - **Window Size / Window Scale**: influenced via `SO_RCVBUF` on all platforms.
-//!   The kernel computes the actual window scale from the receive buffer size.
-//! - **MSS** (`TCP_MAXSEG`): only settable on Linux via `setsockopt`. On other
-//!   platforms the MSS field is stored for informational/JA4T purposes only.
-//! - **TCP Options order**: determined by the OS kernel TCP stack and cannot be
-//!   changed from userspace. The [`tcp_options`](TcpFingerprint::tcp_options)
-//!   field is used for JA4T string formatting and documentation.
+//! The following describes this library's implementation, not every capability
+//! offered by each OS or a packet-capture verification of every OS version.
+//!
+//! | Setting | Windows | Linux | macOS |
+//! |---------|---------|-------|-------|
+//! | IPv4 TTL / IPv6 unicast Hop Limit | Applied | Applied | Applied |
+//! | `TCP_NODELAY`, receive/send buffers | Applied | Applied | Applied |
+//! | Window size + scale | Indirect via receive buffer | Indirect via receive buffer | Indirect via receive buffer |
+//! | MSS (`TCP_MAXSEG`) | Stored only | Applied before connect | Stored only |
+//! | TCP options presence/order | Stored only | Stored only | Stored only |
+//! | Keepalive when enabled, with optional idle/interval | Applied | Applied | Applied |
+//!
+//! Applied settings remain subject to OS limits and errors. Window size and
+//! scale must both be present to derive `SO_RCVBUF`; an explicit receive buffer
+//! overrides that calculation. Neither the SYN window nor its scale is directly
+//! controlled. On Linux, buffer limits and explicit-buffer autotuning changes
+//! also matter. TCP options remain kernel-generated on all three platforms.
+//!
+//! Settings apply to new TCP sockets, including the client-to-first-proxy hop.
+//! The target sees the final proxy's TCP stack when a proxy originates that
+//! connection. Reused connections have no new SYN; QUIC data uses UDP and is
+//! unaffected. [`TcpFingerprint::to_ja4t`] serializes configuration, not traffic.
 
 use std::fmt;
 use std::time::Duration;
@@ -117,8 +132,11 @@ pub struct TcpKeepalive {
 
 /// TCP fingerprint configuration targeting JA4T anti-detection.
 ///
-/// Controls TCP socket parameters to match the JA4T fingerprint of a target
-/// browser.  All fields are optional — `None` means "use the OS default".
+/// Requests TCP socket settings for a target fingerprint, subject to the
+/// [platform limits](crate::tcp_fingerprint). This does not guarantee a JA4T match.
+/// All fields are optional: `None` leaves the transport's setting unchanged.
+/// In particular, the transport defaults to `TCP_NODELAY=true` even without
+/// a fingerprint; other unset options retain their OS defaults.
 ///
 /// # JA4T fields
 ///
@@ -155,7 +173,7 @@ pub struct TcpKeepalive {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TcpFingerprint {
     // === JA4T Part A: Window Size ===
-    /// TCP Window Size advertised in the SYN packet (JA4T Part A).
+    /// Target TCP Window Size in the SYN packet (JA4T Part A).
     ///
     /// Common values:
     /// - `64240` — Windows 10/11
@@ -163,17 +181,18 @@ pub struct TcpFingerprint {
     /// - `29200` — Linux (some kernels)
     ///
     /// When set together with [`window_scale`](Self::window_scale), the
-    /// `SO_RCVBUF` socket option is computed automatically to produce the
-    /// desired combination. If [`recv_buf_size`](Self::recv_buf_size) is
-    /// also set, it takes precedence as a raw override.
+    /// `SO_RCVBUF` request is computed automatically to influence the kernel's
+    /// choice, without guaranteeing either target value. Alone, this field
+    /// does not change the socket. If [`recv_buf_size`](Self::recv_buf_size)
+    /// is also set, it takes precedence as a raw override.
     pub window_size: Option<u32>,
 
     // === JA4T Part B: TCP Options ===
     /// TCP options in SYN packet order (JA4T Part B).
     ///
     /// **Note**: The actual options and their order are determined by the OS
-    /// kernel TCP stack and cannot be changed from userspace via socket
-    /// options.  This field is used for:
+    /// kernel TCP stack. This library does not apply this list to the socket,
+    /// including toggling Timestamps or SACK. This field is used for:
     /// - JA4T string generation ([`to_ja4t()`](Self::to_ja4t))
     /// - Documentation of the target fingerprint
     /// - Validation against captured traffic
@@ -188,27 +207,30 @@ pub struct TcpFingerprint {
     /// headers). Lower values like `1380` suggest VPN/tunnel overhead.
     ///
     /// **Platform support**: applied via `TCP_MAXSEG` setsockopt on Linux.
-    /// On Windows/macOS the MSS is determined by the network MTU and cannot
-    /// be overridden per-socket; the value is stored for JA4T purposes only.
+    /// The Linux kernel still imposes range and MTU limits. On Windows/macOS
+    /// this library does not apply the field; it is stored for JA4T purposes
+    /// only. This is an implementation limit, not a claim that those operating
+    /// systems expose no MSS configuration APIs.
     pub mss: Option<u32>,
 
     // === JA4T Part D: Window Scale ===
     /// Window Scale factor (JA4T Part D).
     ///
-    /// Acts as a multiplier: `effective_window = window_size × 2^window_scale`.
+    /// After negotiation, scales TCP window fields by `2^window_scale`.
+    /// The window field in the SYN itself is not scaled.
     ///
     /// Common values:
     /// - `8` — Windows 10/11, Linux (common)
     /// - `7` — Linux (some configurations)
     /// - `6` — macOS/iOS
     ///
-    /// The kernel chooses the window scale based on `SO_RCVBUF`. When both
-    /// `window_size` and `window_scale` are set, we compute an appropriate
-    /// `SO_RCVBUF` value to coax the kernel into using the desired scale.
+    /// When both `window_size` and `window_scale` are set, we derive a
+    /// `SO_RCVBUF` request. The kernel chooses the actual scale; it need not
+    /// match this value. Alone, this field does not change the socket.
     pub window_scale: Option<u8>,
 
     // === Additional TCP parameters (not in JA4T string) ===
-    /// IP Time-To-Live.
+    /// IPv4 Time-To-Live, or IPv6 unicast Hop Limit.
     ///
     /// Typical values: `64` (Linux/macOS), `128` (Windows).
     /// While not part of the JA4T string, TTL is a key OS fingerprint
@@ -220,9 +242,9 @@ pub struct TcpFingerprint {
     /// When set, this value is used directly as `SO_RCVBUF`, bypassing
     /// the automatic calculation from `window_size` + `window_scale`.
     ///
-    /// Prefer using `window_size` + `window_scale` for JA4T-based
-    /// configuration. Use this only when you need precise control over
-    /// the socket buffer.
+    /// The OS may limit or adjust the requested size. This does not directly
+    /// set the SYN window or its scale. On Linux, explicitly setting the
+    /// receive buffer also disables receive-buffer autotuning for the socket.
     pub recv_buf_size: Option<u32>,
 
     /// TCP send buffer size (`SO_SNDBUF`).
@@ -260,7 +282,10 @@ impl TcpFingerprint {
     // JA4T string operations
     // -------------------------------------------------------------------
 
-    /// Parse a JA4T fingerprint string into a `TcpFingerprint`.
+    /// Parse a target JA4T string into configuration fields.
+    ///
+    /// Parsing does not check whether the platform can emit that fingerprint.
+    /// TTL, buffers, Nagle and keepalive are not encoded in the string.
     ///
     /// Format: `{window_size}_{tcp_options}_{mss}_{window_scale}`
     ///
@@ -269,7 +294,7 @@ impl TcpFingerprint {
     /// ```rust
     /// use lkrequest::TcpFingerprint;
     ///
-    /// // Chrome on Windows
+    /// // A target with a Linux-style options order
     /// let fp = TcpFingerprint::from_ja4t("64240_2-4-8-1-3_1460_8").unwrap();
     /// assert_eq!(fp.window_size, Some(64240));
     /// assert_eq!(fp.mss, Some(1460));
@@ -333,7 +358,10 @@ impl TcpFingerprint {
         })
     }
 
-    /// Format this fingerprint as a JA4T string.
+    /// Format the configured target fields as a JA4T string.
+    ///
+    /// This does not inspect a socket or captured traffic. Stored-only and
+    /// kernel-adjusted fields can differ from the actual SYN fingerprint.
     ///
     /// Returns `None` if any of the four JA4T parts is not set.
     ///
@@ -422,7 +450,7 @@ impl TcpFingerprint {
     // Presets
     // -------------------------------------------------------------------
 
-    /// No TCP fingerprint customization (all OS defaults).
+    /// No TCP fingerprint overrides; the transport still enables TCP_NODELAY.
     pub fn none() -> Self {
         Self::default()
     }
@@ -509,7 +537,7 @@ impl TcpFingerprint {
         }
     }
 
-    /// Chrome TCP fingerprint (auto-detect OS).
+    /// Chrome TCP target selected by the compile-time OS, without wire validation.
     pub fn chrome() -> Self {
         if cfg!(target_os = "windows") {
             Self::chrome_win()
@@ -602,7 +630,7 @@ impl TcpFingerprint {
         }
     }
 
-    /// Firefox TCP fingerprint (auto-detect OS).
+    /// Firefox TCP target selected by the compile-time OS, without wire validation.
     pub fn firefox() -> Self {
         if cfg!(target_os = "windows") {
             Self::firefox_win()
@@ -677,15 +705,15 @@ impl TcpFingerprint {
 
     /// Compute the `SO_RCVBUF` value from `window_size` and `window_scale`.
     ///
-    /// The kernel chooses `window_scale` based on the receive buffer capacity.
-    /// To produce a specific `window_scale = S`, we need:
+    /// Derive a receive-buffer request from the target fields:
     ///
     /// ```text
-    /// SO_RCVBUF >= window_size × 2^S
+    /// target = window_size * 2^window_scale
     /// ```
     ///
     /// On Linux, the kernel internally doubles `SO_RCVBUF` for bookkeeping
-    /// overhead, so we halve the target value on Linux.
+    /// overhead, so we halve the target value on Linux. This heuristic does
+    /// not guarantee the requested SYN window or scale after kernel limits.
     fn compute_recv_buf(&self) -> Option<u32> {
         let ws = self.window_size?;
         let scale = self.window_scale?;
@@ -705,9 +733,9 @@ impl TcpFingerprint {
 
     /// Apply this fingerprint to a `socket2::Socket` before connecting.
     ///
-    /// Parameters are applied in the correct order for maximum SYN packet
-    /// influence. Platform-specific options are guarded by `#[cfg]` and
-    /// silently skipped on unsupported platforms.
+    /// Socket-setting failures are returned to the caller. Stored-only fields
+    /// are skipped: TCP options on all platforms and MSS outside Linux.
+    /// Successful application does not verify the outgoing SYN fingerprint.
     pub(crate) fn apply_to_socket(
         &self,
         socket: &socket2::Socket,
