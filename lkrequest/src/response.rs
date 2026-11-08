@@ -1981,6 +1981,22 @@ mod tests {
     // -- Decompression: zstd -----------------------------------------------
 
     #[test]
+    fn zstd_failed_legacy_frame_does_not_write_output() {
+        use std::io::Write;
+
+        // A failed legacy frame must not leave unwritten bytes ready to flush.
+        let frame = [0x27, 0xb5, 0x2f, 0xfd, 0x08, 0x00];
+        let mut decoder = zstd::stream::write::Decoder::new(Vec::new()).unwrap();
+        assert!(decoder.write_all(&frame).is_err());
+        let _ = decoder.flush();
+        assert!(
+            decoder.get_ref().is_empty(),
+            "failed decompression produced {} bytes",
+            decoder.get_ref().len()
+        );
+    }
+
+    #[test]
     fn decompress_zstd_roundtrip() {
         let original = b"Hello, zstd compressed world!";
         let compressed = zstd::stream::encode_all(&original[..], 3).unwrap();

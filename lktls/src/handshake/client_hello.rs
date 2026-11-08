@@ -3429,10 +3429,20 @@ mod tests {
     }
 
     #[test]
-    fn fresh_trust_anchor_orders_vary_but_retry_uses_the_first_encoding() {
+    fn custom_shuffled_trust_anchor_orders_vary_but_retry_uses_the_first_encoding() {
         use rand_core::SeedableRng;
 
-        let profile = presets::chrome_155();
+        let mut profile = presets::chrome_155();
+        let source = &mut profile
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.extension_type == ext_type::TRUST_ANCHOR_IDS)
+            .unwrap()
+            .source;
+        let ExtensionSource::TrustAnchorIds { shuffle, .. } = source else {
+            panic!("expected trust-anchor source");
+        };
+        *shuffle = true;
         let mut observed = std::collections::BTreeSet::new();
         for seed in 1u8..=4 {
             let first = ClientHelloBuilder::new(&profile, "example.com")
@@ -3454,7 +3464,7 @@ mod tests {
         }
         assert!(
             observed.len() > 1,
-            "fresh connections retain anchor randomization"
+            "custom profiles can randomize anchor order on fresh connections"
         );
     }
 

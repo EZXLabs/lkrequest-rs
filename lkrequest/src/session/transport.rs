@@ -1529,7 +1529,7 @@ impl RequestBuilder {
                             .await?;
 
                         let (sender, conn_task) =
-                            pipeline::handshake_h1(conn2.into_tcp_stream()?).await?;
+                            pipeline::handshake_h1(client, conn2.into_tcp_stream()?).await?;
 
                         tracing::debug!(
                             route = %ctx.conn_key.route,
@@ -1555,7 +1555,8 @@ impl RequestBuilder {
                     );
                 }
 
-                let (sender, conn_task) = pipeline::handshake_h1(conn.into_tcp_stream()?).await?;
+                let (sender, conn_task) =
+                    pipeline::handshake_h1(client, conn.into_tcp_stream()?).await?;
 
                 tracing::debug!(
                     route = %ctx.conn_key.route,
@@ -2043,7 +2044,7 @@ impl RequestBuilder {
     /// for keep-alive reuse.
     pub(crate) async fn send_h1_request(
         &self,
-        mut sender: hyper::client::conn::http1::SendRequest<WireBody>,
+        mut sender: crate::http1::Http1Sender<WireBody>,
         conn_task: std::sync::Arc<tokio::task::JoinHandle<()>>,
         permit: ConnectionPermit,
         ctx: &RequestContext<'_>,
@@ -2293,7 +2294,8 @@ impl RequestBuilder {
         connect_start: std::time::Instant,
     ) -> Result<Response> {
         let stream = crate::connect::TransportStream::plain(tcp);
-        let (sender, conn_task) = pipeline::handshake_h1(stream).await?;
+        let (sender, conn_task) =
+            pipeline::handshake_h1(&self.session.inner.client, stream).await?;
 
         tracing::debug!(
             protocol = "h1.1",
@@ -2435,10 +2437,7 @@ impl RequestBuilder {
         );
 
         let io = TokioIo::new(tcp);
-        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-            .title_case_headers(true)
-            .preserve_header_case(true)
-            .handshake(io)
+        let (mut sender, conn) = crate::http1::handshake(client, io)
             .await
             .map_err(|e| Error::Http(format!("H1 handshake for h2c upgrade failed: {e}")))?;
 

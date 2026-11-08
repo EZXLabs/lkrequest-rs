@@ -323,6 +323,10 @@ enum ChromePresetVersion {
     Chrome154,
     #[value(name = "chrome_155")]
     Chrome155,
+    #[value(name = "chrome_156")]
+    Chrome156,
+    #[value(name = "chrome_157")]
+    Chrome157,
 }
 
 struct CaptureChromeOptions {
@@ -2312,6 +2316,8 @@ fn chrome_base_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome153 => lktls::profile::presets::chrome_153(),
         ChromePresetVersion::Chrome154 => lktls::profile::presets::chrome_154(),
         ChromePresetVersion::Chrome155 => lktls::profile::presets::chrome_155(),
+        ChromePresetVersion::Chrome156 => lktls::profile::presets::chrome_156(),
+        ChromePresetVersion::Chrome157 => lktls::profile::presets::chrome_157(),
     }
 }
 
@@ -2326,6 +2332,8 @@ fn chrome_quic_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome153 => return lktls::profile::presets::chrome_153_quic(),
         ChromePresetVersion::Chrome154 => return lktls::profile::presets::chrome_154_quic(),
         ChromePresetVersion::Chrome155 => return lktls::profile::presets::chrome_155_quic(),
+        ChromePresetVersion::Chrome156 => return lktls::profile::presets::chrome_156_quic(),
+        ChromePresetVersion::Chrome157 => return lktls::profile::presets::chrome_157_quic(),
         _ => {}
     }
 
@@ -2407,6 +2415,8 @@ fn chrome_h2_profile(version: ChromePresetVersion) -> lkh2::profile::H2Profile {
         ChromePresetVersion::Chrome153 => lkh2::profile::chrome_153_h2(),
         ChromePresetVersion::Chrome154 => lkh2::profile::chrome_154_h2(),
         ChromePresetVersion::Chrome155 => lkh2::profile::chrome_155_h2(),
+        ChromePresetVersion::Chrome156 => lkh2::profile::chrome_156_h2(),
+        ChromePresetVersion::Chrome157 => lkh2::profile::chrome_157_h2(),
     }
 }
 
@@ -2419,6 +2429,8 @@ fn chrome_quic_profile(version: ChromePresetVersion) -> lkh3::QuicProfile {
         ChromePresetVersion::Chrome153 => lkh3::chrome_153_quic(),
         ChromePresetVersion::Chrome154 => lkh3::chrome_154_quic(),
         ChromePresetVersion::Chrome155 => lkh3::chrome_155_quic(),
+        ChromePresetVersion::Chrome156 => lkh3::chrome_156_quic(),
+        ChromePresetVersion::Chrome157 => lkh3::chrome_157_quic(),
         _ => lkh3::chrome_quic(),
     }
 }

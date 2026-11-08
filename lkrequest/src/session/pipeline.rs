@@ -541,15 +541,13 @@ pub(crate) fn build_h1_only_connect_config(
 /// Perform HTTP/1.1 handshake on a transport stream and spawn the connection
 /// driver task.
 pub(crate) async fn handshake_h1(
+    client: &Client,
     stream: crate::connect::TransportStream,
 ) -> Result<(
-    hyper::client::conn::http1::SendRequest<WireBody>,
+    crate::http1::Http1Sender<WireBody>,
     Arc<tokio::task::JoinHandle<()>>,
 )> {
-    let mut builder = hyper::client::conn::http1::Builder::new();
-    builder.title_case_headers(true).preserve_header_case(true);
-    let (sender, conn) = builder
-        .handshake::<crate::connect::TransportStream, WireBody>(stream)
+    let (sender, conn) = crate::http1::handshake(client, stream)
         .await
         .map_err(|e| Error::Http(format!("HTTP/1.1 handshake failed: {e}")))?;
 

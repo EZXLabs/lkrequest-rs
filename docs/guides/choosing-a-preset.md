@@ -13,7 +13,7 @@
 
 当前源码提供：
 
-- Chrome：`chrome_131`、`chrome_144`–`chrome_155`；
+- Chrome：`chrome_131`、`chrome_144`–`chrome_157`；
 - Firefox：`firefox_133`、`firefox_147`、`firefox_156`；
 - Safari：`safari_18`、`safari_26`。
 
@@ -23,6 +23,8 @@
 |---|---|---|
 | Chrome 154 | `chrome_154` | TLS/H2；启用 `quic-h3` 后可用 QUIC/H3，H3 SETTINGS 继承 Chrome 153 |
 | Chrome 155 | `chrome_155` | Windows 155.0.8059.40 的 TLS/H2 与 QUIC/H3 均有直接公网抓包证据 |
+| Chrome 156 | `chrome_156` | Windows 156.0.8078.48 的新连接 TLS/H2/QUIC/H3 已抓包；传输及响应边界策略继承 155 |
+| Chrome 157 | `chrome_157` | Windows 157.0.8103.39 的新连接 TLS/H2/QUIC/H3 已抓包；稳定字段与 156 一致，行为边界策略继承 156 |
 | Firefox 156 | `firefox_156` | TLS/H2；不提供 QUIC/H3 profile |
 
 Chrome 154.0.8037.58 与 Firefox 156.0.1 的采集平台均为 Windows。启用 `quic-h3` 不会为 Firefox 或 Safari preset 增加缺失的 QUIC/H3 配置。
@@ -56,7 +58,7 @@ let session = client.session().http2_only().build();
 
 ## FFI 名称
 
-`lk_client_builder_set_preset(builder, "chrome_155")` 和
+`lk_client_builder_set_preset(builder, "chrome_157")` 和
 `lk_client_builder_set_preset(builder, "firefox_156")` 使用与 Rust 函数相同的规范名称。
 `lk_preset_list_json` 列出加载的库实际提供的 preset；`lk_preset_get_detail_json` 返回指定规范名称的配置。
 已发布的旧版本不一定包含本页的新 preset，绑定调用方应按实际库版本查询。
@@ -70,6 +72,14 @@ Chrome 155.0.8059.40 的 Windows 导航抓包使用 `Chrome/155.0.0.0`，
 其导航 `Accept` 为
 `text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7`。
 这些值来自该构建的导航上下文；升级已显式配置的应用请求头时，应同时核对它们。
+
+Chrome 156.0.8078.48 的 Windows 导航抓包使用 `Chrome/156.0.0.0`，
+`sec-ch-ua` 为 `"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"`，
+导航 `Accept` 与上述 155 样本相同。使用 `chrome_156()` 时仍需显式设置这些请求头；默认 preset 继续使用 155。
+
+Chrome 157.0.8103.39 的 Windows 导航使用 `Chrome/157.0.0.0`，
+`sec-ch-ua` 为 `"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"`。
+导航 `Accept` 与 156 样本相同。`chrome_157()` 的请求头值仍由调用方显式设置。
 
 如果目标要求自定义 User-Agent，应把它视为一个新的组合配置，并记录：
 

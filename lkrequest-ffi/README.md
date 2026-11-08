@@ -194,7 +194,7 @@ Pass a canonical preset name to `lk_client_builder_set_preset`:
 
 | Family | Names | TLS/H2 | QUIC/H3 |
 |---|---|---|---|
-| Chrome | `chrome_131`, `chrome_144` through `chrome_155` | Yes | Requires `quic-h3` |
+| Chrome | `chrome_131`, `chrome_144` through `chrome_157` | Yes | Requires `quic-h3` |
 | Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Yes | Not provided |
 | Safari | `safari_18`, `safari_26` | Yes | Not provided |
 
@@ -213,6 +213,15 @@ the library is built with `quic-h3`. See the
 
 `chrome_155` directly verifies the Windows 155.0.8059.40 TLS/H2/QUIC fields
 and H3 SETTINGS using passive public captures, including an H3 HTTP 200 response.
+
+`chrome_156` adds Windows Chrome 156.0.8078.48 with independent public
+TLS/H2/QUIC/H3 capture evidence. Fresh fields match Chrome 155; transport and
+response edge-case policies inherit its model. Select this name explicitly;
+the `default` alias remains `chrome_155`.
+
+`chrome_157` adds Windows Chrome 157.0.8103.39 with public TLS/H2/QUIC/H3
+captures and HTTP 200. Stable fields match 156; transport and response
+edge-case policies inherit its model. Header values remain caller supplied.
 
 ## Fingerprint Randomization
 

@@ -49,11 +49,11 @@ rand_core = { version = "0.9", features = ["os_rng"] }
 rand_chacha = "0.9"
 
 # Certificate verification
-rustls-webpki = { version = "0.103", default-features = false, features = [
+rustls-webpki = { version = "0.103.16", default-features = false, features = [
     "aws-lc-rs",
     "std",
 ] }
-webpki-roots = "1"
+webpki-roots = "1.0.10"
 rustls-pki-types = "1"
 
 # TCP socket configuration
@@ -67,7 +67,7 @@ arc-swap = "1"
 parking_lot = "0.12"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -97,7 +97,7 @@ h2 = "0.4"
 # Compression
 brotli = "8"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.13.4"
 
 # URL parsing
 url = "2"

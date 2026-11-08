@@ -1,6 +1,6 @@
 [package]
 name = "lktls"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Sans-I/O TLS fingerprint protocol engine for lkrequest"
 license.workspace = true
@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 criterion = { version = "0.5" }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 rcgen = { version = "0.14", features = ["aws_lc_rs"] }

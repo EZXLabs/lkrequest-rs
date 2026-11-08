@@ -12,6 +12,70 @@ use lktls::profile::presets;
 use support::local_wss::start_local_wss_server;
 
 #[tokio::test]
+async fn ws_upgrade_uses_client_http1_header_case() {
+    for title_case in [None, Some(false), Some(true)] {
+        let wss = start_local_wss_server().await;
+        let mut builder = Client::builder()
+            .verify(false)
+            .default_header("X-Default", "Keep-MiXeD");
+        if let Some(enabled) = title_case {
+            builder = builder.http1_title_case_headers(enabled);
+        }
+        let session = builder.build().session().http1_only().build();
+        let ws = session
+            .websocket(&wss.url)
+            .header("x-MIXED", "Value-MiXeD")
+            .connect()
+            .await
+            .unwrap();
+        let request = wss.next_handshake().await;
+        let expected = if title_case.unwrap_or(true) {
+            [
+                "Host",
+                "Upgrade",
+                "Sec-Websocket-Key",
+                "X-Default",
+                "X-Mixed",
+            ]
+        } else {
+            [
+                "Host",
+                "upgrade",
+                "sec-websocket-key",
+                "x-default",
+                "x-mixed",
+            ]
+        };
+        for name in expected {
+            assert!(
+                request.headers.iter().any(|(key, _)| key == name),
+                "{request:?}"
+            );
+        }
+        assert!(request
+            .headers
+            .contains(&(expected[3].into(), "Keep-MiXeD".into())));
+        assert!(request
+            .headers
+            .contains(&(expected[4].into(), "Value-MiXeD".into())));
+        if title_case == Some(false) {
+            assert!(request
+                .headers
+                .iter()
+                .all(|(name, _)| *name == "Host" || *name == name.to_ascii_lowercase()));
+        }
+        ws.send_text("case-check").await.unwrap();
+        assert!(matches!(ws.recv().await.unwrap(), WsMessage::Text(text) if text == "case-check"));
+        let data = b"GET / HTTP/1.1\r\nhost: frame\r\n\r\n";
+        ws.send_binary(data.as_slice()).await.unwrap();
+        assert!(
+            matches!(ws.recv().await.unwrap(), WsMessage::Binary(bytes) if bytes == data.as_slice())
+        );
+        ws.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn ws_upgrade_origin_form_preserves_path_and_query() {
     let wss = start_local_wss_server().await;
     let session = chrome_client().session().http1_only().build();

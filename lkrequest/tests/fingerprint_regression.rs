@@ -91,6 +91,77 @@ fn check_tls(browser: &str, profile: TlsProfile) {
     gate_value(&format!("{browser}_tls_fresh"), value);
 }
 
+#[test]
+fn chrome_155_to_157_trust_anchor_wire_order_matches_chromium() {
+    // These versions share the captured ID set and sort it with Chromium's
+    // EncodeTlsRequestedTrustAnchorIDList. Compare unnormalized bytes: the
+    // canonical fingerprint gate sorts IDs and cannot detect extra shuffling.
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/fingerprints/chrome_157_tls_fresh.json"
+    ))
+    .unwrap();
+    let ids = golden["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|extension| extension["extension_type"] == 51764)
+        .unwrap()["source"]["ids"]
+        .as_array()
+        .unwrap();
+    let mut vector = Vec::new();
+    for id in ids {
+        let hex = id.as_str().unwrap();
+        vector.push((hex.len() / 2) as u8);
+        for pair in hex.as_bytes().as_chunks::<2>().0 {
+            vector.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+        }
+    }
+    let mut expected = (vector.len() as u16).to_be_bytes().to_vec();
+    expected.extend(vector);
+    for (profile, quic) in [
+        (lktls::profile::presets::chrome_155(), false),
+        (lktls::profile::presets::chrome_155_quic(), true),
+        (lktls::profile::presets::chrome_156(), false),
+        (lktls::profile::presets::chrome_156_quic(), true),
+        (lktls::profile::presets::chrome_157(), false),
+        (lktls::profile::presets::chrome_157_quic(), true),
+    ] {
+        let mut extension_orders = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let mut builder = ClientHelloBuilder::new(&profile, "www.cloudflare.com");
+            if quic {
+                builder = builder.with_quic_transport_parameters(Vec::new());
+            }
+            let out = builder.build().unwrap();
+            let parsed = parse_client_hello(&out.message).unwrap();
+            let actual = &parsed
+                .extensions
+                .iter()
+                .find(|extension| extension.extension_type == 51764)
+                .unwrap()
+                .data;
+            assert_eq!(
+                actual, &expected,
+                "{} trust-anchor wire order",
+                profile.name
+            );
+            extension_orders.insert(
+                parsed
+                    .extensions
+                    .iter()
+                    .filter(|extension| !lkprofile::is_grease_value(extension.extension_type))
+                    .map(|extension| extension.extension_type)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(
+            extension_orders.len() > 1,
+            "{} must still permute TLS extensions independently of its ID list",
+            profile.name
+        );
+    }
+}
+
 fn check_chromium_ech_grease_shape(message: &[u8]) -> [u8; 32] {
     let parsed = parse_client_hello(message).expect("parse ECH GREASE ClientHello");
     let ech = &parsed
@@ -254,6 +325,40 @@ fn chrome_155_quic_tls() {
 }
 
 // ── HTTP/2 ─────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "quic-h3")]
+#[test]
+fn chrome_156_quic_tls() {
+    let profile = lktls::profile::presets::chrome_156_quic();
+    let message = lktls_quic::LktlsQuicClientConfig::new(profile.clone())
+        .alps_payload(lkh3::encode_alps_h3_settings(&lkh3::chrome_156_h3()))
+        .emit_initial_client_hello("example.com", Vec::new())
+        .expect("emit QUIC ClientHello");
+    let parsed = parse_client_hello(&message).expect("parse QUIC ClientHello");
+    assert_eq!(parsed.cipher_suites, [0x1301, 0x1302, 0x1303]);
+    let canonical = CanonicalTlsFingerprint::from_parsed(&parsed);
+    gate_value(
+        "chrome_156_quic_tls_fresh",
+        serde_json::to_value(canonicalize_tls(&canonical, &tls_shape(&profile))).unwrap(),
+    );
+}
+
+#[cfg(feature = "quic-h3")]
+#[test]
+fn chrome_157_quic_tls() {
+    let profile = lktls::profile::presets::chrome_157_quic();
+    let message = lktls_quic::LktlsQuicClientConfig::new(profile.clone())
+        .alps_payload(lkh3::encode_alps_h3_settings(&lkh3::chrome_157_h3()))
+        .emit_initial_client_hello("example.com", Vec::new())
+        .expect("emit QUIC ClientHello");
+    let parsed = parse_client_hello(&message).expect("parse QUIC ClientHello");
+    assert_eq!(parsed.cipher_suites, [0x1301, 0x1302, 0x1303]);
+    let canonical = CanonicalTlsFingerprint::from_parsed(&parsed);
+    gate_value(
+        "chrome_157_quic_tls_fresh",
+        serde_json::to_value(canonicalize_tls(&canonical, &tls_shape(&profile))).unwrap(),
+    );
+}
 
 /// Emit the H2 preface and first navigation request, then independently parse
 /// every gated dimension from the wire, including HPACK pseudo-header order
@@ -767,6 +872,8 @@ tls_gate! {
     chrome_153 => lktls::profile::presets::chrome_153(),
     chrome_154 => lktls::profile::presets::chrome_154(),
     chrome_155 => lktls::profile::presets::chrome_155(),
+    chrome_156 => lktls::profile::presets::chrome_156(),
+    chrome_157 => lktls::profile::presets::chrome_157(),
     firefox_133 => lktls::profile::presets::firefox_133(),
     firefox_147 => lktls::profile::presets::firefox_147(),
     firefox_156 => lktls::profile::presets::firefox_156(),
@@ -788,6 +895,8 @@ h2_gate! {
     chrome_153_h2 => "chrome_153" => lkh2::profile::chrome_153_h2(),
     chrome_154_h2 => "chrome_154" => lkh2::profile::chrome_154_h2(),
     chrome_155_h2 => "chrome_155" => lkh2::profile::chrome_155_h2(),
+    chrome_156_h2 => "chrome_156" => lkh2::profile::chrome_156_h2(),
+    chrome_157_h2 => "chrome_157" => lkh2::profile::chrome_157_h2(),
     firefox_133_h2 => "firefox_133" => lkh2::profile::firefox_133_h2(),
     firefox_147_h2 => "firefox_147" => lkh2::profile::firefox_147_h2(),
     firefox_156_h2 => "firefox_156" => lkh2::profile::firefox_156_h2(),
@@ -804,5 +913,7 @@ quic_gate! {
     chrome_153_quic => "chrome_153_quic" => lkh3::chrome_153_quic(),
     chrome_154_quic => "chrome_154_quic" => lkh3::chrome_154_quic(),
     chrome_155_quic => "chrome_155_quic" => lkh3::chrome_155_quic(),
+    chrome_156_quic => "chrome_156_quic" => lkh3::chrome_156_quic(),
+    chrome_157_quic => "chrome_157_quic" => lkh3::chrome_157_quic(),
     chrome_generic_quic => "chrome_generic_quic" => lkh3::chrome_quic(),
 }

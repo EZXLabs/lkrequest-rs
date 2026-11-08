@@ -315,6 +315,12 @@ impl std::error::Error for H3RequestContext {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("trust anchor recovery failed: {source}")]
+    TrustAnchorRecovery {
+        #[source]
+        source: Box<Error>,
+        info: Box<lktls::trust_anchor::TrustAnchorInfo>,
+    },
     /// An error from the TLS engine.
     #[error("TLS error: {0}")]
     Tls(#[from] lktls::error::TlsError),
@@ -457,13 +463,17 @@ impl Error {
         }
     }
 
-    /// Removes only H3 request-context wrappers for classification and pattern matching.
+    /// Removes H3 request-context and TAI recovery wrappers for classification.
     ///
     /// Other error sources (for example a connection's underlying I/O error) are not unwrapped.
     pub fn unwrapped(&self) -> &Error {
         let mut error = self;
-        while let Self::H3RequestContext(context) = error {
-            error = &context.source;
+        loop {
+            match error {
+                Self::H3RequestContext(context) => error = &context.source,
+                Self::TrustAnchorRecovery { source, .. } => error = source,
+                _ => break,
+            }
         }
         error
     }
@@ -518,6 +528,20 @@ impl Error {
     /// - `Status` with 4xx — client errors won't fix themselves
     /// - `ResourceLimitExceeded` — won't change on retry
     pub fn is_retryable(&self) -> bool {
+        let mut current = self;
+        loop {
+            match current {
+                Self::TrustAnchorRecovery { .. } => return false,
+                Self::H3RequestContext(context) => current = &context.source,
+                _ => break,
+            }
+        }
+        if matches!(
+            self.unwrapped(),
+            Error::Tls(lktls::error::TlsError::TrustAnchorFailure { .. })
+        ) {
+            return false;
+        }
         if self.is_address_family_mismatch() {
             return false;
         }
@@ -542,7 +566,7 @@ impl Error {
     /// origin server, so re-sending it cannot duplicate a side effect — even
     /// for a non-idempotent method such as `POST`/`PUT`/`PATCH`/`DELETE`.
     ///
-    /// This is a strict subset of [`Self::is_retryable`]. It covers:
+    /// This describes replay safety, independently of retry policy. It covers:
     /// - failures during connection establishment (DNS/TCP/proxy/TLS/QUIC
     ///   handshake), where the request bytes were never written; and
     /// - HTTP/2 `REFUSED_STREAM`, where the server explicitly declined the

@@ -1,5 +1,6 @@
 #[derive(Clone, Debug, Default)]
 pub struct FfiDiagnostics {
+    pub trust_anchor: Option<Box<lkrequest::TrustAnchorInfo>>,
     pub dns_ms: Option<u64>,
     pub tcp_ms: Option<u64>,
     pub tls_ms: Option<u64>,
@@ -32,6 +33,7 @@ impl FfiDiagnostics {
             "remote_addr": self.remote_addr,
             "protocol": self.protocol,
             "cipher_suite": self.cipher_suite,
+            "trust_anchor": self.trust_anchor,
         });
 
         let mut bytes = serde_json::to_vec(&value).expect("serialize diagnostics");
@@ -43,6 +45,7 @@ impl FfiDiagnostics {
 impl From<lkrequest::diagnostics::RequestDiagnostics> for FfiDiagnostics {
     fn from(value: lkrequest::diagnostics::RequestDiagnostics) -> Self {
         Self {
+            trust_anchor: value.trust_anchor,
             dns_ms: value.dns_ms,
             tcp_ms: value.tcp_ms,
             tls_ms: value.tls_ms,

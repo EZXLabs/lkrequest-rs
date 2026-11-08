@@ -403,6 +403,7 @@ pub(crate) fn client_hello_legacy_offer(message: &[u8]) -> Option<(Vec<u16>, Vec
 
 /// Manages the TLS 1.3 handshake process.
 pub struct Tls13Handshake {
+    trust_anchor_observer: Option<crate::trust_anchor::TrustAnchorObserver>,
     /// Current state.
     state: Tls13State,
     /// The profile driving this handshake.
@@ -569,6 +570,7 @@ impl Tls13Handshake {
     pub fn new(profile: TlsProfile, hostname: impl Into<String>) -> Self {
         Self {
             state: Tls13State::Start,
+            trust_anchor_observer: None,
             profile,
             hostname: hostname.into(),
             transcript: None,
@@ -623,6 +625,13 @@ impl Tls13Handshake {
     /// Returns the current handshake state.
     pub fn state(&self) -> Tls13State {
         self.state
+    }
+
+    pub fn set_trust_anchor_observer(
+        &mut self,
+        observer: crate::trust_anchor::TrustAnchorObserver,
+    ) {
+        self.trust_anchor_observer = Some(observer);
     }
 
     /// Returns whether this handshake has processed a HelloRetryRequest.
@@ -1050,6 +1059,14 @@ impl Tls13Handshake {
             .iter()
             .find(|(kind, _)| *kind == ext_type::SUPPORTED_VERSIONS)
             .map(|(_, payload)| payload.to_vec());
+        if let Some(observer) = &self.trust_anchor_observer {
+            let ids = extensions
+                .iter()
+                .find(|(kind, _)| *kind == ext_type::TRUST_ANCHOR_IDS)
+                .and_then(|(_, payload)| crate::trust_anchor::decode_list(payload, true).ok())
+                .unwrap_or_default();
+            observer.update(|info| info.requested_ids = ids);
+        }
         let offered = extensions.into_iter().map(|(kind, _)| kind);
         let known = self.offered_extensions.insert(Vec::new());
         for extension_type in offered {
@@ -2047,6 +2064,12 @@ impl Tls13Handshake {
             let ext_data = &payload[pos..pos + ext_data_len];
 
             match extension_type {
+                ext_type::TRUST_ANCHOR_IDS => {
+                    let ids = crate::trust_anchor::decode_list(ext_data, false)?;
+                    if let Some(observer) = &self.trust_anchor_observer {
+                        observer.update(|info| info.available_ids = ids);
+                    }
+                }
                 // ALPN (0x0010): extract the server's selected protocol
                 ext_type::ALPN => {
                     let selected = crate::extensions::alpn::parse_server_alpn_bytes(ext_data)
@@ -2187,6 +2210,9 @@ impl Tls13Handshake {
         }
 
         self.early_data_accepted = saw_early_data;
+        if let Some(observer) = &self.trust_anchor_observer {
+            observer.update(|info| info.ech_rejected = self.ech_offered && !self.ech_accepted);
+        }
         if !saw_early_data {
             self.client_end_of_early_data = None;
         }
@@ -2222,7 +2248,7 @@ impl Tls13Handshake {
         //     CertificateEntry:
         //       cert_data<1..2^24-1>
         //       extensions<0..2^16-1>
-        self.server_certificates = parse_certificate_message(payload)?;
+        self.accept_certificate(payload)?;
 
         if self.server_certificates.is_empty() {
             return Err(TlsError::CertificateError(
@@ -2282,7 +2308,7 @@ impl Tls13Handshake {
         let decompressed = decompress_certificate(algorithm, compressed_data, uncompressed_length)?;
 
         // Parse the decompressed Certificate message
-        self.server_certificates = parse_certificate_message(&decompressed)?;
+        self.accept_certificate(&decompressed)?;
 
         if self.server_certificates.is_empty() {
             return Err(TlsError::CertificateError(
@@ -2400,15 +2426,30 @@ impl Tls13Handshake {
         // is decided from ServerHello.random, which arrives before Certificate.
         let verify_name = self.ech_rejection_public_name();
         let verify_name = verify_name.as_deref().unwrap_or(&self.hostname);
-        self.verification_policy.verify_certificate_chain(
+        let identity = crate::verify::certchain::verify_certificate_chain_anchor(
             &self.server_certificates,
             verify_name,
             std::time::SystemTime::now(),
             self.custom_ca_anchors.as_deref().map(|v| v.as_slice()),
         )?;
+        if let Some(observer) = &self.trust_anchor_observer {
+            observer.update(|info| info.verified_anchor = Some(identity));
+        }
 
         self.state = Tls13State::WaitFinished;
         Ok(HandshakeAction::ContinueReading)
+    }
+
+    fn accept_certificate(&mut self, payload: &[u8]) -> Result<()> {
+        let (certificates, matched) = parse_certificate_with_tai(payload)?;
+        if matched {
+            self.check_encrypted_extension_offered(ext_type::TRUST_ANCHOR_IDS)?;
+        }
+        self.server_certificates = certificates;
+        if let Some(observer) = &self.trust_anchor_observer {
+            observer.update(|info| info.matched_request = matched);
+        }
+        Ok(())
     }
 
     /// The `public_name` the server must be authenticated as, when ECH was
@@ -2601,6 +2642,11 @@ impl Tls13Handshake {
             master_secret.derive_secret("res master", &transcript_hash_ch_cf)?;
 
         self.state = Tls13State::Connected;
+        if let Some(observer) = &self.trust_anchor_observer {
+            observer.update(|info| {
+                info.authenticated = !self.verification_policy.is_insecure() && !info.ech_rejected
+            });
+        }
         Ok(HandshakeAction::Complete(Box::new(HandshakeComplete {
             client_end_of_early_data,
             client_encrypted_extensions: client_ee,
@@ -3107,7 +3153,12 @@ fn build_empty_client_certificate(request_context: &[u8]) -> Vec<u8> {
 /// Parse a TLS 1.3 Certificate handshake message.
 ///
 /// Returns a list of DER-encoded certificates (leaf first).
+#[cfg(test)]
 fn parse_certificate_message(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+    parse_certificate_with_tai(payload).map(|(certificates, _)| certificates)
+}
+
+fn parse_certificate_with_tai(payload: &[u8]) -> Result<(Vec<Vec<u8>>, bool)> {
     let mut pos = 0;
 
     // certificate_request_context<0..255>
@@ -3138,21 +3189,28 @@ fn parse_certificate_message(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
     pos += 3;
 
     let list_end = pos + list_len;
-    if list_end > payload.len() {
+    if list_end != payload.len() {
         return Err(TlsError::UnexpectedMessage(
             "Certificate list length exceeds message".to_string(),
         ));
     }
 
     let mut certs = Vec::new();
-    while pos + 3 <= list_end {
+    let mut matched = false;
+    while pos < list_end {
+        if pos + 3 > list_end {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "truncated certificate entry",
+            ));
+        }
         // cert_data<1..2^24-1>
         let cert_len = ((payload[pos] as usize) << 16)
             | ((payload[pos + 1] as usize) << 8)
             | (payload[pos + 2] as usize);
         pos += 3;
 
-        if pos + cert_len > list_end {
+        if cert_len == 0 || pos + cert_len > list_end {
             return Err(TlsError::UnexpectedMessage(
                 "Certificate entry exceeds list".to_string(),
             ));
@@ -3162,13 +3220,51 @@ fn parse_certificate_message(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
 
         // extensions<0..2^16-1> (per-certificate extensions)
         if pos + 2 > list_end {
-            break;
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "missing certificate extensions",
+            ));
         }
         let ext_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
-        pos += 2 + ext_len;
+        pos += 2;
+        let ext_end = pos + ext_len;
+        if ext_end > list_end {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "certificate extensions exceed entry",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        while pos < ext_end {
+            if pos + 4 > ext_end {
+                return Err(TlsError::local_alert(
+                    AlertDescription::DecodeError,
+                    "truncated certificate extension",
+                ));
+            }
+            let kind = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+            let len = usize::from(u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]));
+            pos += 4;
+            if pos + len > ext_end || !seen.insert(kind) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::DecodeError,
+                    "invalid certificate extension framing",
+                ));
+            }
+            if kind == ext_type::TRUST_ANCHOR_IDS {
+                if certs.len() != 1 || len != 0 {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::IllegalParameter,
+                        "trust_anchors must be empty and only in the first CertificateEntry",
+                    ));
+                }
+                matched = true;
+            }
+            pos += len;
+        }
     }
 
-    Ok(certs)
+    Ok((certs, matched))
 }
 
 // ---------------------------------------------------------------------------
@@ -3178,6 +3274,40 @@ fn parse_certificate_message(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tai_rejects_empty_server_available_list() {
+        let mut hs = Tls13Handshake::new(crate::profile::presets::chrome_157(), "localhost");
+        let payload = [0, 6, 0xca, 0x34, 0, 2, 0, 0];
+        assert!(hs.process_encrypted_extensions(&[], &payload).is_err());
+    }
+
+    #[test]
+    fn tai_rejects_nonempty_certificate_match_flag() {
+        let mut hs = Tls13Handshake::new(crate::profile::presets::chrome_157(), "localhost");
+        let payload = [0, 0, 0, 11, 0, 0, 1, 0x30, 0, 5, 0xca, 0x34, 0, 1, 1];
+        assert!(hs.process_certificate(&[], &payload).is_err());
+    }
+
+    #[test]
+    fn tai_certificate_match_location_duplicates_and_trailing_data() {
+        let entry = [0, 0, 1, 0x30, 0, 4, 0xca, 0x34, 0, 0];
+        let certificate = |entries: &[u8]| {
+            let mut payload = vec![0];
+            payload.extend_from_slice(&(entries.len() as u32).to_be_bytes()[1..]);
+            payload.extend_from_slice(entries);
+            payload
+        };
+        assert!(parse_certificate_with_tai(&certificate(&entry)).unwrap().1);
+        let mut entries = vec![0, 0, 1, 0x30, 0, 0];
+        entries.extend(entry);
+        assert!(parse_certificate_with_tai(&certificate(&entries)).is_err());
+        let duplicate = [0, 0, 1, 0x30, 0, 8, 0xca, 0x34, 0, 0, 0xca, 0x34, 0, 0];
+        assert!(parse_certificate_with_tai(&certificate(&duplicate)).is_err());
+        let mut trailing = certificate(&entry);
+        trailing.push(0);
+        assert!(parse_certificate_with_tai(&trailing).is_err());
+    }
 
     #[test]
     fn empty_client_certificate_echoes_request_context() {

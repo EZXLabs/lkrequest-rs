@@ -28,6 +28,9 @@ cargo test --workspace -- --include-ignored
 
 ## Cargo feature：`network-e2e`（lkrequest）
 
+TAI 的本地握手、QUIC、FFI 用例和独立 BoringSSL 服务端验证，见
+[Trust Anchor Identifiers 测试与互操作](trust-anchor-testing.md)。
+
 集成测试 crate 可启用可选特性以编译仅在网络环境下有意义的辅助代码：
 
 ```bash

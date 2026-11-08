@@ -71,8 +71,9 @@ pub enum CanonicalExtSource {
     /// fingerprint). A struct variant (not a tuple) so it serializes cleanly
     /// under the internally-tagged representation.
     Raw { data: String },
-    /// Chromium/BoringSSL trust-anchor identifiers. The wire order is shuffled,
-    /// so canonicalization stores the sorted identifier set.
+    /// Chromium/BoringSSL trust-anchor membership, stored as a sorted set.
+    /// Wire ordering depends on the browser version and needs a separate raw
+    /// payload check; this representation also accepts shuffled legacy profiles.
     TrustAnchorIds { ids: Vec<String> },
 }
 

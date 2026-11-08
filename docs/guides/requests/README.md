@@ -50,6 +50,20 @@ let response = client
 
 字符串形式的 `header()` 在名称或值无效时会跳过该 header。需要显式处理解析错误时，先构造 `HeaderName`/`HeaderValue`，再使用 `header_typed()`。
 
+### HTTP/1.1 Header 大小写
+
+HTTP/1.1 默认将字段名写成 Title-Case，例如 `Content-Type`。需要保留 `Host`、将其他字段名写成小写时，在创建 Client 时关闭转换：
+
+```rust
+let client = lkrequest::Client::builder()
+    .http1_title_case_headers(false)
+    .build();
+```
+
+此设置适用于普通请求、流式请求、预连接和 WebSocket 握手，包括自动生成的字段名：`Host` 保持首字母大写，`content-length` 等其他字段为小写；字段值和顺序不受影响。HTTP/2 与 HTTP/3 的字段名始终为小写。该选项不保留调用 `header()` 时传入的原始大小写。
+
+C ABI 使用 `lk_client_builder_set_http1_title_case_headers(builder, false)`，同样保留 `Host` 的首字母大写。现有客户端与浏览器 preset 的默认行为保持 Title-Case；此模式本身不代表与某个浏览器的原始 HTTP/1.1 请求完全一致。
+
 ## Cookie
 
 Session 自动保存响应中的 Cookie，并在后续匹配请求中发送：

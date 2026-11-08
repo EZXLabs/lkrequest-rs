@@ -76,6 +76,7 @@ impl LktlsQuicClientConfig {
                 custom_ca_anchors: None,
                 keylog_callback: None,
                 client_hello_callback: None,
+                trust_anchor_observer: None,
             },
             port: 443,
         }
@@ -83,6 +84,33 @@ impl LktlsQuicClientConfig {
 
     pub fn profile(&self) -> &TlsProfile {
         &self.handshake.profile
+    }
+
+    pub fn trust_anchor_observer(
+        mut self,
+        observer: lktls::trust_anchor::TrustAnchorObserver,
+    ) -> Self {
+        self.handshake.trust_anchor_observer = Some(observer);
+        self
+    }
+
+    pub fn full_handshake(mut self) -> Self {
+        self.handshake.session_store = None;
+        self
+    }
+
+    /// Keep the selected ECH/trust settings for a fresh TAI recovery handshake.
+    pub fn recovery_config(
+        &self,
+        profile: TlsProfile,
+        observer: lktls::trust_anchor::TrustAnchorObserver,
+    ) -> Self {
+        let mut config = self
+            .clone()
+            .full_handshake()
+            .trust_anchor_observer(observer);
+        config.handshake.profile = profile;
+        config
     }
 
     pub fn alpn_protocols(mut self, protocols: Vec<String>) -> Self {

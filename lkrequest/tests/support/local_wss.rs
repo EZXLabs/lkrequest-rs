@@ -28,6 +28,7 @@ pub struct LocalWssServer {
 pub struct WssHandshake {
     pub request_line: String,
     pub hosts: Vec<String>,
+    pub headers: Vec<(String, String)>,
 }
 
 impl LocalWssServer {
@@ -94,12 +95,15 @@ async fn handle_wss_connection(
 
     let mut ws_key = String::new();
     let mut hosts = Vec::new();
+    let mut headers = Vec::new();
     loop {
         let mut line = String::new();
         buf_reader.read_line(&mut line).await?;
         if line.trim().is_empty() {
             break;
         }
+        let (name, value) = line.trim_end().split_once(':').ok_or("invalid header")?;
+        headers.push((name.to_string(), value.trim().to_string()));
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("sec-websocket-key:") {
             ws_key = line
@@ -116,6 +120,7 @@ async fn handle_wss_connection(
     let _ = handshakes.send(WssHandshake {
         request_line: request_line.trim_end().to_string(),
         hosts,
+        headers,
     });
 
     if ws_key.is_empty() {

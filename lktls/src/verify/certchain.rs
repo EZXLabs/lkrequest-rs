@@ -157,6 +157,16 @@ pub fn verify_certificate_chain(
     now: std::time::SystemTime,
     custom_anchors: Option<&[rustls_pki_types::TrustAnchor<'static>]>,
 ) -> Result<()> {
+    verify_certificate_chain_anchor(chain, hostname, now, custom_anchors).map(|_| ())
+}
+
+/// Returns the identity of the root actually selected by the verified path.
+pub fn verify_certificate_chain_anchor(
+    chain: &[Vec<u8>],
+    hostname: &str,
+    now: std::time::SystemTime,
+    custom_anchors: Option<&[rustls_pki_types::TrustAnchor<'static>]>,
+) -> Result<String> {
     if chain.is_empty() {
         return Err(TlsError::CertificateError(
             "empty certificate chain".to_string(),
@@ -189,20 +199,27 @@ pub fn verify_certificate_chain(
     );
 
     // Verify the certificate chain
-    ee.verify_for_usage(
-        SUPPORTED_SIG_ALGS,
-        &trust_anchors,
-        &intermediates,
-        unix_time,
-        webpki::KeyUsage::server_auth(),
-        None, // no revocation checking
-        None, // no budget override
-    )
-    .map_err(|e| {
-        TlsError::CertificateError(format!("certificate chain verification failed: {e}"))
-    })?;
+    // Name failures are terminal even when path building would also fail.
+    verify_hostname(&ee, hostname)?;
+    let path = ee
+        .verify_for_usage(
+            SUPPORTED_SIG_ALGS,
+            &trust_anchors,
+            &intermediates,
+            unix_time,
+            webpki::KeyUsage::server_auth(),
+            None, // no revocation checking
+            None, // no budget override
+        )
+        .map_err(|e| {
+            if matches!(e, webpki::Error::UnknownIssuer) {
+                TlsError::UnknownIssuer(e.to_string())
+            } else {
+                TlsError::CertificateError(format!("certificate chain verification failed: {e}"))
+            }
+        })?;
 
-    verify_hostname(&ee, hostname)
+    Ok(crate::trust_anchor::anchor_identity(path.anchor()))
 }
 
 /// Check that the end-entity certificate's identity covers `hostname`.

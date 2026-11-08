@@ -734,6 +734,8 @@ async fn lkrequest_http3_emits_chrome_control_stream_frames() {
         (lkrequest::preset::chrome_153(), "chrome_153_quic"),
         (lkrequest::preset::chrome_154(), "chrome_154_quic"),
         (lkrequest::preset::chrome_155(), "chrome_155_quic"),
+        (lkrequest::preset::chrome_156(), "chrome_156_quic"),
+        (lkrequest::preset::chrome_157(), "chrome_157_quic"),
     ] {
         let control = captured_h3_control_stream(preset).await;
         assert_eq!(

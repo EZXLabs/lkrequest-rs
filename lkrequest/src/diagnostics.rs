@@ -5,6 +5,8 @@ use std::time::Instant;
 /// Lightweight per-request diagnostics snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct RequestDiagnostics {
+    /// TAI negotiation for the connection established by this request, if any.
+    pub trust_anchor: Option<Box<lktls::trust_anchor::TrustAnchorInfo>>,
     /// DNS resolution time in milliseconds, if measured.
     pub dns_ms: Option<u64>,
     /// TCP connect time in milliseconds, if measured.
@@ -29,6 +31,10 @@ tokio::task_local! {
 
 fn with_diagnostics_mut(f: impl FnOnce(&mut RequestDiagnostics)) {
     let _ = REQUEST_DIAGNOSTICS.try_with(|cell| f(&mut cell.borrow_mut()));
+}
+
+pub fn record_trust_anchor(info: lktls::trust_anchor::TrustAnchorInfo) {
+    with_diagnostics_mut(|diag| diag.trust_anchor = Some(Box::new(info)));
 }
 
 /// Record DNS resolution time (ms) into the active diagnostics scope (no-op outside one).

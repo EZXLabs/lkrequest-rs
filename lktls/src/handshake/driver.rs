@@ -262,6 +262,7 @@ pub struct HandshakeConfig {
     /// Observes the raw ClientHello bytes about to be sent (see
     /// [`ClientHelloCallback`]). Does not affect the handshake.
     pub client_hello_callback: Option<ClientHelloCallback>,
+    pub trust_anchor_observer: Option<crate::trust_anchor::TrustAnchorObserver>,
 }
 
 /// QUIC handshake configuration wrapper.
@@ -394,6 +395,9 @@ impl HandshakeDriver {
 
         let mut hs = Tls13Handshake::new(self.config.profile.clone(), &self.config.hostname);
         hs.set_verification_policy(self.config.verification_policy);
+        if let Some(observer) = &self.config.trust_anchor_observer {
+            hs.set_trust_anchor_observer(observer.clone());
+        }
         if let Some(ref a) = self.config.custom_ca_anchors {
             hs.set_custom_ca_anchors(Arc::clone(a));
         }
@@ -499,6 +503,9 @@ impl HandshakeDriver {
         match self.progress_inner() {
             Ok(output) => Ok(output),
             Err(error) => {
+                if let Some(observer) = &self.config.trust_anchor_observer {
+                    observer.record_error(&error);
+                }
                 let ccs = std::mem::take(&mut self.pending_tls13_ccs);
                 if self.config.profile.tls_client_hello_style
                     == crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl
@@ -1379,6 +1386,9 @@ impl QuicHandshakeDriver {
             hs.set_alps_payload(p.clone());
         }
         hs.set_verification_policy(self.config.tls.verification_policy);
+        if let Some(observer) = &self.config.tls.trust_anchor_observer {
+            hs.set_trust_anchor_observer(observer.clone());
+        }
         if let Some(ref anchors) = self.config.tls.custom_ca_anchors {
             hs.set_custom_ca_anchors(Arc::clone(anchors));
         }
@@ -1439,6 +1449,14 @@ impl QuicHandshakeDriver {
     }
 
     pub fn progress(&mut self) -> Result<QuicHandshakeOutput> {
+        let result = self.progress_inner();
+        if let (Err(error), Some(observer)) = (&result, &self.config.tls.trust_anchor_observer) {
+            observer.record_error(error);
+        }
+        result
+    }
+
+    fn progress_inner(&mut self) -> Result<QuicHandshakeOutput> {
         loop {
             let state = std::mem::replace(&mut self.state, QuicDriverState::Complete);
             match state {
@@ -2002,6 +2020,7 @@ mod tests {
             custom_ca_anchors: None,
             keylog_callback: None,
             client_hello_callback: None,
+            trust_anchor_observer: None,
         }
     }
 
@@ -2634,6 +2653,7 @@ mod tests {
             custom_ca_anchors: None,
             keylog_callback: None,
             client_hello_callback: None,
+            trust_anchor_observer: None,
         }
     }
 

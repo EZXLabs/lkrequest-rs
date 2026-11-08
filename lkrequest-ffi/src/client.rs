@@ -36,6 +36,8 @@ pub(crate) fn parse_preset_name(name: &str) -> Result<PresetKind, FfiError> {
         "chrome_153" => Ok(PresetKind::Chrome153),
         "chrome_154" => Ok(PresetKind::Chrome154),
         "chrome_155" | "default" => Ok(PresetKind::Chrome155),
+        "chrome_156" => Ok(PresetKind::Chrome156),
+        "chrome_157" => Ok(PresetKind::Chrome157),
         "firefox_133" => Ok(PresetKind::Firefox133),
         "firefox_147" => Ok(PresetKind::Firefox147),
         "firefox_156" => Ok(PresetKind::Firefox156),
@@ -60,6 +62,8 @@ pub(crate) fn preset_bundle(preset: PresetKind) -> lkrequest::preset::ClientPres
         PresetKind::Chrome153 => lkrequest::preset::chrome_153(),
         PresetKind::Chrome154 => lkrequest::preset::chrome_154(),
         PresetKind::Chrome155 => lkrequest::preset::chrome_155(),
+        PresetKind::Chrome156 => lkrequest::preset::chrome_156(),
+        PresetKind::Chrome157 => lkrequest::preset::chrome_157(),
         PresetKind::Firefox133 => lkrequest::preset::firefox_133(),
         PresetKind::Firefox147 => lkrequest::preset::firefox_147(),
         PresetKind::Firefox156 => lkrequest::preset::firefox_156(),
@@ -168,7 +172,8 @@ fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShare
     let preset = preset_bundle(state.preset);
     let mut builder = lkrequest::Client::builder()
         .preset(preset)
-        .verify(state.verify);
+        .verify(state.verify)
+        .http1_title_case_headers(state.http1_title_case_headers);
 
     if let Some(h2_preset) = state.h2_preset {
         let preset = preset_bundle(h2_preset);
@@ -370,7 +375,15 @@ fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShare
     }
 
     Ok(Arc::new(ClientShared {
-        client: builder.build(),
+        client: {
+            builder = builder.trust_anchor_policy(state.trust_anchor_policy);
+            for binding in &state.trust_anchor_bindings {
+                builder = builder.trust_anchor_binding(binding.clone());
+            }
+            builder
+                .try_build()
+                .map_err(|error| FfiError::invalid_config(error.to_string()))?
+        },
         outstanding_ops: AtomicUsize::new(0),
         max_outstanding_ops: state.max_outstanding_ops,
     }))
@@ -655,6 +668,21 @@ pub extern "C" fn lk_client_builder_set_verify(
     })
 }
 
+/// Choose HTTP/1.1 request header casing. Defaults to true (Title-Case).
+/// False sends lowercase names except `Host`, including auto-generated headers
+/// and WebSocket upgrades. Does not preserve caller spelling or affect HTTP/2 or HTTP/3.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_http1_title_case_headers(
+    builder: *mut lk_client_builder_t,
+    enabled: bool,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.http1_title_case_headers = enabled;
+        Ok(())
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn lk_client_builder_set_dns(
     builder: *mut lk_client_builder_t,
@@ -920,6 +948,66 @@ pub extern "C" fn lk_client_builder_set_session_resumption_json(
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
         let json = read_string_parts(json_ptr, json_len, "session resumption json")?;
         builder.state.session_resumption = Some(parse_session_resumption_json(&json)?);
+        Ok(())
+    })
+}
+
+/// Configure TAI advertisement and recovery. JSON example:
+/// {"advertisement":"profile","recovery":"once"}.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_trust_anchor_policy_json(
+    builder: *mut lk_client_builder_t,
+    json_ptr: *const c_char,
+    json_len: usize,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        let json = read_string_parts(json_ptr, json_len, "trust anchor policy JSON")?;
+        builder.state.trust_anchor_policy = serde_json::from_str(&json)
+            .map_err(|error| FfiError::invalid_config(error.to_string()))?;
+        Ok(())
+    })
+}
+
+/// Add metadata for an already trusted root: {"anchor_identity":"...","id":"d6790901"}.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_add_trust_anchor_binding_json(
+    builder: *mut lk_client_builder_t,
+    json_ptr: *const c_char,
+    json_len: usize,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        let json = read_string_parts(json_ptr, json_len, "trust anchor binding JSON")?;
+        let binding = serde_json::from_str(&json)
+            .map_err(|error| FfiError::invalid_config(error.to_string()))?;
+        builder.state.trust_anchor_bindings.push(binding);
+        Ok(())
+    })
+}
+
+/// Compute an anchor identity from a DER certificate without adding trust.
+/// `out_hex` must point to at least 65 writable bytes, including the NUL terminator.
+#[no_mangle]
+pub extern "C" fn lk_trust_anchor_identity_from_der(
+    der_ptr: *const u8,
+    der_len: usize,
+    out_hex: *mut c_char,
+    out_hex_capacity: usize,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        if out_hex.is_null() || out_hex_capacity < 65 {
+            return Err(FfiError::invalid_argument(
+                "anchor identity output requires 65 bytes",
+            ));
+        }
+        *out_hex = 0;
+        let der = read_bytes(der_ptr, der_len, "certificate DER")?;
+        let anchor = lkrequest::lktls::verify::certchain::parse_trust_anchor_from_der(&der)
+            .map_err(|error| FfiError::invalid_config(error.to_string()))?;
+        let identity = lkrequest::lktls::trust_anchor::anchor_identity(&anchor);
+        ptr::copy_nonoverlapping(identity.as_ptr(), out_hex.cast(), identity.len());
+        *out_hex.add(identity.len()) = 0;
         Ok(())
     })
 }

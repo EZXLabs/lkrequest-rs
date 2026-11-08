@@ -79,6 +79,7 @@ impl TlsConnector {
                 custom_ca_anchors: None,
                 keylog_callback: None,
                 client_hello_callback: None,
+                trust_anchor_observer: None,
             },
             require_close_notify: false,
         }
@@ -86,6 +87,34 @@ impl TlsConnector {
 
     pub fn profile(&self) -> &TlsProfile {
         &self.config.profile
+    }
+
+    pub fn trust_anchor_observer(
+        mut self,
+        observer: lktls::trust_anchor::TrustAnchorObserver,
+    ) -> Self {
+        self.config.trust_anchor_observer = Some(observer);
+        self
+    }
+
+    pub fn full_handshake(mut self) -> Self {
+        self.config.session_store = None;
+        self
+    }
+
+    pub(crate) fn recovery_connector(
+        &self,
+        profile: TlsProfile,
+        observer: lktls::trust_anchor::TrustAnchorObserver,
+    ) -> Self {
+        let mut config = self.config.clone();
+        config.profile = profile;
+        config.session_store = None;
+        config.trust_anchor_observer = Some(observer);
+        Self {
+            config,
+            require_close_notify: self.require_close_notify,
+        }
     }
 
     pub fn verification_policy(mut self, policy: VerificationPolicy) -> Self {
@@ -180,9 +209,30 @@ impl TlsConnector {
         stream: S,
     ) -> Result<TlsStream<S>> {
         let span = tracing::debug_span!("tls.handshake", sni = %hostname);
-        self.connect_inner(hostname, port, stream)
+        let observer = self
+            .config
+            .trust_anchor_observer
+            .clone()
+            .unwrap_or_default();
+        let result = self
+            .connect_inner(hostname, port, stream, observer.clone())
             .instrument(span)
-            .await
+            .await;
+        if let Err(error) = &result {
+            observer.record_error(error);
+        }
+        let info = observer.snapshot();
+        crate::diagnostics::record_trust_anchor(info.clone());
+        result.map_err(|source| {
+            if info.available_ids.is_empty() || info.ech_rejected {
+                source
+            } else {
+                TlsError::TrustAnchorFailure {
+                    source: Box::new(source),
+                    info: Box::new(info),
+                }
+            }
+        })
     }
 
     /// Perform the TLS handshake using the Sans-I/O [`HandshakeDriver`].
@@ -191,11 +241,13 @@ impl TlsConnector {
         hostname: &'a str,
         port: u16,
         mut stream: S,
+        observer: lktls::trust_anchor::TrustAnchorObserver,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<TlsStream<S>>> + Send + 'a>> {
         Box::pin(async move {
             let mut config = self.config.clone();
             config.hostname = hostname.to_string();
             config.port = port;
+            config.trust_anchor_observer = Some(observer);
 
             let mut driver = HandshakeDriver::new(config);
 

@@ -6,6 +6,54 @@ All important changes to this project will be documented in this file.
 
 ## Unreleased
 
+## lkrequest 0.2.5
+
+### Features
+
+- Add configurable HTTP/1 header casing through Rust and C FFI. Title-Case
+  remains the default; lowercase mode also covers streaming requests and
+  WebSocket upgrades.
+
+- Add X.509 Trust Anchor Identifier negotiation from
+  `draft-ietf-tls-trust-anchor-ids-06` for TLS 1.3 over TCP and QUIC, including
+  explicit root/ID bindings, Rust and C configuration, and response/error
+  diagnostics. The default preserves the preset's advertised bytes. Optional
+  recovery permits one new connection within the original route, deadline and
+  connection budget; advertised IDs never install trust roots. MTC verification
+  and intermediate elision are not implemented.
+
+- Add `chrome_157` for Chrome 157.0.8103.39 on Windows across Rust, FFI,
+  TLS, H2, QUIC/H3, synthesis and profile collection. Independent public
+  captures confirm fresh TLS/H2/QUIC fields, H3 SETTINGS, navigation/favicon
+  priority and HTTP 200 responses. Stable fields match Chrome 156;
+  trust-anchor IDs retain their captured fixed order instead of inheriting
+  earlier presets' shuffling. Other transport and response edge-case policies
+  inherit Chrome 156's model.
+
+- Add `chrome_156` for Chrome 156.0.8078.48 on Windows across Rust, FFI,
+  TLS, H2, QUIC/H3, synthesis and profile collection. Passive public captures
+  confirm fresh TLS/H2/QUIC fields and H3 SETTINGS, navigation/favicon priority
+  updates and HTTP 200 responses. Transport and response edge-case policies
+  inherit Chrome 155; the default preset remains Chrome 155.
+
+### Fixes
+
+- Keep HTTP/1 `Host` capitalized when other field names use lowercase,
+  including pooled requests, streaming requests and WebSocket upgrades.
+
+- Preserve Chromium's bytewise sorted trust-anchor IDs in the Chrome 155 and
+  156 TCP/QUIC presets. Remove inherited per-handshake ID shuffling while
+  keeping TLS extension permutation. Add raw-payload ordering coverage for
+  Chrome 155-157 and clarify version/configuration changes versus randomness.
+
+### Security & Dependencies
+
+- Update `rustls-webpki` to 0.103.16, bundled Mozilla roots to 1.0.10, Tokio
+  to 1.53.3, and zstd to 0.13.4 (`zstd-safe` 7.4.0 and `zstd-sys` 2.1.2).
+  Certificate verification now rejects paths through the distrusted emSign
+  intermediates. Add a regression check that failed zstd legacy-frame
+  decoding does not write output.
+
 ## lkrequest 0.2.4
 
 ### Features

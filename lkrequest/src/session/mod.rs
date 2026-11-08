@@ -1574,6 +1574,13 @@ impl Session {
         let client = &self.inner.client;
         let mut connector = crate::tls::TlsConnector::new(tls_profile)
             .session_store(self.inner.session_store.clone());
+        if client.inner.trust_anchor_policy.recovery
+            == lktls::trust_anchor::TrustAnchorRecovery::Once
+        {
+            connector = connector.session_store(Arc::new(lktls::trust_anchor::WithoutEarlyData(
+                self.inner.session_store.clone(),
+            )));
+        }
         // `None` => don't advertise ALPS; `Some(bytes)` => advertise + Client EE
         // payload `bytes` (empty for Chrome). Leaving the connector's default
         // (`None`) untouched keeps ALPS off.
@@ -1689,6 +1696,13 @@ impl Session {
         let mut crypto = lktls_quic::LktlsQuicClientConfig::new(tls_profile)
             .port(dial_port)
             .session_store(self.inner.session_store.clone());
+        if client.inner.trust_anchor_policy.recovery
+            == lktls::trust_anchor::TrustAnchorRecovery::Once
+        {
+            crypto = crypto.session_store(Arc::new(lktls::trust_anchor::WithoutEarlyData(
+                self.inner.session_store.clone(),
+            )));
+        }
         if let Some(alps_payload) = alps_payload {
             crypto = crypto.alps_payload(alps_payload);
         }
@@ -1792,6 +1806,7 @@ impl Session {
             config,
         )
         .await?;
+        let selected_tcp_addr = tcp.peer_addr().ok();
         let tcp_duration = tcp_start.elapsed();
 
         tracing::debug!(
@@ -1817,6 +1832,78 @@ impl Session {
 
                 let first =
                     crate::connect::wrap_tls(tcp, host, port, &tls_connector, tls_timeout).await;
+
+                let tai_hint = match &first {
+                    Err(Error::Tls(lktls::error::TlsError::TrustAnchorFailure {
+                        info, ..
+                    })) if client.inner.trust_anchor_policy.recovery
+                        == lktls::trust_anchor::TrustAnchorRecovery::Once
+                        && info.recovery_eligible =>
+                    {
+                        client
+                            .inner
+                            .trust_anchor_catalog
+                            .select(info)
+                            .map(|id| (id, (**info).clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((id, first_info)) = tai_hint {
+                    if !crate::trust_anchor::consume_recovery_budget() {
+                        return first;
+                    }
+                    if config.proxy_to_direct_fallback {
+                        return Err(Error::InvalidConfig(
+                            "TAI recovery cannot combine with proxy-to-direct fallback".into(),
+                        ));
+                    }
+                    let retry_host = if proxy.is_none() {
+                        selected_tcp_addr.map(|addr| addr.ip().to_string())
+                    } else {
+                        None
+                    };
+                    let retry_port = if proxy.is_none() {
+                        selected_tcp_addr.map_or(dial_port, |addr| addr.port())
+                    } else {
+                        dial_port
+                    };
+                    let mut profile = config.tls_profile.clone();
+                    lktls::trust_anchor::replace_profile_ids(&mut profile, &[id])?;
+                    let observer = lktls::trust_anchor::TrustAnchorObserver::default();
+                    let retry_connector =
+                        tls_connector.recovery_connector(profile, observer.clone());
+                    let remaining = (tcp_timeout + tls_timeout).saturating_sub(tcp_start.elapsed());
+                    let result = tokio::time::timeout(remaining, async {
+                        let tcp = crate::connect::connect_tcp(
+                            retry_host.as_deref().unwrap_or(dial_host),
+                            retry_port,
+                            proxy,
+                            client.tcp_fingerprint(),
+                            client.resolver(),
+                            tcp_timeout.min(remaining),
+                            Some(self.connection_budget()),
+                            config,
+                        )
+                        .await?;
+                        crate::connect::wrap_tls(
+                            tcp,
+                            host,
+                            port,
+                            &retry_connector,
+                            tls_timeout.min(remaining),
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::timeout(
+                            "TAI recovery exceeded connection deadline",
+                            Some(crate::error::ConnectionPhase::TlsHandshake),
+                            Some(remaining),
+                        ))
+                    });
+                    return crate::trust_anchor::finish_recovery(result, first_info, &observer);
+                }
 
                 // ECH rejected, and the server handed us fresh configs: retry
                 // once with them, the way a browser does. The alternative —
@@ -1911,6 +1998,88 @@ impl Session {
         proxy: Option<&crate::proxy::ProxyConfig>,
         allow_0rtt: bool,
     ) -> crate::error::Result<H3ConnectOutcome> {
+        let started = tokio::time::Instant::now();
+        let mut endpoint = None;
+        let mut crypto = None;
+        let observer = lktls::trust_anchor::TrustAnchorObserver::default();
+        let recovery = self.inner.client.inner.trust_anchor_policy.recovery
+            == lktls::trust_anchor::TrustAnchorRecovery::Once;
+        let first = self
+            .establish_h3_attempt(
+                host,
+                port,
+                advertised_host,
+                advertised_port,
+                proxy,
+                allow_0rtt && !recovery,
+                None,
+                &mut endpoint,
+                &mut crypto,
+                observer.clone(),
+            )
+            .await;
+        let info = observer.snapshot();
+        crate::diagnostics::record_trust_anchor(info.clone());
+        let candidate = if first.is_err() && recovery && info.recovery_eligible {
+            self.inner.client.inner.trust_anchor_catalog.select(&info)
+        } else {
+            None
+        };
+        let Some(id) = candidate.filter(|_| crate::trust_anchor::consume_recovery_budget()) else {
+            return first;
+        };
+        let timeouts = self.inner.client.timeouts();
+        let budget = timeouts
+            .quic_connect_timeout
+            .unwrap_or(std::time::Duration::from_secs(5))
+            + if proxy.is_some() {
+                timeouts.tcp_connect_timeout_or(std::time::Duration::from_secs(10))
+            } else {
+                std::time::Duration::ZERO
+            };
+        let remaining = budget.saturating_sub(started.elapsed());
+        let retry_observer = lktls::trust_anchor::TrustAnchorObserver::default();
+        let retry = tokio::time::timeout(
+            remaining,
+            self.establish_h3_attempt(
+                host,
+                port,
+                advertised_host,
+                advertised_port,
+                proxy,
+                false,
+                Some(&id),
+                &mut endpoint,
+                &mut crypto,
+                retry_observer.clone(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::timeout(
+                "TAI recovery exceeded QUIC connection deadline",
+                Some(crate::error::ConnectionPhase::QuicHandshake),
+                Some(remaining),
+            ))
+        });
+        crate::trust_anchor::finish_recovery(retry, info, &retry_observer)
+    }
+
+    #[cfg(feature = "quic-h3")]
+    #[allow(clippy::too_many_arguments)]
+    async fn establish_h3_attempt(
+        &self,
+        host: &str,
+        port: u16,
+        advertised_host: Option<&str>,
+        advertised_port: Option<u16>,
+        proxy: Option<&crate::proxy::ProxyConfig>,
+        allow_0rtt: bool,
+        tai_request: Option<&lktls::trust_anchor::TrustAnchorId>,
+        pinned_endpoint: &mut Option<std::net::SocketAddr>,
+        pinned_crypto: &mut Option<lktls_quic::LktlsQuicClientConfig>,
+        tai_observer: lktls::trust_anchor::TrustAnchorObserver,
+    ) -> crate::error::Result<H3ConnectOutcome> {
         let client = &self.inner.client;
         let quic_profile = client.quic_profile().ok_or_else(|| {
             Error::InvalidConfig("HTTP/3 requested but client has no QUIC/H3 profile".into())
@@ -1951,6 +2120,8 @@ impl Session {
 
         let remote_addr = if is_remote_dns {
             None
+        } else if pinned_endpoint.is_some() {
+            *pinned_endpoint
         } else {
             Some(
                 client
@@ -1971,6 +2142,7 @@ impl Session {
                     })?,
             )
         };
+        *pinned_endpoint = remote_addr;
 
         let mut tls_profile = client
             .quic_tls_profile()
@@ -1984,9 +2156,17 @@ impl Session {
             None
         };
 
-        let crypto = self
-            .build_h3_crypto(tls_profile, alps_payload, host, port, is_remote_dns)
-            .await;
+        if let Some(id) = tai_request {
+            lktls::trust_anchor::replace_profile_ids(&mut tls_profile, std::slice::from_ref(id))?;
+        }
+        let crypto = if let Some(first) = pinned_crypto.as_ref() {
+            first.recovery_config(tls_profile, tai_observer.clone())
+        } else {
+            self.build_h3_crypto(tls_profile, alps_payload, host, port, is_remote_dns)
+                .await
+                .trust_anchor_observer(tai_observer.clone())
+        };
+        *pinned_crypto = Some(crypto.clone());
 
         let mut quinn_config = crypto.into_quinn();
         let tp = &quic_profile.transport_params;
@@ -2137,6 +2317,7 @@ impl Session {
                     client,
                     tcp_timeout,
                     quic_timeout,
+                    &tai_observer,
                 )
                 .await?
             }
@@ -2161,6 +2342,7 @@ impl Session {
                     client,
                     tcp_timeout,
                     quic_timeout,
+                    &tai_observer,
                 )
                 .await?
             }
@@ -2247,7 +2429,7 @@ impl Session {
                                         Some(quic_timeout),
                                     )
                                 })?
-                                .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?
+                                .map_err(|e| crate::trust_anchor::quic_backend_error(e, &tai_observer))?
                         }
                     }
                 } else {
@@ -2265,7 +2447,7 @@ impl Session {
                                 Some(quic_timeout),
                             )
                         })?
-                        .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?
+                        .map_err(|e| crate::trust_anchor::quic_backend_error(e, &tai_observer))?
                 }
             }
         };
@@ -2315,6 +2497,7 @@ impl Session {
         client: &crate::client::Client,
         proxy_timeout: std::time::Duration,
         quic_timeout: std::time::Duration,
+        tai_observer: &lktls::trust_anchor::TrustAnchorObserver,
     ) -> crate::error::Result<quinn::Connection> {
         use crate::proxy::socks5_udp::{Socks5UdpSocket, SocksTarget};
 
@@ -2470,7 +2653,7 @@ impl Session {
                     "quic.socks5_connect_established"
                 );
             })
-            .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))
+            .map_err(|e| crate::trust_anchor::quic_handshake_error(e, tai_observer))
     }
 
     /// Establish a QUIC connection through a MASQUE CONNECT-UDP tunnel
@@ -2513,6 +2696,7 @@ impl Session {
         client: &crate::client::Client,
         proxy_timeout: std::time::Duration,
         quic_timeout: std::time::Duration,
+        tai_observer: &lktls::trust_anchor::TrustAnchorObserver,
     ) -> crate::error::Result<quinn::Connection> {
         let route = crate::protocol::RouteKey::from_proxy(Some(proxy_cfg));
         let origin = crate::alt_svc::Origin::https(dial_host, dial_port);
@@ -2673,7 +2857,7 @@ impl Session {
                     Some(quic_timeout),
                 )
             })?
-            .map_err(|e| Error::quic(QuicPhase::Handshake, e.to_string()))?;
+            .map_err(|e| crate::trust_anchor::quic_handshake_error(e, tai_observer))?;
 
         tracing::debug!(
             target = %format_args!("{dial_host}:{dial_port}"),
@@ -2883,18 +3067,14 @@ impl Session {
                     permit,
                 );
             } else {
-                let mut builder = hyper::client::conn::http1::Builder::new();
-                builder.title_case_headers(true).preserve_header_case(true);
-                let (sender, conn_driver) = builder
-                    .handshake::<crate::connect::TransportStream, crate::body::WireBody>(
-                        conn.into_tcp_stream()?,
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::error::Error::Http(format!(
-                            "preconnect HTTP/1.1 handshake failed: {e}"
-                        ))
-                    })?;
+                let (sender, conn_driver) =
+                    crate::http1::handshake(client, conn.into_tcp_stream()?)
+                        .await
+                        .map_err(|e| {
+                            crate::error::Error::Http(format!(
+                                "preconnect HTTP/1.1 handshake failed: {e}"
+                            ))
+                        })?;
 
                 let conn_task = tokio::spawn(async move {
                     if let Err(e) = conn_driver.await {
@@ -2982,6 +3162,10 @@ impl Session {
     /// # }
     /// ```
     pub async fn preconnect(&self, url: &str) -> crate::error::Result<()> {
+        crate::trust_anchor::scope(self.preconnect_inner(url)).await
+    }
+
+    async fn preconnect_inner(&self, url: &str) -> crate::error::Result<()> {
         use crate::connection_pool::{ConnectionKey, Scheme};
 
         let parsed =

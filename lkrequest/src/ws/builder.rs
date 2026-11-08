@@ -156,15 +156,7 @@ impl WsBuilder {
                 "ws.alpn_negotiated",
             );
 
-            let default_headers = client.default_headers();
-            ws_upgrade_h1(
-                conn.into_tcp_stream()?,
-                authority,
-                path,
-                &self,
-                default_headers,
-            )
-            .await
+            ws_upgrade_h1(conn.into_tcp_stream()?, authority, path, &self, client).await
         })
     }
 }

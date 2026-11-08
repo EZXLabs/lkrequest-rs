@@ -207,7 +207,9 @@ pub enum ExtensionSource {
     TrustAnchorIds {
         /// Hex-encoded trust-anchor identifiers.
         ids: Vec<String>,
-        /// Shuffle identifier order for each ClientHello.
+        /// Shuffle identifiers for each fresh handshake; HRR reuses the first
+        /// encoding. Independent of TLS extension permutation. Chrome 155-157
+        /// presets keep this disabled to preserve Chromium's sorted ID list.
         #[serde(default)]
         shuffle: bool,
     },

@@ -30,6 +30,8 @@ pub enum PresetKind {
     Chrome154,
     #[default]
     Chrome155,
+    Chrome156,
+    Chrome157,
     Firefox133,
     Firefox147,
     Firefox156,
@@ -38,6 +40,8 @@ pub enum PresetKind {
 }
 
 pub struct ClientBuilderState {
+    pub trust_anchor_policy: lkrequest::TrustAnchorPolicy,
+    pub trust_anchor_bindings: Vec<lkrequest::TrustAnchorBinding>,
     pub preset: PresetKind,
     pub h2_preset: Option<PresetKind>,
     pub dns_timeout_ms: Option<u64>,
@@ -52,6 +56,7 @@ pub struct ClientBuilderState {
     pub max_outstanding_ops: usize,
     pub ca_der_certs: Vec<Vec<u8>>,
     pub default_headers: Vec<(String, String)>,
+    pub http1_title_case_headers: bool,
     pub header_order: Vec<String>,
     pub h3_header_order: Vec<String>,
     pub cookie_order: Vec<String>,
@@ -84,6 +89,8 @@ pub struct ClientBuilderState {
 impl Default for ClientBuilderState {
     fn default() -> Self {
         Self {
+            trust_anchor_policy: Default::default(),
+            trust_anchor_bindings: Vec::new(),
             preset: PresetKind::default(),
             h2_preset: None,
             dns_timeout_ms: None,
@@ -98,6 +105,7 @@ impl Default for ClientBuilderState {
             max_outstanding_ops: 4096,
             ca_der_certs: Vec::new(),
             default_headers: Vec::new(),
+            http1_title_case_headers: true,
             header_order: Vec::new(),
             h3_header_order: Vec::new(),
             cookie_order: Vec::new(),

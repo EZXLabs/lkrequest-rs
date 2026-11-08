@@ -898,7 +898,7 @@ impl StreamRequestBuilder {
                             .await?;
 
                         let (sender, conn_task) =
-                            pipeline::handshake_h1(conn2.into_tcp_stream()?).await?;
+                            pipeline::handshake_h1(client, conn2.into_tcp_stream()?).await?;
 
                         tracing::debug!(
                             route = %target.conn_key.route,
@@ -925,7 +925,8 @@ impl StreamRequestBuilder {
                     );
                 }
 
-                let (sender, conn_task) = pipeline::handshake_h1(conn.into_tcp_stream()?).await?;
+                let (sender, conn_task) =
+                    pipeline::handshake_h1(client, conn.into_tcp_stream()?).await?;
 
                 tracing::debug!(
                     route = %target.conn_key.route,
@@ -943,7 +944,7 @@ impl StreamRequestBuilder {
 
     async fn send_h1_streaming(
         &self,
-        mut sender: hyper::client::conn::http1::SendRequest<WireBody>,
+        mut sender: crate::http1::Http1Sender<WireBody>,
         conn_task: Arc<tokio::task::JoinHandle<()>>,
         permit: ConnectionPermit,
         target: &pipeline::ParsedTarget,

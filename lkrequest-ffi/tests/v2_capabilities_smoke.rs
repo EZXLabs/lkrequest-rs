@@ -1513,6 +1513,24 @@ fn chrome_155_preset_is_exposed_through_ffi() {
 }
 
 #[test]
+fn chrome_156_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("chrome_156", "Chrome 156", true, 15_663_105),
+        3
+    );
+}
+
+#[test]
+fn chrome_157_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("chrome_157", "Chrome 157", true, 15_663_105),
+        3
+    );
+}
+
+#[test]
 fn default_clients_use_chrome_155_and_explicit_144_remains_available() {
     let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     unsafe {

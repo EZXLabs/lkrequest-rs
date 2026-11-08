@@ -480,11 +480,16 @@ pub(crate) struct Fingerprint {
 /// Immutable transport machinery shared by all clones (and all sessions) of a
 /// `Client`. The wire fingerprint lives separately in [`Fingerprint`].
 pub(crate) struct ClientInner {
+    pub trust_anchor_policy: lktls::trust_anchor::TrustAnchorPolicy,
+    pub trust_anchor_catalog: Arc<lktls::trust_anchor::TrustAnchorCatalog>,
     /// Default headers sent with every request (e.g. User-Agent, Accept).
     pub default_headers: HeaderMap,
 
     /// Header sending order template.
     pub header_order: Option<Vec<HeaderName>>,
+
+    /// Whether HTTP/1.1 sends header names in Title-Case instead of lowercase.
+    pub http1_title_case_headers: bool,
 
     /// HTTP/3-specific header sending order template.
     ///
@@ -729,6 +734,19 @@ impl Client {
         self.inner.header_order.as_deref()
     }
 
+    /// Whether HTTP/1.1 sends header names in Title-Case (the default).
+    pub fn http1_title_case_headers(&self) -> bool {
+        self.inner.http1_title_case_headers
+    }
+
+    pub(crate) fn http1_builder(&self) -> hyper::client::conn::http1::Builder {
+        let mut builder = hyper::client::conn::http1::Builder::new();
+        builder
+            .title_case_headers(self.http1_title_case_headers())
+            .preserve_header_case(true);
+        builder
+    }
+
     /// Returns the HTTP/3-specific header order template, if set.
     pub fn h3_header_order(&self) -> Option<&[HeaderName]> {
         self.inner.h3_header_order.as_deref()
@@ -911,12 +929,15 @@ impl H2DataFramePolicy {
 
 /// Builder for constructing a [`Client`].
 pub struct ClientBuilder {
+    trust_anchor_policy: lktls::trust_anchor::TrustAnchorPolicy,
+    trust_anchor_bindings: Vec<lktls::trust_anchor::TrustAnchorBinding>,
     tls_profile: Option<TlsProfile>,
     quic_tls_profile: Option<Option<TlsProfile>>,
     h2_profile: Option<H2Profile>,
     quic_profile: Option<Option<QuicProfile>>,
     default_headers: HeaderMap,
     header_order: Option<Vec<HeaderName>>,
+    http1_title_case_headers: bool,
     h3_header_order: Option<Vec<HeaderName>>,
     cookie_order: Option<Vec<Box<str>>>,
     ech_config: Option<Vec<u8>>,
@@ -944,14 +965,33 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Configure X.509 trust-anchor advertisement and optional recovery.
+    /// Defaults to the profile's bytes with recovery disabled.
+    pub fn trust_anchor_policy(mut self, policy: lktls::trust_anchor::TrustAnchorPolicy) -> Self {
+        self.trust_anchor_policy = policy;
+        self
+    }
+
+    /// Bind an agreed ID to an anchor already present in the effective store.
+    pub fn trust_anchor_binding(
+        mut self,
+        binding: lktls::trust_anchor::TrustAnchorBinding,
+    ) -> Self {
+        self.trust_anchor_bindings.push(binding);
+        self
+    }
+
     fn new() -> Self {
         Self {
+            trust_anchor_policy: Default::default(),
+            trust_anchor_bindings: Vec::new(),
             tls_profile: None,
             quic_tls_profile: None,
             h2_profile: None,
             quic_profile: None,
             default_headers: HeaderMap::new(),
             header_order: None,
+            http1_title_case_headers: true,
             h3_header_order: None,
             cookie_order: None,
             ech_config: None,
@@ -1314,6 +1354,19 @@ impl ClientBuilder {
         value: http::header::HeaderValue,
     ) -> Self {
         self.default_headers.insert(name, value);
+        self
+    }
+
+    /// Choose the casing of HTTP/1.1 request header names.
+    ///
+    /// Defaults to `true`, producing names such as `Content-Type`. Set to
+    /// `false` to send lowercase names such as `content-type`, while keeping
+    /// `Host` capitalized. This includes generated headers (`content-length`, etc.).
+    /// Applies to ordinary requests, streaming, preconnected connections and
+    /// WebSocket upgrades. HTTP/2 and HTTP/3 always use lowercase names.
+    /// This does not preserve the spelling originally passed to `header()`.
+    pub fn http1_title_case_headers(mut self, enabled: bool) -> Self {
+        self.http1_title_case_headers = enabled;
         self
     }
 
@@ -1995,7 +2048,36 @@ impl ClientBuilder {
     /// This means `Client::builder().build()` produces a fully functional
     /// client with Chrome 155 TLS/H2 fingerprints out of the box. QUIC/H3
     /// remains opt-in through a complete preset or an explicit QUIC profile.
+    ///
+    /// # Panics
+    /// Panics for invalid TAI settings. Use [`Self::try_build`] for fallible configuration.
     pub fn build(self) -> Client {
+        self.try_build().expect("invalid client configuration")
+    }
+
+    /// Build a client, reporting invalid trust-anchor configuration.
+    pub fn try_build(self) -> crate::error::Result<Client> {
+        use lktls::trust_anchor::{
+            TrustAnchorAdvertisement, TrustAnchorCatalog, TrustAnchorRecovery,
+        };
+        let catalog = Arc::new(
+            TrustAnchorCatalog::new(self.trust_anchor_bindings, &self.custom_ca_anchors)
+                .map_err(|error| crate::error::Error::InvalidConfig(error.to_string()))?,
+        );
+        if self.trust_anchor_policy.recovery == TrustAnchorRecovery::Once
+            && (!self.verify || catalog.ids().is_empty())
+        {
+            return Err(crate::error::Error::InvalidConfig(
+                "TAI recovery requires certificate verification and usable ID bindings".into(),
+            ));
+        }
+        if self.trust_anchor_policy.recovery == TrustAnchorRecovery::Once
+            && self.fallback.proxy_to_direct
+        {
+            return Err(crate::error::Error::InvalidConfig(
+                "TAI recovery cannot combine with proxy-to-direct fallback".into(),
+            ));
+        }
         let mut tls_profile = self
             .tls_profile
             .unwrap_or_else(lktls::profile::presets::chrome_155);
@@ -2008,7 +2090,35 @@ impl ClientBuilder {
                 .get_or_insert_with(Default::default)
                 .shuffle_extensions = true;
         }
-        let quic_tls_profile = self.quic_tls_profile.unwrap_or(None);
+        let mut quic_tls_profile = self.quic_tls_profile.unwrap_or(None);
+        if self.trust_anchor_policy != Default::default() {
+            #[cfg(feature = "synthetic-fp")]
+            if matches!(self.randomize.mode(), crate::randomize::RandomizeMode::Recombine(layers) | crate::randomize::RandomizeMode::Full(layers) if layers.contains(crate::randomize::Layers::TLS))
+            {
+                return Err(crate::error::Error::InvalidConfig(
+                    "TAI negotiation requires a stable TLS profile; TLS synthesis is incompatible"
+                        .into(),
+                ));
+            }
+            for profile in std::iter::once(&tls_profile).chain(quic_tls_profile.iter()) {
+                if !profile
+                    .extensions
+                    .iter()
+                    .any(|ext| ext.extension_type == lktls::trust_anchor::EXTENSION_TYPE)
+                {
+                    return Err(crate::error::Error::InvalidConfig(
+                        "TAI policy requires a trust_anchors extension slot in each TLS profile"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if self.trust_anchor_policy.advertisement == TrustAnchorAdvertisement::Trusted {
+            lktls::trust_anchor::replace_profile_ids(&mut tls_profile, &catalog.ids())?;
+            if let Some(profile) = &mut quic_tls_profile {
+                lktls::trust_anchor::replace_profile_ids(profile, &catalog.ids())?;
+            }
+        }
 
         // Default to Chrome 155 H2 profile if not explicitly set
         let mut h2_profile = self
@@ -2092,7 +2202,7 @@ impl ClientBuilder {
             )
         };
 
-        Client {
+        Ok(Client {
             fingerprint: Arc::new(Fingerprint {
                 tls_profile,
                 quic_tls_profile,
@@ -2100,8 +2210,11 @@ impl ClientBuilder {
                 quic_profile,
             }),
             inner: Arc::new(ClientInner {
+                trust_anchor_policy: self.trust_anchor_policy,
+                trust_anchor_catalog: catalog,
                 default_headers: self.default_headers,
                 header_order,
+                http1_title_case_headers: self.http1_title_case_headers,
                 h3_header_order,
                 cookie_order: self.cookie_order,
                 ech_config: self.ech_config,
@@ -2132,7 +2245,7 @@ impl ClientBuilder {
                 #[cfg(feature = "synthetic-fp")]
                 randomize: self.randomize,
             }),
-        }
+        })
     }
 }
 

@@ -25,6 +25,16 @@ Browser presets may contain a mix of directly captured and explicitly inherited 
 capture evidence from Windows Chrome 155.0.8059.40, including decrypted H3
 SETTINGS and a successful H3 navigation. Stable fields match the previous model.
 
+`chrome_156_quic()` and `chrome_156_h3()` add Windows Chrome 156.0.8078.48,
+captured on 2026-10-21. Fresh transport values, H3 SETTINGS and navigation/favicon
+priority updates match Chrome 155, with successful public H3 responses. Timing,
+loss, STOP, resumption and response edge-case policies inherit its model.
+
+`chrome_157_quic()` and `chrome_157_h3()` add Windows Chrome 157.0.8103.39,
+captured on 2026-11-05. Fresh QUIC transport, H3 SETTINGS and navigation/favicon
+priority match 156, with HTTP 200 responses. Timing, loss, STOP, resumption
+and response edge-case policies inherit 156.
+
 Chrome 155 also emits a control-stream `PRIORITY_UPDATE` for each allocated
 request stream before HEADERS, including pooled requests and streaming uploads.
 Preconnect sends SETTINGS and GREASE without targeting an unallocated request.

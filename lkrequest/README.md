@@ -47,7 +47,7 @@ drop it now.
 
 | Family | Preset names | QUIC/H3 |
 |---|---|---|
-| Chrome | `chrome_131`, `chrome_144` through `chrome_155` | Requires `quic-h3` |
+| Chrome | `chrome_131`, `chrome_144` through `chrome_157` | Requires `quic-h3` |
 | Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Not provided |
 | Safari | `safari_18`, `safari_26` | Not provided |
 
@@ -59,6 +59,16 @@ per-layer evidence.
 
 `chrome_155()` adds Chrome 155.0.8059.40 with passive public TLS/H2/QUIC
 captures and directly observed Cloudflare H3 SETTINGS and HTTP 200.
+
+`chrome_156()` adds Chrome 156.0.8078.48 with independently captured fresh
+TLS/H2/QUIC/H3 fields, including navigation/favicon priority updates and HTTP
+200. Transport and response edge-case policies inherit Chrome 155. The default
+preset remains Chrome 155.
+
+`chrome_157()` adds Chrome 157.0.8103.39 on Windows, captured on 2026-11-05.
+Public TLS/H2/QUIC/H3 samples confirm stable fields matching 156, navigation
+and favicon priorities, and HTTP 200. Transport and response edge-case
+policies inherit 156. Application header values remain caller supplied.
 
 Presets combine TLS, H2, optional QUIC/H3, protocol policy, and header ordering. Browser behavior can vary by version, platform, GREASE, Finch configuration, and request context. Treat committed fixtures as regression evidence, not as proof of every live-browser behavior.
 

@@ -734,6 +734,19 @@ pub fn chrome_155_h2() -> H2Profile {
     chrome_154_h2()
 }
 
+/// Chrome 156.0.8078.48 H2 profile captured on 2026-10-21.
+/// SETTINGS, connection window, pseudo-header order and navigation priority
+/// match Chrome 155 in the public Cloudflare capture.
+pub fn chrome_156_h2() -> H2Profile {
+    chrome_155_h2()
+}
+
+/// Chrome 157.0.8103.39 H2 navigation captured on 2026-11-05.
+/// SETTINGS, window, pseudo-header order and navigation priority match Chrome 156.
+pub fn chrome_157_h2() -> H2Profile {
+    chrome_156_h2()
+}
+
 /// Returns the Chrome 131 H2 fingerprint profile.
 ///
 /// Same H2 parameters as Chrome 144 (H2 fingerprint hasn't changed).
@@ -1216,6 +1229,16 @@ pub fn chrome_154_header_order() -> Vec<String> {
 /// Returns the Chrome 155 HTTP header sending order (navigation only).
 pub fn chrome_155_header_order() -> Vec<String> {
     chrome_154_header_order()
+}
+
+/// Chrome 156 navigation header order, observed over public H2 and H3.
+pub fn chrome_156_header_order() -> Vec<String> {
+    chrome_155_header_order()
+}
+
+/// Chrome 157 navigation header order, observed over public H2 and H3.
+pub fn chrome_157_header_order() -> Vec<String> {
+    chrome_156_header_order()
 }
 
 /// Returns the Chrome 131 HTTP header sending order.

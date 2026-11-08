@@ -1,5 +1,7 @@
 #[path = "support/server_regressions.rs"]
 mod server_regressions;
+#[path = "support/trust_anchor_diagnostics.rs"]
+mod trust_anchor_diagnostics;
 
 use std::ffi::{c_char, CStr, CString};
 use std::io::{Read, Write};
@@ -21,14 +23,14 @@ use lkrequest_ffi::{
     lk_client_builder_build, lk_client_builder_free, lk_client_builder_new,
     lk_client_builder_set_ech_config, lk_client_builder_set_fallback_h2_to_h1,
     lk_client_builder_set_fallback_proxy_to_direct, lk_client_builder_set_h2_preset,
-    lk_client_builder_set_keylog_file, lk_client_builder_set_max_connections_per_session,
-    lk_client_builder_set_max_header_count, lk_client_builder_set_max_header_size,
-    lk_client_builder_set_max_headers_total_size, lk_client_builder_set_max_response_body_size,
-    lk_client_builder_set_min_transfer_rate, lk_client_builder_set_retry_on_connection_close,
-    lk_client_builder_set_tcp_fingerprint_ja4t, lk_error_code, lk_error_free,
-    lk_error_get_diagnostics_json, lk_error_message, lk_error_t, lk_feature_supported,
-    lk_http_version_t, lk_log_init, lk_op_free, lk_op_poll, lk_op_state_t, lk_op_t,
-    lk_op_take_chunk, lk_op_take_error, lk_op_take_streaming_response, lk_op_wait,
+    lk_client_builder_set_http1_title_case_headers, lk_client_builder_set_keylog_file,
+    lk_client_builder_set_max_connections_per_session, lk_client_builder_set_max_header_count,
+    lk_client_builder_set_max_header_size, lk_client_builder_set_max_headers_total_size,
+    lk_client_builder_set_max_response_body_size, lk_client_builder_set_min_transfer_rate,
+    lk_client_builder_set_retry_on_connection_close, lk_client_builder_set_tcp_fingerprint_ja4t,
+    lk_error_code, lk_error_free, lk_error_get_diagnostics_json, lk_error_message, lk_error_t,
+    lk_feature_supported, lk_http_version_t, lk_log_init, lk_op_free, lk_op_poll, lk_op_state_t,
+    lk_op_t, lk_op_take_chunk, lk_op_take_error, lk_op_take_streaming_response, lk_op_wait,
     lk_preset_get_detail_json, lk_preset_list_json, lk_request_add_h3_header_order,
     lk_request_add_header, lk_request_free, lk_request_new, lk_request_send, lk_request_send_async,
     lk_request_send_streaming, lk_request_send_streaming_async, lk_request_set_accept_encoding,
@@ -48,6 +50,89 @@ struct TestServer {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[test]
+fn trust_anchor_configuration_checks_ids_roots_and_verification() {
+    use lkrequest_ffi::*;
+    let builder = lk_client_builder_new();
+    let set_policy = |json: &str| {
+        lk_client_builder_set_trust_anchor_policy_json(builder, json.as_ptr().cast(), json.len())
+    };
+    let add_binding = |json: &str| {
+        lk_client_builder_add_trust_anchor_binding_json(builder, json.as_ptr().cast(), json.len())
+    };
+    assert_ne!(set_policy(r#"{"recovery":"forever"}"#), lk_status_t::LK_OK);
+    assert_ne!(
+        add_binding(r#"{"anchor_identity":"unknown","id":"80"}"#),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        set_policy(r#"{"advertisement":"profile","recovery":"once"}"#),
+        lk_status_t::LK_OK
+    );
+    let mut client = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    assert_eq!(
+        lk_client_builder_set_verify(builder, false),
+        lk_status_t::LK_OK
+    );
+    assert_ne!(
+        lk_client_builder_build(builder, &mut client, &mut error),
+        lk_status_t::LK_OK
+    );
+    assert!(client.is_null());
+    lk_error_free(error);
+    assert_eq!(
+        lk_client_builder_set_verify(builder, true),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        lk_client_builder_build(builder, &mut client, &mut error),
+        lk_status_t::LK_OK
+    );
+    lk_client_free(client);
+    assert_eq!(
+        add_binding(r#"{"anchor_identity":"unknown","id":"81fd5901"}"#),
+        lk_status_t::LK_OK
+    );
+    assert_ne!(
+        lk_client_builder_build(builder, &mut client, &mut error),
+        lk_status_t::LK_OK
+    );
+    lk_error_free(error);
+    lk_client_builder_free(builder);
+}
+
+#[test]
+fn trust_anchor_identity_helper_validates_output_and_der() {
+    use lkrequest_ffi::*;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = cert.cert.der();
+    let mut output = [0 as c_char; 65];
+    assert_ne!(
+        lk_trust_anchor_identity_from_der(der.as_ptr(), der.len(), output.as_mut_ptr(), 64),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        lk_trust_anchor_identity_from_der(
+            der.as_ptr(),
+            der.len(),
+            output.as_mut_ptr(),
+            output.len()
+        ),
+        lk_status_t::LK_OK
+    );
+    let anchor = lkrequest::lktls::verify::certchain::parse_trust_anchor_from_der(der).unwrap();
+    assert_eq!(
+        unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap(),
+        lkrequest::lktls::trust_anchor::anchor_identity(&anchor)
+    );
+    assert_ne!(
+        lk_trust_anchor_identity_from_der(ptr::null(), 0, output.as_mut_ptr(), output.len()),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(output[0], 0);
 }
 
 impl TestServer {
@@ -121,6 +206,15 @@ fn handle_connection(mut stream: TcpStream) {
         .unwrap_or(request.path.as_str());
 
     match route {
+        "/header-case" => {
+            let body = serde_json::to_vec(&request.headers).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        }
         "/stream" => write_chunked_response(
             &mut stream,
             "200 OK",
@@ -477,6 +571,107 @@ unsafe fn new_client_and_session() -> (*mut lkrequest_ffi::lk_client_t, *mut lk_
     assert!(err.is_null());
     lk_session_builder_free(session_builder);
     (client, session)
+}
+
+#[test]
+fn client_builder_http1_header_case_reaches_the_wire() {
+    assert_eq!(
+        lk_client_builder_set_http1_title_case_headers(ptr::null_mut(), false),
+        lk_status_t::LK_ERR
+    );
+    let server = TestServer::start();
+    for title_case in [None, Some(false), Some(true)] {
+        let builder = lk_client_builder_new();
+        if let Some(enabled) = title_case {
+            assert_eq!(
+                lk_client_builder_set_http1_title_case_headers(builder, !enabled),
+                lk_status_t::LK_OK
+            );
+            assert_eq!(
+                lk_client_builder_set_http1_title_case_headers(builder, enabled),
+                lk_status_t::LK_OK
+            );
+        }
+        assert_eq!(
+            lk_client_builder_add_default_header(
+                builder,
+                cstring("X-Default").as_ptr(),
+                9,
+                cstring("Keep-MiXeD").as_ptr(),
+                10,
+            ),
+            lk_status_t::LK_OK
+        );
+        let mut client = ptr::null_mut();
+        let mut err = ptr::null_mut();
+        assert_eq!(
+            lk_client_builder_build(builder, &mut client, &mut err),
+            lk_status_t::LK_OK
+        );
+        lk_client_builder_free(builder);
+        let mut session = ptr::null_mut();
+        assert_eq!(
+            lkrequest_ffi::lk_session_new(client, &mut session, &mut err),
+            lk_status_t::LK_OK
+        );
+        let url = server.url("/header-case");
+        let mut request = ptr::null_mut();
+        assert_eq!(
+            lk_request_new(
+                session,
+                cstring("GET").as_ptr(),
+                3,
+                cstring(&url).as_ptr(),
+                url.len(),
+                &mut request,
+                &mut err
+            ),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lk_request_add_header(
+                request,
+                cstring("x-MIXED").as_ptr(),
+                7,
+                cstring("Value-MiXeD").as_ptr(),
+                11
+            ),
+            lk_status_t::LK_OK
+        );
+        let mut response = ptr::null_mut();
+        assert_eq!(
+            lk_request_send(request, &mut response, &mut err),
+            lk_status_t::LK_OK
+        );
+        assert!(err.is_null());
+        let mut body_ptr = ptr::null();
+        let mut body_len = 0;
+        assert_eq!(
+            lkrequest_ffi::lk_response_body(response, &mut body_ptr, &mut body_len),
+            lk_status_t::LK_OK
+        );
+        let headers: Vec<(String, String)> =
+            unsafe { serde_json::from_slice(&view_bytes(body_ptr, body_len)).unwrap() };
+        let expected = if title_case.unwrap_or(true) {
+            ["Host", "X-Default", "X-Mixed"]
+        } else {
+            ["Host", "x-default", "x-mixed"]
+        };
+        for name in expected {
+            assert!(headers.iter().any(|(key, _)| key == name), "{headers:?}");
+        }
+        assert!(headers.contains(&(expected[1].into(), "Keep-MiXeD".into())));
+        assert!(headers.contains(&(expected[2].into(), "Value-MiXeD".into())));
+        if title_case == Some(false) {
+            assert!(headers
+                .iter()
+                .all(|(name, _)| *name == "Host" || *name == name.to_ascii_lowercase()));
+        }
+        lk_response_free(response);
+        lk_request_free(request);
+        lk_session_free(session);
+        lkrequest_ffi::lk_client_free(client);
+    }
 }
 
 #[test]

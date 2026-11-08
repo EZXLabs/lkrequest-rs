@@ -26,6 +26,8 @@ available.
 | `chrome_153` | yes | yes | yes | public Cloudflare TLS/H2/QUIC/H3 capture |
 | `chrome_154` | yes | yes | yes | public Cloudflare TLS/H2/QUIC capture; H3 baseline inherited |
 | `chrome_155` | yes | yes | yes | passive public TLS/H2/QUIC captures and completed Cloudflare H3 |
+| `chrome_156` | yes | yes | yes | independent public TLS/H2/QUIC captures and completed Cloudflare H3 |
+| `chrome_157` | yes | yes | yes | public TLS/H2/QUIC captures and completed Cloudflare H3 |
 
 Chrome 153.0.8010.37 was captured against public Cloudflare targets on
 2026-09-15, including decrypted H3 SETTINGS.
@@ -34,6 +36,11 @@ Chrome 155.0.8059.40 was independently captured with Wireshark on 2026-10-07
 against Cloudflare and example.com. Stable TLS/H2/QUIC fields match 154;
 Cloudflare H3 SETTINGS and a successful H3 response were directly observed.
 Collector output supplements the passive packet evidence.
+
+Chrome 156.0.8078.48 was independently captured with Wireshark on 2026-10-21
+against Cloudflare and example.com. Fresh TLS/H2/QUIC fields, H3 SETTINGS and
+navigation/favicon priority updates match 155; public H2 and H3 returned HTTP
+200. Transport and response edge-case policies remain inherited from 155.
 
 Chrome 154.0.8037.58 was captured against public Cloudflare targets on
 2026-09-24. TLS, H2, QUIC TLS, transport parameters, and Initial packetization
@@ -55,6 +62,12 @@ headers, but the TLS, H2, QUIC transport, and H3 setup fields are the intended
 comparison surface.
 
 ## Capture Chrome
+
+Chrome 157.0.8103.39 on Windows was captured on 2026-11-05 against Cloudflare
+and example.com. Stable fresh TLS/H2/QUIC fields and H3 SETTINGS match 156;
+Cloudflare H2/H3 returned HTTP 200. Navigation headers use `Chrome/157.0.0.0`
+and `"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"`.
+Timing, loss, STOP, resumption and response edge-case policies inherit 156.
 
 H2:
 

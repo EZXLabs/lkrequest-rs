@@ -242,6 +242,42 @@ quic_transport = "verified"
 h3_settings = "verified"
 
 [[preset]]
+name = "chrome_156"
+browser_version = "156.0.8078.48"
+platform = "Windows"
+captured_at = "2026-10-21"
+evidence = ["CHANGELOG.md", "lktls/profiles/chrome_156.json", "lkrequest/tests/fixtures/fingerprints/chrome_156_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_156_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_156_quic.json", "lkrequest/tests/fixtures/fingerprints/chrome_156_quic_tls_fresh.json"]
+notes = ["Independent passive Cloudflare and example.com captures establish fresh TCP TLS/H2 fields; TShark and lkprofile agree on parsed ClientHello fields.", "Public QUIC captures establish classic signatures, 28 trust anchors, stable transport values and varying Initial CRYPTO/PING/PADDING layouts matching Chrome 155.", "Decrypted H3 SETTINGS 1=65536, 6=262144, 7=100, 51=1, navigation u=0, i, favicon u=1, i and HTTP 200 responses were directly observed.", "Timing, loss, STOP, resumption and response edge-case policies inherit Chrome 155 and were not independently revalidated for Chrome 156. ECH inner policy and full randomization distributions remain unproven. Application header values remain caller supplied; the default stays Chrome 155."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "verified"
+h3_settings = "verified"
+
+[[preset]]
+name = "chrome_157"
+browser_version = "157.0.8103.39"
+platform = "Windows"
+captured_at = "2026-11-05"
+evidence = ["CHANGELOG.md", "lktls/profiles/chrome_157.json", "lkrequest/tests/fixtures/fingerprints/chrome_157_tls_fresh.json", "lkrequest/tests/fixtures/fingerprints/chrome_157_h2.json", "lkrequest/tests/fixtures/fingerprints/chrome_157_quic.json", "lkrequest/tests/fixtures/fingerprints/chrome_157_quic_tls_fresh.json"]
+notes = ["Independent Cloudflare and example.com TCP captures and local profile collection confirm stable TLS/H2 fields matching Chrome 156 captures.", "Six raw TCP/QUIC samples preserve the sorted 28 trust-anchor IDs, matching Chrome 157.0.8103.39 EncodeTlsRequestedTrustAnchorIDList; the preset disables inherited ID shuffling while retaining extension permutation.", "Public QUIC captures confirm classic signatures, stable transport values and varying Initial layouts matching Chrome 156.", "Decrypted H3 SETTINGS 1=65536, 6=262144, 7=100, 51=1, navigation u=0, i, favicon u=1, i and HTTP 200 responses were observed.", "Timing, loss, STOP, resumption and response edge-case policies inherit Chrome 156. ECH inner policy and full randomization distributions remain unproven. Header values remain caller supplied; the default stays Chrome 155."]
+[preset.support]
+rust = true
+ffi = true
+h3 = true
+[preset.layers]
+tcp_tls = "verified"
+h2 = "verified"
+quic_tls = "verified"
+quic_transport = "verified"
+h3_settings = "verified"
+
+[[preset]]
 name = "firefox_133"
 browser_version = "133"
 platform = "unspecified"

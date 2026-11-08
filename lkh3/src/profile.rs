@@ -1132,6 +1132,36 @@ pub fn chrome_155_quic() -> QuicProfile {
     profile
 }
 
+/// Chrome 156 SETTINGS and navigation/favicon priority updates captured on
+/// 2026-10-21. Response edge-case policies inherit Chrome 155's model.
+pub fn chrome_156_h3() -> H3Profile {
+    chrome_155_h3()
+}
+
+/// Chrome 156 fresh QUIC transport captured against public Cloudflare.
+/// Stable transport values and randomized Initial layouts match Chrome 155;
+/// timing, loss, STOP and resumption policies inherit its existing model.
+pub fn chrome_156_quic() -> QuicProfile {
+    let mut profile = chrome_155_quic();
+    profile.h3 = chrome_156_h3();
+    profile
+}
+
+/// Chrome 157 SETTINGS and navigation/favicon priority captured on 2026-11-05.
+/// Response edge-case policies inherit Chrome 156's model.
+pub fn chrome_157_h3() -> H3Profile {
+    chrome_156_h3()
+}
+
+/// Chrome 157 fresh QUIC transport captured against public Cloudflare.
+/// Stable values match Chrome 156; timing, loss, STOP and resumption policies
+/// inherit its existing model.
+pub fn chrome_157_quic() -> QuicProfile {
+    let mut profile = chrome_156_quic();
+    profile.h3 = chrome_157_h3();
+    profile
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![

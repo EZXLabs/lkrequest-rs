@@ -338,6 +338,18 @@ pub enum TlsError {
     #[error("certificate error: {0}")]
     CertificateError(String),
 
+    /// A well-formed chain could not reach a locally trusted issuer.
+    #[error("certificate error: certificate chain verification failed: {0}")]
+    UnknownIssuer(String),
+
+    /// Preserves peer negotiation hints when a transport handshake fails.
+    #[error("{source}")]
+    TrustAnchorFailure {
+        #[source]
+        source: Box<TlsError>,
+        info: Box<crate::trust_anchor::TrustAnchorInfo>,
+    },
+
     /// The server sent an unexpected or malformed message.
     #[error("unexpected message: {0}")]
     UnexpectedMessage(String),
@@ -379,13 +391,14 @@ impl TlsError {
     pub fn as_alert(&self) -> Option<&TlsAlert> {
         match self {
             TlsError::Alert(alert) | TlsError::LocalAlert { alert, .. } => Some(alert),
+            TlsError::TrustAnchorFailure { source, .. } => source.as_alert(),
             _ => None,
         }
     }
 
     /// Returns `true` if this error is a TLS alert.
     pub fn is_alert(&self) -> bool {
-        matches!(self, TlsError::Alert(_) | TlsError::LocalAlert { .. })
+        self.as_alert().is_some()
     }
 }
 

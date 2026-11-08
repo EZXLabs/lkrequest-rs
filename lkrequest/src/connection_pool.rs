@@ -196,7 +196,7 @@ pub(crate) enum AcquiredConnection {
     /// An HTTP/1.1 sender — exclusively borrowed from the pool.
     /// The `Arc<JoinHandle>` keeps the connection driver alive.
     H1 {
-        sender: hyper::client::conn::http1::SendRequest<WireBody>,
+        sender: crate::http1::Http1Sender<WireBody>,
         conn_task: Arc<tokio::task::JoinHandle<()>>,
         permit: ConnectionPermit,
     },
@@ -253,7 +253,7 @@ pub struct H3PoolEntry {
 
 enum H1Sender {
     Legacy(hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>),
-    Wire(hyper::client::conn::http1::SendRequest<WireBody>),
+    Wire(crate::http1::Http1Sender<WireBody>),
 }
 
 /// An HTTP/1.1 pool entry — holds an exclusive sender for keep-alive reuse.
@@ -817,7 +817,7 @@ impl ConnectionPool {
     pub(crate) fn return_h1_reserved(
         &mut self,
         key: ConnectionKey,
-        sender: hyper::client::conn::http1::SendRequest<WireBody>,
+        sender: crate::http1::Http1Sender<WireBody>,
         conn_task: Arc<tokio::task::JoinHandle<()>>,
         permit: ConnectionPermit,
     ) {
@@ -846,7 +846,7 @@ impl ConnectionPool {
     pub(crate) fn insert_h1_reserved(
         &mut self,
         key: ConnectionKey,
-        sender: hyper::client::conn::http1::SendRequest<WireBody>,
+        sender: crate::http1::Http1Sender<WireBody>,
         conn_task: tokio::task::JoinHandle<()>,
         permit: ConnectionPermit,
     ) {
@@ -1115,7 +1115,7 @@ mod tests {
         let key = test_key("example.test");
         let (h1, h1_driver, h1_server) = local_h1::<WireBody>().await;
         let permit = pool.try_reserve_connection().unwrap();
-        pool.return_h1_reserved(key.clone(), h1, Arc::new(h1_driver), permit);
+        pool.return_h1_reserved(key.clone(), h1.into(), Arc::new(h1_driver), permit);
         let (old_io, _old_peer) = tokio::io::duplex(4096);
         let (old_sender, old_driver) = lkh2::spawn_driver(old_io, &lkh2::profile::chrome_155_h2())
             .await
@@ -1217,7 +1217,7 @@ mod tests {
             pool.insert_h1(key.clone(), sender, driver);
             let (wire_sender, wire_driver, wire_server) = local_h1::<WireBody>().await;
             let permit = pool.try_reserve_connection().unwrap();
-            pool.insert_h1_reserved(key.clone(), wire_sender, wire_driver, permit);
+            pool.insert_h1_reserved(key.clone(), wire_sender.into(), wire_driver, permit);
             assert_eq!(pool.stats().total, 2);
             assert_eq!(pool.stats().h1_connections, 2);
             assert!(pool.is_at_capacity());

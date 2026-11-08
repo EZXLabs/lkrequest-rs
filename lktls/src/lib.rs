@@ -54,4 +54,5 @@ pub mod handshake;
 pub mod profile;
 pub mod record;
 pub mod session_store;
+pub mod trust_anchor;
 pub mod verify;

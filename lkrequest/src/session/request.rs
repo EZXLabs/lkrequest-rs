@@ -1047,13 +1047,16 @@ impl RequestBuilder {
             // Opt-in path: wrap execution in the diagnostics task-local scope so
             // the phase recorders populate, then attach the snapshot. Only paid
             // when explicitly enabled.
-            let (r, diag) = crate::diagnostics::capture_request_diagnostics(self.send_impl()).await;
+            let (r, diag) = crate::diagnostics::capture_request_diagnostics(
+                crate::trust_anchor::scope(self.send_impl()),
+            )
+            .await;
             r.map(|mut resp| {
                 resp.set_diagnostics(diag);
                 resp
             })
         } else {
-            self.send_impl().await
+            crate::trust_anchor::scope(self.send_impl()).await
         };
         #[cfg(feature = "telemetry")]
         crate::telemetry::counters().record_request(result.is_err());
@@ -1351,13 +1354,13 @@ impl RequestBuilder {
     pub async fn send_streaming(self) -> Result<StreamingResponse> {
         #[cfg(feature = "telemetry")]
         {
-            let result = self.send_streaming_impl().await;
+            let result = crate::trust_anchor::scope(self.send_streaming_impl()).await;
             crate::telemetry::counters().record_request(result.is_err());
             result
         }
         #[cfg(not(feature = "telemetry"))]
         {
-            self.send_streaming_impl().await
+            crate::trust_anchor::scope(self.send_streaming_impl()).await
         }
     }
 

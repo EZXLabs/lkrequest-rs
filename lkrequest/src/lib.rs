@@ -114,6 +114,7 @@ pub mod dns;
 pub mod error;
 pub mod h2;
 pub mod hsts;
+mod http1;
 pub mod middleware;
 pub mod multipart;
 pub mod network_partition;
@@ -130,6 +131,11 @@ pub mod tcp_fingerprint;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod tls;
+mod trust_anchor;
+pub use lktls::trust_anchor::{
+    TrustAnchorAdvertisement, TrustAnchorBinding, TrustAnchorId, TrustAnchorInfo,
+    TrustAnchorPolicy, TrustAnchorRecovery,
+};
 pub mod ws;
 
 // Re-exports for convenience

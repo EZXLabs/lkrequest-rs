@@ -44,7 +44,7 @@ pub(crate) async fn ws_upgrade_h1<S>(
     authority: &str,
     path: &str,
     builder: &WsBuilder,
-    default_headers: &http::HeaderMap,
+    client: &crate::Client,
 ) -> Result<WsConnection<TokioIo<hyper::upgrade::Upgraded>>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -79,7 +79,7 @@ where
         .map_err(|e| Error::Http(format!("Failed to build WS upgrade request: {e}")))?;
 
     // Merge default headers (don't overwrite WS-specific ones)
-    for (name, value) in default_headers.iter() {
+    for (name, value) in client.default_headers().iter() {
         if !req.headers().contains_key(name) {
             req.headers_mut().insert(name.clone(), value.clone());
         }
@@ -92,10 +92,7 @@ where
 
     // Perform the HTTP/1.1 handshake using hyper
     let io = TokioIo::new(tls_stream);
-    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        .title_case_headers(true)
-        .preserve_header_case(true)
-        .handshake(io)
+    let (mut sender, conn) = crate::http1::handshake(client, io)
         .await
         .map_err(|e| Error::Http(format!("H1 handshake for WS upgrade failed: {e}")))?;
 
