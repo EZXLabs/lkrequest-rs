@@ -5,6 +5,17 @@
 
 use super::Extension;
 
+pub(super) fn validate_payload(data: &[u8]) -> crate::error::Result<()> {
+    super::registry::require_empty(data)
+}
+
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    validate_payload(data)?;
+    Ok(super::tls12::ServerValue::ExtendedMasterSecret)
+}
+
 /// Extended Master Secret extension.
 ///
 /// When present, the master secret is derived using the session hash

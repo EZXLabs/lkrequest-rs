@@ -57,12 +57,25 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
 ```bash
 mdbook build
-mdbook test
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo test --doc --workspace --all-features
 ```
 
+`cargo test --doc --workspace` 验证 crate 的 rustdoc，不会自动测试 `docs/` 中的代码。
+`mdbook test` 直接调用 rustdoc，也不会自动构建或链接本工作区依赖；缺少依赖时会报
+`unresolved import lkrequest`，这不构成示例已通过验证。
+
+引用 `lkrequest`、`tokio` 等 crate 的指南，应额外放入临时 Cargo 文档测试工程验证。
+将工程放在 `target/` 下，以 path dependency 指向当前 `lkrequest`，启用示例需要的
+feature，并通过 `#[doc = include_str!("...")]` 将原始 Markdown 挂到测试工程的模块上。
+执行该工程的 `cargo test --doc --manifest-path ...`，使 Cargo 提供完整依赖和链接参数。
+直接引用原文可避免验证副本与页面漂移；临时工程和产物不提交。
+
 仅包含示意性、不应执行的 Rust 片段要使用 `rust,ignore`；能够编译但不能在测试中联网运行的片段使用 `rust,no_run`。不要通过关闭全局测试来掩盖单个示例的问题。
+
+构建后还应检查生成 HTML 的本地链接与 heading anchors。正文链接到目录首页时使用
+`guides/`、`requests/` 等目录路径；`SUMMARY.md` 仍使用真实的 `README.md` 源路径。
+这样可以同时适配源码浏览和 mdBook 将 README 输出为 `index.html` 的行为。
 
 ## 内容边界
 

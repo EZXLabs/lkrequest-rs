@@ -18,6 +18,22 @@ pub struct FfiError {
 }
 
 impl FfiError {
+    pub(crate) fn from_preset(error: lkrequest::preset::PresetError) -> Self {
+        let mut result = match error.code {
+            lkrequest::preset::PresetErrorCode::ResourceLimit => {
+                Self::resource_limit_exceeded(error.to_string())
+            }
+            lkrequest::preset::PresetErrorCode::Io => {
+                Self::new(lk_error_code_t::LK_ERR_IO, error.to_string())
+            }
+            _ => Self::invalid_config(error.to_string()),
+        };
+        result.diagnostics = Some(Box::new(FfiDiagnostics {
+            preset_error: Some(Box::new(error)),
+            ..Default::default()
+        }));
+        result
+    }
     pub fn new(code: lk_error_code_t, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -58,6 +74,7 @@ impl FfiError {
         let phase = map_phase(err.phase());
         let http_status = err.status().map_or(-1, |status| i32::from(status.as_u16()));
         let code = match err.unwrapped() {
+            _ if err.as_tls_alert().is_some() => lk_error_code_t::LK_ERR_TLS,
             lkrequest::error::Error::Tls(_) => lk_error_code_t::LK_ERR_TLS,
             lkrequest::error::Error::Http(_) => lk_error_code_t::LK_ERR_HTTP,
             lkrequest::error::Error::Body(_) => lk_error_code_t::LK_ERR_DECOMPRESSION_FAILED,
@@ -83,7 +100,8 @@ impl FfiError {
             lkrequest::error::Error::Pool(_) => lk_error_code_t::LK_ERR_POOL,
             lkrequest::error::Error::InvalidConfig(_) => lk_error_code_t::LK_ERR_INVALID_CONFIG,
             lkrequest::error::Error::UrlParse(_) => lk_error_code_t::LK_ERR_URL_PARSE,
-            lkrequest::error::Error::ResourceLimitExceeded(_) => {
+            lkrequest::error::Error::ResourceLimitExceeded(_)
+            | lkrequest::error::Error::ConnectAttemptDenied(_) => {
                 lk_error_code_t::LK_ERR_RESOURCE_LIMIT_EXCEEDED
             }
             lkrequest::error::Error::Status { .. } => lk_error_code_t::LK_ERR_STATUS,
@@ -135,6 +153,7 @@ pub(crate) unsafe fn write_error_out(out_err: *mut *mut lk_error_t, error: FfiEr
             .map(|value| *value)
             .unwrap_or_default();
         *out_err = box_into_handle::<ErrorHandle, lk_error_t>(ErrorHandle {
+            observer: None,
             error,
             diagnostics,
             diagnostics_json: std::sync::OnceLock::new(),
@@ -144,6 +163,7 @@ pub(crate) unsafe fn write_error_out(out_err: *mut *mut lk_error_t, error: FfiEr
 
 pub(crate) fn make_error_handle(error: FfiError, diagnostics: FfiDiagnostics) -> ErrorHandle {
     ErrorHandle {
+        observer: None,
         error,
         diagnostics,
         diagnostics_json: std::sync::OnceLock::new(),
@@ -230,6 +250,27 @@ pub extern "C" fn lk_error_free(err: *mut lk_error_t) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_handshake_alert_retains_tls_code_and_request_phase() {
+        use lkrequest::lktls;
+        let source = lktls::error::TlsError::Alert(lktls::error::TlsAlert {
+            level: lktls::error::AlertLevel::Fatal,
+            description: lktls::error::AlertDescription::CertificateRequired,
+        });
+        let error =
+            lkrequest::error::Error::Connection(Box::new(lkrequest::error::ConnectionError {
+                phase: lkrequest::ConnectionPhase::HttpRequest,
+                message: source.to_string(),
+                source: Some(Box::new(source)),
+            }));
+        let ffi = super::FfiError::from_lkrequest(error);
+        assert_eq!(ffi.code, lk_error_code_t::LK_ERR_TLS);
+        assert_eq!(ffi.phase, lk_phase_t::LK_PHASE_HTTP_REQUEST);
+        assert!(!ffi.retryable);
+        assert!(String::from_utf8(ffi.message)
+            .unwrap()
+            .contains("certificate_required (116)"));
+    }
     use super::*;
 
     #[test]

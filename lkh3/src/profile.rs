@@ -1162,6 +1162,20 @@ pub fn chrome_157_quic() -> QuicProfile {
     profile
 }
 
+/// Chrome 158 SETTINGS and navigation/favicon priority captured on 2026-11-18.
+/// Response edge-case policies inherit Chrome 157's model.
+pub fn chrome_158_h3() -> H3Profile {
+    chrome_157_h3()
+}
+
+/// Chrome 158 fresh public QUIC transport. Stable values match Chrome 157;
+/// timing, loss, STOP and resumption policies retain its existing model.
+pub fn chrome_158_quic() -> QuicProfile {
+    let mut profile = chrome_157_quic();
+    profile.h3 = chrome_158_h3();
+    profile
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![

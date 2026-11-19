@@ -340,9 +340,8 @@ unsafe fn new_client_and_session() -> (*mut lk_client_t, *mut lk_session_t) {
 struct ProviderContext {
     urls: Vec<CString>,
     next: AtomicUsize,
+    destroy_count: Arc<AtomicUsize>,
 }
-
-static PROVIDER_DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn provider_next_proxy(
     context: *mut c_void,
@@ -362,17 +361,18 @@ unsafe extern "C" fn provider_len(context: *mut c_void) -> usize {
 }
 
 unsafe extern "C" fn provider_destroy(context: *mut c_void) {
-    PROVIDER_DESTROY_COUNT.fetch_add(1, Ordering::Relaxed);
-    drop(Box::from_raw(context.cast::<ProviderContext>()));
+    let context = Box::from_raw(context.cast::<ProviderContext>());
+    context.destroy_count.fetch_add(1, Ordering::Relaxed);
 }
 
-fn static_provider() -> lk_proxy_provider_t {
+fn static_provider(destroy_count: Arc<AtomicUsize>) -> lk_proxy_provider_t {
     let ctx = Box::new(ProviderContext {
         urls: vec![
             cstring("http://user:pass@proxy-a.local:8080"),
             cstring("socks5h://proxy-b.local:1080"),
         ],
         next: AtomicUsize::new(0),
+        destroy_count,
     });
     lk_proxy_provider_t {
         context: Box::into_raw(ctx).cast::<c_void>(),
@@ -984,8 +984,6 @@ fn proxy_and_session_pool_extensions_work() -> usize {
     let server = TestServer::start();
 
     unsafe {
-        PROVIDER_DESTROY_COUNT.store(0, Ordering::Relaxed);
-
         let proxy_builder = lk_proxy_pool_builder_new();
         assert_eq!(
             lk_proxy_pool_builder_add_proxy(
@@ -1007,7 +1005,7 @@ fn proxy_and_session_pool_extensions_work() -> usize {
             lk_status_t::LK_OK
         );
         assert_eq!(
-            lk_proxy_pool_builder_set_provider(proxy_builder, static_provider()),
+            lk_proxy_pool_builder_set_provider(proxy_builder, static_provider(Arc::default())),
             lk_status_t::LK_OK
         );
 
@@ -1070,12 +1068,16 @@ fn proxy_and_session_pool_extensions_work() -> usize {
         lk_proxy_pool_free(proxy_pool);
 
         let provider_builder = lk_proxy_pool_builder_new();
+        let builder_provider_drops = Arc::new(AtomicUsize::new(0));
         assert_eq!(
-            lk_proxy_pool_builder_set_provider(provider_builder, static_provider()),
+            lk_proxy_pool_builder_set_provider(
+                provider_builder,
+                static_provider(builder_provider_drops.clone())
+            ),
             lk_status_t::LK_OK
         );
         lk_proxy_pool_builder_free(provider_builder);
-        assert_eq!(PROVIDER_DESTROY_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(builder_provider_drops.load(Ordering::Relaxed), 1);
 
         let builder = lk_client_builder_new();
         assert_eq!(
@@ -1526,6 +1528,15 @@ fn chrome_157_preset_is_exposed_through_ffi() {
     let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     assert_eq!(
         browser_preset_ffi_extensions_work("chrome_157", "Chrome 157", true, 15_663_105),
+        3
+    );
+}
+
+#[test]
+fn chrome_158_preset_is_exposed_through_ffi() {
+    let _guard = V2_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    assert_eq!(
+        browser_preset_ffi_extensions_work("chrome_158", "Chrome 158", true, 15_663_105),
         3
     );
 }

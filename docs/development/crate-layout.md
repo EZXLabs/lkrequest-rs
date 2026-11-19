@@ -2,7 +2,7 @@
 
 lkrequest 将高层会话状态、协议实现和线缆指纹控制分层隔离。修改应落在能够完整表达需求的最高层；只有确实需要改变序列化字节或传输行为时，才进入底层协议 crate。
 
-本页面向贡献者，说明源码结构、设计不变量和修改归属。应用开发者应从[使用场景导航](../guides/README.md)开始；只需要判断 Client 与 Session 生命周期时，阅读[用户对象模型](../guides/object-model.md)。
+本页面向贡献者，说明源码结构、设计不变量和修改归属。应用开发者应从[使用场景导航](../guides/)开始；只需要判断 Client 与 Session 生命周期时，阅读[用户对象模型](../guides/object-model.md)。
 
 ## Workspace 分层
 
@@ -44,13 +44,23 @@ lkrequest-ffi ──► lkrequest
 一次请求依次经过：
 
 1. request builder 组装 method、headers、body 和单次请求选项；
-2. middleware、retry 和 redirect 策略；
-3. transport 根据显式策略、Alt-Svc 与 QUIC 失败状态选择 H1/H2/H3；
-4. DNS、TCP/UDP、代理、TLS 和协议握手；
-5. connection pool 复用连接并执行 multiplexing；
-6. response 层处理 streaming、解压和资源释放。
+2. 解析 Client/Session/Request 的有效次数上限，建立请求执行生命周期与总 deadline；
+3. middleware、retry 和 redirect 策略决定候选行为，恢复路径申请本次请求的授权；
+4. transport 根据显式策略、Alt-Svc 与 QUIC 失败状态选择 H1/H2/H3，查询连接池或等待共享建链；
+5. 必要时执行 DNS、TCP/UDP、代理、TLS 和协议握手，在实际启动后端连接时计数；
+6. 在协议提交边界提交 HTTP permit，再由 response 层处理 body、解压和资源释放。
 
 状态应由拥有其生命周期的层维护。例如 Cookie 与 HSTS 属于 Session，TLS 扩展顺序属于 `lktls` profile，H2 SETTINGS 属于 `lkh2` profile，QUIC transport parameters 属于 H3/QUIC profile。
+
+### 执行授权与共享建链
+
+`session::execution` 为每次公开操作保存 deadline、停止状态、HTTP 提交与建链计数。根执行 guard 结束后，派生引用不能继续授权提交；只读 observer 不拥有发送权限。普通响应完成时结束该操作，流式响应在 headers 发布时结束 HTTP 提交统计，后续 body 读取继续使用原 timeout。
+
+`session::recovery` 检查具体的恢复条件、方法幂等性和 body 可重放性，再向当前执行申请授权。协议选择、应用 `RetryPolicy` 与 TLS/H2/H3 profile 仍由各自模块解释；执行层不把它们合并成一个全局策略调度器。
+
+`session::acquisition` 按 Session 和连接键协调正在进行的建链。实际启动者使用自己的建链额度，等待者没有共享其 HTTP 权限或总 deadline。启动者退出后，等待者可以重新竞争启动资格；取消等待者不应取消启动者。已有物理连接的并发占用仍由 `connection_pool` 管理，与每次操作累计启动多少次连接是两项独立约束。
+
+TCP/QUIC 竞速可产生多个连接尝试，但每个 HTTP attempt 只允许一次提交。复用已入池的 H2 连接与新建连接一样，必须在消费上传源和提交前检查竞速发送门控。连接计数、恢复获准数和 HTTP 提交数分开维护，不能互相推导。
 
 ## 高层模块职责
 
@@ -58,6 +68,10 @@ lkrequest-ffi ──► lkrequest
 |---|---|---|
 | `client` / `preset` | 共享配置、跨协议 preset、默认策略 | 每个身份的 Cookie 或连接 |
 | `session` | 请求 pipeline、身份状态和 protocol selection | TLS/H2/H3 字节序列化细节 |
+| `attempts` / `attempt_observer` | 公开次数配置、有效值与只读摘要 | Session 物理连接占用 |
+| `session::execution` | 单次操作的生命周期、deadline、授权与记账 | 浏览器 profile 或协议选择决策 |
+| `session::recovery` | 恢复条件、重放安全与应用重试衔接 | 创建独立于当前请求的重发额度 |
+| `session::acquisition` / `tcp_acquisition` | Session 内共享建链、启动者选举与就绪连接获取 | 跨请求共享 HTTP 提交权限 |
 | `connection_pool` | 按 origin、proxy 和协议复用物理连接 | 代理轮换或 Session 生命周期 |
 | `proxy` | HTTP CONNECT、SOCKS5、chain 和 UDP relay | 业务 retry 决策 |
 | `proxy_pool` / `session_pool` | 并发 permit、rotation、cooldown 和 guard | 单连接 stream flow control |
@@ -71,6 +85,8 @@ lkrequest-ffi ──► lkrequest
 | 需求 | 首选位置 |
 |---|---|
 | 新增用户 builder/API | `lkrequest` 的 Client、Session 或 RequestBuilder |
+| 新增 HTTP 恢复路径 | 在 `session::recovery` 表达条件，复用 `session::execution` 的授权与提交计数 |
+| 新增建链后端或候选连接 | 通过当前 `ConnectionExecution` 在实际启动边界申请额度，维持共享建链与物理 permit 语义 |
 | 新增跨协议 browser preset | `lkrequest/src/preset.rs`，引用各协议 profile |
 | ClientHello 字段或顺序 | `lktls` 和对应 capture profile |
 | H2 SETTINGS/HPACK/frame 行为 | `lkh2` |

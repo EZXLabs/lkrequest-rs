@@ -1210,6 +1210,7 @@ impl std::fmt::Debug for Response {
 /// Internal enum wrapping different body stream types.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum BodyStream {
+    Closed,
     /// HTTP/2 body stream.
     H2(lkh2::H2RecvStream),
     /// HTTP/1.1 body chunks forwarded from a bridge task via mpsc channel.
@@ -1315,6 +1316,10 @@ pub struct StreamingResponse {
     body_received: usize,
     /// Skip automatic decompression in `bytes()` / `chunk_decoded()`.
     no_decompress: bool,
+    timeout: crate::timeout::RequestTimeout,
+    read_idle_timeout: Option<std::time::Duration>,
+    read_idle_deadline: Option<tokio::time::Instant>,
+    timed_out: bool,
 }
 
 impl StreamingResponse {
@@ -1329,6 +1334,10 @@ impl StreamingResponse {
             max_body_size: usize::MAX,
             body_received: 0,
             no_decompress: false,
+            timeout: crate::timeout::RequestTimeout::default(),
+            read_idle_timeout: None,
+            read_idle_deadline: None,
+            timed_out: false,
         }
     }
 
@@ -1342,6 +1351,16 @@ impl StreamingResponse {
         self
     }
 
+    pub(crate) fn with_timeouts(
+        mut self,
+        timeout: crate::timeout::RequestTimeout,
+        read_idle_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        self.timeout = timeout;
+        self.read_idle_timeout = read_idle_timeout;
+        self
+    }
+
     /// Returns the HTTP status code.
     pub fn status(&self) -> StatusCode {
         self.status
@@ -1350,6 +1369,22 @@ impl StreamingResponse {
     /// Returns a reference to the response headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    fn check_timeout(&mut self) -> crate::error::Result<()> {
+        if self.timed_out {
+            return Err(crate::error::Error::timeout(
+                "response body read previously timed out",
+                Some(crate::error::ConnectionPhase::HttpRequest),
+                None,
+            ));
+        }
+        if let Err(error) = self.timeout.check() {
+            self.body_stream = BodyStream::Closed;
+            self.timed_out = true;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Read the next chunk of the response body.
@@ -1361,7 +1396,55 @@ impl StreamingResponse {
     /// applied in streaming mode.  Use [`bytes()`](Self::bytes) or
     /// [`text()`](Self::text) for decompressed full-body reads.
     pub async fn chunk(&mut self) -> crate::error::Result<Option<bytes::Bytes>> {
+        self.check_timeout()?;
+        if self.read_idle_deadline.is_none() {
+            self.read_idle_deadline = self
+                .read_idle_timeout
+                .and_then(|duration| tokio::time::Instant::now().checked_add(duration));
+        }
+        let total = self.timeout.deadline();
+        let deadline = match (total, self.read_idle_deadline) {
+            (Some(total), Some(idle)) => Some(total.min(idle)),
+            (total, idle) => total.or(idle),
+        };
+        let result = match deadline {
+            Some(deadline) => {
+                if tokio::time::Instant::now() >= deadline {
+                    None
+                } else {
+                    tokio::time::timeout_at(deadline, self.chunk_inner())
+                        .await
+                        .ok()
+                }
+            }
+            None => Some(self.chunk_inner().await),
+        };
+        let result = match result {
+            Some(result) => result,
+            None => {
+                self.body_stream = BodyStream::Closed;
+                self.timed_out = true;
+                return Err(if total == deadline {
+                    self.timeout.error()
+                } else {
+                    crate::error::Error::timeout(
+                        "response body read exceeded idle timeout",
+                        Some(crate::error::ConnectionPhase::HttpRequest),
+                        self.read_idle_timeout,
+                    )
+                });
+            }
+        };
+        self.check_timeout()?;
+        if matches!(&result, Ok(None)) || matches!(&result, Ok(Some(data)) if !data.is_empty()) {
+            self.read_idle_deadline = None;
+        }
+        result
+    }
+
+    async fn chunk_inner(&mut self) -> crate::error::Result<Option<bytes::Bytes>> {
         let result = match &mut self.body_stream {
+            BodyStream::Closed => Ok(None),
             BodyStream::H2(recv_stream) => match recv_stream.data().await {
                 Some(Ok(chunk)) => {
                     let len = chunk.len();
@@ -1413,7 +1496,9 @@ impl StreamingResponse {
         if self.no_decompress {
             Ok(raw)
         } else {
-            decompress_body(&self.headers, raw)
+            let result = decompress_body(&self.headers, raw);
+            self.check_timeout()?;
+            result
         }
     }
 
@@ -1442,6 +1527,7 @@ impl StreamingResponse {
     /// For uncompressed responses (`identity` or no `content-encoding`),
     /// this behaves identically to [`chunk()`](Self::chunk).
     pub async fn chunk_decoded(&mut self) -> crate::error::Result<Option<Bytes>> {
+        self.check_timeout()?;
         if self.no_decompress {
             return self.chunk().await;
         }
@@ -1508,6 +1594,7 @@ impl StreamingResponse {
                     }
 
                     if !decoded.is_empty() {
+                        self.check_timeout()?;
                         return Ok(Some(decoded));
                     }
                     // Decoder buffering internally (e.g. headers); keep reading.
@@ -1537,6 +1624,7 @@ impl StreamingResponse {
                         )));
                     }
 
+                    self.check_timeout()?;
                     if remaining.is_empty() {
                         return Ok(None);
                     }

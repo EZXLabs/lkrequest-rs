@@ -214,6 +214,7 @@ pub extern "C" fn lk_socks5_udp_probe_async(
 
         let op_shared = Arc::new(OpShared::default());
         let op_handle = OpHandle {
+            observer: None,
             client: None,
             shared: Arc::clone(&op_shared),
             counted: false,

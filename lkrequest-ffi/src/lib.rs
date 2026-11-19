@@ -7,6 +7,10 @@
 //! in `handles_state`; callers hold handles and must pair every create with the
 //! matching free.
 //!
+//! Exported Rust handle/state types are implementation details, not a stable
+//! Rust API. Rust applications should use the `lkrequest` crate; bindings should
+//! use the documented C ABI and opaque handles.
+//!
 //! Optional features mirror the core crate: `quic-h3` (the HTTP/3 surface) and
 //! `debug-registry` (handle-leak diagnostics).
 //!
@@ -18,6 +22,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod abi;
+mod attempts;
 mod client;
 mod conv;
 mod diagnostics;
@@ -44,6 +49,7 @@ mod telemetry;
 mod types;
 
 pub use abi::*;
+pub use attempts::*;
 pub use client::*;
 pub use error::*;
 pub use handles::*;

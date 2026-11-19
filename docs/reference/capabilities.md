@@ -2,7 +2,11 @@
 
 本页描述当前 workspace 的用户可见能力。精确类型和参数以 rustdoc 为准。
 
+各能力的 Rust/C 配置入口、作用层级和使用指南见[功能与配置入口](configuration.md)。
+
 ## Cargo features
+
+`lkrequest` 的默认 feature 集为空。HTTP/1.1、HTTP/2 和请求次数上限/摘要始终可用；`default-features = false` 不会移除这些能力。0.2.x 的旧 H2 feature 已删除，升级步骤见[迁移指南](../guides/upgrading.md)。
 
 | Feature | 默认 | 类型 | 影响 |
 |---|---:|---|---|
@@ -12,11 +16,10 @@
 | `telemetry` | 否 | operations | 启用连接、请求和带宽计数 |
 | `synthetic-fp` | 否 | research | 启用 synthetic recombine/full randomization；不代表真实浏览器 |
 
-### 兼容与开发 feature
+### 开发 feature
 
 | Feature | 类型 | 说明 |
 |---|---|---|
-| `h2-native` | deprecated compatibility | `0.2.2` 为避免旧 Cargo 配置解析失败而保留的 no-op alias；HTTP/2 始终使用 `lkh2`。将在 `0.3.0` 从 `lkrequest` 和 `lkh2` 完全删除，现在应从用户的 feature 列表中移除 |
 | `network-e2e` | test-only | 编译公网集成测试辅助面，不增加生产能力 |
 | `bench-internals` | internal | benchmark 诊断入口，不属于稳定用户 API |
 
@@ -25,13 +28,13 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | HTTP/1.1 | 支持 | 可强制 H1-only |
-| HTTP/2 | 支持、默认编译 | 原生 `lkh2`，支持 SETTINGS/header/priority/HPACK 指纹控制 |
+| HTTP/2 | 支持、始终编译 | 原生 `lkh2`，支持 SETTINGS/header/priority/HPACK 指纹控制 |
 | HTTP/3 | 可选 | 需要 `quic-h3`，支持 strict、fallback 和自动发现策略 |
 | TLS 1.2 / 1.3 | 支持 | 具体版本、cipher 和 extension 由 profile 决定 |
 | ECH | 支持 | 可从 HTTPS DNS record 获取配置；rejection 不降级为泄漏真实名称的明文路径 |
 | ALPS / cert compression | profile-dependent | 由目标 preset 决定 |
 | TLS key log | 支持 | 用于受控诊断，产物高度敏感 |
-| mTLS server request | 协议支持 | 用户侧客户端证书配置能力需按具体 API/FFI surface 验证，不能假设自动提供客户端证书 |
+| mTLS 客户端身份 | 高层未提供 | 当前 ClientBuilder 和 C ABI 没有客户端证书/私钥配置入口；添加 CA 仅影响服务端证书信任 |
 
 ## 请求与响应
 
@@ -44,9 +47,14 @@
 - Brotli、gzip、deflate、zstd 解压；
 - redirect history、status error、structured diagnostics；
 - middleware、retry policy、idempotency 和资源限制；
+- Client/Session/Request 分层的可选 `AttemptLimits`，独立限制额外 HTTP 提交与实际建链次数；
+- 请求尝试摘要、取消 observer，以及 C ABI 的配置、能力查询与摘要 JSON；
+- TLS/QUIC session cache 启停、可配置 TTL 和恢复默认期限，提供 Rust/C API；
 - WebSocket、preconnect 和 prefetch。
 
 Rust API 支持通过 `body_reader(reader, length)` 和 `body_stream(stream, length)` 流式上传；同步接口支持 `std::io::Read`。覆盖 H1/H2，以及启用 `quic-h3` 后的 H3。multipart、JSON、form、`body()` 和 C ABI 上传接口仍使用内存 body。参见[流式上传](../guides/requests/streaming-upload.md)。
+
+额外 HTTP/建链上限默认不启用；连接关闭重发和 H2-to-H1 回退默认关闭。配置上限不等于授权重试，也不改变 0-RTT 的幂等性要求。参见[次数上限](../guides/client-session.md#请求重发上限与统计)、[超时与显式重试](../guides/networking/timeouts.md)和[请求诊断](../guides/advanced/observability.md)。
 
 ## 网络与代理
 

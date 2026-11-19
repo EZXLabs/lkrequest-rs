@@ -136,49 +136,7 @@ pub(crate) enum ProtocolDecision {
 }
 
 #[cfg(feature = "quic-h3")]
-#[derive(Clone)]
-pub(crate) struct RaceSendGate {
-    selected: tokio::sync::watch::Sender<Option<ProtocolDecision>>,
-    branch: ProtocolDecision,
-}
-
-#[cfg(feature = "quic-h3")]
-impl RaceSendGate {
-    pub(crate) fn pair() -> (
-        Self,
-        Self,
-        tokio::sync::watch::Receiver<Option<ProtocolDecision>>,
-    ) {
-        let (selected, receiver) = tokio::sync::watch::channel(None);
-        (
-            Self {
-                selected: selected.clone(),
-                branch: ProtocolDecision::Quic,
-            },
-            Self {
-                selected,
-                branch: ProtocolDecision::Tcp,
-            },
-            receiver,
-        )
-    }
-
-    /// Claim the request after acquisition, before writing any HTTP headers/body.
-    pub(crate) async fn acquired(&self) {
-        self.selected.send_if_modified(|selected| {
-            if selected.is_none() {
-                *selected = Some(self.branch);
-                true
-            } else {
-                false
-            }
-        });
-        let won = *self.selected.borrow() == Some(self.branch);
-        if !won {
-            std::future::pending::<()>().await;
-        }
-    }
-}
+pub(crate) use super::recovery::RaceSendGate;
 
 impl ProtocolDecision {
     pub(crate) fn as_str(self) -> &'static str {
@@ -242,6 +200,14 @@ pub(crate) fn decide_protocol(
         return ProtocolDecision::Tcp;
     }
 
+    if let AcquisitionPolicy::Race(race) = &policy.acquisition {
+        match (race.enable_tcp, race.enable_quic) {
+            (true, false) => return ProtocolDecision::Tcp,
+            (false, true) => return ProtocolDecision::Quic,
+            _ => {}
+        }
+    }
+
     match policy.intent {
         HttpIntent::AcquireH3WhenViable | HttpIntent::PreferH3 => match &policy.acquisition {
             AcquisitionPolicy::Race(race) if race.enable_quic && race.enable_tcp => {
@@ -301,6 +267,12 @@ pub(crate) fn is_connection_limit_error(error: &Error) -> bool {
 
 #[cfg(feature = "quic-h3")]
 pub(crate) fn protocol_race_error(tcp_error: Error, quic_error: Error) -> Error {
+    if tcp_error.is_connect_attempt_denied() {
+        return tcp_error.with_connect_prior(quic_error);
+    }
+    if quic_error.is_connect_attempt_denied() {
+        return quic_error.with_connect_prior(tcp_error);
+    }
     Error::connection(
         crate::error::ConnectionPhase::QuicFallback,
         format!("protocol race failed (tcp: {tcp_error}; quic: {quic_error})"),
@@ -494,10 +466,7 @@ pub(crate) fn build_connect_config(
     http_version_pref: PreferredHttpVersion,
     scheme: Scheme,
 ) -> crate::connect::ConnectConfig {
-    let mut tls_profile = client.tls_profile().clone();
-    if http_version_pref == PreferredHttpVersion::Http1Only {
-        tls_profile.alpn_protocols = alpn_for_h1_only(&tls_profile.alpn_protocols);
-    }
+    let tls_config = client.tcp_tls_config(http_version_pref == PreferredHttpVersion::Http1Only);
 
     // ALPS: real Chrome advertises `application_settings: h2` in the ClientHello
     // but sends an EMPTY client-settings payload in its Client EncryptedExtensions
@@ -505,13 +474,16 @@ pub(crate) fn build_connect_config(
     // ALPS support; never for the H1-only path. `Some(empty)` = advertise + empty.
     let alps_payload = if http_version_pref == PreferredHttpVersion::Http1Only {
         None
-    } else if tls_profile.alps_protocols.is_some() {
+    } else if tls_config.profile().alps_protocols.is_some() {
         Some(Vec::new())
     } else {
         None
     };
 
-    let config = crate::connect::ConnectConfig::https(tls_profile, alps_payload);
+    let mut config = crate::connect::ConnectConfig::https_template(tls_config, alps_payload);
+    if http_version_pref == PreferredHttpVersion::Http1Only {
+        config = config.require_profile_alpn();
+    }
     if scheme == Scheme::Http {
         config.into_http()
     } else {
@@ -524,9 +496,8 @@ pub(crate) fn build_h1_only_connect_config(
     client: &Client,
     scheme: Scheme,
 ) -> crate::connect::ConnectConfig {
-    let mut h1_profile = client.tls_profile().clone();
-    h1_profile.alpn_protocols = alpn_for_h1_only(&h1_profile.alpn_protocols);
-    let config = crate::connect::ConnectConfig::https(h1_profile, None);
+    let config = crate::connect::ConnectConfig::https_template(client.tcp_tls_config(true), None)
+        .require_profile_alpn();
     if scheme == Scheme::Http {
         config.into_http()
     } else {
@@ -624,16 +595,41 @@ pub(crate) async fn await_response_headers<T>(
     client: &Client,
     response: impl std::future::Future<Output = T>,
 ) -> Result<T> {
-    let timeout = client
-        .timeouts()
-        .ttfb_timeout_or(std::time::Duration::from_secs(30));
-    tokio::time::timeout(timeout, response).await.map_err(|_| {
-        Error::timeout(
-            format!("response headers exceeded TTFB timeout of {timeout:?}"),
-            Some(crate::error::ConnectionPhase::HttpRequest),
-            Some(timeout),
-        )
-    })
+    let timeout = client.timeouts().ttfb_timeout;
+    crate::timeout::optional(timeout, response)
+        .await
+        .map_err(|_| {
+            let timeout = timeout.expect("an elapsed timer has a configured duration");
+            Error::timeout(
+                format!("response headers exceeded TTFB timeout of {timeout:?}"),
+                Some(crate::error::ConnectionPhase::HttpRequest),
+                Some(timeout),
+            )
+        })
+}
+
+pub(crate) async fn await_body_read<T>(
+    client: &Client,
+    read: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    match client.timeouts().read_idle_timeout {
+        Some(timeout) => {
+            let timeout_error = || {
+                Error::timeout(
+                    "response body read exceeded idle timeout",
+                    Some(crate::error::ConnectionPhase::HttpRequest),
+                    Some(timeout),
+                )
+            };
+            if timeout.is_zero() {
+                return Err(timeout_error());
+            }
+            tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| timeout_error())
+        }
+        None => Ok(read.await),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,15 +686,20 @@ pub(crate) async fn establish_h2_with_first_request(
     conn_key: &ConnectionKey,
     first_request: http::Request<Option<bytes::Bytes>>,
     permit: ConnectionPermit,
+    http_permit: super::execution::HttpPermit,
 ) -> Result<(lkh2::driver::FirstRequestResponse, lkh2::H2ReadySender)> {
-    let mut h2_conn = crate::h2::connect_h2_with_config(
-        stream,
-        client.h2_profile(),
-        Some(first_request),
-        client.max_pending_h2_requests(),
-        client.h2_dispatch_batch_size(),
-    )
-    .await?;
+    let mut h2_conn = http_permit
+        .commit("h2")?
+        .submit(|| {
+            crate::h2::connect_h2_with_config(
+                stream,
+                client.h2_profile(),
+                Some(first_request),
+                client.max_pending_h2_requests(),
+                client.h2_dispatch_batch_size(),
+            )
+        })
+        .await?;
 
     let first_resp = h2_conn
         .take_first_response()
@@ -1869,9 +1870,12 @@ mod tests {
 
         let config =
             crate::connect::ConnectConfig::https(lktls::profile::presets::chrome_144(), None);
+        let (execution, _guard) = super::super::execution::RequestExecution::new(
+            crate::timeout::RequestTimeout::default(),
+        );
         // The handshake fails (the peer hung up); only the lookup count matters.
         let _ = session
-            .establish_connection("example.com", port, None, &config)
+            .establish_connection("example.com", port, None, &config, &execution.connection())
             .await;
         accept.abort();
 

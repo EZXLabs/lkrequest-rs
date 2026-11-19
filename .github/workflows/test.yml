@@ -24,6 +24,9 @@ jobs:
       - name: Cargo test (workspace, Tier 0 — no ignored tests)
         run: cargo test --workspace
 
+      - name: Quinn endpoint cleanup regressions
+        run: cargo test --manifest-path deps/quinn/Cargo.toml -p quinn -p quinn-proto --lib endpoint_cleanup
+
       - name: Remove standard test build artifacts
         run: cargo clean
 

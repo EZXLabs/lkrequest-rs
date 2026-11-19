@@ -95,7 +95,7 @@
 //! | [`middleware`] | Request/response interceptor chain (onion model) |
 //! | [`retry`] | Retry policies — exponential backoff, fixed interval |
 //! | [`multipart`] | Multipart/form-data body builder for file uploads |
-//! | [`ws`] | WebSocket support — HTTP/1.1 Upgrade (RFC 6455) + H2 Extended CONNECT (RFC 8441) |
+//! | [`ws`] | TLS WebSocket support via HTTP/1.1 Upgrade (RFC 6455), with opt-in permessage-deflate |
 //! | [`blocking`] | Synchronous (non-async) API wrapper (includes blocking WebSocket) |
 //! | [`dns`] | Pluggable DNS resolution — custom servers, DoH/DoT, HTTPS RR for ECH auto-config |
 //! | [`tcp_fingerprint`] | TCP-level fingerprint (JA4T) — window size, TCP options, MSS, window scale, TTL |
@@ -104,6 +104,8 @@
 #![allow(clippy::double_must_use)]
 
 pub mod alt_svc;
+mod attempt_observer;
+pub mod attempts;
 pub mod blocking;
 mod body;
 pub mod client;
@@ -130,6 +132,7 @@ pub mod session_pool;
 pub mod tcp_fingerprint;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+mod timeout;
 pub mod tls;
 mod trust_anchor;
 pub use lktls::trust_anchor::{
@@ -142,6 +145,11 @@ pub mod ws;
 pub use alt_svc::{
     should_skip_quic, AltSvcCache, AltSvcEntry, BrokenQuicConfig, BrokenQuicPolicy,
     BrokenQuicTracker, BrokenReason, Origin, Scheme as AltSvcScheme,
+};
+pub use attempt_observer::AttemptObserver;
+pub use attempts::{
+    AttemptDenialReason, AttemptLimitScope, AttemptLimits, AttemptOutcome, AttemptSummary,
+    EffectiveAttemptLimits,
 };
 pub use client::{Client, FallbackConfig, H2DataFramePolicy, ResourceLimits, TimeoutConfig};
 pub use connect::{EstablishedConnection, TransportStream};

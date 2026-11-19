@@ -60,25 +60,34 @@ let response = session
 
 首个请求要承担 DNS、TCP、TLS 和 ALPN 的全部耗时。已知接下来要访问哪些站点时可以提前预热：
 
-```rust,ignore
+```rust,no_run
+# async fn example(session: &lkrequest::Session) -> lkrequest::error::Result<()> {
 // 只建连接，不发请求
 session.preconnect("https://api.example.com").await?;
 
 // 并发预热多个目标，返回每个目标的结果
-for result in session.preconnect_many(&[
+let urls = [
     "https://api.example.com",
     "https://cdn.example.com",
-]).await {
-    if !result.success {
-        eprintln!("{} 预热失败，耗时 {:?}：{:?}", result.url, result.duration, result.error);
+];
+let results = session.preconnect_many(&urls).await;
+for (url, result) in urls.iter().zip(results) {
+    if let Err(error) = result {
+        eprintln!("{url} 预热失败：{error}");
     }
 }
+# Ok(())
+# }
 ```
 
 `preconnect` 只建立连接；`prefetch` 会发送真实的 HEAD 请求，因此会在服务端留下访问记录，
-也会触发风控计数。两者返回的 `PrefetchResult` 带 `url`、`success`、`duration` 和
-`error`，可用来判断某个目标是否值得继续。预热的连接进入 Session 的连接池，随后的请求
-直接复用。
+也会触发风控计数。`preconnect` 返回 `Result<()>`，`preconnect_many` 按输入顺序返回
+`Vec<Result<()>>`；`prefetch` 返回的 `PrefetchResult` 才带有 `url`、`success`、
+`duration` 和 `error`。预热的连接进入 Session 的连接池，随后的请求直接复用。
+
+`preconnect` 继承 Client/Session 的建链上限，`preconnect_many` 对每个 URL 独立计数；
+`prefetch` 的每个 HEAD 请求有自己的 HTTP 与建链计数。共享建链只在实际启动者一侧计数，
+等待者保留自己的 deadline，接手启动时再使用自己的额度。配置见[请求重发上限与统计](../client-session.md#请求重发上限与统计)。
 
 ## 重放边界
 
@@ -87,6 +96,8 @@ for result in session.preconnect_many(&[
 - 0-RTT 只应用于有可恢复 session 且被判定为 replay-safe 的请求；
 - `POST` 等非幂等请求应由调用方明确判断 idempotency；
 - streaming API 不执行普通请求的完整 redirect/retry pipeline。
+
+连接关闭重发与 H2-to-H1 回退默认关闭；显式开启也不会绕过上述限制。次数上限约束同一次请求内已获准的恢复，TCP/QUIC 竞速的落败候选不能再提交 HTTP。细节见[竞速、回退与次数上限](../protocols.md#竞速回退与次数上限)与[超时与显式重试](../networking/timeouts.md)。
 
 ## 排障顺序
 

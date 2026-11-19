@@ -477,10 +477,11 @@ pub struct SessionResumptionConfig {
     #[serde(default = "default_true")]
     pub tls13_psk: bool,
 
-    /// Whether to attempt TLS 1.2 session ticket resumption.
+    /// Whether to attempt TLS 1.2 ticket or session-ID resumption.
     ///
     /// When `true` (default), stored TLS 1.2 tickets are presented in the
-    /// `session_ticket` extension payload.
+    /// `session_ticket` extension payload when the profile advertises it.
+    /// Stored session IDs may be presented without adding that extension.
     #[serde(default = "default_true")]
     pub tls12_session_ticket: bool,
 

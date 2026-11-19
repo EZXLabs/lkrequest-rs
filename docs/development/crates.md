@@ -43,6 +43,23 @@ profile_collector / fpverify / pcap_diff ──► lkprofile and protocol crates
 
 ## `lkrequest`：高层客户端
 
+### DNS 安全补丁依赖
+
+`deps/hickory-{resolver,net,proto}` 固定来自 crates.io 0.26.3 的源码，
+通过显式 path 依赖串联，保证下游 Git/path 引用和 FFI 构建都包含安全补丁。
+上游 0.26.3 的 question-count 解析仍按报文声明预分配；本地修复将初始
+容量限制为 8，再随实际解析增长，不限制合法 DNS question 数量。
+来源、补丁和移除条件见 `deps/hickory-proto/LKREQUEST-PATCHES.md`。
+
+高级调用方为 `HickoryDns::with_config` / `try_with_config` / `from_resolver`
+构造参数时，请从 `lkrequest::dns::hickory` 导入类型。独立添加的 crates.io
+`hickory-resolver` 与本地补丁依赖具有不同的 Cargo 来源，类型不能直接混用。
+普通 `DnsConfig` 配置和 C ABI 不受此类型来源差异影响。
+
+crates.io 打包会移除本地 path，不能携带此补丁。因此当前 registry 发布
+任务会明确停止，直到改用包含修复的上游版本或已发布的补丁 crate。
+GitHub 源码和已编译 FFI 的交付方式不受此打包规则影响。
+
 面向最终应用的主要 crate，负责把协议能力组织成稳定的请求模型。
 
 主要功能：
@@ -71,6 +88,18 @@ Sans-I/O TLS 状态机，负责生成和处理 fingerprint-sensitive TLS 字节�
 - JSON browser profiles 与 profile synthesis；
 - 将网络 I/O 与 TLS 状态机分离，供 TCP 和 QUIC bridge 使用。
 
+需要重复创建连接时，用 `config::CompiledClientConfig` 校验并共享不可变 profile 输入，
+每次连接提供独立的 `ConnectionInputs`。`ClientHelloOverrides` 表达经校验的 ALPN/ALPS/TAI
+覆盖；随机数、临时密钥和选取的票据不缓存到 compiled config 中。TCP 的
+`connection::ClientConnection` 与 QUIC 的 `connection::QuicClientConnection` 分别驱动
+各自传输的状态；两者均不进行 socket I/O。
+
+默认 `CompileOptions` 检查声明能力并使用 modern 安全策略；
+`CompileOptions::compatibility()` 保留浏览器的历史或未实现声明，通过
+`capability_issues()` 暴露限制，不会删除 profile 项或保证对端选中任意声明都能握手。
+完整低层输入/输出与旧驱动兼容说明见
+[`lktls` README](https://github.com/EZXLabs/lkrequest-rs/blob/main/lktls/README.md)。
+
 ClientHello 或 TLS record bytes 的变化属于该层。profile 必须来自真实 capture，不应手工修改 golden 迎合测试。
 
 ## `lkh2`：HTTP/2、HPACK 与 frame engine
@@ -86,7 +115,7 @@ ClientHello 或 TLS record bytes 的变化属于该层。profile 必须来自真
 - multiplexing、stream state、flow control 和响应事件；
 - 可验证的 write batching 边界。
 
-H2 SETTINGS、HPACK policy、frame bytes 或发送顺序变化属于该层。`h2-native` 只是将在 `0.3.0` 删除的兼容别名。
+H2 SETTINGS、HPACK policy、frame bytes 或发送顺序变化属于该层。HTTP/2 引擎始终编译，不再提供后端选择 feature。
 
 ## `lkh3`：HTTP/3 与 QUIC profile
 

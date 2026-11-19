@@ -28,6 +28,7 @@ available.
 | `chrome_155` | yes | yes | yes | passive public TLS/H2/QUIC captures and completed Cloudflare H3 |
 | `chrome_156` | yes | yes | yes | independent public TLS/H2/QUIC captures and completed Cloudflare H3 |
 | `chrome_157` | yes | yes | yes | public TLS/H2/QUIC captures and completed Cloudflare H3 |
+| `chrome_158` | yes | yes | yes | public TLS/H2/QUIC captures and completed Cloudflare H3 |
 
 Chrome 153.0.8010.37 was captured against public Cloudflare targets on
 2026-09-15, including decrypted H3 SETTINGS.
@@ -62,6 +63,11 @@ headers, but the TLS, H2, QUIC transport, and H3 setup fields are the intended
 comparison surface.
 
 ## Capture Chrome
+
+Chrome 158.0.8127.37 on Windows was captured on 2026-11-18 against public
+Cloudflare. Fresh TLS/H2/QUIC fields, H3 SETTINGS and navigation/favicon
+priorities match 157, with HTTP 200 over both H2 and H3. Timing, loss, STOP,
+resumption, ECH inner policy and response edge cases retain 157's model.
 
 Chrome 157.0.8103.39 on Windows was captured on 2026-11-05 against Cloudflare
 and example.com. Stable fresh TLS/H2/QUIC fields and H3 SETTINGS match 156;

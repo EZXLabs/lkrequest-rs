@@ -345,6 +345,7 @@ pub extern "C" fn lk_proxy_pool_acquire_async(
         let pool_value = pool.pool.clone();
         let op_shared = Arc::new(crate::handles::OpShared::default());
         let op_handle = OpHandle {
+            observer: None,
             client: None,
             shared: Arc::clone(&op_shared),
             counted: false,

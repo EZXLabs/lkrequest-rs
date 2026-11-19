@@ -34,7 +34,8 @@ fn build_session(state: &SessionBuilderState) -> Arc<SessionShared> {
         .client
         .client
         .session()
-        .redirect_policy(state.redirect_policy.clone());
+        .redirect_policy(state.redirect_policy.clone())
+        .attempt_limits(state.attempt_limits);
     // A handle-built config can express credentials a URL cannot, so it wins.
     if let Some(proxy_config) = &state.proxy_config {
         builder = builder.proxy_config(proxy_config.clone());
@@ -801,6 +802,7 @@ pub extern "C" fn lk_session_preconnect_async(
 
         let op_shared = Arc::new(crate::handles::OpShared::default());
         let op_handle = OpHandle {
+            observer: None,
             client: Some(Arc::clone(&session.shared.client)),
             shared: Arc::clone(&op_shared),
             counted: true,

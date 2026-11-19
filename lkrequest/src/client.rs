@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::attempts::{AttemptLimitScope, AttemptLimits, EffectiveAttemptLimits};
 use crate::QuicProfile;
 use http::header::HeaderName;
 use http::HeaderMap;
@@ -43,7 +44,8 @@ type SharedQuicEndpointManager =
 /// Fine-grained timeout configuration for each phase of a request.
 ///
 /// Each timeout controls a specific phase of the request lifecycle.
-/// All timeouts are optional — when `None`, reasonable defaults are used.
+/// `None` disables the corresponding client deadline without substituting a
+/// default. Other configured phase and total deadlines remain active.
 ///
 /// The **total timeout** acts as an overall deadline that supersedes all
 /// phase-level timeouts.
@@ -56,8 +58,9 @@ type SharedQuicEndpointManager =
 /// | TCP connect        | 10 seconds |
 /// | TLS handshake      | 10 seconds |
 /// | QUIC handshake     | 10 seconds |
-/// | TTFB (first byte)  | 30 seconds |
-/// | Total request      | 60 seconds |
+/// | Response headers   | 30 seconds |
+/// | Read idle          | Disabled  |
+/// | Total request      | 120 seconds |
 ///
 /// # Example
 ///
@@ -83,15 +86,20 @@ pub struct TimeoutConfig {
     /// Per-query DNS timeout, applied to address and HTTPS record lookups,
     /// including custom resolvers. `None` adds no client-level DNS deadline.
     pub dns_timeout: Option<Duration>,
-    /// TCP connection timeout (SYN → SYN-ACK).
+    /// TCP connection timeout (SYN → SYN-ACK). `None` disables it.
     pub tcp_connect_timeout: Option<Duration>,
-    /// TLS handshake timeout (ClientHello → Finished).
+    /// TLS handshake timeout (ClientHello → Finished). `None` disables it.
     pub tls_handshake_timeout: Option<Duration>,
-    /// QUIC connection timeout (Initial → Handshake Complete).
+    /// QUIC connection timeout (Initial → Handshake Complete). `None` disables it.
     pub quic_connect_timeout: Option<Duration>,
-    /// Time to first byte (TTFB): from request sent to first response byte.
+    /// Response-header timeout (legacy TTFB name), including request upload.
+    /// Expires unless the complete response headers arrive within this limit.
+    /// `None` disables it.
     pub ttfb_timeout: Option<Duration>,
-    /// Total request timeout (overall deadline for the entire request).
+    /// Maximum wait for a response body read to make progress. `None` disables it.
+    pub read_idle_timeout: Option<Duration>,
+    /// Overall deadline, including redirects, configured retries, backoff, and
+    /// streaming response reads. `None` disables the total deadline.
     pub total_timeout: Option<Duration>,
 }
 
@@ -103,13 +111,14 @@ impl Default for TimeoutConfig {
             tls_handshake_timeout: Some(Duration::from_secs(10)),
             quic_connect_timeout: Some(Duration::from_secs(10)),
             ttfb_timeout: Some(Duration::from_secs(30)),
-            total_timeout: Some(Duration::from_secs(60)),
+            read_idle_timeout: None,
+            total_timeout: Some(Duration::from_secs(120)),
         }
     }
 }
 
 impl TimeoutConfig {
-    /// Create a config with no timeouts (infinite).
+    /// Disable all client request and connection phase deadlines.
     pub fn none() -> Self {
         Self {
             dns_timeout: None,
@@ -117,6 +126,7 @@ impl TimeoutConfig {
             tls_handshake_timeout: None,
             quic_connect_timeout: None,
             ttfb_timeout: None,
+            read_idle_timeout: None,
             total_timeout: None,
         }
     }
@@ -157,46 +167,10 @@ impl TimeoutConfig {
         self
     }
 
-    /// DNS timeout with fallback to a default.
-    #[allow(dead_code)]
-    pub(crate) fn dns_timeout_or(&self, default: Duration) -> Duration {
-        self.dns_timeout.unwrap_or(default)
-    }
-
-    /// TCP connect timeout with fallback.
-    pub(crate) fn tcp_connect_timeout_or(&self, default: Duration) -> Duration {
-        self.tcp_connect_timeout.unwrap_or(default)
-    }
-
-    /// TLS handshake timeout with fallback.
-    pub(crate) fn tls_handshake_timeout_or(&self, default: Duration) -> Duration {
-        self.tls_handshake_timeout.unwrap_or(default)
-    }
-
-    /// TTFB timeout with fallback.
-    #[allow(dead_code)]
-    pub(crate) fn ttfb_timeout_or(&self, default: Duration) -> Duration {
-        self.ttfb_timeout.unwrap_or(default)
-    }
-
-    /// Total timeout with fallback.
-    pub(crate) fn total_timeout_or(&self, default: Duration) -> Duration {
-        self.total_timeout.unwrap_or(default)
-    }
-
-    /// Merge `other` into `self`: fields set in `other` override those in `self`.
-    #[allow(dead_code)]
-    pub(crate) fn merge_overrides(&self, overrides: &TimeoutConfig) -> TimeoutConfig {
-        TimeoutConfig {
-            dns_timeout: overrides.dns_timeout.or(self.dns_timeout),
-            tcp_connect_timeout: overrides.tcp_connect_timeout.or(self.tcp_connect_timeout),
-            tls_handshake_timeout: overrides
-                .tls_handshake_timeout
-                .or(self.tls_handshake_timeout),
-            quic_connect_timeout: overrides.quic_connect_timeout.or(self.quic_connect_timeout),
-            ttfb_timeout: overrides.ttfb_timeout.or(self.ttfb_timeout),
-            total_timeout: overrides.total_timeout.or(self.total_timeout),
-        }
+    /// Limit each pending response body read independently of the total deadline.
+    pub fn with_read_idle_timeout(mut self, t: Duration) -> Self {
+        self.read_idle_timeout = Some(t);
+        self
     }
 }
 
@@ -352,12 +326,12 @@ impl ResourceLimits {
 /// `proxy_to_direct` is `false` by default.  Enabling it can cause
 /// requests to bypass the proxy and reveal the client's real IP address.
 /// Only enable if you understand the privacy implications.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FallbackConfig {
     /// When true, if HTTP/2 connection setup fails after ALPN negotiation,
     /// the client will automatically retry with HTTP/1.1.
     ///
-    /// Default: `true`
+    /// Default: `false`; protocol fallback requires explicit opt-in.
     pub h2_to_h1: bool,
 
     /// When true, if the proxy connection fails, the client will fall back
@@ -377,18 +351,8 @@ pub struct FallbackConfig {
     /// Go's `net/http` Transport: a stale pooled connection is not a fatal
     /// error — the request is transparently retried.
     ///
-    /// Default: `true`
+    /// Default: `false`; request replay requires explicit opt-in.
     pub retry_on_connection_close: bool,
-}
-
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            h2_to_h1: true,
-            proxy_to_direct: false,
-            retry_on_connection_close: true,
-        }
-    }
 }
 
 /// An HTTP client with a specific TLS + H2 fingerprint.
@@ -462,6 +426,9 @@ impl Default for Client {
 /// a client and must never be duplicated. Keeping the two in separate `Arc`s
 /// lets a session swap its fingerprint while sharing the machinery.
 pub(crate) struct Fingerprint {
+    tcp_tls_configs: [std::sync::OnceLock<lktls::config::ClientConfigTemplate>; 2],
+    #[cfg(feature = "quic-h3")]
+    quic_tls_config: std::sync::OnceLock<lktls::config::ClientConfigTemplate>,
     /// TLS fingerprint profile (drives ClientHello construction).
     pub tls_profile: TlsProfile,
 
@@ -480,6 +447,7 @@ pub(crate) struct Fingerprint {
 /// Immutable transport machinery shared by all clones (and all sessions) of a
 /// `Client`. The wire fingerprint lives separately in [`Fingerprint`].
 pub(crate) struct ClientInner {
+    pub attempt_limits: AttemptLimits,
     pub trust_anchor_policy: lktls::trust_anchor::TrustAnchorPolicy,
     pub trust_anchor_catalog: Arc<lktls::trust_anchor::TrustAnchorCatalog>,
     /// Default headers sent with every request (e.g. User-Agent, Accept).
@@ -570,6 +538,7 @@ pub(crate) struct ClientInner {
 
     /// Policy used to construct the shared TLS/QUIC ticket store.
     pub tls_session_resumption_policy: TlsSessionResumptionPolicy,
+    pub tls_session_cache_ttl: Option<Duration>,
 
     /// Browser policy used to partition TLS and QUIC session tickets.
     pub tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy,
@@ -581,6 +550,18 @@ pub(crate) struct ClientInner {
 }
 
 impl Client {
+    /// Limits configured at the client scope. Unset values add no aggregate cap.
+    pub fn configured_attempt_limits(&self) -> AttemptLimits {
+        self.inner.attempt_limits
+    }
+
+    /// Effective per-operation limits; counters are never shared across requests.
+    pub fn effective_attempt_limits(&self) -> crate::error::Result<EffectiveAttemptLimits> {
+        self.inner
+            .attempt_limits
+            .resolve(None, AttemptLimitScope::Client)
+    }
+
     /// Start building a new `Client`.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -598,6 +579,57 @@ impl Client {
         &self.fingerprint.tls_profile
     }
 
+    fn tls_compile_options(&self) -> lktls::config::CompileOptions {
+        lktls::config::CompileOptions {
+            verification: if self.verify() {
+                lktls::verify::policy::VerificationPolicy::Strict
+            } else {
+                lktls::verify::policy::VerificationPolicy::Insecure
+            },
+            custom_ca_anchors: self.custom_ca_anchors().cloned(),
+            ..lktls::config::CompileOptions::compatibility()
+        }
+    }
+
+    pub(crate) fn tcp_tls_config(&self, h1_only: bool) -> lktls::config::ClientConfigTemplate {
+        self.fingerprint.tcp_tls_configs[usize::from(h1_only)]
+            .get_or_init(|| {
+                let mut profile = self.tls_profile().clone();
+                if h1_only {
+                    profile.alpn_protocols =
+                        crate::session::pipeline::alpn_for_h1_only(&profile.alpn_protocols);
+                }
+                lktls::config::ClientConfigTemplate::new(
+                    profile,
+                    lktls::config::Transport::Tcp,
+                    self.tls_compile_options(),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(feature = "quic-h3")]
+    pub(crate) fn quic_tls_config(&self) -> lktls::config::ClientConfigTemplate {
+        self.fingerprint
+            .quic_tls_config
+            .get_or_init(|| {
+                let mut profile = self
+                    .quic_tls_profile()
+                    .unwrap_or_else(|| self.tls_profile())
+                    .clone();
+                profile.alpn_protocols = vec!["h3".into()];
+                if profile.alps_protocols.is_some() {
+                    profile.alps_protocols = Some(vec!["h3".into()]);
+                }
+                lktls::config::ClientConfigTemplate::new(
+                    profile,
+                    lktls::config::Transport::Quic,
+                    self.tls_compile_options(),
+                )
+            })
+            .clone()
+    }
+
     /// Returns the QUIC-specific TLS profile, if configured.
     pub fn quic_tls_profile(&self) -> Option<&TlsProfile> {
         self.fingerprint.quic_tls_profile.as_ref()
@@ -611,6 +643,17 @@ impl Client {
     /// Return the configured TLS session-resumption policy.
     pub fn tls_session_resumption_policy(&self) -> TlsSessionResumptionPolicy {
         self.inner.tls_session_resumption_policy
+    }
+
+    /// Local TLS/QUIC cache TTL override, or `None` for version-specific defaults.
+    pub fn tls_session_cache_ttl(&self) -> Option<Duration> {
+        self.inner.tls_session_cache_ttl
+    }
+
+    /// Whether the cache policy allows storage and resumption (nonzero TTL).
+    pub fn tls_session_cache_enabled(&self) -> bool {
+        self.inner.tls_session_resumption_policy != TlsSessionResumptionPolicy::Disabled
+            && self.inner.tls_session_cache_ttl != Some(Duration::ZERO)
     }
 
     /// Returns a reference to the QUIC fingerprint profile.
@@ -652,6 +695,9 @@ impl Client {
         Client {
             inner: Arc::clone(&self.inner),
             fingerprint: Arc::new(Fingerprint {
+                tcp_tls_configs: Default::default(),
+                #[cfg(feature = "quic-h3")]
+                quic_tls_config: Default::default(),
                 tls_profile: if layers.contains(Layers::TLS) {
                     id.tls
                 } else {
@@ -714,19 +760,18 @@ impl Client {
     /// Returns the connect timeout (TCP + TLS combined, for backward compat).
     ///
     /// Computed as `tcp_connect_timeout + tls_handshake_timeout`.
+    /// `Duration::MAX` means either phase has no deadline.
     pub fn connect_timeout(&self) -> Duration {
         let t = &self.inner.timeouts;
-        let tcp = t.tcp_connect_timeout.unwrap_or(Duration::from_secs(10));
-        let tls = t.tls_handshake_timeout.unwrap_or(Duration::from_secs(10));
-        tcp + tls
+        match (t.tcp_connect_timeout, t.tls_handshake_timeout) {
+            (Some(tcp), Some(tls)) => tcp.saturating_add(tls),
+            _ => Duration::MAX,
+        }
     }
 
-    /// Returns the read/total timeout (for backward compat).
+    /// Returns the total timeout (legacy getter). `Duration::MAX` means disabled.
     pub fn read_timeout(&self) -> Duration {
-        self.inner
-            .timeouts
-            .total_timeout
-            .unwrap_or(Duration::from_secs(60))
+        self.inner.timeouts.total_timeout.unwrap_or(Duration::MAX)
     }
 
     /// Returns the header order template, if set.
@@ -929,6 +974,7 @@ impl H2DataFramePolicy {
 
 /// Builder for constructing a [`Client`].
 pub struct ClientBuilder {
+    attempt_limits: AttemptLimits,
     trust_anchor_policy: lktls::trust_anchor::TrustAnchorPolicy,
     trust_anchor_bindings: Vec<lktls::trust_anchor::TrustAnchorBinding>,
     tls_profile: Option<TlsProfile>,
@@ -945,6 +991,7 @@ pub struct ClientBuilder {
     tcp_fingerprint: Option<TcpFingerprint>,
     fallback: FallbackConfig,
     protocol_policy: Option<ProtocolPolicy>,
+    validate_preset_profiles: bool,
     middlewares: crate::middleware::MiddlewareStack,
     timeouts: TimeoutConfig,
     resource_limits: ResourceLimits,
@@ -958,6 +1005,7 @@ pub struct ClientBuilder {
     connect_targets: HashMap<(String, u16), SocketAddr>,
     h2_data_frame_policy: H2DataFramePolicy,
     tls_session_resumption_policy: TlsSessionResumptionPolicy,
+    tls_session_cache_ttl: Option<Duration>,
     tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy,
     randomize: crate::randomize::Randomize,
     #[cfg(feature = "masque")]
@@ -965,6 +1013,12 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Set optional per-request attempt caps. Defaults to no aggregate cap.
+    pub fn attempt_limits(mut self, limits: AttemptLimits) -> Self {
+        self.attempt_limits = limits;
+        self
+    }
+
     /// Configure X.509 trust-anchor advertisement and optional recovery.
     /// Defaults to the profile's bytes with recovery disabled.
     pub fn trust_anchor_policy(mut self, policy: lktls::trust_anchor::TrustAnchorPolicy) -> Self {
@@ -983,6 +1037,7 @@ impl ClientBuilder {
 
     fn new() -> Self {
         Self {
+            attempt_limits: AttemptLimits::default(),
             trust_anchor_policy: Default::default(),
             trust_anchor_bindings: Vec::new(),
             tls_profile: None,
@@ -999,6 +1054,7 @@ impl ClientBuilder {
             tcp_fingerprint: None,
             fallback: FallbackConfig::default(),
             protocol_policy: None,
+            validate_preset_profiles: false,
             middlewares: Vec::new(),
             timeouts: TimeoutConfig::default(),
             resource_limits: ResourceLimits::default(),
@@ -1012,6 +1068,7 @@ impl ClientBuilder {
             connect_targets: HashMap::new(),
             h2_data_frame_policy: H2DataFramePolicy::BrowserDefault,
             tls_session_resumption_policy: TlsSessionResumptionPolicy::BrowserDefault,
+            tls_session_cache_ttl: None,
             tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Unpartitioned,
             randomize: crate::randomize::Randomize::off(),
             #[cfg(feature = "masque")]
@@ -1053,7 +1110,38 @@ impl ClientBuilder {
         self
     }
 
-    /// Configure whether TLS session tickets are cached and offered as PSKs.
+    /// Enable or disable TLS/QUIC session caching and resumption.
+    /// Re-enabling a disabled cache restores the default two-ticket capacity.
+    /// This does not change existing connection-pool reuse or profile settings.
+    pub fn tls_session_cache_enabled(mut self, enabled: bool) -> Self {
+        self.tls_session_resumption_policy = if !enabled {
+            TlsSessionResumptionPolicy::Disabled
+        } else if self.tls_session_resumption_policy == TlsSessionResumptionPolicy::Disabled {
+            TlsSessionResumptionPolicy::BrowserDefault
+        } else {
+            self.tls_session_resumption_policy
+        };
+        self
+    }
+
+    /// Override the local cache TTL for TLS 1.2, TLS 1.3 and QUIC.
+    ///
+    /// Defaults are one hour for TLS 1.2 and seven days for TLS 1.3. A shorter
+    /// server lifetime still wins, and TLS 1.3 cannot exceed seven days.
+    /// TLS 1.2 renewal does not reset the original secret age. Zero prevents
+    /// caching. This setter does not re-enable a disabled cache.
+    pub fn tls_session_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.tls_session_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Restore the version-specific default TLS/QUIC cache lifetimes.
+    pub fn default_tls_session_cache_ttl(mut self) -> Self {
+        self.tls_session_cache_ttl = None;
+        self
+    }
+
+    /// Configure TLS/QUIC session caching, resumption and per-server capacity.
     pub fn tls_session_resumption_policy(mut self, policy: TlsSessionResumptionPolicy) -> Self {
         if let TlsSessionResumptionPolicy::Enabled {
             max_tickets_per_server,
@@ -1414,6 +1502,22 @@ impl ClientBuilder {
         self
     }
 
+    pub(crate) fn preset_templates(
+        mut self,
+        headers: Vec<HeaderName>,
+        h3_headers: Option<Vec<HeaderName>>,
+        cookies: Option<Vec<String>>,
+        protocol: Option<ProtocolPolicy>,
+    ) -> Self {
+        self.header_order = (!headers.is_empty()).then_some(headers);
+        self.h3_header_order = h3_headers;
+        self.cookie_order =
+            cookies.map(|names| names.into_iter().map(String::into_boxed_str).collect());
+        self.protocol_policy = protocol;
+        self.validate_preset_profiles = true;
+        self
+    }
+
     /// Set the HTTP/3-specific header sending order for requests.
     pub fn h3_header_order(mut self, order: Vec<&str>) -> Self {
         let names: Vec<HeaderName> = order
@@ -1650,7 +1754,7 @@ impl ClientBuilder {
 
     /// Enable or disable H2→H1.1 automatic fallback.
     ///
-    /// When enabled (default), if HTTP/2 connection setup fails after ALPN
+    /// When explicitly enabled (default: disabled), if HTTP/2 setup fails after ALPN
     /// negotiated h2, the client automatically retries with HTTP/1.1.
     pub fn h2_fallback_h1(mut self, enabled: bool) -> Self {
         self.fallback.h2_to_h1 = enabled;
@@ -1686,7 +1790,7 @@ impl ClientBuilder {
 
     /// Enable or disable automatic retry on stale pooled connections.
     ///
-    /// **Default: `true`**.  When enabled, if a request sent on a reused
+    /// **Default: `false`**. When explicitly enabled, if a request sent on a reused
     /// (pooled) connection fails because the connection was closed by the
     /// peer (e.g. server idle timeout, GOAWAY, TCP RST), the client
     /// automatically evicts the dead connection and retries on a fresh one.
@@ -1768,15 +1872,22 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the time-to-first-byte (TTFB) timeout.
+    /// Set the response-header timeout (legacy TTFB name), including upload.
     pub fn ttfb_timeout(mut self, timeout: Duration) -> Self {
         self.timeouts.ttfb_timeout = Some(timeout);
         self
     }
 
-    /// Set the total request timeout.
+    /// Set the total request timeout (default: 120 seconds).
     pub fn total_timeout(mut self, timeout: Duration) -> Self {
         self.timeouts.total_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the maximum wait for each pending response body read.
+    /// Disabled by default; independent of the overall request deadline.
+    pub fn read_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.timeouts.read_idle_timeout = Some(timeout);
         self
     }
 
@@ -2050,12 +2161,12 @@ impl ClientBuilder {
     /// remains opt-in through a complete preset or an explicit QUIC profile.
     ///
     /// # Panics
-    /// Panics for invalid TAI settings. Use [`Self::try_build`] for fallible configuration.
+    /// Panics for invalid configuration. Use [`Self::try_build`] for fallible configuration.
     pub fn build(self) -> Client {
         self.try_build().expect("invalid client configuration")
     }
 
-    /// Build a client, reporting invalid trust-anchor configuration.
+    /// Build a client, reporting invalid trust-anchor and final preset configuration.
     pub fn try_build(self) -> crate::error::Result<Client> {
         use lktls::trust_anchor::{
             TrustAnchorAdvertisement, TrustAnchorCatalog, TrustAnchorRecovery,
@@ -2156,6 +2267,18 @@ impl ClientBuilder {
         }
         let default_protocol_policy = self.protocol_policy.unwrap_or_default();
 
+        if self.validate_preset_profiles {
+            crate::preset::validation::validate_effective(
+                &tls_profile,
+                quic_tls_profile.as_ref(),
+                &h2_profile,
+                quic_profile.as_ref(),
+                &default_protocol_policy,
+                &crate::preset::PresetLimits::default(),
+            )
+            .map_err(|error| crate::error::Error::InvalidConfig(error.to_string()))?;
+        }
+
         #[cfg(feature = "quic-h3")]
         let endpoint_managers = {
             let (
@@ -2204,12 +2327,16 @@ impl ClientBuilder {
 
         Ok(Client {
             fingerprint: Arc::new(Fingerprint {
+                tcp_tls_configs: Default::default(),
+                #[cfg(feature = "quic-h3")]
+                quic_tls_config: Default::default(),
                 tls_profile,
                 quic_tls_profile,
                 h2_profile,
                 quic_profile,
             }),
             inner: Arc::new(ClientInner {
+                attempt_limits: self.attempt_limits,
                 trust_anchor_policy: self.trust_anchor_policy,
                 trust_anchor_catalog: catalog,
                 default_headers: self.default_headers,
@@ -2239,8 +2366,11 @@ impl ClientBuilder {
                 quic_endpoint_manager_ipv6: tokio::sync::Mutex::new(endpoint_managers.1),
                 #[cfg(feature = "masque")]
                 masque: Arc::new(self.masque),
-                session_store: self.tls_session_resumption_policy.create_store(),
+                session_store: self
+                    .tls_session_resumption_policy
+                    .create_store(self.tls_session_cache_ttl),
                 tls_session_resumption_policy: self.tls_session_resumption_policy,
+                tls_session_cache_ttl: self.tls_session_cache_ttl,
                 tls_session_cache_partition_policy: self.tls_session_cache_partition_policy,
                 #[cfg(feature = "synthetic-fp")]
                 randomize: self.randomize,
@@ -2348,6 +2478,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tls_session_cache_switch_and_ttl_are_independent() {
+        let ttl = Duration::from_secs(7200);
+        let client = Client::builder()
+            .tls_session_cache_enabled(false)
+            .tls_session_cache_ttl(ttl)
+            .build();
+        assert_eq!(client.tls_session_cache_ttl(), Some(ttl));
+        assert!(client.inner.session_store.client_sessions().is_none());
+        let enabled = Client::builder()
+            .tls_session_cache_enabled(false)
+            .tls_session_cache_ttl(ttl)
+            .tls_session_cache_enabled(true)
+            .build();
+        assert_eq!(enabled.inner.session_store.session_cache_ttl(), Some(ttl));
+        assert!(enabled.inner.session_store.client_sessions().is_some());
+        let defaults = Client::builder()
+            .tls_session_cache_enabled(false)
+            .tls_session_cache_ttl(ttl)
+            .default_tls_session_cache_ttl()
+            .build();
+        assert_eq!(defaults.tls_session_cache_ttl(), None);
+        assert_eq!(
+            defaults.tls_session_resumption_policy(),
+            TlsSessionResumptionPolicy::Disabled
+        );
+        assert_eq!(Client::builder().build().tls_session_cache_ttl(), None);
+        let capacity = TlsSessionResumptionPolicy::Enabled {
+            max_tickets_per_server: 4,
+        };
+        assert_eq!(
+            Client::builder()
+                .tls_session_resumption_policy(capacity)
+                .tls_session_cache_enabled(true)
+                .build()
+                .tls_session_resumption_policy(),
+            capacity
+        );
+    }
+
     // -- TimeoutConfig -----------------------------------------------------
 
     #[test]
@@ -2358,7 +2528,8 @@ mod tests {
         assert_eq!(tc.tls_handshake_timeout, Some(Duration::from_secs(10)));
         assert_eq!(tc.quic_connect_timeout, Some(Duration::from_secs(10)));
         assert_eq!(tc.ttfb_timeout, Some(Duration::from_secs(30)));
-        assert_eq!(tc.total_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(tc.total_timeout, Some(Duration::from_secs(120)));
+        assert!(tc.read_idle_timeout.is_none());
     }
 
     #[test]
@@ -2388,26 +2559,6 @@ mod tests {
         assert_eq!(tc.quic_connect_timeout, Some(Duration::from_secs(4)));
         assert_eq!(tc.ttfb_timeout, Some(Duration::from_secs(5)));
         assert_eq!(tc.total_timeout, Some(Duration::from_secs(6)));
-    }
-
-    #[test]
-    fn timeout_config_or_fallback() {
-        let tc = TimeoutConfig::none();
-        let default = Duration::from_secs(99);
-        assert_eq!(tc.tcp_connect_timeout_or(default), default);
-
-        let tc2 = TimeoutConfig::default();
-        assert_eq!(tc2.tcp_connect_timeout_or(default), Duration::from_secs(10));
-    }
-
-    #[test]
-    fn timeout_config_merge_overrides() {
-        let base = TimeoutConfig::default();
-        let overrides = TimeoutConfig::none().with_dns_timeout(Duration::from_secs(1));
-        let merged = base.merge_overrides(&overrides);
-
-        assert_eq!(merged.dns_timeout, Some(Duration::from_secs(1)));
-        assert_eq!(merged.tcp_connect_timeout, Some(Duration::from_secs(10)));
     }
 
     // -- ResourceLimits ---------------------------------------------------
@@ -2646,27 +2797,27 @@ mod tests {
     }
 
     #[test]
-    fn timeout_config_none_falls_back_in_getters() {
+    fn timeout_config_none_disables_legacy_getters() {
         let client = Client::builder()
             .timeout_config(TimeoutConfig::none())
             .build();
         assert!(client.timeouts().total_timeout.is_none());
-        assert_eq!(client.connect_timeout(), Duration::from_secs(20)); // 10 + 10 fallback
-        assert_eq!(client.read_timeout(), Duration::from_secs(60)); // total fallback
+        assert_eq!(client.connect_timeout(), Duration::MAX);
+        assert_eq!(client.read_timeout(), Duration::MAX);
     }
 
     #[test]
-    fn timeout_or_helpers_use_fallback_when_none() {
-        let none = TimeoutConfig::none();
-        let d = Duration::from_secs(42);
-        assert_eq!(none.dns_timeout_or(d), d);
-        assert_eq!(none.tls_handshake_timeout_or(d), d);
-        assert_eq!(none.ttfb_timeout_or(d), d);
-        assert_eq!(none.total_timeout_or(d), d);
-        assert_eq!(
-            TimeoutConfig::default().total_timeout_or(d),
-            Duration::from_secs(60)
-        );
+    fn a_disabled_connection_phase_makes_the_combined_getter_unbounded() {
+        for tls_disabled in [false, true] {
+            let mut config = TimeoutConfig::default();
+            if tls_disabled {
+                config.tls_handshake_timeout = None;
+            } else {
+                config.tcp_connect_timeout = None;
+            }
+            let client = Client::builder().timeout_config(config).build();
+            assert_eq!(client.connect_timeout(), Duration::MAX);
+        }
     }
 
     // -- Resource limits ---------------------------------------------------
@@ -2739,9 +2890,9 @@ mod tests {
     #[test]
     fn fallback_config_defaults() {
         let f = FallbackConfig::default();
-        assert!(f.h2_to_h1);
+        assert!(!f.h2_to_h1);
         assert!(!f.proxy_to_direct);
-        assert!(f.retry_on_connection_close);
+        assert!(!f.retry_on_connection_close);
     }
 
     // -- Header / cookie order variants ------------------------------------
@@ -2849,6 +3000,32 @@ mod tests {
             .build();
         // Configuring resumption without a preset still uses Chrome 155.
         assert_eq!(client.tls_profile().name, "Chrome 155");
+    }
+
+    #[test]
+    fn compiled_tls_templates_are_shared_and_protocol_specific() {
+        let client = Client::builder().build();
+        let base = client.tcp_tls_config(false).compile().unwrap();
+        let cloned = client.clone().tcp_tls_config(false).compile().unwrap();
+        assert!(Arc::ptr_eq(&base, &cloned));
+        let h1 = client.tcp_tls_config(true).compile().unwrap();
+        assert!(!Arc::ptr_eq(&base, &h1));
+        assert_eq!(h1.profile().alpn_protocols, ["http/1.1"]);
+        assert_eq!(base.profile().alpn_protocols, ["h2", "http/1.1"]);
+        assert!(Arc::ptr_eq(
+            &h1,
+            &client.tcp_tls_config(true).compile().unwrap()
+        ));
+        #[cfg(feature = "quic-h3")]
+        {
+            let quic = client.quic_tls_config().compile().unwrap();
+            assert_eq!(quic.profile().alpn_protocols, ["h3"]);
+            assert!(Arc::ptr_eq(
+                &quic,
+                &client.quic_tls_config().compile().unwrap()
+            ));
+            assert_ne!(quic.transport(), base.transport());
+        }
     }
 
     // -- DNS resolver setters ----------------------------------------------

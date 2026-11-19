@@ -8,6 +8,29 @@
 
 use super::Extension;
 
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    super::registry::require_empty(data)?;
+    Ok(super::tls12::ServerValue::StatusRequest)
+}
+
+pub(crate) fn parse_certificate_status(body: &[u8]) -> crate::error::Result<&[u8]> {
+    let mut input = crate::wire::Reader::new(body);
+    if input.u8()? != 1 {
+        return Err(crate::error::TlsError::local_alert(
+            crate::error::AlertDescription::IllegalParameter,
+            "CertificateStatus must contain an OCSP response",
+        ));
+    }
+    let response = input.vector24()?;
+    if response.is_empty() {
+        return Err(crate::wire::decode_error("empty OCSP response"));
+    }
+    input.finish()?;
+    Ok(response)
+}
+
 /// Status Request (OCSP Stapling) extension.
 ///
 /// This extension tells the server that the client supports receiving

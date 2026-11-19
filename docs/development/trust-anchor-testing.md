@@ -20,7 +20,7 @@ cargo test -p lkrequest-ffi --test streaming_diagnostics_and_configuration tai_f
 
 The all-feature invocation includes QUIC/H3 and TLS-synthesis configuration
 guards. The independent BoringSSL test is ignored by default and must be run
-separately after building the [Tier-1 peer](../../tools/tai_interop/README.md).
+separately after building the [Tier-1 peer](https://github.com/EZXLabs/lkrequest-rs/blob/main/tools/tai_interop/README.md).
 Avoid a workspace-wide `--include-ignored`: unrelated targets include public
 network tests.
 
@@ -62,9 +62,9 @@ cargo fmt --all -- --check
 | FFI response/error JSON retains requested IDs, authentication and both attempts | `trust_anchor_diagnostics::tai_ffi_recovery_*` |
 | Independent server selects the requested credential and reports the actual trusted root | `boringssl::tai_boringssl_selects_trusted_credential_after_one_recovery` (Tier-1) |
 
-Tests are in [the integration target](../../lkrequest/tests/trust_anchor_negotiation.rs)
+Tests are in [the integration target](https://github.com/EZXLabs/lkrequest-rs/blob/main/lkrequest/tests/trust_anchor_negotiation.rs)
 and its `validation`, `lifecycle`, `quic`, and `boringssl` modules. FFI transport
-tests are in [trust_anchor_diagnostics.rs](../../lkrequest-ffi/tests/support/trust_anchor_diagnostics.rs).
+tests are in [trust_anchor_diagnostics.rs](https://github.com/EZXLabs/lkrequest-rs/blob/main/lkrequest-ffi/tests/support/trust_anchor_diagnostics.rs).
 The shared controlled-flight helper is test-only. It stops before Finished;
 successful handshakes use rustls or BoringSSL independently.
 

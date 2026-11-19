@@ -551,6 +551,7 @@ impl H2Engine {
         req_priority: Option<crate::profile::RequestPriority>,
         weight_override: Option<u8>,
     ) -> Vec<H2Frame> {
+        crate::request_warnings::warn_if_noncompliant(stream_id, headers);
         let mut priority = self.resolve_priority(stream_id, req_priority);
         if let (Some(priority), Some(weight)) = (&mut priority, weight_override) {
             priority.weight = weight;
@@ -1308,7 +1309,7 @@ impl H2Engine {
             }
 
             stream_recv_window = stream.recv_window();
-            stream_initial_window = stream.initial_window_size();
+            stream_initial_window = stream.initial_recv_window_size();
 
             if frame.end_stream {
                 let _ = stream.recv_end_stream();

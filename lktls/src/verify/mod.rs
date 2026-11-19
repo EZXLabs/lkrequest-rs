@@ -12,3 +12,4 @@
 
 pub mod certchain;
 pub mod policy;
+pub(crate) mod signature;

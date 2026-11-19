@@ -1,4 +1,4 @@
-//! Key Exchange — ECDH operations (X25519, P-256, P-384) and hybrid post-quantum (X25519MLKEM768).
+//! Key Exchange — ECDH operations (X25519, P-256, P-384, P-521) and hybrid post-quantum (X25519MLKEM768).
 
 use aws_lc_rs::agreement::{self, EphemeralPrivateKey};
 use aws_lc_rs::rand::SystemRandom;
@@ -14,6 +14,8 @@ pub enum KxGroup {
     Secp256r1,
     /// secp384r1 / P-384 (code-point 0x0018).
     Secp384r1,
+    /// secp521r1 / P-521 (code-point 0x0019).
+    Secp521r1,
     /// X25519MLKEM768 — hybrid post-quantum (code-point 0x11EC / 4588).
     ///
     /// Combines classical X25519 ECDH with ML-KEM-768 (NIST FIPS 203).
@@ -28,6 +30,7 @@ impl KxGroup {
             KxGroup::X25519 => 0x001d,
             KxGroup::Secp256r1 => 0x0017,
             KxGroup::Secp384r1 => 0x0018,
+            KxGroup::Secp521r1 => 0x0019,
             KxGroup::X25519MlKem768 => 0x11ec,
         }
     }
@@ -38,6 +41,7 @@ impl KxGroup {
             0x001d => Some(KxGroup::X25519),
             0x0017 => Some(KxGroup::Secp256r1),
             0x0018 => Some(KxGroup::Secp384r1),
+            0x0019 => Some(KxGroup::Secp521r1),
             0x11ec => Some(KxGroup::X25519MlKem768),
             _ => None,
         }
@@ -46,7 +50,7 @@ impl KxGroup {
 
 /// Internal private key storage — supports both classical and hybrid schemes.
 pub(crate) enum PrivateKeyInner {
-    /// Classical ECDH (X25519, P-256, or P-384).
+    /// Classical ECDH (X25519, P-256, P-384, or P-521).
     Classical(EphemeralPrivateKey),
     /// Hybrid X25519 + ML-KEM-768.
     Hybrid {
@@ -81,7 +85,7 @@ impl std::fmt::Debug for EphemeralKeyPair {
 /// Generate a fresh ephemeral key pair for the given group.
 pub fn generate_key_pair(group: KxGroup) -> Result<EphemeralKeyPair> {
     match group {
-        KxGroup::X25519 | KxGroup::Secp256r1 | KxGroup::Secp384r1 => {
+        KxGroup::X25519 | KxGroup::Secp256r1 | KxGroup::Secp384r1 | KxGroup::Secp521r1 => {
             generate_classical_key_pair(group)
         }
         KxGroup::X25519MlKem768 => generate_hybrid_key_pair(),
@@ -95,6 +99,7 @@ fn generate_classical_key_pair(group: KxGroup) -> Result<EphemeralKeyPair> {
         KxGroup::X25519 => &agreement::X25519,
         KxGroup::Secp256r1 => &agreement::ECDH_P256,
         KxGroup::Secp384r1 => &agreement::ECDH_P384,
+        KxGroup::Secp521r1 => &agreement::ECDH_P521,
         _ => unreachable!(),
     };
 
@@ -162,6 +167,7 @@ pub fn compute_shared_secret(our_key: EphemeralKeyPair, peer_public_key: &[u8]) 
                 KxGroup::X25519 => &agreement::X25519,
                 KxGroup::Secp256r1 => &agreement::ECDH_P256,
                 KxGroup::Secp384r1 => &agreement::ECDH_P384,
+                KxGroup::Secp521r1 => &agreement::ECDH_P521,
                 _ => unreachable!(),
             };
             let peer_key = agreement::UnparsedPublicKey::new(algorithm, peer_public_key);
@@ -317,6 +323,7 @@ mod tests {
             KxGroup::X25519,
             KxGroup::Secp256r1,
             KxGroup::Secp384r1,
+            KxGroup::Secp521r1,
             KxGroup::X25519MlKem768,
         ] {
             let cp = group.code_point();

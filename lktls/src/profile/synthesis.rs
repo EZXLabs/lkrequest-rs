@@ -86,8 +86,8 @@ pub enum NegotiabilityFloor {
 /// Key-exchange groups the engine can perform (key_share / HRR). Source of
 /// truth is [`KxGroup::from_code_point`]; the list is asserted in-sync by tests.
 pub fn supported_kx_groups() -> &'static [u16] {
-    // X25519, secp256r1, secp384r1, X25519MLKEM768.
-    &[0x001d, 0x0017, 0x0018, 0x11ec]
+    // X25519, secp256r1, secp384r1, secp521r1, X25519MLKEM768.
+    &[0x001d, 0x0017, 0x0018, 0x0019, 0x11ec]
 }
 
 /// TLS 1.3 cipher suites the engine implements.
@@ -276,6 +276,7 @@ impl Constraints {
             presets::chrome_155(),
             presets::chrome_156(),
             presets::chrome_157(),
+            presets::chrome_158(),
             presets::firefox_133(),
             presets::firefox_147(),
             presets::firefox_156(),
@@ -452,7 +453,9 @@ mod tests {
             ("chrome_156", presets::chrome_156()),
             ("chrome_156_quic", presets::chrome_156_quic()),
             ("chrome_157", presets::chrome_157()),
+            ("chrome_158", presets::chrome_158()),
             ("chrome_157_quic", presets::chrome_157_quic()),
+            ("chrome_158_quic", presets::chrome_158_quic()),
             ("firefox_133", presets::firefox_133()),
             ("firefox_147", presets::firefox_147()),
             ("firefox_156", presets::firefox_156()),
@@ -500,14 +503,13 @@ mod tests {
 
     #[test]
     fn rejects_key_share_engine_cannot_perform() {
-        // secp521r1 (0x0019) is a valid curve but the engine does not implement
-        // its ECDH — advertising a key_share for it would break the handshake.
+        // ffdhe2048 is a valid group but is not implemented by the engine.
         let mut p = presets::chrome_146();
-        p.supported_groups.push(0x0019); // pass the "in groups" check
-        p.key_share_curves.push(0x0019);
+        p.supported_groups.push(0x0100); // pass the "in groups" check
+        p.key_share_curves.push(0x0100);
         assert_eq!(
             validate(&p),
-            Err(InvalidSpec::KeyShareUnsupportedByEngine(0x0019))
+            Err(InvalidSpec::KeyShareUnsupportedByEngine(0x0100))
         );
     }
 
@@ -535,8 +537,8 @@ mod tests {
         // A curve not in the list must not be implemented (catches drift if the
         // engine gains a group but the registry isn't updated).
         assert!(
-            KxGroup::from_code_point(0x0019).is_none(),
-            "secp521r1 unexpectedly implemented"
+            KxGroup::from_code_point(0x0100).is_none(),
+            "ffdhe2048 unexpectedly implemented"
         );
     }
 

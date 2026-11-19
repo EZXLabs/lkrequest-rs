@@ -92,7 +92,7 @@ fn check_tls(browser: &str, profile: TlsProfile) {
 }
 
 #[test]
-fn chrome_155_to_157_trust_anchor_wire_order_matches_chromium() {
+fn chrome_155_to_158_trust_anchor_wire_order_matches_chromium() {
     // These versions share the captured ID set and sort it with Chromium's
     // EncodeTlsRequestedTrustAnchorIDList. Compare unnormalized bytes: the
     // canonical fingerprint gate sorts IDs and cannot detect extra shuffling.
@@ -124,7 +124,9 @@ fn chrome_155_to_157_trust_anchor_wire_order_matches_chromium() {
         (lktls::profile::presets::chrome_156(), false),
         (lktls::profile::presets::chrome_156_quic(), true),
         (lktls::profile::presets::chrome_157(), false),
+        (lktls::profile::presets::chrome_158(), false),
         (lktls::profile::presets::chrome_157_quic(), true),
+        (lktls::profile::presets::chrome_158_quic(), true),
     ] {
         let mut extension_orders = std::collections::BTreeSet::new();
         for _ in 0..8 {
@@ -356,6 +358,23 @@ fn chrome_157_quic_tls() {
     let canonical = CanonicalTlsFingerprint::from_parsed(&parsed);
     gate_value(
         "chrome_157_quic_tls_fresh",
+        serde_json::to_value(canonicalize_tls(&canonical, &tls_shape(&profile))).unwrap(),
+    );
+}
+
+#[cfg(feature = "quic-h3")]
+#[test]
+fn chrome_158_quic_tls() {
+    let profile = lktls::profile::presets::chrome_158_quic();
+    let message = lktls_quic::LktlsQuicClientConfig::new(profile.clone())
+        .alps_payload(lkh3::encode_alps_h3_settings(&lkh3::chrome_158_h3()))
+        .emit_initial_client_hello("example.com", Vec::new())
+        .expect("emit QUIC ClientHello");
+    let parsed = parse_client_hello(&message).expect("parse QUIC ClientHello");
+    assert_eq!(parsed.cipher_suites, [0x1301, 0x1302, 0x1303]);
+    let canonical = CanonicalTlsFingerprint::from_parsed(&parsed);
+    gate_value(
+        "chrome_158_quic_tls_fresh",
         serde_json::to_value(canonicalize_tls(&canonical, &tls_shape(&profile))).unwrap(),
     );
 }
@@ -724,6 +743,10 @@ fn check_quic(basename: &str, profile: lkh3::QuicProfile) {
 // age + binder, so the canonical only fingerprints its presence/position.)
 
 #[cfg(feature = "quic-h3")]
+#[path = "tls_support/sessions.rs"]
+mod session_fixtures;
+
+#[cfg(feature = "quic-h3")]
 fn synthetic_h3_ticket() -> lktls::session_store::SessionTicketData {
     lktls::session_store::SessionTicketData {
         ticket: vec![1, 2, 3, 4],
@@ -747,11 +770,13 @@ fn synthetic_h3_ticket() -> lktls::session_store::SessionTicketData {
 #[cfg(feature = "quic-h3")]
 fn emit_quic_client_hello(
     store: std::sync::Arc<dyn lktls::session_store::SessionStore>,
+    anchors: std::sync::Arc<Vec<rustls::pki_types::TrustAnchor<'static>>>,
 ) -> CanonicalTlsFingerprint {
     let mut profile = lktls::profile::presets::chrome_146_quic();
     profile.session_resumption.tls13_psk = true;
     let config = lktls_quic::LktlsQuicClientConfig::new(profile)
         .session_store(store)
+        .custom_ca_anchors(anchors)
         .port(443);
     let bytes = config
         .emit_initial_client_hello("localhost", Vec::new())
@@ -763,14 +788,14 @@ fn emit_quic_client_hello(
 #[cfg(feature = "quic-h3")]
 #[test]
 fn chrome_146_quic_tls_resumed() {
-    use lktls::session_store::{InMemorySessionStore, SessionStore};
+    use lktls::session_store::InMemorySessionStore;
     use std::sync::Arc;
 
-    let fresh = emit_quic_client_hello(Arc::new(InMemorySessionStore::new()));
+    let fresh = emit_quic_client_hello(Arc::new(InMemorySessionStore::new()), Arc::new(Vec::new()));
 
-    let store = Arc::new(InMemorySessionStore::new());
-    store.store("localhost:443", synthetic_h3_ticket());
-    let resumed = emit_quic_client_hello(store);
+    let (store, anchors) =
+        session_fixtures::seeded_session("localhost", 443, Vec::new(), synthetic_h3_ticket(), true);
+    let resumed = emit_quic_client_hello(store, anchors);
 
     let types = |fp: &CanonicalTlsFingerprint| -> Vec<u16> {
         fp.extensions.iter().map(|e| e.extension_type).collect()
@@ -874,6 +899,7 @@ tls_gate! {
     chrome_155 => lktls::profile::presets::chrome_155(),
     chrome_156 => lktls::profile::presets::chrome_156(),
     chrome_157 => lktls::profile::presets::chrome_157(),
+    chrome_158 => lktls::profile::presets::chrome_158(),
     firefox_133 => lktls::profile::presets::firefox_133(),
     firefox_147 => lktls::profile::presets::firefox_147(),
     firefox_156 => lktls::profile::presets::firefox_156(),
@@ -897,6 +923,7 @@ h2_gate! {
     chrome_155_h2 => "chrome_155" => lkh2::profile::chrome_155_h2(),
     chrome_156_h2 => "chrome_156" => lkh2::profile::chrome_156_h2(),
     chrome_157_h2 => "chrome_157" => lkh2::profile::chrome_157_h2(),
+    chrome_158_h2 => "chrome_158" => lkh2::profile::chrome_158_h2(),
     firefox_133_h2 => "firefox_133" => lkh2::profile::firefox_133_h2(),
     firefox_147_h2 => "firefox_147" => lkh2::profile::firefox_147_h2(),
     firefox_156_h2 => "firefox_156" => lkh2::profile::firefox_156_h2(),
@@ -915,5 +942,6 @@ quic_gate! {
     chrome_155_quic => "chrome_155_quic" => lkh3::chrome_155_quic(),
     chrome_156_quic => "chrome_156_quic" => lkh3::chrome_156_quic(),
     chrome_157_quic => "chrome_157_quic" => lkh3::chrome_157_quic(),
+    chrome_158_quic => "chrome_158_quic" => lkh3::chrome_158_quic(),
     chrome_generic_quic => "chrome_generic_quic" => lkh3::chrome_quic(),
 }

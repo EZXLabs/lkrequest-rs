@@ -39,7 +39,7 @@ pub struct GreaseValues {
 }
 
 #[repr(usize)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum GreaseIndex {
     Cipher = 0,
     Group = 1,
@@ -58,6 +58,10 @@ impl Default for GreaseValues {
 }
 
 impl GreaseValues {
+    pub(crate) fn placeholders() -> Self {
+        Self { seeds: [0; 8] }
+    }
+
     /// Generate a fresh set of GREASE seeds for a new connection.
     pub fn new() -> Self {
         use aws_lc_rs::rand::{SecureRandom, SystemRandom};

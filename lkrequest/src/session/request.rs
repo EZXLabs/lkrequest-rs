@@ -5,12 +5,15 @@ use tracing::Instrument;
 use http::HeaderMap;
 use url::Url;
 
+use crate::attempt_observer::{AttemptObserver, ObservationBinding};
+use crate::attempts::{AttemptLimitScope, AttemptLimits, AttemptSummary, EffectiveAttemptLimits};
 use crate::body::RequestBody;
 use crate::error::{Error, Result};
 use crate::protocol::{HttpIntent, ProtocolPolicy};
 use crate::proxy::ProxyConfig;
 use crate::response::{HttpVersion, Response, StreamingResponse};
 
+use super::execution::{ExecutionGuard, HttpAttempt, RecoveryOwner, RequestExecution};
 use super::next_request_id;
 use super::streaming::StreamRequestBuilder;
 use super::{AcceptEncoding, Idempotency, PreferredHttpVersion, Session};
@@ -47,6 +50,8 @@ use super::{AcceptEncoding, Idempotency, PreferredHttpVersion, Session};
 /// # }
 /// ```
 pub struct RequestBuilder {
+    attempt_limits: AttemptLimits,
+    observation: Option<ObservationBinding>,
     pub(crate) session: Session,
     pub(crate) method: http::Method,
     pub(crate) url: String,
@@ -61,6 +66,9 @@ pub struct RequestBuilder {
     pub(crate) cookie_overrides: Vec<String>,
     /// Per-request end-to-end deadline override (see [`RequestBuilder::timeout`]).
     pub(crate) timeout: Option<Duration>,
+    pub(crate) request_timeout: crate::timeout::RequestTimeout,
+    pub(crate) execution: Option<RequestExecution>,
+    pub(crate) attempt: Option<HttpAttempt>,
     /// Per-request proxy override (overrides session proxy).
     pub(crate) proxy_override: Option<ProxyConfig>,
     /// Per-request HTTP version override.
@@ -100,6 +108,8 @@ pub struct RequestBuilder {
 /// `String`, and `Vec` fields on every retry attempt.  Only the `Arc`
 /// reference count is incremented (O(1)).
 pub(crate) struct SharedRequestContext {
+    attempt_limits: AttemptLimits,
+    pub(crate) execution: RequestExecution,
     pub(crate) method: http::Method,
     pub(crate) url: String,
     pub(crate) headers: HeaderMap,
@@ -107,6 +117,7 @@ pub(crate) struct SharedRequestContext {
     pub(crate) extra_cookies: Vec<(String, String)>,
     pub(crate) cookie_overrides: Vec<String>,
     pub(crate) timeout: Option<Duration>,
+    pub(crate) request_timeout: crate::timeout::RequestTimeout,
     pub(crate) proxy_override: Option<ProxyConfig>,
     pub(crate) version_override: Option<PreferredHttpVersion>,
     pub(crate) protocol_policy_override: Option<ProtocolPolicy>,
@@ -121,8 +132,75 @@ pub(crate) struct SharedRequestContext {
 }
 
 impl RequestBuilder {
+    fn begin_execution(&mut self) -> (ExecutionGuard, Result<RecoveryOwner>) {
+        self.request_timeout = crate::timeout::RequestTimeout::new(self.effective_total_timeout());
+        let limits = self.effective_attempt_limits();
+        let (execution, guard) =
+            RequestExecution::with_limits(self.request_timeout, limits.as_ref().ok().copied());
+        if let Some(observation) = self.observation.take() {
+            observation.bind(&execution);
+        }
+        let admission = limits
+            .and_then(|_| execution.start_http())
+            .map(|(attempt, owner)| {
+                self.execution = Some(execution);
+                self.attempt = Some(attempt);
+                owner
+            });
+        (guard, admission)
+    }
+
+    /// Set optional aggregate caps for this request. Unset fields inherit the
+    /// session cap; a finite parent can be tightened but cannot be relaxed.
+    pub fn attempt_limits(mut self, limits: AttemptLimits) -> Self {
+        self.attempt_limits = limits;
+        self
+    }
+
+    /// Return the request-level configuration before inheritance.
+    pub fn configured_attempt_limits(&self) -> AttemptLimits {
+        self.attempt_limits
+    }
+
+    /// Resolve the final request configuration without starting any I/O.
+    pub fn effective_attempt_limits(&self) -> Result<EffectiveAttemptLimits> {
+        self.attempt_limits.resolve(
+            Some(&self.session.effective_attempt_limits()?),
+            AttemptLimitScope::Request,
+        )
+    }
+
+    /// Attach read-only observation before sending or spawning this request.
+    /// Repeated calls return observers of the same operation.
+    pub fn observe_attempts(mut self) -> (Self, AttemptObserver) {
+        let observer = self
+            .observation
+            .get_or_insert_with(ObservationBinding::new)
+            .observer();
+        (self, observer)
+    }
+
+    /// Send and return an independent summary for either success or failure.
+    pub async fn send_with_attempt_summary(self) -> (Result<Response>, AttemptSummary) {
+        let (request, observer) = self.observe_attempts();
+        let result = request.send().await;
+        (result, observer.snapshot())
+    }
+
+    /// Send a streaming request and snapshot HTTP execution at publication.
+    /// Subsequent response-body reads do not create HTTP submission attempts.
+    pub async fn send_streaming_with_attempt_summary(
+        self,
+    ) -> (Result<StreamingResponse>, AttemptSummary) {
+        let (request, observer) = self.observe_attempts();
+        let result = request.send_streaming().await;
+        (result, observer.snapshot())
+    }
+
     pub(crate) fn new(session: Session, method: http::Method, url: &str) -> Self {
         Self {
+            attempt_limits: AttemptLimits::default(),
+            observation: None,
             session,
             method,
             url: url.to_string(),
@@ -133,6 +211,9 @@ impl RequestBuilder {
             extra_cookies: Vec::new(),
             cookie_overrides: Vec::new(),
             timeout: None,
+            request_timeout: crate::timeout::RequestTimeout::default(),
+            execution: None,
+            attempt: None,
             proxy_override: None,
             version_override: None,
             protocol_policy_override: None,
@@ -156,8 +237,11 @@ impl RequestBuilder {
         session: Session,
         ctx: Arc<SharedRequestContext>,
         body: Option<RequestBody>,
+        attempt: HttpAttempt,
     ) -> Self {
         Self {
+            attempt_limits: ctx.attempt_limits,
+            observation: None,
             session,
             method: ctx.method.clone(),
             url: ctx.url.clone(),
@@ -168,6 +252,9 @@ impl RequestBuilder {
             extra_cookies: ctx.extra_cookies.clone(),
             cookie_overrides: ctx.cookie_overrides.clone(),
             timeout: ctx.timeout,
+            request_timeout: ctx.request_timeout,
+            execution: Some(ctx.execution.clone()),
+            attempt: Some(attempt),
             proxy_override: ctx.proxy_override.clone(),
             version_override: ctx.version_override,
             protocol_policy_override: ctx.protocol_policy_override.clone(),
@@ -183,6 +270,18 @@ impl RequestBuilder {
             deferred_error: None,
             collect_diagnostics: false,
         }
+    }
+
+    pub(crate) fn execution(&self) -> Result<&RequestExecution> {
+        self.execution
+            .as_ref()
+            .ok_or_else(|| Error::Http("missing request execution context".into()))
+    }
+
+    pub(crate) fn attempt(&self) -> Result<&HttpAttempt> {
+        self.attempt
+            .as_ref()
+            .ok_or_else(|| Error::Http("missing HTTP attempt authority".into()))
     }
 
     /// Add a cookie to this request only (does not modify the session jar).
@@ -532,32 +631,6 @@ impl RequestBuilder {
         self
     }
 
-    /// Set a per-request **end-to-end** deadline.
-    ///
-    /// When set, this duration bounds the **whole** attempt: connection setup,
-    /// request write, and response read (until the body is fully received for
-    /// [`send`](Self::send)). It is **not** the same thing as the client’s
-    /// [`Client::read_timeout`](crate::Client::read_timeout) alone (read phase
-    /// after connect) or [`Client::connect_timeout`](crate::Client::connect_timeout)
-    /// alone; it overrides those for this request’s combined operation.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use lkrequest::Client;
-    /// # use lktls::profile::presets;
-    /// # async fn example() -> Result<(), lkrequest::error::Error> {
-    /// # let client = Client::builder().fingerprint(presets::chrome_131()).build();
-    /// # let session = client.session().build();
-    /// use std::time::Duration;
-    ///
-    /// let resp = session.get("https://slow-api.example.com")
-    ///     .timeout(Duration::from_secs(60))
-    ///     .send()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     /// Set the RFC 9218 request priority (urgency + incremental).
     ///
     /// Sets HTTP priority and the profile's optional H2 urgency-to-weight
@@ -605,6 +678,12 @@ impl RequestBuilder {
         self
     }
 
+    /// Set a per-request end-to-end deadline.
+    ///
+    /// Bounds connection setup, upload, redirects, explicitly configured retries
+    /// and backoff, and response body reads, including streaming reads after
+    /// headers are returned. Overrides the client total while keeping phase
+    /// limits active. The deadline never resets on retry.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -1041,46 +1120,77 @@ impl RequestBuilder {
     /// If a retry policy is configured on the session, retryable failures will
     /// be automatically retried according to the policy.
     #[allow(clippy::let_and_return)] // `result` is consumed by the telemetry cfg arm
-    pub async fn send(self) -> Result<Response> {
-        let collect_diagnostics = self.collect_diagnostics;
-        let result = if collect_diagnostics {
-            // Opt-in path: wrap execution in the diagnostics task-local scope so
-            // the phase recorders populate, then attach the snapshot. Only paid
-            // when explicitly enabled.
-            let (r, diag) = crate::diagnostics::capture_request_diagnostics(
-                crate::trust_anchor::scope(self.send_impl()),
-            )
-            .await;
-            r.map(|mut resp| {
-                resp.set_diagnostics(diag);
-                resp
-            })
-        } else {
-            crate::trust_anchor::scope(self.send_impl()).await
+    pub async fn send(mut self) -> Result<Response> {
+        let (mut guard, admission) = self.begin_execution();
+        let result = match admission {
+            Err(error) => Err(error),
+            Ok(owner) => {
+                if self.collect_diagnostics {
+                    // Opt-in capture attaches phase diagnostics to the response.
+                    let (result, diagnostics) = crate::diagnostics::capture_request_diagnostics(
+                        guard.run(self.send_impl(owner)),
+                    )
+                    .await;
+                    result.map(|mut response| {
+                        response.set_diagnostics(diagnostics);
+                        response
+                    })
+                } else {
+                    guard.run(self.send_impl(owner)).await
+                }
+            }
         };
+        let result = result.and_then(|response| {
+            guard.publish()?;
+            Ok(response)
+        });
+        if let Err(error) = &result {
+            guard.finish_error(error);
+        }
         #[cfg(feature = "telemetry")]
         crate::telemetry::counters().record_request(result.is_err());
-        result
+        result.map_err(Error::into_public_connect_error)
     }
 
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]
-    pub async fn send_transport_only_for_benchmark(self) -> Result<Response> {
-        if let Some(err) = self.deferred_error {
-            return Err(err);
+    pub async fn send_transport_only_for_benchmark(mut self) -> Result<Response> {
+        let (mut guard, admission) = self.begin_execution();
+        let result = match admission
+            .and_then(|_| self.session.validate_proxy_config())
+            .and_then(|_| self.deferred_error.take().map_or(Ok(()), Err))
+        {
+            Err(error) => Err(error),
+            Ok(()) => {
+                guard
+                    .run(self.send_single_request(
+                        &self.url,
+                        &self.method,
+                        &self.headers,
+                        self.body.clone(),
+                    ))
+                    .await
+            }
         }
-        let deadline = tokio::time::Instant::now() + self.effective_total_timeout();
-        self.send_single_request(
-            &self.url,
-            &self.method,
-            &self.headers,
-            self.body.clone(),
-            deadline,
-        )
-        .await
+        .and_then(|response| {
+            guard.publish()?;
+            Ok(response)
+        });
+        if let Err(error) = &result {
+            guard.finish_error(error);
+        }
+        result.map_err(Error::into_public_connect_error)
     }
 
-    async fn send_impl(self) -> Result<Response> {
+    async fn send_impl(self, owner: RecoveryOwner) -> Result<Response> {
+        let execution = self
+            .execution
+            .ok_or_else(|| Error::Http("missing request execution context".into()))?;
+        execution.ensure_active()?;
+        let mut attempt = self
+            .attempt
+            .ok_or_else(|| Error::Http("missing HTTP attempt authority".into()))?;
+        self.session.validate_proxy_config()?;
         if let Some(err) = self.deferred_error {
             return Err(err);
         }
@@ -1139,6 +1249,8 @@ impl RequestBuilder {
         let session = self.session;
         let body = mw_req.body.map(RequestBody::from).or(streaming_body);
         let ctx = Arc::new(SharedRequestContext {
+            attempt_limits: self.attempt_limits,
+            execution,
             method: mw_req.method,
             url: mw_req.url,
             headers: mw_req.headers,
@@ -1146,6 +1258,7 @@ impl RequestBuilder {
             extra_cookies: self.extra_cookies,
             cookie_overrides: self.cookie_overrides,
             timeout: self.timeout,
+            request_timeout: self.request_timeout,
             proxy_override: self.proxy_override,
             version_override: self.version_override,
             protocol_policy_override: self.protocol_policy_override,
@@ -1160,108 +1273,75 @@ impl RequestBuilder {
         });
 
         let result = async move {
+            let mut recovery = super::recovery::ApplicationRecovery::new(owner);
             // --- Core send logic (retry + redirect) ---
             let raw_response = if let Some(policy) = retry_policy {
-                let mut attempt = 0u32;
+                let retain_prior = ctx.execution.has_connect_limit();
+                let mut prior: Option<Box<Result<Response>>> = None;
                 loop {
                     let rb = RequestBuilder::from_shared_context(
                         session.clone(),
                         ctx.clone(),
                         body.clone(),
+                        attempt,
                     );
-                    let mut replay_safe = true;
-                    let mut allow_policy_retry = true;
-                    let result = rb
-                        .send_with_redirects(&mut replay_safe, &mut allow_policy_retry)
-                        .await;
+                    recovery.start_attempt();
+                    let submissions_before = retain_prior.then(|| ctx.execution.submissions());
+                    let result = rb.send_with_redirects(&mut recovery).await;
+                    if let Err(error) = &result {
+                        if error.is_connect_attempt_denied()
+                            && submissions_before == Some(ctx.execution.submissions())
+                        {
+                            if let Some(prior) = prior.take() {
+                                ctx.execution.record_connect_denial(error);
+                                break match *prior {
+                                    Ok(response) => Ok(response),
+                                    Err(prior) => {
+                                        Err(result.err().unwrap().with_connect_prior(prior))
+                                    }
+                                };
+                            }
+                        }
+                    }
+                    prior = None;
+                    let facts = super::recovery::ReplayFacts::new(
+                        &ctx.method,
+                        ctx.idempotency,
+                        body.as_ref(),
+                    );
 
                     match result {
                         Ok(resp) => {
                             let status = resp.status();
-                            if allow_policy_retry
-                                && crate::retry::is_retryable_status(status)
-                                && body.as_ref().is_none_or(RequestBody::can_replay)
+                            if let Some(approved) =
+                                recovery.retry_status(policy.as_ref(), facts, status)
                             {
-                                attempt += 1;
-                                if let Some(delay) =
-                                    policy.should_retry(attempt, None, Some(status))
-                                {
-                                    // The server answered, so a status code
-                                    // cannot prove that an unsafe request was
-                                    // not applied. Only safe methods or an
-                                    // explicit idempotency opt-in may replay
-                                    // the buffered request (RFC 9110 §9.2.2).
-                                    if !crate::retry::status_retry_is_replay_safe(
-                                        &ctx.method,
-                                        ctx.idempotency,
-                                        status,
-                                    ) {
-                                        tracing::debug!(
-                                            method = %ctx.method,
-                                            status = status.as_u16(),
-                                            "http.retry_on_status_skipped_not_replay_safe",
-                                        );
-                                        break Ok(resp);
-                                    }
-                                    tracing::warn!(
-                                        attempt = attempt,
-                                        status = status.as_u16(),
-                                        delay_ms = delay.as_millis() as u64,
-                                        "http.retry_on_status",
-                                    );
-                                    tokio::time::sleep(delay).await;
-                                    continue;
+                                attempt = approved.attempt;
+                                if retain_prior {
+                                    prior = Some(Box::new(Ok(resp)));
                                 }
+                                tokio::time::sleep(approved.delay).await;
+                                continue;
                             }
                             break Ok(resp);
                         }
                         Err(e) => {
-                            if !allow_policy_retry {
-                                break Err(e);
-                            }
-                            attempt += 1;
-                            if let Some(delay) = policy.should_retry(attempt, Some(&e), None) {
-                                // Only replay if doing so cannot duplicate a
-                                // server-side side effect (RFC 9110 §9.2.2):
-                                // safe/idempotent methods, or a failure that
-                                // proves the request was never processed. A
-                                // non-idempotent POST that failed *after*
-                                // transmission must surface the error rather
-                                // than be silently re-sent.
-                                if replay_safe
-                                    && body.as_ref().is_none_or(RequestBody::can_replay)
-                                    && crate::retry::retry_is_replay_safe(
-                                        &ctx.method,
-                                        ctx.idempotency,
-                                        &e,
-                                    )
-                                {
-                                    tracing::warn!(
-                                        attempt = attempt,
-                                        error = %e,
-                                        delay_ms = delay.as_millis() as u64,
-                                        "http.retry_on_error",
-                                    );
-                                    tokio::time::sleep(delay).await;
-                                    continue;
+                            if let Some(approved) = recovery.retry_error(policy.as_ref(), facts, &e)
+                            {
+                                attempt = approved.attempt;
+                                if retain_prior {
+                                    prior = Some(Box::new(Err(e)));
                                 }
-                                tracing::warn!(
-                                    attempt = attempt,
-                                    error = %e,
-                                    method = %ctx.method,
-                                    "http.retry_skipped_non_idempotent",
-                                );
+                                tokio::time::sleep(approved.delay).await;
+                                continue;
                             }
                             break Err(e);
                         }
                     }
                 }
             } else {
-                let rb = RequestBuilder::from_shared_context(session.clone(), ctx, body);
-                let mut replay_safe = true;
-                let mut allow_policy_retry = true;
-                rb.send_with_redirects(&mut replay_safe, &mut allow_policy_retry)
-                    .await
+                let rb = RequestBuilder::from_shared_context(session.clone(), ctx, body, attempt);
+                rb.send_with_redirects(&mut recovery).await
             };
 
             // --- Middleware: on_response phase ---
@@ -1326,6 +1406,10 @@ impl RequestBuilder {
     /// buffered. Instead, the body is read on demand via
     /// [`StreamingResponse::chunk()`].
     ///
+    /// The total deadline continues after this method returns. For long-lived
+    /// streams, disable `TimeoutConfig::total_timeout` and optionally configure
+    /// `read_idle_timeout` to limit each pending body read.
+    ///
     /// This is suitable for:
     /// - Large file downloads (avoids OOM)
     /// - Server-Sent Events (SSE)
@@ -1351,20 +1435,35 @@ impl RequestBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_streaming(self) -> Result<StreamingResponse> {
+    pub async fn send_streaming(mut self) -> Result<StreamingResponse> {
+        let (mut guard, admission) = self.begin_execution();
+        let timeout = self.request_timeout;
+        let read_idle_timeout = self.session.inner.client.timeouts().read_idle_timeout;
+        let result = match admission {
+            Err(error) => Err(error),
+            Ok(owner) => guard.run(self.send_streaming_impl(owner)).await,
+        }
+        .and_then(|response| {
+            guard.publish()?;
+            Ok(response.with_timeouts(timeout, read_idle_timeout))
+        });
+        if let Err(error) = &result {
+            guard.finish_error(error);
+        }
         #[cfg(feature = "telemetry")]
-        {
-            let result = crate::trust_anchor::scope(self.send_streaming_impl()).await;
-            crate::telemetry::counters().record_request(result.is_err());
-            result
-        }
-        #[cfg(not(feature = "telemetry"))]
-        {
-            crate::trust_anchor::scope(self.send_streaming_impl()).await
-        }
+        crate::telemetry::counters().record_request(result.is_err());
+        result.map_err(Error::into_public_connect_error)
     }
 
-    async fn send_streaming_impl(self) -> Result<StreamingResponse> {
+    async fn send_streaming_impl(self, owner: RecoveryOwner) -> Result<StreamingResponse> {
+        let execution = self
+            .execution
+            .ok_or_else(|| Error::Http("missing request execution context".into()))?;
+        execution.ensure_active()?;
+        let attempt = self
+            .attempt
+            .ok_or_else(|| Error::Http("missing HTTP attempt authority".into()))?;
+        self.session.validate_proxy_config()?;
         if let Some(err) = self.deferred_error {
             return Err(err);
         }
@@ -1431,14 +1530,9 @@ impl RequestBuilder {
         let url = super::transport::hsts_upgrade(&url, &*hsts_policy).unwrap_or(url);
         let hsts_host = super::transport::hsts_host_to_record(&url);
 
-        let read_timeout = self.timeout.unwrap_or_else(|| {
-            self.session
-                .inner
-                .client
-                .timeouts()
-                .total_timeout_or(Duration::from_secs(60))
-        });
         let rb = StreamRequestBuilder {
+            execution,
+            attempt,
             session: self.session,
             method: mw_req.method,
             url,
@@ -1458,22 +1552,13 @@ impl RequestBuilder {
             h2_priority_weight: self.h2_priority_weight,
             idempotency: self.idempotency,
             #[cfg(feature = "quic-h3")]
-            race_send_gate: None,
+            race_send_gates: Vec::new(),
         };
 
-        let result = async move {
-            tokio::time::timeout(read_timeout, rb.send_streaming_inner())
-                .await
-                .map_err(|_| {
-                    Error::timeout(
-                        format!("streaming request timed out after {:?}", read_timeout),
-                        None,
-                        Some(read_timeout),
-                    )
-                })?
-        }
-        .instrument(span.clone())
-        .await;
+        let result = rb
+            .send_streaming_inner(owner)
+            .instrument(span.clone())
+            .await;
 
         match &result {
             Ok(resp) => {
@@ -1507,6 +1592,193 @@ mod tests {
             .build()
             .session()
             .build()
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[tokio::test]
+    async fn benchmark_request_has_independent_recovery_accounting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+                assert!(head.len() < 16 * 1024);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (outer_execution, _guard) =
+            RequestExecution::new(crate::timeout::RequestTimeout::default());
+        let run = async {
+            let (attempt, _owner) = outer_execution.start_http().unwrap();
+            attempt
+                .take()
+                .unwrap()
+                .commit("outer_request")
+                .unwrap()
+                .submit(|| ());
+            let response = Client::builder()
+                .build()
+                .session()
+                .build()
+                .get(&url)
+                .send_transport_only_for_benchmark()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(
+                outer_execution.snapshot(),
+                (1, 0),
+                "a benchmark request must not charge its caller's execution"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_counts_wire_attempts_across_redirect_and_application_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/initial", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let responses = [
+                "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ];
+            let mut paths = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(stream.read_u8().await.unwrap());
+                    assert!(head.len() < 16 * 1024);
+                }
+                paths.push(
+                    String::from_utf8(head)
+                        .unwrap()
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            paths
+        });
+        let session = Client::builder()
+            .build()
+            .session()
+            .retry_policy(crate::retry::FixedInterval::new(1, Duration::ZERO))
+            .build();
+        let (execution, _guard) = RequestExecution::new(crate::timeout::RequestTimeout::default());
+        let run = async {
+            let (attempt, owner) = execution.start_http().unwrap();
+            let mut request = session.get(&url);
+            request.execution = Some(execution.clone());
+            request.attempt = Some(attempt);
+            let response = request.send_impl(owner).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(execution.snapshot(), (3, 1));
+        };
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap();
+        let paths = server.await.unwrap();
+        assert_eq!(
+            paths,
+            [
+                "GET /initial HTTP/1.1",
+                "GET /next HTTP/1.1",
+                "GET /initial HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_execution_rejects_both_entries_before_side_effects() {
+        use crate::middleware::{Middleware, MiddlewareRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        struct CountMiddleware(Arc<AtomicUsize>);
+
+        impl Middleware for CountMiddleware {
+            fn on_request(&self, request: MiddlewareRequest) -> Result<MiddlewareRequest> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(request)
+            }
+        }
+
+        for (streaming, missing_context) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/upload", listener.local_addr().unwrap());
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let body_polls = Arc::new(AtomicUsize::new(0));
+            let session = Client::builder()
+                .middleware(CountMiddleware(middleware_calls.clone()))
+                .build()
+                .session()
+                .http1_only()
+                .build();
+            let polls = body_polls.clone();
+            let mut request = session.post(&url).body_stream(
+                futures_util::stream::poll_fn(move |_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    Poll::<Option<std::io::Result<bytes::Bytes>>>::Ready(None)
+                }),
+                None,
+            );
+            let body = request.body.clone().unwrap();
+            let (execution, _guard) =
+                RequestExecution::new(crate::timeout::RequestTimeout::default());
+            let (_attempt, owner) = execution.start_http().unwrap();
+            if !missing_context {
+                request.execution = Some(execution);
+            }
+            let expected = if missing_context {
+                "missing request execution context"
+            } else {
+                "missing HTTP attempt authority"
+            };
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                if streaming {
+                    request.send_streaming_impl(owner).await.map(|_| ())
+                } else {
+                    request.send_impl(owner).await.map(|_| ())
+                }
+            })
+            .await
+            .expect("missing execution must fail before I/O");
+            assert!(matches!(
+                result,
+                Err(Error::Http(message)) if message == expected
+            ));
+            assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            assert!(
+                body.can_replay(),
+                "missing execution must not claim the upload"
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "missing execution must not open a connection"
+            );
+        }
     }
 
     // ====================================================================

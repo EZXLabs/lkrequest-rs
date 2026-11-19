@@ -43,7 +43,9 @@ struct Peer {
     certificate: Vec<u8>,
     attempts: Arc<Mutex<Vec<Attempt>>>,
     tcp_connections: Arc<AtomicUsize>,
+    quic_connections: Arc<AtomicUsize>,
     tcp_ready: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    handshake_ready: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     tasks: JoinSet<()>,
 }
 
@@ -57,6 +59,10 @@ impl Drop for Peer {
 
 impl Peer {
     async fn new(scenario: Scenario, gate_tcp: bool) -> Self {
+        Self::with_handshake_gate(scenario, gate_tcp, false).await
+    }
+
+    async fn with_handshake_gate(scenario: Scenario, gate_tcp: bool, gate_handshake: bool) -> Self {
         let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.cert.der().to_vec();
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -101,11 +107,14 @@ impl Peer {
             bound.expect("a shared loopback TCP/UDP port must be available");
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let tcp_connections = Arc::new(AtomicUsize::new(0));
+        let quic_connections = Arc::new(AtomicUsize::new(0));
         let (tcp_tx, tcp_ready) = mpsc::unbounded_channel();
+        let (handshake_tx, handshake_ready) = mpsc::unbounded_channel();
         let mut tasks = JoinSet::new();
         tasks.spawn({
             let attempts = attempts.clone();
             let tcp_connections = tcp_connections.clone();
+            let handshake_tx = handshake_tx.clone();
             async move {
                 let mut connections = JoinSet::new();
                 let mut next_connection = 0;
@@ -119,7 +128,15 @@ impl Peer {
                             let acceptor = tcp_acceptor.clone();
                             let attempts = attempts.clone();
                             let tcp_tx = tcp_tx.clone();
+                            let handshake = if gate_handshake {
+                                let (release, ready) = oneshot::channel();
+                                handshake_tx.send(release).unwrap();
+                                Some(ready)
+                            } else { None };
                             connections.spawn(async move {
+                                if let Some(ready) = handshake {
+                                    if ready.await.is_err() { return; }
+                                }
                                 let tls = acceptor.accept(socket).await.unwrap();
                                 assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
                                 let service = service_fn(move |request: http::Request<Incoming>| {
@@ -162,6 +179,7 @@ impl Peer {
         tasks.spawn({
             let endpoint = endpoint.clone();
             let attempts = attempts.clone();
+            let quic_connections = quic_connections.clone();
             async move {
                 let mut connections = JoinSet::new();
                 let mut next_connection = 0;
@@ -169,10 +187,19 @@ impl Peer {
                     tokio::select! {
                         incoming = endpoint.accept() => {
                             let Some(incoming) = incoming else { break; };
+                            quic_connections.fetch_add(1, Ordering::SeqCst);
                             let id = next_connection;
                             next_connection += 1;
                             let attempts = attempts.clone();
+                            let handshake = if gate_handshake {
+                                let (release, ready) = oneshot::channel();
+                                handshake_tx.send(release).unwrap();
+                                Some(ready)
+                            } else { None };
                             connections.spawn(async move {
+                                if let Some(ready) = handshake {
+                                    if ready.await.is_err() { return; }
+                                }
                                 let connection = incoming.await.unwrap();
                                 let mut h3 = server::Connection::<_, Bytes>::new(
                                     h3_quinn::Connection::new(connection),
@@ -207,7 +234,9 @@ impl Peer {
             certificate,
             attempts,
             tcp_connections,
+            quic_connections,
             tcp_ready,
+            handshake_ready,
             tasks,
         }
     }
@@ -323,6 +352,76 @@ fn requests<'a>(attempts: &'a [Attempt], path: &str) -> Vec<&'a Attempt> {
         .iter()
         .filter(|attempt| attempt.path == path)
         .collect()
+}
+
+#[tokio::test]
+async fn cold_tcp_quic_race_with_one_connect_allowance_starts_only_one_backend() {
+    for streaming in [false, true] {
+        tokio::time::timeout(LIMIT, async {
+            let mut peer = Peer::with_handshake_gate(Scenario::Reset, false, true).await;
+            let policy = ProtocolPolicy::new(
+                HttpIntent::AcquireH3WhenViable,
+                AcquisitionPolicy::Race(
+                    lkrequest::RacePolicy::chrome_like().with_tcp_delay(Duration::ZERO),
+                ),
+                UpgradePolicy::Off,
+                FallbackPolicy::AllowFallback,
+            );
+            let session = lkrequest::Client::builder()
+                .preset(lkrequest::preset::chrome_155())
+                .add_ca_cert_der(&peer.certificate)
+                .dns_resolver(Arc::new(LocalIpv4Dns))
+                .build()
+                .session()
+                .protocol_policy(policy)
+                .build();
+            let (request, observer) = session
+                .get(&peer.url("/healthy"))
+                .timeout(LIMIT)
+                .attempt_limits(lkrequest::AttemptLimits::default().with_connect_attempts(1))
+                .observe_attempts();
+            let response = tokio::spawn(async move {
+                if streaming {
+                    let response = request.send_streaming().await.unwrap();
+                    response.bytes().await.unwrap().to_vec()
+                } else {
+                    request.send().await.unwrap().bytes().to_vec()
+                }
+            });
+            let release = peer.handshake_ready.recv().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), peer.handshake_ready.recv())
+                    .await
+                    .is_err(),
+                "a second backend connection escaped the shared limit"
+            );
+            assert!(
+                !response.is_finished(),
+                "the admitted handshake is still gated"
+            );
+            assert_eq!(observer.snapshot().connect_initiations(), 1);
+            release.send(()).unwrap();
+            let body = response.await.unwrap();
+            assert!(body == b"tcp-success" || body == b"h3-success");
+            let summary = observer.snapshot();
+            assert_eq!(summary.connect_initiations(), 1);
+            assert_eq!(summary.http_submissions(), 1);
+            assert_eq!(
+                summary.denial_reason(),
+                None,
+                "losing-branch denial must not poison the winner"
+            );
+            let attempts = peer.snapshot().await;
+            assert_eq!(requests(&attempts, "/healthy").len(), 1);
+            assert_eq!(
+                peer.tcp_connections.load(Ordering::SeqCst)
+                    + peer.quic_connections.load(Ordering::SeqCst),
+                1
+            );
+        })
+        .await
+        .expect("one-start race must finish within its deadline");
+    }
 }
 
 #[tokio::test]
@@ -487,6 +586,43 @@ async fn browser_retry_routing_tcp_redirect_restores_original_protocol() {
         assert_eq!(
             second[0].connection,
             requests(&attempts, "/warm")[0].connection
+        );
+    }
+}
+
+#[tokio::test]
+async fn aggregate_limit_survives_protocol_retry_window_reset_on_redirect() {
+    for limit in [2, 3, 4] {
+        let mut peer = Peer::new(Scenario::H3Redirect, false).await;
+        let session = peer.session(FallbackPolicy::AllowFallback);
+        peer.warm(&session).await;
+        let (request, observer) = session
+            .post(&peer.url("/hop0"))
+            .body(POST_BODY)
+            .preferred_http_version(PreferredHttpVersion::Http3Only)
+            .timeout(LIMIT)
+            .attempt_limits(lkrequest::AttemptLimits::default().with_extra_http_attempts(limit))
+            .observe_attempts();
+        let result = request.send().await;
+        if limit == 4 {
+            assert_eq!(result.unwrap().bytes(), b"h3-success");
+        } else {
+            assert!(result.unwrap_err().h3_request_context().is_some());
+        }
+        let summary = observer.snapshot();
+        let attempts = peer.snapshot().await;
+        assert_eq!(requests(&attempts, "/hop0").len(), 3);
+        assert_eq!(requests(&attempts, "/hop1").len() as u64, limit - 1);
+        assert_eq!(summary.http_submissions(), 2 + limit);
+        assert_eq!(summary.extra_http_submissions(), limit);
+        assert_eq!(summary.redirects(), 1);
+        assert_eq!(
+            summary.denial_reason(),
+            if limit == 4 {
+                None
+            } else {
+                Some(lkrequest::AttemptDenialReason::ExtraHttpLimit)
+            }
         );
     }
 }

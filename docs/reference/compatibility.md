@@ -1,5 +1,15 @@
 # 兼容性与环境边界
 
+## 0.3.0 API 与配置
+
+- 常用请求 builder 方法与 C ABI 继续保留，C ABI 版本仍为 `1`。`TimeoutConfig` 新增字段，完整旧字面量需要调整；FFI 内部 Handle/State Rust 结构可增加字段，不属于稳定的结构体字面量接口。
+- H2 始终使用 `lkh2`，包括 `default-features = false` 的构建。旧 H2 feature 已删除，显式引用它的依赖或 wrapper feature 转发必须修改。
+- 低层 `ConnectionPool` 兼容方法仍保留为 deprecated 包装，原定 0.3.0 的移除计划已延后。
+- 连接关闭重发和 H2-to-H1 回退默认关闭；请求次数上限默认不启用，不能替代重试授权或 timeout。
+- 总超时默认改为 120 秒；timeout 的 `None` 关闭对应 deadline，不替换为有限默认值。
+
+具体配置调整和 Rust/C 对应入口见[版本升级与迁移](../guides/upgrading.md)。
+
 ## Rust 与构建工具
 
 - workspace 同时包含 Rust 2021 和 Rust 2024 edition crate；edition 不是 MSRV 声明。

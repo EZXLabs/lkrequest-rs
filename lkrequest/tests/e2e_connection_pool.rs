@@ -4,6 +4,12 @@
 
 mod support;
 
+#[path = "e2e_connection_pool/attempt_limits.rs"]
+mod attempt_limits;
+
+#[path = "e2e_connection_pool/h2_fallback_limits.rs"]
+mod h2_fallback_limits;
+
 #[cfg(feature = "quic-h3")]
 #[path = "e2e_connection_pool/h3_race.rs"]
 mod h3_race;
@@ -347,8 +353,8 @@ async fn test_h3_fallback_reuses_pooled_h2_after_quic_is_marked_broken() {
 
     assert_eq!(
         srv.tcp_accept_counter.load(Ordering::Relaxed),
-        2,
-        "the initial H2 connection and QUIC-fallback H2 connection are expected; later requests must reuse the pooled fallback connection"
+        1,
+        "QUIC fallback and later requests must reuse the initial ready H2 connection"
     );
 
     quic_server.close(0u32.into(), b"done");

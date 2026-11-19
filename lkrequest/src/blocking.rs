@@ -139,6 +139,16 @@ impl Client {
         &self.inner
     }
 
+    /// Return the client-level attempt limits before inheritance.
+    pub fn configured_attempt_limits(&self) -> crate::AttemptLimits {
+        self.inner.configured_attempt_limits()
+    }
+
+    /// Resolve the client's aggregate attempt limits without starting I/O.
+    pub fn effective_attempt_limits(&self) -> Result<crate::EffectiveAttemptLimits> {
+        self.inner.effective_attempt_limits()
+    }
+
     // -------------------------------------------------------------------
     // Convenience one-off request methods
     // -------------------------------------------------------------------
@@ -192,6 +202,23 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Set optional aggregate attempt caps for each logical request.
+    pub fn attempt_limits(mut self, limits: crate::AttemptLimits) -> Self {
+        self.inner = self.inner.attempt_limits(limits);
+        self
+    }
+
+    /// Apply a complete built-in or loaded profile bundle.
+    pub fn preset(mut self, preset: crate::preset::ClientPreset) -> Self {
+        self.inner = self.inner.preset(preset);
+        self
+    }
+
+    /// Build a blocking client, reporting invalid final configuration.
+    pub fn try_build(self) -> crate::error::Result<Client> {
+        self.inner.try_build().map(|inner| Client { inner })
+    }
+
     /// Set the TLS fingerprint profile.
     pub fn fingerprint(mut self, profile: lktls::profile::types::TlsProfile) -> Self {
         self.inner = self.inner.fingerprint(profile);
@@ -269,6 +296,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Limit each pending response body read independently of the total deadline.
+    pub fn read_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner = self.inner.read_idle_timeout(timeout);
+        self
+    }
+
     /// Set the full timeout configuration.
     pub fn timeout_config(mut self, config: crate::client::TimeoutConfig) -> Self {
         self.inner = self.inner.timeout_config(config);
@@ -329,6 +362,13 @@ pub struct SessionBuilder {
 }
 
 impl SessionBuilder {
+    /// Set session attempt caps. Unset fields inherit the client limits.
+    pub fn attempt_limits(self, limits: crate::AttemptLimits) -> Self {
+        Self {
+            inner: self.inner.attempt_limits(limits),
+        }
+    }
+
     /// Set the proxy for this session from a URL string.
     pub fn proxy(self, proxy_url: &str) -> Self {
         Self {
@@ -448,6 +488,16 @@ impl Session {
     /// Returns a reference to the underlying async `Session`.
     pub fn inner(&self) -> &crate::Session {
         &self.inner
+    }
+
+    /// Return the session-level attempt limits before inheritance.
+    pub fn configured_attempt_limits(&self) -> crate::AttemptLimits {
+        self.inner.configured_attempt_limits()
+    }
+
+    /// Resolve the session's aggregate attempt limits without starting I/O.
+    pub fn effective_attempt_limits(&self) -> Result<crate::EffectiveAttemptLimits> {
+        self.inner.effective_attempt_limits()
     }
 
     /// Returns a reference to the underlying client.
@@ -720,6 +770,29 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
+    /// Set request attempt caps. Unset fields inherit the session limits.
+    pub fn attempt_limits(self, limits: crate::AttemptLimits) -> Self {
+        Self {
+            inner: self.inner.attempt_limits(limits),
+        }
+    }
+
+    /// Return the request-level attempt limits before inheritance.
+    pub fn configured_attempt_limits(&self) -> crate::AttemptLimits {
+        self.inner.configured_attempt_limits()
+    }
+
+    /// Resolve the final request limits without starting I/O.
+    pub fn effective_attempt_limits(&self) -> Result<crate::EffectiveAttemptLimits> {
+        self.inner.effective_attempt_limits()
+    }
+
+    /// Attach read-only observation of this request, including failures.
+    pub fn observe_attempts(self) -> (Self, crate::AttemptObserver) {
+        let (inner, observer) = self.inner.observe_attempts();
+        (Self { inner }, observer)
+    }
+
     // -------------------------------------------------------------------
     // Builder methods (delegated — already sync)
     // -------------------------------------------------------------------
@@ -925,6 +998,13 @@ impl RequestBuilder {
         runtime().block_on(self.inner.send())
     }
 
+    /// Send and return an independent attempt summary for success or failure.
+    ///
+    /// Panics if called from within a Tokio async context.
+    pub fn send_with_attempt_summary(self) -> (Result<crate::Response>, crate::AttemptSummary) {
+        runtime().block_on(self.inner.send_with_attempt_summary())
+    }
+
     /// Send the request and return a blocking streaming response.
     ///
     /// # Panics
@@ -933,6 +1013,17 @@ impl RequestBuilder {
     pub fn send_streaming(self) -> Result<StreamingResponse> {
         let inner = runtime().block_on(self.inner.send_streaming())?;
         Ok(StreamingResponse { inner })
+    }
+
+    /// Send a streaming request and snapshot attempt accounting at publication.
+    ///
+    /// Panics if called from within a Tokio async context.
+    pub fn send_streaming_with_attempt_summary(
+        self,
+    ) -> (Result<StreamingResponse>, crate::AttemptSummary) {
+        let (result, summary) =
+            runtime().block_on(self.inner.send_streaming_with_attempt_summary());
+        (result.map(|inner| StreamingResponse { inner }), summary)
     }
 }
 

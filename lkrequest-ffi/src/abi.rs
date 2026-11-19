@@ -198,7 +198,13 @@ pub extern "C" fn lk_feature_supported(name: *const c_char) -> bool {
             Ok("async") => true,
             Ok("streaming") => true,
             Ok("preset-discovery") => true,
+            Ok("tls-profile-json") => true,
+            Ok("h2-profile-json") => true,
+            Ok("preset-bundle-v2") => true,
             Ok("diagnostics") => true,
+            Ok("extra-http-attempt-limit")
+            | Ok("connect-attempt-limit")
+            | Ok("attempt-summary") => true,
             Ok("logging") => true,
             Ok("logging-callback") => true,
             Ok("multipart") => true,
@@ -208,8 +214,11 @@ pub extern "C" fn lk_feature_supported(name: *const c_char) -> bool {
             Ok("dns-custom-resolver") => true,
             Ok("socks5-udp-probe") => true,
             Ok("session-resumption") => true,
+            Ok("tls-session-cache") => true,
             Ok("quic-connect-timeout") => true,
-            Ok("quic-profile-json") => cfg!(feature = "quic-h3"),
+            Ok("read-idle-timeout") | Ok("optional-total-timeout") => true,
+            Ok("optional-phase-timeouts") => true,
+            Ok("quic-profile-json") | Ok("quic-tls-profile-json") => cfg!(feature = "quic-h3"),
             Ok("http3") | Ok("quic-h3") | Ok("http3-with-fallback") => {
                 cfg!(feature = "quic-h3")
             }

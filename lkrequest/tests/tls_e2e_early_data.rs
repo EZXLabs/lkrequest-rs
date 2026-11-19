@@ -128,17 +128,18 @@ async fn resumption_does_not_negotiate_early_data() {
     // The server must have issued a 0-RTT-capable ticket, otherwise the
     // early-data assertion below would hold for an uninteresting reason.
     let host_key = format!("127.0.0.1:{}", addr.port());
-    let ticket = store
-        .take(&host_key)
+    let versioned = store.client_sessions().unwrap();
+    let ticket = versioned
+        .take_session(&host_key)
         .expect("ticket stored after first handshake");
     assert!(
-        ticket.max_early_data_size > 0,
+        ticket.max_early_data_size() > 0,
         "the local server must issue an early-data-capable ticket, got \
          max_early_data_size = {}",
-        ticket.max_early_data_size
+        ticket.max_early_data_size()
     );
     // `take` removes it; put it back for the resumption below.
-    store.store(&host_key, ticket);
+    versioned.store_session(&host_key, ticket);
 
     // --- Connection 2: resume ----------------------------------------------
     let tcp = tokio::net::TcpStream::connect(addr)

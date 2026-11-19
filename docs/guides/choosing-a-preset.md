@@ -2,18 +2,20 @@
 
 用户应通过 `lkrequest::preset` 中的完整 `ClientPreset` 选择浏览器，而不是分别拼接 TLS、H2 和 H3 profile。完整 preset 同时携带协议 profile、header order、协议选择策略和会话缓存分区策略；浏览器请求头的值由应用显式设置。
 
-`Cookie` 头的顺序不来自 preset：内置 preset 的 `cookie_order` 都是 `None`，顺序由 Session 的 cookie jar 按 Chrome 规则决定（path 长的在前，长度相同则先创建的在前）。需要固定某几个 cookie 的位置时，用 `Client`、`Session` 或请求级的 `cookie_order()` 显式指定，未列出的 cookie 仍按上述规则排在其后。详见[请求配置](requests/README.md#cookie)。
+`Cookie` 头的顺序不来自 preset：内置 preset 的 `cookie_order` 都是 `None`，顺序由 Session 的 cookie jar 按 Chrome 规则决定（path 长的在前，长度相同则先创建的在前）。需要固定某几个 cookie 的位置时，用 `Client`、`Session` 或请求级的 `cookie_order()` 显式指定，未列出的 cookie 仍按上述规则排在其后。详见[请求配置](requests/#cookie)。
 
 ## 当前公共 preset 名称
+
+外部 JSON preset 的加载、导出、校验及 FFI 入口见 [Loading Profile Bundles](loading-profiles.md)。完整文件使用 v2 格式；旧配置快照需要显式补齐运行策略后迁移。
 
 默认浏览器版本为 Chrome 155。Rust 默认客户端提供 TLS/H2，完整
 `chrome_155()` preset 在启用 `quic-h3` 时附带 QUIC/H3。FFI 默认构造器、
 未指定 preset 的 builder 和 `default` alias 均选择完整 `chrome_155` preset。
 需要维持旧版本时显式指定 `chrome_144`。
 
-当前源码提供：
+0.3.0 当前提供 21 个完整 preset；各系列最新版本分别为 Chrome 158、Firefox 156 和 Safari 26.2：
 
-- Chrome：`chrome_131`、`chrome_144`–`chrome_157`；
+- Chrome：`chrome_131`、`chrome_144`–`chrome_158`；
 - Firefox：`firefox_133`、`firefox_147`、`firefox_156`；
 - Safari：`safari_18`、`safari_26`。
 
@@ -25,23 +27,29 @@
 | Chrome 155 | `chrome_155` | Windows 155.0.8059.40 的 TLS/H2 与 QUIC/H3 均有直接公网抓包证据 |
 | Chrome 156 | `chrome_156` | Windows 156.0.8078.48 的新连接 TLS/H2/QUIC/H3 已抓包；传输及响应边界策略继承 155 |
 | Chrome 157 | `chrome_157` | Windows 157.0.8103.39 的新连接 TLS/H2/QUIC/H3 已抓包；稳定字段与 156 一致，行为边界策略继承 156 |
+| Chrome 158 | `chrome_158` | Windows 158.0.8127.37 的公网 TLS/H2/QUIC/H3 已抓包并返回 200；稳定字段与 157 一致，行为边界策略继承 157 |
 | Firefox 156 | `firefox_156` | TLS/H2；不提供 QUIC/H3 profile |
+| Safari 26.2 | `safari_26` | TLS/H2；TLS 有 BrowserLeaks 校准证据，H2 为 fixture 覆盖，不提供 QUIC/H3 profile |
 
 Chrome 154.0.8037.58 与 Firefox 156.0.1 的采集平台均为 Windows。启用 `quic-h3` 不会为 Firefox 或 Safari preset 增加缺失的 QUIC/H3 配置。
 
 ## 显式固定版本
 
-```rust,ignore
+```rust
+use lkrequest::Client;
+
 let client = Client::builder()
-    .preset(lkrequest::preset::chrome_155())
+    .preset(lkrequest::preset::chrome_158())
     .build();
 ```
+
+这会显式选择 0.3.0 新增的 Chrome 158；省略 `.preset(...)` 时仍使用 Chrome 155。Chrome 156、157 已在 0.2.5 中提供。
 
 不要使用“最新 Chrome”作为不可审计的运行时概念。升级 preset 时应作为显式代码改动，并重新验证目标平台、TLS、H2，以及启用 H3 时的 QUIC/H3 层。
 
 Firefox 156 示例：
 
-```rust,ignore
+```rust
 use lkrequest::Client;
 
 let client = Client::builder()
@@ -56,10 +64,14 @@ let session = client.session().http2_only().build();
 
 这里显式要求 H2；不设置 `http2_only()` 时仍可按该 preset 的协议策略使用 H1/H2。
 
+Safari 26.2 使用 `lkrequest::preset::safari_26()`。函数名中的 `26` 对应当前校准的 26.2；Rust 不提供 `safari_26_2()`。Firefox 与 Safari 的完整 preset 都没有 QUIC/H3 profile，启用 `quic-h3` feature 不会补出对应浏览器的 H3 指纹。
+
 ## FFI 名称
 
-`lk_client_builder_set_preset(builder, "chrome_157")` 和
-`lk_client_builder_set_preset(builder, "firefox_156")` 使用与 Rust 函数相同的规范名称。
+`lk_client_builder_set_preset(builder, "chrome_158")`、
+`lk_client_builder_set_preset(builder, "firefox_156")` 和
+`lk_client_builder_set_preset(builder, "safari_26")` 使用与 Rust 函数相同的规范名称。
+FFI 另外接受 `default`（Chrome 155）和 `safari_26_2`（Safari 26.2）alias。
 `lk_preset_list_json` 列出加载的库实际提供的 preset；`lk_preset_get_detail_json` 返回指定规范名称的配置。
 已发布的旧版本不一定包含本页的新 preset，绑定调用方应按实际库版本查询。
 
@@ -80,6 +92,10 @@ Chrome 156.0.8078.48 的 Windows 导航抓包使用 `Chrome/156.0.0.0`，
 Chrome 157.0.8103.39 的 Windows 导航使用 `Chrome/157.0.0.0`，
 `sec-ch-ua` 为 `"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"`。
 导航 `Accept` 与 156 样本相同。`chrome_157()` 的请求头值仍由调用方显式设置。
+
+Chrome 158.0.8127.37 的 Windows 导航使用 `Chrome/158.0.0.0`，
+`sec-ch-ua` 为 `"Chromium";v="158", "Not.A/Brand";v="24", "Google Chrome";v="158"`。
+导航 `Accept` 与 157 样本相同。`chrome_158()` 仍不自动注入这些请求头值。
 
 如果目标要求自定义 User-Agent，应把它视为一个新的组合配置，并记录：
 

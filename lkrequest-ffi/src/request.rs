@@ -56,10 +56,13 @@ pub(crate) fn take_request_config(handle: &RequestHandle) -> Result<RequestConfi
     match state.lifecycle {
         RequestLifecycle::Building => {
             state.lifecycle = RequestLifecycle::Consumed;
-            Ok(std::mem::replace(
-                &mut state.config,
-                RequestConfig::new(http::Method::GET, String::new()),
-            ))
+            // Keep configuration introspection available after consuming the body.
+            let replacement = RequestConfig {
+                attempt_limits: state.config.attempt_limits,
+                observe_attempts: state.config.observe_attempts,
+                ..RequestConfig::new(http::Method::GET, String::new())
+            };
+            Ok(std::mem::replace(&mut state.config, replacement))
         }
         RequestLifecycle::Consumed => Err(FfiError::invalid_argument(
             "request has already been consumed",
@@ -82,6 +85,8 @@ pub(crate) fn build_request_builder(
     config: RequestConfig,
 ) -> lkrequest::session::RequestBuilder {
     let RequestConfig {
+        attempt_limits,
+        observe_attempts: _,
         method,
         url,
         headers,
@@ -103,7 +108,7 @@ pub(crate) fn build_request_builder(
         h2_priority_weight,
     } = config;
 
-    let mut builder = session.request(method, &url);
+    let mut builder = session.request(method, &url).attempt_limits(attempt_limits);
     if let Some(weight) = h2_priority_weight {
         builder = builder.h2_priority_weight(weight);
     }
@@ -190,14 +195,21 @@ pub(crate) fn clone_request_session(owner: &RequestOwner) -> Result<lkrequest::S
     }
 }
 
-pub(crate) async fn execute_request(
-    session: lkrequest::Session,
+pub(crate) fn prepare_request(
+    session: &lkrequest::Session,
     config: RequestConfig,
-) -> Result<lkrequest::Response, FfiError> {
-    build_request_builder(&session, config)
-        .send()
-        .await
-        .map_err(FfiError::from_lkrequest)
+) -> (
+    lkrequest::session::RequestBuilder,
+    Option<lkrequest::AttemptObserver>,
+) {
+    let observe = config.observe_attempts;
+    let builder = build_request_builder(session, config);
+    if observe {
+        let (builder, observer) = builder.observe_attempts();
+        (builder, Some(observer))
+    } else {
+        (builder, None)
+    }
 }
 
 pub(crate) fn parse_accept_encoding(bits: u8) -> Result<lkrequest::AcceptEncoding, FfiError> {
@@ -693,7 +705,8 @@ pub extern "C" fn lk_request_send(
     out_response: *mut *mut lk_response_t,
     out_err: *mut *mut lk_error_t,
 ) -> lk_status_t {
-    catch_status(out_err, || unsafe {
+    let mut observer = None;
+    let status = catch_status(out_err, || unsafe {
         if out_response.is_null() {
             return Err(FfiError::invalid_argument("out_response is null"));
         }
@@ -702,21 +715,28 @@ pub extern "C" fn lk_request_send(
         let request = require_handle::<RequestHandle, lk_request_t>(request)?;
         let config = take_request_config(request)?;
         let session = clone_request_session(&request.owner)?;
+        let (builder, observed) = prepare_request(&session, config);
+        observer = observed;
         let (result, diagnostics) = runtime().block_on(
-            lkrequest::diagnostics::capture_request_diagnostics(execute_request(session, config)),
+            lkrequest::diagnostics::capture_request_diagnostics(builder.send()),
         );
         let diagnostics = FfiDiagnostics::from(diagnostics);
         match result {
             Ok(response) => {
-                *out_response = box_into_handle(make_response_handle(response, diagnostics));
+                let mut response = make_response_handle(response, diagnostics);
+                response.observer = observer.clone();
+                *out_response = box_into_handle(response);
                 Ok(())
             }
-            Err(mut err) => {
+            Err(err) => {
+                let mut err = FfiError::from_lkrequest(err);
                 err.diagnostics = Some(Box::new(diagnostics));
                 Err(err)
             }
         }
-    })
+    });
+    crate::attempts::attach_error_observer(out_err, observer);
+    status
 }
 
 #[no_mangle]
@@ -754,8 +774,10 @@ pub extern "C" fn lk_request_send_async(
             }
         };
         let client = Arc::clone(&request.client);
+        let (builder, observer) = prepare_request(&session, config);
         let op_shared = Arc::new(crate::handles::OpShared::default());
         let op_handle = OpHandle {
+            observer,
             client: Some(Arc::clone(&client)),
             shared: Arc::clone(&op_shared),
             counted: true,
@@ -764,10 +786,8 @@ pub extern "C" fn lk_request_send_async(
 
         let shared = Arc::clone(&op_shared);
         let join = runtime().spawn(async move {
-            let (result, diagnostics) = lkrequest::diagnostics::capture_request_diagnostics(
-                execute_request(session, config),
-            )
-            .await;
+            let (result, diagnostics) =
+                lkrequest::diagnostics::capture_request_diagnostics(builder.send()).await;
             let diagnostics = FfiDiagnostics::from(diagnostics);
             let mut state = shared.state.lock();
             if matches!(state.result, OpResult::InProgress) {
@@ -775,7 +795,10 @@ pub extern "C" fn lk_request_send_async(
                     Ok(response) => OpResult::CompletedOk(Some(OpSuccess::Response(
                         make_response_handle(response, diagnostics),
                     ))),
-                    Err(err) => OpResult::CompletedErr(Some(make_error_handle(err, diagnostics))),
+                    Err(err) => OpResult::CompletedErr(Some(make_error_handle(
+                        FfiError::from_lkrequest(err),
+                        diagnostics,
+                    ))),
                 };
             }
             shared.cv.notify_all();

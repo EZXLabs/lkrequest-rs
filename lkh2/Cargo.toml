@@ -1,6 +1,6 @@
 [package]
 name = "lkh2"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 description = "HTTP/2 fingerprint-controlled connection library"
 license.workspace = true
@@ -10,14 +10,6 @@ readme = "README.md"
 documentation = "https://docs.rs/lkh2"
 keywords = ["http2", "fingerprint", "hpack", "browser", "networking"]
 categories = ["network-programming", "web-programming::http-client"]
-
-[features]
-default = ["h2-native"]
-# Backward-compatible alias. The fingerprint-controlled native engine is now
-# the only HTTP/2 implementation and is always compiled.
-# Deprecated no-op compatibility alias. Remove completely in 0.3.0.
-h2-native = []
-
 
 [dependencies]
 http = { workspace = true }

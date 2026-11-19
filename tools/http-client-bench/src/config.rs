@@ -13,6 +13,8 @@ pub enum ClientName {
     LkrequestBatch64,
     #[serde(rename = "lkrequest-transport")]
     LkrequestTransport,
+    #[serde(rename = "lkrequest-streaming")]
+    LkrequestStreaming,
     Lkh2,
     #[serde(rename = "lkh2-drain64")]
     Lkh2Drain64,
@@ -28,6 +30,7 @@ impl fmt::Display for ClientName {
             Self::Lkrequest => formatter.write_str("lkrequest"),
             Self::LkrequestBatch64 => formatter.write_str("lkrequest-batch64"),
             Self::LkrequestTransport => formatter.write_str("lkrequest-transport"),
+            Self::LkrequestStreaming => formatter.write_str("lkrequest-streaming"),
             Self::Lkh2 => formatter.write_str("lkh2"),
             Self::Lkh2Drain64 => formatter.write_str("lkh2-drain64"),
             Self::Lkh2Batch64 => formatter.write_str("lkh2-batch64"),
@@ -45,13 +48,98 @@ impl FromStr for ClientName {
             "lkrequest" => Ok(Self::Lkrequest),
             "lkrequest-batch64" => Ok(Self::LkrequestBatch64),
             "lkrequest-transport" => Ok(Self::LkrequestTransport),
+            "lkrequest-streaming" => Ok(Self::LkrequestStreaming),
             "lkh2" => Ok(Self::Lkh2),
             "lkh2-drain64" => Ok(Self::Lkh2Drain64),
             "lkh2-batch64" => Ok(Self::Lkh2Batch64),
             "hyper" => Ok(Self::Hyper),
             "reqwest" => Ok(Self::Reqwest),
             _ => Err(format!(
-                "unknown client `{value}`; expected lkrequest, lkrequest-batch64, lkrequest-transport, lkh2, lkh2-drain64, lkh2-batch64, hyper, or reqwest"
+                "unknown client `{value}`; expected lkrequest, lkrequest-batch64, lkrequest-transport, lkrequest-streaming, lkh2, lkh2-drain64, lkh2-batch64, hyper, or reqwest"
+            )),
+        }
+    }
+}
+
+impl ClientName {
+    pub fn is_lkrequest(self) -> bool {
+        matches!(
+            self,
+            Self::Lkrequest
+                | Self::LkrequestBatch64
+                | Self::LkrequestTransport
+                | Self::LkrequestStreaming
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    H1,
+    #[default]
+    H2c,
+    H3,
+    Race,
+}
+
+impl Protocol {
+    pub fn report_name(self) -> &'static str {
+        match self {
+            Self::H1 => "http1-cleartext",
+            Self::H2c => "h2c-prior-knowledge",
+            Self::H3 => "h3",
+            Self::Race => "tls-h2-quic-h3-race",
+        }
+    }
+
+    pub fn uses_tls(self) -> bool {
+        matches!(self, Self::H3 | Self::Race)
+    }
+
+    fn validate_feature(self) -> Result<(), Box<dyn Error>> {
+        if self.uses_tls() && !cfg!(feature = "quic-h3") {
+            return Err(
+                "h3/race requires building http-client-bench with --features quic-h3".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Protocol {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "h1" => Ok(Self::H1),
+            "h2c" => Ok(Self::H2c),
+            "h3" => Ok(Self::H3),
+            "race" => Ok(Self::Race),
+            _ => Err(format!(
+                "unknown protocol `{value}`; expected h1, h2c, h3, or race"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lifecycle {
+    #[default]
+    Warm,
+    Cold,
+}
+
+impl FromStr for Lifecycle {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "warm" => Ok(Self::Warm),
+            "cold" => Ok(Self::Cold),
+            _ => Err(format!(
+                "unknown lifecycle `{value}`; expected warm or cold"
             )),
         }
     }
@@ -68,6 +156,10 @@ pub struct RunConfig {
     pub expected_bytes: usize,
     pub output: Option<PathBuf>,
     pub runtime_workers: usize,
+    pub protocol: Protocol,
+    pub lifecycle: Lifecycle,
+    pub allocations: bool,
+    pub server_stats: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +167,8 @@ pub struct ServeConfig {
     pub listen: SocketAddr,
     pub body_size: usize,
     pub runtime_workers: usize,
+    pub protocol: Protocol,
+    pub stats_output: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +204,7 @@ impl Command {
 }
 
 fn parse_run(arguments: &[String]) -> Result<RunConfig, Box<dyn Error>> {
-    let mut client = None;
+    let mut client: Option<ClientName> = None;
     let mut url = "http://127.0.0.1:18481/".to_owned();
     let mut requests = 10_000;
     let mut concurrency = 32;
@@ -119,6 +213,10 @@ fn parse_run(arguments: &[String]) -> Result<RunConfig, Box<dyn Error>> {
     let mut expected_bytes = 1_024;
     let mut output = None;
     let mut runtime_workers = 1;
+    let mut protocol = Protocol::H2c;
+    let mut lifecycle = Lifecycle::Warm;
+    let mut allocations = false;
+    let mut server_stats = None;
 
     let mut index = 0;
     while index < arguments.len() {
@@ -139,13 +237,36 @@ fn parse_run(arguments: &[String]) -> Result<RunConfig, Box<dyn Error>> {
             "--expected-bytes" => expected_bytes = value.parse()?,
             "--output" => output = Some(PathBuf::from(value)),
             "--runtime-workers" => runtime_workers = parse_positive(value, flag)?,
+            "--protocol" => protocol = value.parse()?,
+            "--lifecycle" => lifecycle = value.parse()?,
+            "--allocations" => allocations = value.parse()?,
+            "--server-stats" => server_stats = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown run option `{flag}`").into()),
         }
     }
 
     let client = client.ok_or("`run` requires --client")?;
-    if !url.starts_with("http://") {
-        return Err("the initial benchmark supports h2c URLs beginning with http://".into());
+    protocol.validate_feature()?;
+    if !client.is_lkrequest() && (protocol != Protocol::H2c || lifecycle != Lifecycle::Warm) {
+        return Err("non-lkrequest clients support only --protocol h2c --lifecycle warm".into());
+    }
+    let uri: http::Uri = url.parse()?;
+    let required_scheme = if protocol.uses_tls() { "https" } else { "http" };
+    if uri.scheme_str() != Some(required_scheme) || uri.host().is_none() {
+        return Err(format!(
+            "{} requires an absolute {required_scheme}:// URL",
+            protocol.report_name()
+        )
+        .into());
+    }
+    if protocol.uses_tls() && loopback_address(&uri).is_none() {
+        return Err("h3/race fixtures require localhost or a loopback IP address".into());
+    }
+    if protocol == Protocol::Race && server_stats.is_none() {
+        return Err("race requires --server-stats PATH to verify both transport starts".into());
+    }
+    if server_stats.is_some() && loopback_address(&uri).is_none() {
+        return Err("--server-stats requires a loopback fixture URL".into());
     }
     if sessions > concurrency {
         return Err("--sessions cannot exceed --concurrency".into());
@@ -161,13 +282,19 @@ fn parse_run(arguments: &[String]) -> Result<RunConfig, Box<dyn Error>> {
         expected_bytes,
         output,
         runtime_workers,
+        protocol,
+        lifecycle,
+        allocations,
+        server_stats,
     })
 }
 
 fn parse_serve(arguments: &[String]) -> Result<ServeConfig, Box<dyn Error>> {
-    let mut listen = "127.0.0.1:18481".parse()?;
+    let mut listen: SocketAddr = "127.0.0.1:18481".parse()?;
     let mut body_size = 1_024;
     let mut runtime_workers = 2;
+    let mut protocol = Protocol::H2c;
+    let mut stats_output = None;
 
     let mut index = 0;
     while index < arguments.len() {
@@ -182,15 +309,33 @@ fn parse_serve(arguments: &[String]) -> Result<ServeConfig, Box<dyn Error>> {
             "--listen" => listen = value.parse()?,
             "--body-size" => body_size = value.parse()?,
             "--runtime-workers" => runtime_workers = parse_positive(value, flag)?,
+            "--protocol" => protocol = value.parse()?,
+            "--stats-output" => stats_output = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown serve option `{flag}`").into()),
         }
     }
 
+    protocol.validate_feature()?;
+    if protocol.uses_tls() && !listen.ip().is_loopback() {
+        return Err("h3/race fixture servers must listen on a loopback address".into());
+    }
     Ok(ServeConfig {
         listen,
         body_size,
         runtime_workers,
+        protocol,
+        stats_output,
     })
+}
+
+pub fn loopback_address(uri: &http::Uri) -> Option<std::net::IpAddr> {
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .filter(|ip| ip.is_loopback())
 }
 
 fn parse_positive<T>(value: &str, flag: &str) -> Result<T, Box<dyn Error>>
@@ -210,11 +355,14 @@ pub fn print_help() {
         "http-client-bench\n\n",
         "Server:\n  http-client-bench serve [server options]\n\n",
         "Client:\n  http-client-bench run --client CLIENT [run options]\n\n",
-        "Clients:\n  lkrequest, lkrequest-batch64, lkrequest-transport, ",
+        "Clients:\n  lkrequest, lkrequest-batch64, lkrequest-transport, lkrequest-streaming, ",
         "lkh2, lkh2-drain64, lkh2-batch64, hyper, reqwest\n\n",
         "Run options:\n  --url URL --requests N --concurrency N --sessions N\n",
         "  --warmup-requests N --expected-bytes N --runtime-workers N\n",
-        "  --output PATH"
+        "  --protocol h1|h2c|h3|race --lifecycle warm|cold\n",
+        "  --allocations true|false --server-stats PATH --output PATH\n\n",
+        "Server options:\n  --listen ADDR --body-size N --runtime-workers N\n",
+        "  --protocol h1|h2c|h3|race --stats-output PATH"
     ));
 }
 
@@ -236,6 +384,9 @@ mod tests {
         assert_eq!(config.client, ClientName::Hyper);
         assert_eq!(config.requests, 42);
         assert_eq!(config.concurrency, 4);
+        assert_eq!(config.protocol, Protocol::H2c);
+        assert_eq!(config.lifecycle, Lifecycle::Warm);
+        assert!(!config.allocations);
     }
 
     #[test]
@@ -260,5 +411,159 @@ mod tests {
             "5".into(),
         ];
         assert!(parse_run(&arguments).is_err());
+    }
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn accepts_cold_h1_and_separate_allocation_sample() {
+        let config = parse_run(&arguments(&[
+            "--client",
+            "lkrequest",
+            "--protocol",
+            "h1",
+            "--lifecycle",
+            "cold",
+            "--warmup-requests",
+            "0",
+            "--allocations",
+            "true",
+        ]))
+        .unwrap();
+        assert_eq!(config.protocol, Protocol::H1);
+        assert_eq!(config.lifecycle, Lifecycle::Cold);
+        assert_eq!(config.warmup_requests, 0);
+        assert!(config.allocations);
+    }
+
+    #[test]
+    fn streaming_client_accepts_all_available_protocols_and_lifecycles() {
+        for protocol in ["h1", "h2c", "h3", "race"] {
+            for lifecycle in ["warm", "cold"] {
+                let tls = matches!(protocol, "h3" | "race");
+                let config = parse_run(&arguments(&[
+                    "--client",
+                    "lkrequest-streaming",
+                    "--protocol",
+                    protocol,
+                    "--lifecycle",
+                    lifecycle,
+                    "--url",
+                    if tls {
+                        "https://localhost:18481/"
+                    } else {
+                        "http://127.0.0.1:18481/"
+                    },
+                    "--server-stats",
+                    "stats.json",
+                ]));
+                if tls && !cfg!(feature = "quic-h3") {
+                    assert!(config
+                        .unwrap_err()
+                        .to_string()
+                        .contains("--features quic-h3"));
+                } else {
+                    let config = config.unwrap();
+                    assert_eq!(config.client, ClientName::LkrequestStreaming);
+                    assert_eq!(config.client.to_string(), "lkrequest-streaming");
+                    assert_eq!(
+                        serde_json::to_string(&config.client).unwrap(),
+                        "\"lkrequest-streaming\""
+                    );
+                    assert_eq!(config.protocol, protocol.parse().unwrap());
+                    assert_eq!(config.lifecycle, lifecycle.parse().unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_comparator_workloads() {
+        for (flag, value) in [("--protocol", "h1"), ("--lifecycle", "cold")] {
+            let error = parse_run(&arguments(&["--client", "hyper", flag, value])).unwrap_err();
+            assert!(error.to_string().contains("non-lkrequest clients"));
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_allocation_flag_and_missing_stats_identity() {
+        assert!(parse_run(&arguments(&[
+            "--client",
+            "lkrequest",
+            "--allocations",
+            "yes"
+        ]))
+        .is_err());
+        assert!(parse_run(&arguments(&[
+            "--client",
+            "lkrequest",
+            "--url",
+            "http://example.com/",
+            "--server-stats",
+            "stats.json",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn resolves_fixture_loopback_without_losing_ipv6() {
+        assert_eq!(
+            loopback_address(&"https://localhost:18481/".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            loopback_address(&"https://[::1]:18481/".parse().unwrap()),
+            Some("::1".parse().unwrap())
+        );
+        assert_eq!(
+            loopback_address(&"https://192.0.2.1/".parse().unwrap()),
+            None
+        );
+    }
+
+    #[cfg(not(feature = "quic-h3"))]
+    #[test]
+    fn rejects_quic_mode_without_feature() {
+        let error = parse_run(&arguments(&[
+            "--client",
+            "lkrequest",
+            "--protocol",
+            "h3",
+            "--url",
+            "https://localhost/",
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("--features quic-h3"));
+    }
+
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn race_requires_evidence_and_local_tls_fixture() {
+        let mut args = arguments(&[
+            "--client",
+            "lkrequest",
+            "--protocol",
+            "race",
+            "--url",
+            "https://localhost:18481/",
+        ]);
+        assert!(parse_run(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("--server-stats"));
+        args.extend(arguments(&["--server-stats", "stats.json"]));
+        let config = parse_run(&args).unwrap();
+        assert_eq!(config.protocol, Protocol::Race);
+        args[5] = "https://example.com/".into();
+        assert!(parse_run(&args).is_err());
+        assert!(parse_serve(&arguments(&[
+            "--protocol",
+            "race",
+            "--listen",
+            "0.0.0.0:18481"
+        ]))
+        .is_err());
     }
 }

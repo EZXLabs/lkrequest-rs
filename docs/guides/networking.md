@@ -300,6 +300,13 @@ let client = Client::builder()
 
 `DnsConfig::Google`、`Cloudflare`、`Quad9` 和 `Custom` 使用 Hickory resolver。对应的 `*Https` 变体需要 `doh` feature。
 
+应用需要自己的解析逻辑时，实现 `DnsResolver`，通过 `.dns_resolver(Arc::new(resolver))`
+安装。返回的候选地址仍受 `ip_family` 过滤，等待 resolver 的时间仍受 DNS/总超时约束；
+resolver 内部的查询传输与缓存则由实现者管理。C ABI 对应
+`lk_client_builder_set_dns_resolver` 回调接口，具体回调签名、并发与内存生命周期见生成
+header。只需指定 DNS 服务器时使用 `dns(DnsConfig::Custom(...))` 或
+`lk_client_builder_set_dns_custom`，无需编写 resolver。
+
 ## 多地址与 IPv6
 
 resolver 可以返回多个 IPv4/IPv6 地址。连接建立会在资源预算内尝试候选地址；不要假设第一个 DNS 结果就是最终连接地址。代理 hostname 也会经过相同的解析与拨号过程。

@@ -33,8 +33,16 @@ pub struct PlaintextRecord {
 pub struct RecordReader {
     /// Buffer for accumulating incoming bytes.
     buf: Vec<u8>,
+    input_pos: usize,
+    pending_header: Option<RecordHeader>,
+    #[cfg(test)]
+    header_parses: usize,
+    poisoned: bool,
     /// Read sequence number (for AEAD nonce construction).
     seq_num: u64,
+    /// Cached receive budget. Confidentiality bounds constrain encryption;
+    /// current TLS decryptors enforce only sequence exhaustion.
+    record_limit: u64,
     /// TLS 1.3 AEAD decryption key + IV (None before keys are established).
     aead: Option<Aead>,
     /// TLS 1.2 record cipher (None if using TLS 1.3 or plaintext).
@@ -50,6 +58,7 @@ pub struct RecordReader {
     tls13_handshake_complete: bool,
     consecutive_empty_records: u8,
     nss_ccs_received_with_keys: bool,
+    tls12_session_state: Option<crate::session_store::client::Tls12SessionState>,
 }
 
 impl RecordReader {
@@ -59,7 +68,13 @@ impl RecordReader {
             buf: Vec::with_capacity(
                 MAX_RECORD_PAYLOAD + RECORD_HEADER_SIZE + MAX_CIPHERTEXT_EXPANSION,
             ),
+            input_pos: 0,
+            pending_header: None,
+            #[cfg(test)]
+            header_parses: 0,
+            poisoned: false,
             seq_num: 0,
+            record_limit: u64::MAX,
             aead: None,
             tls12_cipher: None,
             own_record_size_limit: None,
@@ -68,11 +83,25 @@ impl RecordReader {
             tls13_handshake_complete: false,
             consecutive_empty_records: 0,
             nss_ccs_received_with_keys: false,
+            tls12_session_state: None,
         }
     }
 
     pub(crate) fn set_client_style(&mut self, style: TlsClientHelloStyle) {
         self.client_style = style;
+    }
+
+    pub(crate) fn set_tls12_session_state(
+        &mut self,
+        state: crate::session_store::client::Tls12SessionState,
+    ) {
+        self.tls12_session_state = Some(state);
+    }
+
+    pub(crate) fn invalidate_tls12_session(&self) {
+        if let Some(state) = &self.tls12_session_state {
+            state.invalidate();
+        }
     }
 
     pub(crate) fn select_tls13(&mut self) {
@@ -169,6 +198,10 @@ impl RecordReader {
     /// Install TLS 1.3 decryption keys. All subsequent records will be decrypted.
     /// Resets the sequence number to 0.
     pub fn set_keys(&mut self, aead: Aead) {
+        if self.poisoned {
+            return;
+        }
+        self.record_limit = aead.algorithm().tls_record_limits().decrypt;
         self.aead = Some(aead);
         self.tls12_cipher = None;
         self.seq_num = 0;
@@ -178,6 +211,10 @@ impl RecordReader {
     /// Install TLS 1.2 decryption keys. All subsequent records will be decrypted.
     /// Resets the sequence number to 0.
     pub fn set_tls12_keys(&mut self, cipher: Tls12RecordCipher) {
+        if self.poisoned {
+            return;
+        }
+        self.record_limit = cipher.tls_record_limits().decrypt;
         self.tls12_cipher = Some(cipher);
         self.aead = None;
         self.seq_num = 0;
@@ -189,12 +226,64 @@ impl RecordReader {
 
     /// Feed raw bytes from the transport into the reader.
     pub fn feed(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
+        self.feed_bounded(data, usize::MAX);
+    }
+
+    pub fn install_keys(&mut self, keys: super::ReadKeys) {
+        match keys.0 {
+            super::protection::Protection::Tls13(key) => self.set_keys(key),
+            super::protection::Protection::Tls12(key) => self.set_tls12_keys(key),
+        }
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sequence_for_test(&mut self, sequence: u64) {
+        self.seq_num = sequence;
+    }
+
+    /// Accept a bounded prefix; the caller retains and retries the remainder.
+    pub fn feed_bounded(&mut self, data: &[u8], limit: usize) -> usize {
+        if self.poisoned {
+            return 0;
+        }
+        let count = data.len().min(limit.saturating_sub(self.buffered_len()));
+        if self.input_pos != 0
+            && (self.input_pos >= self.buf.len() / 2
+                || self.buf.len().saturating_add(count) > limit)
+        {
+            #[cfg(test)]
+            super::measurement::copied(
+                super::measurement::CopySite::InputCompact,
+                self.buffered_len(),
+            );
+            self.buf.copy_within(self.input_pos.., 0);
+            self.buf.truncate(self.buffered_len());
+            self.input_pos = 0;
+        }
+        super::reserve_bounded(&mut self.buf, count, limit);
+        self.buf.extend_from_slice(&data[..count]);
+        #[cfg(test)]
+        super::measurement::copied(super::measurement::CopySite::InputFeed, count);
+        count
     }
 
     /// Returns the number of buffered bytes not yet consumed.
     pub fn buffered_len(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.input_pos
+    }
+
+    #[cfg(test)]
+    pub(super) fn measurement_snapshot(&self) -> super::measurement::BufferSnapshot {
+        super::measurement::BufferSnapshot::new(self.buf.capacity(), self.buf.len(), self.input_pos)
+    }
+
+    #[cfg(test)]
+    pub(super) fn measurement_header_parses(&self) -> usize {
+        self.header_parses
     }
 
     /// Try to read the next complete TLS record.
@@ -202,12 +291,63 @@ impl RecordReader {
     /// Returns `Ok(None)` if not enough data is available yet.
     /// Returns `Ok(Some(record))` when a complete record is available.
     pub fn next_record(&mut self) -> Result<Option<PlaintextRecord>> {
+        let mut payload = Vec::new();
+        self.next_record_into(&mut payload).map(|kind| {
+            kind.map(|content_type| PlaintextRecord {
+                content_type,
+                payload,
+            })
+        })
+    }
+
+    /// Decode into reusable caller storage. No plaintext is exposed on error.
+    /// The returned byte is the authenticated content type.
+    /// Every call clears output first, including when returning `Ok(None)`;
+    /// its allocation is retained for the next record.
+    pub fn next_record_into(&mut self, output: &mut Vec<u8>) -> Result<Option<u8>> {
+        output.clear();
+        if self.poisoned {
+            return Err(TlsError::UnexpectedMessage(
+                "record reader is poisoned".into(),
+            ));
+        }
+        let result = self.next_record_inner(output);
+        if matches!(result, Ok(Some(content_type::ALERT))) && output.first() == Some(&2) {
+            self.invalidate_tls12_session();
+        }
+        if result.is_err() {
+            self.invalidate_tls12_session();
+            output.clear();
+            self.poisoned = true;
+            self.buf.clear();
+            self.input_pos = 0;
+            self.pending_header = None;
+            self.aead = None;
+            self.tls12_cipher = None;
+        }
+        result
+    }
+
+    fn next_record_inner(&mut self, output: &mut Vec<u8>) -> Result<Option<u8>> {
         // Step 1: Do we have a complete header?
-        if self.buf.len() < RECORD_HEADER_SIZE {
+        if self.buffered_len() < RECORD_HEADER_SIZE {
             return Ok(None);
         }
 
-        let header = RecordHeader::from_bytes(self.buf[..RECORD_HEADER_SIZE].try_into().unwrap());
+        let header = self
+            .pending_header
+            .get_or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    self.header_parses += 1;
+                }
+                RecordHeader::from_bytes(
+                    self.buf[self.input_pos..self.input_pos + RECORD_HEADER_SIZE]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .clone();
 
         let payload_len = header.length as usize;
         let is_encrypted = self.aead.is_some() || self.tls12_cipher.is_some();
@@ -240,14 +380,31 @@ impl RecordReader {
 
         // Step 2: Do we have the full record?
         let total_len = RECORD_HEADER_SIZE + payload_len;
-        if self.buf.len() < total_len {
+        if self.buffered_len() < total_len {
             return Ok(None);
         }
 
+        let protected = self.tls12_cipher.is_some()
+            || (self.aead.is_some() && header.content_type == content_type::APPLICATION_DATA);
+        if protected && self.seq_num >= self.record_limit {
+            return Err(TlsError::UnexpectedMessage(
+                "read sequence number exhausted".into(),
+            ));
+        }
+
         // Step 3: Extract the record payload
-        let raw_payload = self.buf[RECORD_HEADER_SIZE..total_len].to_vec();
-        // Remove the consumed record from the buffer
-        self.buf.drain(..total_len);
+        output.extend_from_slice(
+            &self.buf[self.input_pos + RECORD_HEADER_SIZE..self.input_pos + total_len],
+        );
+        #[cfg(test)]
+        super::measurement::copied(super::measurement::CopySite::CiphertextOpen, payload_len);
+        self.input_pos += total_len;
+        self.pending_header = None;
+        if self.input_pos == self.buf.len() {
+            self.buf.clear();
+            self.input_pos = 0;
+        }
+        let raw_payload = output;
 
         // Step 4a: TLS 1.2 decryption — decrypt ALL records after keys installed
         if let Some(ref tls12_cipher) = self.tls12_cipher {
@@ -262,7 +419,7 @@ impl RecordReader {
                 )
             };
 
-            let plaintext = match tls12_cipher {
+            match tls12_cipher {
                 Tls12RecordCipher::Gcm(gcm) => {
                     // GCM: raw_payload = explicit_nonce(8) + ciphertext + tag(16)
                     // Plaintext length = record payload length - 8 - 16
@@ -278,7 +435,7 @@ impl RecordReader {
                     aad[11] = (plaintext_len >> 8) as u8;
                     aad[12] = plaintext_len as u8;
 
-                    gcm.decrypt(&aad, &raw_payload)
+                    gcm.decrypt_in_place(&aad, raw_payload)
                         .map_err(|_| authentication_failure())?
                 }
                 Tls12RecordCipher::Chacha20(chacha) => {
@@ -296,7 +453,7 @@ impl RecordReader {
                     aad[12] = plaintext_len as u8;
 
                     chacha
-                        .decrypt(self.seq_num, &aad, &raw_payload)
+                        .decrypt_in_place(self.seq_num, &aad, raw_payload)
                         .map_err(|_| authentication_failure())?
                 }
                 Tls12RecordCipher::Cbc(cbc) => {
@@ -314,8 +471,8 @@ impl RecordReader {
                     aad[11] = (rpl >> 8) as u8;
                     aad[12] = rpl as u8;
 
-                    cbc.decrypt(&aad, &raw_payload)
-                        .map_err(|_| authentication_failure())?
+                    cbc.decrypt_in_place(&aad, raw_payload)
+                        .map_err(|_| authentication_failure())?;
                 }
             };
             self.seq_num = self.seq_num.checked_add(1).ok_or_else(|| {
@@ -324,13 +481,10 @@ impl RecordReader {
 
             // RFC 8449 §4 / RFC 5246 §6.2.3: the fragment we just recovered must
             // fit the limit we advertised, and the protocol's 2^14 in any case.
-            self.check_protected_plaintext_len(plaintext.len())?;
+            self.check_protected_plaintext_len(raw_payload.len())?;
             check_content_type(header.content_type)?;
 
-            return Ok(Some(PlaintextRecord {
-                content_type: header.content_type,
-                payload: plaintext,
-            }));
+            return Ok(Some(header.content_type));
         }
 
         // Step 4b: TLS 1.3 decryption — only APPLICATION_DATA records
@@ -356,8 +510,7 @@ impl RecordReader {
                 // TLS 1.3: encrypted records use content_type APPLICATION_DATA on the wire.
                 // AAD = the 5-byte record header (with the encrypted length).
                 let aad = header.to_bytes();
-                let plaintext = aead
-                    .decrypt(self.seq_num, &aad, &raw_payload)
+                aead.open_in_place(self.seq_num, &aad, raw_payload)
                     .map_err(|_| {
                         TlsError::local_alert(
                             AlertDescription::BadRecordMac,
@@ -372,12 +525,12 @@ impl RecordReader {
                 // TLSInnerPlaintext, so it is checked before the content-type
                 // octet and padding are stripped. RFC 8446 §5.2's 2^14+1 ceiling
                 // rides along in the same comparison.
-                self.check_protected_plaintext_len(plaintext.len())?;
+                self.check_protected_plaintext_len(raw_payload.len())?;
 
                 // TLS 1.3: the last non-zero byte of the decrypted payload is the
                 // inner content type. Strip trailing zeros and the content type byte.
                 let (inner_ct, inner_payload) =
-                    strip_inner_content_type(&plaintext).map_err(|_| {
+                    strip_inner_content_type(raw_payload).map_err(|_| {
                         TlsError::local_alert(
                             if self.client_style == TlsClientHelloStyle::ChromiumBoringssl {
                                 AlertDescription::DecryptError
@@ -409,10 +562,9 @@ impl RecordReader {
                 }
                 self.count_empty_record(inner_payload.is_empty())?;
 
-                return Ok(Some(PlaintextRecord {
-                    content_type: inner_ct,
-                    payload: inner_payload,
-                }));
+                let len = inner_payload.len();
+                raw_payload.truncate(len);
+                return Ok(Some(inner_ct));
             }
         }
 
@@ -437,7 +589,7 @@ impl RecordReader {
 
         if self.aead.is_some()
             && header.content_type == content_type::CHANGE_CIPHER_SPEC
-            && (raw_payload != [1] || self.tls13_handshake_complete)
+            && (raw_payload.as_slice() != [1] || self.tls13_handshake_complete)
         {
             return Err(TlsError::local_alert(
                 if self.client_style == TlsClientHelloStyle::ChromiumBoringssl {
@@ -453,7 +605,7 @@ impl RecordReader {
 
         if self.tls13_selected
             && header.content_type == content_type::CHANGE_CIPHER_SPEC
-            && raw_payload == [1]
+            && raw_payload.as_slice() == [1]
         {
             // BoringSSL counts compatibility CCS with empty records. NSS only
             // permits one CCS once handshake read keys have been installed.
@@ -471,10 +623,7 @@ impl RecordReader {
             self.count_empty_record(raw_payload.is_empty())?;
         }
 
-        Ok(Some(PlaintextRecord {
-            content_type: header.content_type,
-            payload: raw_payload,
-        }))
+        Ok(Some(header.content_type))
     }
 }
 
@@ -508,14 +657,14 @@ fn check_content_type(content_type: u8) -> Result<()> {
 ///
 /// The inner content type is the last non-zero byte. Everything after (zeros)
 /// is padding and is stripped.
-fn strip_inner_content_type(plaintext: &[u8]) -> Result<(u8, Vec<u8>)> {
+fn strip_inner_content_type(plaintext: &[u8]) -> Result<(u8, &[u8])> {
     // Find the last non-zero byte (the inner content type)
     let ct_pos = plaintext.iter().rposition(|&b| b != 0).ok_or_else(|| {
         TlsError::UnexpectedMessage("Decrypted record has no content type".to_string())
     })?;
 
     let inner_content_type = plaintext[ct_pos];
-    let inner_payload = plaintext[..ct_pos].to_vec();
+    let inner_payload = &plaintext[..ct_pos];
 
     Ok((inner_content_type, inner_payload))
 }
@@ -529,6 +678,72 @@ mod tests {
     use super::*;
     use crate::crypto::aead::AeadAlgorithm;
     use crate::crypto::tls12_cipher::Tls12GcmCipher;
+
+    #[test]
+    fn usage_limit_read_sequence_is_rejected_before_authentication() {
+        for tls12 in [false, true] {
+            let mut reader = RecordReader::new();
+            if tls12 {
+                reader.set_tls12_keys(Tls12RecordCipher::Gcm(
+                    Tls12GcmCipher::new(&[3; 16], &[4; 4], false).unwrap(),
+                ));
+            } else {
+                reader.set_keys(Aead::new(AeadAlgorithm::Aes128Gcm, &[3; 16], &[4; 12]).unwrap());
+            }
+            reader.set_sequence_for_test(u64::MAX);
+            reader.feed(&[23, 3, 3, 0, 1, 0]);
+            let mut output = vec![0xab; 10];
+            let error = reader.next_record_into(&mut output).unwrap_err();
+            assert!(
+                matches!(error, TlsError::UnexpectedMessage(ref reason) if reason.contains("sequence")),
+                "record was authenticated before the exhausted sequence check: {error:?}"
+            );
+            assert!(output.is_empty());
+            assert!(reader.is_poisoned());
+            reader
+                .set_keys(Aead::new(AeadAlgorithm::Chacha20Poly1305, &[5; 32], &[6; 12]).unwrap());
+            assert_eq!(reader.feed_bounded(&[23, 3, 3, 0, 0], 100), 0);
+            assert!(reader.next_record_into(&mut output).is_err());
+        }
+    }
+
+    #[test]
+    fn usage_limit_reads_do_not_apply_the_peers_confidentiality_budget() {
+        // Rejecting ciphertext after the peer has already encrypted it cannot
+        // restore confidentiality. Keep the read nonce guard independent.
+        let sequence = 1 << 24;
+        let mut reader = RecordReader::new();
+        reader.set_keys(Aead::new(AeadAlgorithm::Aes128Gcm, &TEST_KEY, &TEST_IV).unwrap());
+        reader.set_sequence_for_test(sequence);
+        reader.feed(&tls13_record_at_sequence(&[7, 23], sequence));
+        assert_eq!(reader.next_record().unwrap().unwrap().payload, [7]);
+
+        let cipher = Tls12GcmCipher::new(&TEST_KEY, &[4; 4], false).unwrap();
+        let mut aad = [0; 13];
+        aad[..8].copy_from_slice(&sequence.to_be_bytes());
+        aad[8..].copy_from_slice(&[23, 3, 3, 0, 1]);
+        let ciphertext = cipher.encrypt(sequence, &aad, &[7]).unwrap();
+        let mut record = vec![23, 3, 3, 0, ciphertext.len() as u8];
+        record.extend_from_slice(&ciphertext);
+        reader.set_tls12_keys(Tls12RecordCipher::Gcm(cipher));
+        reader.set_sequence_for_test(sequence);
+        reader.feed(&record);
+        assert_eq!(reader.next_record().unwrap().unwrap().payload, [7]);
+    }
+
+    #[test]
+    fn usage_limit_read_accepts_last_sequence_then_rejects_without_plaintext() {
+        let mut reader = RecordReader::new();
+        reader.set_keys(Aead::new(AeadAlgorithm::Aes128Gcm, &TEST_KEY, &TEST_IV).unwrap());
+        reader.set_sequence_for_test(u64::MAX - 1);
+        reader.feed(&tls13_record_at_sequence(&[7, 23], u64::MAX - 1));
+        assert_eq!(reader.next_record().unwrap().unwrap().payload, [7]);
+        reader.feed(&tls13_record_at_sequence(&[8, 23], u64::MAX));
+        let mut output = vec![9; 10];
+        assert!(reader.next_record_into(&mut output).is_err());
+        assert!(output.is_empty());
+        assert!(reader.is_poisoned());
+    }
 
     #[test]
     fn test_read_plaintext_record() {

@@ -2,6 +2,13 @@
 
 use super::Extension;
 
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    super::registry::require_empty(data)?;
+    Ok(super::tls12::ServerValue::ServerName)
+}
+
 /// SNI extension carrying the target hostname.
 pub struct Sni {
     /// The hostname to include in the SNI extension.

@@ -8,6 +8,7 @@ use http_body::Body;
 use hyper::client::conn::http1::{Connection, SendRequest};
 use hyper::rt::{Read, ReadBufCursor, Write};
 use parking_lot::Mutex;
+use tokio::sync::watch;
 
 use crate::Client;
 
@@ -23,6 +24,7 @@ type HostRewriteState = Option<Arc<Mutex<HostRewrite>>>;
 pub(crate) struct Http1Sender<B> {
     inner: SendRequest<B>,
     host_rewrite: HostRewriteState,
+    failure: watch::Receiver<Option<Arc<io::Error>>>,
 }
 
 #[cfg(test)]
@@ -31,13 +33,14 @@ impl<B> From<SendRequest<B>> for Http1Sender<B> {
         Self {
             inner,
             host_rewrite: None,
+            failure: watch::channel(None).1,
         }
     }
 }
 
 impl<B> Http1Sender<B> {
-    pub(crate) async fn ready(&mut self) -> Result<(), hyper::Error> {
-        self.inner.ready().await
+    pub(crate) async fn ready(&mut self) -> crate::error::Result<()> {
+        observe_request(self.inner.ready(), &mut self.failure).await
     }
 }
 
@@ -45,19 +48,43 @@ impl<B: Body + 'static> Http1Sender<B> {
     pub(crate) async fn send_request(
         &mut self,
         request: http::Request<B>,
-    ) -> Result<http::Response<hyper::body::Incoming>, hyper::Error> {
-        self.inner.ready().await?;
+    ) -> crate::error::Result<http::Response<hyper::body::Incoming>> {
+        self.ready().await?;
         if let Some(state) = &self.host_rewrite {
             *state.lock() = HostRewrite::RequestHead;
         }
-        self.inner.send_request(request).await
+        observe_request(self.inner.send_request(request), &mut self.failure).await
+    }
+}
+
+async fn observe_request<T>(
+    future: impl std::future::Future<Output = Result<T, hyper::Error>>,
+    failure: &mut watch::Receiver<Option<Arc<io::Error>>>,
+) -> crate::error::Result<T> {
+    tokio::select! {
+        biased;
+        result = future => result.map_err(|error| {
+            match failure.borrow().as_ref() {
+                Some(cause) => crate::error::Error::from_h1_io(cause.clone()),
+                None => crate::error::Error::from_h1_error(error, "HTTP/1.1 request failed"),
+            }
+        }),
+        error = async {
+            loop {
+                let error = failure.borrow().clone();
+                if let Some(error) = error { return error; }
+                if failure.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+            }
+        } => Err(crate::error::Error::from_h1_io(error)),
     }
 }
 
 pub(crate) async fn handshake<T, B>(
     client: &Client,
     io: T,
-) -> Result<(Http1Sender<B>, Connection<HostCaseIo<T>, B>), hyper::Error>
+) -> Result<(Http1Sender<B>, Connection<HostCaseIo<ObservedIo<T>>, B>), hyper::Error>
 where
     T: Read + Write + Unpin,
     B: Body + 'static,
@@ -66,8 +93,12 @@ where
 {
     let host_rewrite =
         (!client.http1_title_case_headers()).then(|| Arc::new(Mutex::new(HostRewrite::Idle)));
+    let (failure_tx, failure) = watch::channel(None);
     let io = HostCaseIo {
-        inner: io,
+        inner: ObservedIo {
+            inner: io,
+            failure: failure_tx,
+        },
         host_rewrite: host_rewrite.clone(),
     };
     let (inner, connection) = client.http1_builder().handshake(io).await?;
@@ -75,9 +106,85 @@ where
         Http1Sender {
             inner,
             host_rewrite,
+            failure,
         },
         connection,
     ))
+}
+
+// Capture the original transport error before Hyper drops it while closing
+// its dispatch channel. Wake the request even if driver teardown is pending.
+pub(crate) struct ObservedIo<T> {
+    inner: T,
+    failure: watch::Sender<Option<Arc<io::Error>>>,
+}
+
+impl<T> ObservedIo<T> {
+    fn observe<V>(&self, result: Poll<io::Result<V>>) -> Poll<io::Result<V>> {
+        match result {
+            Poll::Ready(Err(error)) => {
+                let error = Arc::new(error);
+                self.failure.send_if_modified(|failure| {
+                    if failure.is_some() {
+                        return false;
+                    }
+                    *failure = Some(error.clone());
+                    true
+                });
+                Poll::Ready(Err(io::Error::new(
+                    error.kind(),
+                    crate::error::SharedIoError(error),
+                )))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<T: Read + Unpin> Read for ObservedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        this.observe(result)
+    }
+}
+
+impl<T: Write + Unpin> Write for ObservedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.observe(result)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_flush(cx);
+        this.observe(result)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.observe(result)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.observe(result)
+    }
 }
 
 pub(crate) struct HostCaseIo<T> {
@@ -201,6 +308,29 @@ fn host_offset(buf: &[u8]) -> io::Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_failure_wakes_pending_request_but_preserves_ready_response() {
+        let error = lktls::error::TlsError::Alert(lktls::error::TlsAlert {
+            level: lktls::error::AlertLevel::Fatal,
+            description: lktls::error::AlertDescription::CertificateRequired,
+        });
+        let (_tx, mut failure) = watch::channel(Some(Arc::new(io::Error::other(error))));
+        assert_eq!(
+            observe_request(std::future::ready(Ok(200)), &mut failure)
+                .await
+                .unwrap(),
+            200
+        );
+        let error = observe_request(
+            std::future::pending::<Result<(), hyper::Error>>(),
+            &mut failure,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.as_tls_alert().unwrap().description.as_byte(), 116);
+        assert!(!error.is_safe_to_replay());
+    }
 
     struct PartialWriter {
         bytes: Vec<u8>,

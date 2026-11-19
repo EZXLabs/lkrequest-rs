@@ -380,6 +380,7 @@ pub extern "C" fn lk_session_pool_acquire_async(
         let client = Arc::clone(&pool.client);
         let op_shared = Arc::new(crate::handles::OpShared::default());
         let op_handle = OpHandle {
+            observer: None,
             client: Some(Arc::clone(&client)),
             shared: Arc::clone(&op_shared),
             counted: true,

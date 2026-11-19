@@ -1,8 +1,8 @@
 # 指纹 preset 支持与验证矩阵
 
-本页区分两件事：**API 可以构造某个完整 preset**，以及**该 preset 的每一协议层是否有直接外部证据**。数据源是 `docs/data/preset-evidence.toml`，审阅日期为 2026-11-05。
+本页区分两件事：**API 可以构造某个完整 preset**，以及**该 preset 的每一协议层是否有直接外部证据**。数据源是 `docs/data/preset-evidence.toml`，目录与 API 一致性审阅日期为 2026-11-18。本轮新增 Chrome 158 公网抓包，其他版本的采集日期和证据等级保持不变。
 
-当前源码提供 20 个完整 preset，Rust 与 FFI 名称一致。最新新增版本为 Chrome 157。
+0.3.0 源码提供 21 个完整 preset，Rust 与 FFI 规范名称一致，不计 alias。各浏览器系列的最新版本为 **Chrome 158、Firefox 156、Safari 26.2**；默认仍为 **Chrome 155**，需要新版本时显式选择。
 
 | 选择 | TLS / H2 | QUIC / H3 | 验证说明 |
 |---|---|---|---|
@@ -10,7 +10,9 @@
 | `chrome_155` | 支持 | 需要 `quic-h3` | Chrome 155.0.8059.40 的 TLS/H2、QUIC 和 H3 SETTINGS 均有公网抓包证据，H3 返回 200 |
 | `chrome_156` | 支持 | 需要 `quic-h3` | Chrome 156.0.8078.48 的新连接 TLS/H2/QUIC/H3 已抓包，H2/H3 返回 200；行为边界策略继承 155 |
 | `chrome_157` | 支持 | 需要 `quic-h3` | Chrome 157.0.8103.39 的新连接 TLS/H2/QUIC/H3 已抓包，H2/H3 返回 200；稳定字段与 156 一致，行为策略继承 156 |
+| `chrome_158` | 支持 | 需要 `quic-h3` | Chrome 158.0.8127.37 的公网新连接 TLS/H2/QUIC/H3 已抓包，H2/H3 返回 200；稳定字段与 157 一致，行为边界策略继承 157 |
 | `firefox_156` | 支持 | 未提供 | Firefox 156.0.1 的 TLS/H2 已抓包，库的完整 preset 已完成公网 H2 请求 |
+| `safari_26` | 支持 | 未提供 | 对应 Safari 26.2；TLS 有 BrowserLeaks 校准证据，H2 为离线 fixture 覆盖 |
 
 支持范围按当前源码描述。使用发布包或固定 Git revision 时，应确认该版本包含所需 preset；FFI 可通过 `lk_preset_list_json` 查询实际可用名称。
 
@@ -44,6 +46,7 @@
 | `chrome_155` | 155.0.8059.40 | Windows | 是 | 是 | 是 |
 | `chrome_156` | 156.0.8078.48 | Windows | 是 | 是 | 是 |
 | `chrome_157` | 157.0.8103.39 | Windows | 是 | 是 | 是 |
+| `chrome_158` | 158.0.8127.37 | Windows | 是 | 是 | 是 |
 | `firefox_133` | 133 | 未记录 | 是 | 是 | 否 |
 | `firefox_147` | 147.0.3 | 未记录 | 是 | 是 | 否 |
 | `firefox_156` | 156.0.1 | Windows | 是 | 是 | 否 |
@@ -75,6 +78,7 @@ H3 profile 的“是”要求构建时启用 `quic-h3`；“否”表示该 pres
 | `chrome_155` | verified | verified | verified | verified | verified |
 | `chrome_156` | verified | verified | verified | verified | verified |
 | `chrome_157` | verified | verified | verified | verified | verified |
+| `chrome_158` | verified | verified | verified | verified | verified |
 | `firefox_133` | unverified | fixture-only | — | — | — |
 | `firefox_147` | verified | fixture-only | — | — | — |
 | `firefox_156` | verified | verified | — | — | — |

@@ -9,7 +9,8 @@
 //! A retry re-sends the (buffered) request body, so error-based retries are
 //! gated on whether the request is safe to replay — the policy decides the
 //! backoff, [`retry_is_replay_safe`] decides whether a replay is allowed at
-//! all. Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) are always retried;
+//! all. Callers must explicitly enable a retry policy or recovery option.
+//! Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) are eligible for enabled retries;
 //! non-idempotent methods (`POST`/`PUT`/`PATCH`/`DELETE`) are retried only
 //! when the failure proves the request was never processed
 //! (connection-establishment failures, HTTP/2 `REFUSED_STREAM` or GOAWAY
@@ -59,7 +60,7 @@ use crate::error::Error;
 #[cfg(feature = "quic-h3")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum H3RetryMode {
-    /// Preserve the existing automatic replay safety checks.
+    /// Preserve replay safety checks without enabling retries on its own.
     #[default]
     Safe,
     /// Retry selected HTTP/3 protocol errors up to twice per redirect hop,

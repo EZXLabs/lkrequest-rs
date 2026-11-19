@@ -19,14 +19,13 @@ use tracing::Instrument;
 
 use hyper::rt::{Read as HyperRead, Write as HyperWrite};
 
-use lktls::error::{Result, TlsError};
-use lktls::handshake::content_type;
-use lktls::handshake::driver::{
-    HandshakeConfig, HandshakeDriver, HandshakeOutput, PostHandshakeState, SessionTicketContext,
+use lktls::config::{
+    ClientConfigTemplate, ClientHelloOverrides, CompileOptions, CompiledClientConfig,
+    ConnectionInputs, Transport,
 };
-use lktls::profile::types::{TlsClientHelloStyle, TlsProfile};
-use lktls::record::reader::RecordReader;
-use lktls::record::writer::RecordWriter;
+use lktls::connection::{ClientConnection, HandshakeProgress, ReadProgress};
+use lktls::error::{Result, TlsError};
+use lktls::profile::types::TlsProfile;
 use lktls::session_store::SessionStore;
 use lktls::verify::policy::VerificationPolicy;
 use lktls::{ClientHelloCallback, KeyLogCallback};
@@ -58,35 +57,62 @@ pub fn keylog_to_file(path: impl Into<std::path::PathBuf>) -> io::Result<KeyLogC
 
 /// Connector that establishes TLS connections with a specific fingerprint.
 ///
-/// Wraps an [`lktls::handshake::driver::HandshakeConfig`] with a builder
-/// API and provides the async I/O adapter for the TLS handshake.
+/// Shares compiled static configuration across connections and provides the
+/// async I/O adapter. Each handshake owns its connection inputs and secrets.
 pub struct TlsConnector {
-    config: HandshakeConfig,
+    template: ClientConfigTemplate,
+    config: ConnectionInputs,
     require_close_notify: bool,
+}
+
+impl From<TlsProfile> for TlsConnector {
+    fn from(profile: TlsProfile) -> Self {
+        Self::new(profile)
+    }
 }
 
 impl TlsConnector {
     pub fn new(profile: TlsProfile) -> Self {
+        Self::from_template(ClientConfigTemplate::new(
+            profile,
+            Transport::Tcp,
+            CompileOptions::compatibility(),
+        ))
+    }
+
+    pub fn from_compiled(config: Arc<CompiledClientConfig>) -> Result<Self> {
+        if config.transport() != Transport::Tcp {
+            return Err(TlsError::InvalidProfile(
+                "TCP connector requires a TCP configuration".into(),
+            ));
+        }
+        Ok(Self::from_template(ClientConfigTemplate::from_compiled(
+            config,
+        )))
+    }
+
+    pub(crate) fn from_template(template: ClientConfigTemplate) -> Self {
         Self {
-            config: HandshakeConfig {
-                profile,
-                hostname: String::new(),
-                port: 0,
-                verification_policy: VerificationPolicy::default(),
-                alps_payload: None,
-                session_store: None,
-                ech_config_list: None,
-                custom_ca_anchors: None,
-                keylog_callback: None,
-                client_hello_callback: None,
-                trust_anchor_observer: None,
-            },
+            template,
+            config: ConnectionInputs::default(),
             require_close_notify: false,
         }
     }
 
     pub fn profile(&self) -> &TlsProfile {
-        &self.config.profile
+        self.template.profile()
+    }
+
+    /// Apply generated values per connection without changing the shared profile.
+    /// Raw extension conflicts are rejected before selecting a session.
+    pub fn client_hello_overrides(mut self, overrides: ClientHelloOverrides) -> Self {
+        self.config.hello_overrides = overrides;
+        self
+    }
+
+    pub(crate) fn require_alpn(mut self, protocols: Option<Vec<String>>) -> Self {
+        self.config.required_alpn = protocols;
+        self
     }
 
     pub fn trust_anchor_observer(
@@ -102,29 +128,35 @@ impl TlsConnector {
         self
     }
 
-    pub(crate) fn recovery_connector(
+    pub(crate) fn recovery_with_trust_anchor_ids(
         &self,
-        profile: TlsProfile,
+        ids: Vec<lktls::trust_anchor::TrustAnchorId>,
         observer: lktls::trust_anchor::TrustAnchorObserver,
-    ) -> Self {
+    ) -> Result<Self> {
+        let (template, overrides) = self
+            .template
+            .trust_anchor_recovery(ids, &self.config.hello_overrides)?;
         let mut config = self.config.clone();
-        config.profile = profile;
         config.session_store = None;
         config.trust_anchor_observer = Some(observer);
-        Self {
+        config.hello_overrides = overrides;
+        Ok(Self {
+            template,
             config,
             require_close_notify: self.require_close_notify,
-        }
+        })
     }
 
     pub fn verification_policy(mut self, policy: VerificationPolicy) -> Self {
-        self.config.verification_policy = policy;
+        self.template = self.template.verification_policy(policy);
         self
     }
 
     pub fn insecure_skip_verify(mut self, skip: bool) -> Self {
         if skip {
-            self.config.verification_policy = VerificationPolicy::Insecure;
+            self.template = self
+                .template
+                .verification_policy(VerificationPolicy::Insecure);
         }
         self
     }
@@ -152,7 +184,7 @@ impl TlsConnector {
         mut self,
         anchors: Arc<Vec<rustls_pki_types::TrustAnchor<'static>>>,
     ) -> Self {
-        self.config.custom_ca_anchors = Some(anchors);
+        self.template = self.template.custom_ca_anchors(Some(anchors));
         self
     }
 
@@ -249,24 +281,14 @@ impl TlsConnector {
             config.port = port;
             config.trust_anchor_observer = Some(observer);
 
-            let mut driver = HandshakeDriver::new(config);
-
-            // `driver.start()` fires `client_hello_callback` (set via
-            // `on_client_hello`) internally, so the same hook works for direct
-            // lktls users — see `HandshakeDriver::start`.
-            let ch_bytes = driver.start()?;
-            stream.write_all(&ch_bytes).await.map_err(TlsError::Io)?;
-
+            let mut connection = ClientConnection::from_compiled(self.template.compile()?, config)?;
             loop {
-                let output = match driver.progress() {
-                    Ok(output) => output,
+                let progress = match connection.progress_handshake() {
+                    Ok(progress) => progress,
                     Err(error) => {
-                        if let Some(alert) = driver.take_pending_alert() {
-                            if let Err(write_error) = stream.write_all(&alert).await {
-                                tracing::debug!(
-                                    error = %write_error,
-                                    "tls.local_alert_send_failed"
-                                );
+                        if !connection.output().is_empty() {
+                            if let Err(write_error) = stream.write_all(connection.output()).await {
+                                tracing::debug!(error = %write_error, "tls.local_alert_send_failed");
                             } else {
                                 let _ = stream.flush().await;
                                 let _ = stream.shutdown().await;
@@ -275,32 +297,54 @@ impl TlsConnector {
                         return Err(error);
                     }
                 };
-
-                match output {
-                    HandshakeOutput::SendData(data) => {
-                        stream.write_all(&data).await.map_err(TlsError::Io)?;
+                match progress {
+                    HandshakeProgress::NeedOutput => {
+                        if connection.output().is_empty() {
+                            continue;
+                        }
+                        let written = stream
+                            .write(connection.output())
+                            .await
+                            .map_err(TlsError::Io)?;
+                        if written == 0 {
+                            return Err(TlsError::Io(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "TLS transport accepted no handshake bytes",
+                            )));
+                        }
+                        connection.consume_output(written);
                     }
-                    HandshakeOutput::NeedData => {
-                        let mut buf = [0u8; 16384];
-                        let n = stream.read(&mut buf).await.map_err(TlsError::Io)?;
-                        if n == 0 {
+                    HandshakeProgress::NeedInput => {
+                        let mut bytes = [0; 16384];
+                        let capacity = bytes.len().min(connection.input_capacity());
+                        if capacity == 0 {
+                            return Err(TlsError::HandshakeFailure(
+                                "TLS input budget exhausted without progress".into(),
+                            ));
+                        }
+                        let count = stream
+                            .read(&mut bytes[..capacity])
+                            .await
+                            .map_err(TlsError::Io)?;
+                        if count == 0 {
                             return Err(TlsError::Io(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "connection closed during TLS handshake",
                             )));
                         }
-                        driver.feed(&buf[..n]);
-                    }
-                    HandshakeOutput::Done { to_send, result } => {
-                        if !to_send.is_empty() {
-                            stream.write_all(&to_send).await.map_err(TlsError::Io)?;
+                        if connection.feed_bounded(&bytes[..count]) != count {
+                            return Err(TlsError::HandshakeFailure(
+                                "TLS connection rejected handshake input".into(),
+                            ));
                         }
-                        return Ok(TlsStream::from_handshake(
-                            stream,
-                            *result,
-                            self.require_close_notify,
-                            self.config.profile.tls_client_hello_style,
-                        ));
+                    }
+                    HandshakeProgress::Complete => {
+                        return Ok(TlsStream {
+                            inner: stream,
+                            connection,
+                            read_failure: None,
+                            require_close_notify: self.require_close_notify,
+                        });
                     }
                 }
             }
@@ -313,366 +357,110 @@ impl TlsConnector {
 // ---------------------------------------------------------------------------
 
 struct ReadFailure {
-    kind: io::ErrorKind,
-    message: String,
+    error: Arc<io::Error>,
     flushed: bool,
     shutdown: bool,
+    terminal_io: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLAINTEXT_TO_CALLER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub struct TlsStream<S: TlsTransport = TcpStream> {
     inner: S,
-    reader: RecordReader,
-    writer: RecordWriter,
-    read_buf: Vec<u8>,
-    read_pos: usize,
-    write_buf: Vec<u8>,
-    closed: bool,
+    connection: ClientConnection,
     read_failure: Option<ReadFailure>,
-    client_style: TlsClientHelloStyle,
-    key_update_flush_pending: bool,
-    consecutive_key_updates: u8,
-    // Bytes through the queued KU record, including any preceding records.
-    pending_key_update_bytes: usize,
-    pending_key_update_record_len: usize,
-    key_update_without_application_write: bool,
-    negotiated_alpn: Option<String>,
-    negotiated_cipher_suite: Option<u16>,
-    negotiated_version: Option<u16>,
-    peer_certificates: Vec<Vec<u8>>,
-    post_handshake: Option<PostHandshakeState>,
-    session_ticket_ctx: Option<SessionTicketContext>,
-    /// Reassembly buffer for post-handshake handshake messages.
-    ///
-    /// Post-handshake messages obey the same framing as the handshake itself
-    /// (RFC 8446 §5.1): several MAY be coalesced into one record, and one MAY
-    /// be fragmented across several records. Servers routinely coalesce two
-    /// `NewSessionTicket`s, and a `KeyUpdate` may share a record with them.
-    /// Decrypted handshake bytes are appended here and only *complete* messages
-    /// are dispatched, with any partial trailer carried to the next record —
-    /// the same buffering `HandshakeDriver::hs_buffer` does during the
-    /// handshake.
-    post_handshake_buf: Vec<u8>,
-    /// Whether the peer's `close_notify` was seen before the stream ended.
-    ///
-    /// RFC 8446 §6.1 requires each side to send `close_notify` before closing.
-    /// A peer that just drops the TCP connection produces a byte-identical EOF,
-    /// so without this flag a truncation attack is indistinguishable from a
-    /// clean shutdown on any body framed by connection close.
-    received_close_notify: bool,
-    /// Whether a socket EOF with no preceding `close_notify` is an error.
-    ///
-    /// Off by default: plenty of real servers close without the alert, and
-    /// erroring by default would break requests that browsers accept.
     require_close_notify: bool,
 }
 
 impl<S: TlsTransport> std::fmt::Debug for TlsStream<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsStream")
-            .field("closed", &self.closed)
+            .field("closed", &self.connection.is_closed())
             .finish()
     }
 }
 
 impl<S: TlsTransport> TlsStream<S> {
-    /// Construct a `TlsStream` from a completed handshake result and the
-    /// underlying transport stream.
-    fn from_handshake(
-        inner: S,
-        result: lktls::handshake::driver::HandshakeResult,
-        require_close_notify: bool,
-        client_style: TlsClientHelloStyle,
-    ) -> Self {
-        Self {
-            inner,
-            reader: result.reader,
-            writer: result.writer,
-            read_buf: Vec::new(),
-            read_pos: 0,
-            write_buf: Vec::new(),
-            closed: false,
-            read_failure: None,
-            client_style,
-            key_update_flush_pending: false,
-            consecutive_key_updates: 0,
-            pending_key_update_bytes: 0,
-            pending_key_update_record_len: 0,
-            key_update_without_application_write: false,
-            negotiated_alpn: result.negotiated_alpn,
-            negotiated_cipher_suite: result.negotiated_cipher_suite,
-            negotiated_version: result.negotiated_version,
-            peer_certificates: result.peer_certificates,
-            post_handshake: result.post_handshake,
-            session_ticket_ctx: result.session_ticket_ctx,
-            post_handshake_buf: Vec::new(),
-            received_close_notify: false,
-            require_close_notify,
-        }
-    }
-
     pub fn inner_stream(&self) -> &S {
         &self.inner
     }
-
     pub fn negotiated_alpn(&self) -> Option<&str> {
-        self.negotiated_alpn.as_deref()
+        self.connection.negotiated_alpn()
     }
-
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
-        self.negotiated_cipher_suite
+        self.connection.negotiated_cipher_suite()
     }
-
-    /// Negotiated TLS version (0x0303 = TLS 1.2, 0x0304 = TLS 1.3), if known.
     pub fn negotiated_version(&self) -> Option<u16> {
-        self.negotiated_version
+        self.connection.negotiated_version()
     }
-
-    /// Whether the peer sent `close_notify` (RFC 8446 §6.1) before the stream
-    /// ended.
-    ///
-    /// Only meaningful once reading has reached EOF. `false` at that point means
-    /// the peer closed the TCP connection without a TLS-level shutdown, so a
-    /// body delimited by connection close may have been truncated in transit.
     pub fn received_close_notify(&self) -> bool {
-        self.received_close_notify
+        self.connection.received_close_notify()
+    }
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        self.connection.peer_certificates()
     }
 
-    /// Outcome to report when the socket reaches EOF.
     fn eof_outcome(&self) -> io::Result<()> {
-        if self.require_close_notify && !self.received_close_notify {
+        if self.require_close_notify && !self.received_close_notify() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "TLS connection closed without close_notify (RFC 8446 §6.1);                  a body delimited by connection close may be truncated",
+                "TLS connection closed without close_notify (RFC 8446 section 6.1)",
             ));
         }
         Ok(())
-    }
-
-    /// The server's certificate chain (DER, leaf first). Empty on a resumed
-    /// handshake that carried no Certificate message.
-    pub fn peer_certificates(&self) -> &[Vec<u8>] {
-        &self.peer_certificates
-    }
-
-    /// Feed one decrypted handshake *record* payload into the post-handshake
-    /// reassembly buffer and dispatch every complete message it yields.
-    ///
-    /// Processing a record as if it were exactly one message loses coalesced
-    /// messages (a `KeyUpdate` sharing a record with a `NewSessionTicket` would
-    /// never rotate the read keys, breaking every subsequent record) and
-    /// mis-parses fragmented ones.
-    fn handle_post_handshake_record(&mut self, payload: &[u8]) -> io::Result<()> {
-        self.post_handshake_buf.extend_from_slice(payload);
-        while let Some(message) = take_post_handshake_message(&mut self.post_handshake_buf)? {
-            self.handle_post_handshake_message(&message, self.post_handshake_buf.is_empty())?;
-        }
-        Ok(())
-    }
-
-    /// Dispatch exactly one complete post-handshake handshake message
-    /// (4-byte header included).
-    fn handle_post_handshake_message(
-        &mut self,
-        payload: &[u8],
-        at_record_end: bool,
-    ) -> io::Result<()> {
-        let Some(&msg_type) = payload.first() else {
-            return Ok(());
-        };
-        match msg_type {
-            0x18 => {
-                if self.post_handshake.is_some() {
-                    if self.client_style == TlsClientHelloStyle::ChromiumBoringssl {
-                        if self.consecutive_key_updates == 32 {
-                            return Err(self.post_handshake_alert(
-                                lktls::error::AlertDescription::UnexpectedMessage,
-                                "too many consecutive KeyUpdate messages",
-                            ));
-                        }
-                        self.consecutive_key_updates += 1;
-                    }
-                    if payload.len() != 5 {
-                        return Err(self.post_handshake_alert(
-                            lktls::error::AlertDescription::DecodeError,
-                            "KeyUpdate must contain exactly one request byte",
-                        ));
-                    }
-                    if payload[4] > 1 {
-                        let description = if matches!(
-                            self.client_style,
-                            TlsClientHelloStyle::ChromiumBoringssl
-                                | TlsClientHelloStyle::FirefoxNss
-                        ) {
-                            lktls::error::AlertDescription::DecodeError
-                        } else {
-                            lktls::error::AlertDescription::IllegalParameter
-                        };
-                        return Err(self
-                            .post_handshake_alert(description, "invalid KeyUpdate request value"));
-                    }
-                    if !at_record_end {
-                        return Err(self.post_handshake_alert(
-                            lktls::error::AlertDescription::UnexpectedMessage,
-                            "KeyUpdate must end at a record boundary",
-                        ));
-                    }
-                }
-                if let Some(ref mut ph) = self.post_handshake {
-                    // Update read-side keys (server's new key).
-                    let new_read_aead = ph
-                        .process_key_update()
-                        .map_err(|e| io::Error::other(format!("KeyUpdate failed: {e}")))?;
-                    self.reader.set_keys(new_read_aead);
-
-                    // Check if the server requested us to update our keys too.
-                    // KeyUpdate body: update_requested(1 byte).
-                    // 0x00 = update_not_requested, 0x01 = update_requested
-                    let update_requested = payload[4] == 0x01;
-                    let can_respond = match self.client_style {
-                        TlsClientHelloStyle::ChromiumBoringssl => {
-                            self.pending_key_update_bytes == 0
-                        }
-                        TlsClientHelloStyle::FirefoxNss => {
-                            !self.key_update_without_application_write
-                        }
-                        _ => true,
-                    };
-                    if update_requested && can_respond {
-                        let (ku_msg, new_write_aead) =
-                            ph.build_key_update_response().map_err(|e| {
-                                io::Error::other(format!("KeyUpdate response failed: {e}"))
-                            })?;
-                        // Encrypt the KeyUpdate message with the current write key,
-                        // then install the new write key.
-                        let record = self
-                            .writer
-                            .write_record(lktls::handshake::content_type::HANDSHAKE, &ku_msg)
-                            .map_err(|e| {
-                                io::Error::other(format!("KeyUpdate write failed: {e}"))
-                            })?;
-                        self.write_buf.extend_from_slice(&record);
-                        self.pending_key_update_bytes = self.write_buf.len();
-                        self.pending_key_update_record_len = record.len();
-                        self.key_update_without_application_write = true;
-                        self.writer.set_keys(new_write_aead);
-                        self.key_update_flush_pending =
-                            self.client_style == TlsClientHelloStyle::FirefoxNss;
-                    }
-                }
-            }
-            0x04 => {
-                if let Some(ref ctx) = self.session_ticket_ctx {
-                    ctx.process_new_session_ticket(payload);
-                } else {
-                    tracing::trace!("tls.session_ticket_received_no_store");
-                }
-            }
-            HELLO_REQUEST if self.negotiated_version.is_some_and(|v| v < TLS13_VERSION) => {
-                return Err(self.refuse_renegotiation());
-            }
-            other => {
-                tracing::trace!(
-                    msg_type = format_args!("0x{:02x}", other),
-                    "tls.post_handshake_ignored"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn post_handshake_alert(
-        &mut self,
-        description: lktls::error::AlertDescription,
-        message: &str,
-    ) -> io::Error {
-        let error = TlsError::local_alert(description, message);
-        if let Ok(record) = self
-            .writer
-            .write_record(content_type::ALERT, &[2, description.as_byte()])
-        {
-            self.write_buf.extend_from_slice(&record);
-        }
-        io::Error::other(error.to_string())
-    }
-
-    fn unsent_trailing_key_update_len(&self) -> usize {
-        if self.pending_key_update_bytes == self.write_buf.len()
-            && self.pending_key_update_bytes >= self.pending_key_update_record_len
-        {
-            self.pending_key_update_record_len
-        } else {
-            0
-        }
     }
 
     pub(crate) fn poll_browser_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.client_style != TlsClientHelloStyle::ChromiumBoringssl
-            || self.read_failure.is_some()
-        {
-            return AsyncWrite::poll_flush(self, cx);
+        if self.read_failure.is_some() {
+            return self.poll_read_failure(cx);
         }
-        // An HTTP driver's idle flush does not initiate Chromium's queued KU.
-        // Already accepted application records must still reach the transport.
-        let retained_tail = self.unsent_trailing_key_update_len();
         let this = &mut *self;
-        flush_write_buf_prefix(
-            &mut this.inner,
-            &mut this.write_buf,
-            &mut this.pending_key_update_bytes,
-            retained_tail,
-            cx,
-        )?;
-        if this.write_buf.len() > retained_tail {
+        if let Err(error) = flush_connection(&mut this.inner, &mut this.connection, true, cx) {
+            this.fail_io(error);
+            return this.poll_read_failure(cx);
+        }
+        if !this.connection.idle_output().is_empty() {
             return Poll::Pending;
         }
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(Err(error)) => {
+                this.fail_io(error);
+                this.poll_read_failure(cx)
+            }
+            result => result,
+        }
     }
 
     pub(crate) fn poll_browser_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.client_style != TlsClientHelloStyle::ChromiumBoringssl
-            || self.read_failure.is_some()
-        {
+        if self.read_failure.is_some() {
             return AsyncWrite::poll_shutdown(self, cx);
         }
-        if !self.closed {
-            self.closed = true;
-            // Chromium disconnects without close_notify. A trailing unsent KU
-            // can be dropped only when no accepted data depends on its epoch.
-            let discard = self.unsent_trailing_key_update_len();
-            if discard > 0 {
-                let keep = self.write_buf.len() - discard;
-                self.write_buf.truncate(keep);
-                self.pending_key_update_bytes = 0;
-            }
-        }
+        self.connection.start_browser_close();
         std::task::ready!(AsyncWrite::poll_flush(self.as_mut(), cx))?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 
     fn poll_key_update_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let result = match flush_write_buf(
-            &mut self.inner,
-            &mut self.write_buf,
-            &mut self.pending_key_update_bytes,
-            cx,
-        ) {
+        let result = match flush_connection(&mut self.inner, &mut self.connection, false, cx) {
             Err(error) => Err(error),
-            Ok(()) if !self.write_buf.is_empty() => return Poll::Pending,
+            Ok(()) if !self.connection.output().is_empty() => return Poll::Pending,
             Ok(()) => match Pin::new(&mut self.inner).poll_flush(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result,
             },
         };
-        self.key_update_flush_pending = false;
+        self.connection.acknowledge_flush();
         if let Err(error) = result {
-            self.write_buf.clear();
-            self.pending_key_update_bytes = 0;
+            self.connection.discard_output();
             self.fail_read(error);
             self.read_failure.as_mut().unwrap().flushed = true;
             return self.poll_read_failure(cx);
@@ -681,31 +469,41 @@ impl<S: TlsTransport> TlsStream<S> {
     }
 
     fn fail_read(&mut self, error: io::Error) {
-        self.closed = true;
+        let peer_fatal = error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<TlsError>())
+            .is_some_and(|cause| matches!(cause, TlsError::Alert(alert) if alert.is_fatal()));
+        self.connection.fail();
+        if peer_fatal {
+            self.connection.discard_output();
+        }
         self.read_failure.get_or_insert_with(|| ReadFailure {
-            kind: error.kind(),
-            message: error.to_string(),
-            flushed: false,
+            error: Arc::new(error),
+            flushed: peer_fatal,
             shutdown: false,
+            terminal_io: peer_fatal,
         });
     }
 
-    /// Keep a fatal read pending until its queued records reach the transport.
-    /// If the transport fails, retain the original TLS error and stop retrying.
+    fn fail_io(&mut self, error: io::Error) {
+        self.connection.discard_output();
+        self.fail_read(error);
+        // A failed transport cannot carry pending records or another TLS alert.
+        self.read_failure.as_mut().unwrap().flushed = true;
+        self.read_failure.as_mut().unwrap().terminal_io = true;
+    }
+
     fn poll_read_failure(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.read_failure.as_ref().unwrap().flushed {
-            while !self.write_buf.is_empty() {
-                match Pin::new(&mut self.inner).poll_write(cx, &self.write_buf) {
+            while !self.connection.output().is_empty() {
+                let this = &mut *self;
+                match Pin::new(&mut this.inner).poll_write(cx, this.connection.output()) {
                     Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => {
-                        self.write_buf.clear();
-                        self.read_failure.as_mut().unwrap().flushed = true;
+                        this.connection.discard_output();
+                        this.read_failure.as_mut().unwrap().flushed = true;
                         break;
                     }
-                    Poll::Ready(Ok(n)) => {
-                        self.write_buf.drain(..n);
-                        self.pending_key_update_bytes =
-                            self.pending_key_update_bytes.saturating_sub(n);
-                    }
+                    Poll::Ready(Ok(n)) => this.connection.consume_output(n),
                     Poll::Pending => return Poll::Pending,
                 }
             }
@@ -717,122 +515,58 @@ impl<S: TlsTransport> TlsStream<S> {
             }
         }
         if !self.read_failure.as_ref().unwrap().shutdown {
-            if Pin::new(&mut self.inner).poll_shutdown(cx).is_pending() {
+            if Pin::new(&mut self.inner).poll_shutdown(cx).is_pending()
+                && !self.read_failure.as_ref().unwrap().terminal_io
+            {
                 return Poll::Pending;
             }
             self.read_failure.as_mut().unwrap().shutdown = true;
         }
         let failure = self.read_failure.as_ref().unwrap();
-        Poll::Ready(Err(io::Error::new(failure.kind, failure.message.clone())))
-    }
-
-    /// Answer a TLS 1.2 `HelloRequest` the way BoringSSL does: a **fatal**
-    /// `no_renegotiation` alert, then fail the connection.
-    ///
-    /// This client never renegotiates, and the previous behaviour — dropping the
-    /// message into `post_handshake_ignored` — is something no browser does, so
-    /// it was a behavioural tell to any server willing to probe with a
-    /// `HelloRequest`.
-    ///
-    /// The BoringSSL path (`ssl/ssl_lib.cc`, `ssl_do_post_handshake`) for a
-    /// client below TLS 1.3: the default `renegotiate_mode` is
-    /// `ssl_renegotiate_never`, so the message falls through to
-    /// `SSL_renegotiate`, `ssl_can_renegotiate` returns false for that mode, and
-    /// the caller sends `SSL3_AL_FATAL` / `SSL_AD_NO_RENEGOTIATION` and aborts.
-    /// Chrome reaches the same place: `SSLClientSocketImpl` arms
-    /// `ssl_renegotiate_explicit` for the handshake and then drops to
-    /// `ssl_renegotiate_never` unless the negotiated ALPN is in
-    /// `renego_allowed_for_protos`, which is empty by default and can never
-    /// contain h2 (RFC 9113 §9.2.1 forbids renegotiation outright).
-    ///
-    /// Note the alert is **fatal**, even though RFC 5246 §7.2.2 classifies
-    /// `no_renegotiation` as a warning. That deviation is BoringSSL's, and
-    /// matching the browser is what this crate is for.
-    fn refuse_renegotiation(&mut self) -> io::Error {
-        // level = fatal(2), description = no_renegotiation(100)
-        let alert: &[u8] = &[0x02, 0x64];
-        if let Ok(record) = self.writer.write_record(content_type::ALERT, alert) {
-            self.write_buf.extend_from_slice(&record);
-        }
-        tracing::debug!("tls.renegotiation_refused");
-        io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "server requested TLS 1.2 renegotiation (HelloRequest); refused with no_renegotiation",
-        )
+        Poll::Ready(Err(io::Error::new(
+            failure.error.kind(),
+            crate::error::SharedIoError(failure.error.clone()),
+        )))
     }
 
     fn poll_read_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let mut buf = [0u8; 16384];
-        let mut read_buf = ReadBuf::new(&mut buf);
+        let mut bytes = [0u8; 16384];
+        let capacity = self.connection.input_capacity().min(bytes.len());
+        if capacity == 0 {
+            return Poll::Ready(Err(io::Error::other(
+                "TLS input budget exhausted without progress",
+            )));
+        }
+        let mut read_buf = ReadBuf::new(&mut bytes[..capacity]);
         match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
-                if n == 0 {
-                    Poll::Ready(Ok(0))
-                } else {
-                    self.reader.feed(&buf[..n]);
-                    Poll::Ready(Ok(n))
+                let accepted = self.connection.feed_bounded(&bytes[..n]);
+                if accepted != n {
+                    return Poll::Ready(Err(io::Error::other(
+                        "TLS connection rejected transport input",
+                    )));
                 }
+                Poll::Ready(Ok(n))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn try_read_app_data(&mut self) -> io::Result<bool> {
-        loop {
-            match self.reader.next_record() {
-                Ok(Some(record)) => {
-                    if record.content_type == content_type::APPLICATION_DATA {
-                        if !record.payload.is_empty() {
-                            self.consecutive_key_updates = 0;
-                        }
-                        self.read_buf = record.payload;
-                        self.read_pos = 0;
-                        return Ok(true);
-                    } else if record.content_type == content_type::ALERT {
-                        let level = record.payload.first().copied().unwrap_or(0);
-                        let desc = record.payload.get(1).copied().unwrap_or(0);
-                        let alert = lktls::error::TlsAlert::from_bytes(level, desc);
-                        if alert.is_close_notify() {
-                            self.received_close_notify = true;
-                            return Ok(false);
-                        } else if alert.level == lktls::error::AlertLevel::Warning {
-                            continue;
-                        } else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::ConnectionReset,
-                                format!("TLS {}", alert),
-                            ));
-                        }
-                    } else if record.content_type == content_type::HANDSHAKE {
-                        self.handle_post_handshake_record(&record.payload)?;
-                        if self.key_update_flush_pending {
-                            return Ok(false);
-                        }
-                        continue;
-                    } else {
-                        continue;
-                    }
-                }
-                Ok(None) => return Ok(false),
-                Err(e) => {
-                    if let TlsError::LocalAlert { alert, .. } = &e {
-                        let bytes = [alert.level.as_byte(), alert.description.as_byte()];
-                        if let Ok(record) = self.writer.write_record(content_type::ALERT, &bytes) {
-                            self.write_buf.extend_from_slice(&record);
-                        }
-                    }
-                    return Err(io::Error::other(e.to_string()));
-                }
-            }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// AsyncRead / AsyncWrite for TlsStream
-// ---------------------------------------------------------------------------
+fn connection_io_error(error: TlsError) -> io::Error {
+    let kind = match &error {
+        TlsError::Alert(_) => io::ErrorKind::ConnectionReset,
+        TlsError::LocalAlert { alert, .. }
+            if alert.description == lktls::error::AlertDescription::NoRenegotiation =>
+        {
+            io::ErrorKind::ConnectionAborted
+        }
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
+}
 
 impl<S: TlsTransport> AsyncRead for TlsStream<S> {
     fn poll_read(
@@ -844,47 +578,40 @@ impl<S: TlsTransport> AsyncRead for TlsStream<S> {
             if self.read_failure.is_some() {
                 return self.poll_read_failure(cx);
             }
-            if self.key_update_flush_pending {
-                match self.poll_key_update_flush(cx) {
-                    Poll::Ready(Ok(())) => {}
-                    other => return other,
+            match self.connection.process_read() {
+                Ok(ReadProgress::Plaintext) => {
+                    let count = self.connection.plaintext().len().min(buf.remaining());
+                    buf.put_slice(&self.connection.plaintext()[..count]);
+                    #[cfg(test)]
+                    PLAINTEXT_TO_CALLER_BYTES.with(|bytes| bytes.set(bytes.get() + count));
+                    self.connection.consume_plaintext(count);
+                    return Poll::Ready(Ok(()));
                 }
-            }
-            if self.read_pos < self.read_buf.len() {
-                let available = &self.read_buf[self.read_pos..];
-                let to_copy = available.len().min(buf.remaining());
-                buf.put_slice(&available[..to_copy]);
-                self.read_pos += to_copy;
-                return Poll::Ready(Ok(()));
-            }
-            // No records after close_notify may be exposed to the caller.
-            if self.received_close_notify {
-                return Poll::Ready(Ok(()));
-            }
-            match self.try_read_app_data() {
-                Ok(true) => continue,
-                Err(error) => {
-                    self.fail_read(error);
-                    continue;
+                Ok(ReadProgress::PeerClosed) => return Poll::Ready(Ok(())),
+                Ok(ReadProgress::Flush) => {
+                    std::task::ready!(self.poll_key_update_flush(cx))?;
                 }
-                Ok(false) => {
-                    if self.key_update_flush_pending || self.received_close_notify {
-                        continue;
+                Ok(ReadProgress::NeedInput) => match self.poll_read_inner(cx) {
+                    Poll::Ready(Ok(0)) => match self.eof_outcome() {
+                        Ok(()) => return Poll::Ready(Ok(())),
+                        Err(error) => self.fail_io(error),
+                    },
+                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                        return Poll::Ready(Err(error));
                     }
+                    Poll::Ready(Err(error)) => self.fail_io(error),
+                    Poll::Pending => return Poll::Pending,
+                },
+                Ok(ReadProgress::Yield) => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
-            }
-            match self.poll_read_inner(cx) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(self.eof_outcome()),
-                Poll::Ready(Ok(_)) => continue,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Err(error) => self.fail_read(connection_io_error(error)),
             }
         }
     }
 }
-
-/// Maximum write buffer size before applying back-pressure (256 KB).
-const MAX_WRITE_BUF: usize = 256 * 1024;
 
 impl<S: TlsTransport> AsyncWrite for TlsStream<S> {
     fn poll_write(
@@ -892,72 +619,88 @@ impl<S: TlsTransport> AsyncWrite for TlsStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.closed {
+        if let Some(error) = self.connection.take_write_error() {
+            self.fail_io(connection_io_error(error));
+        }
+        if self
+            .read_failure
+            .as_ref()
+            .is_some_and(|failure| failure.terminal_io)
+        {
+            return self.poll_read_failure(cx).map(|result| result.map(|()| 0));
+        }
+        if self.connection.is_closed() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TLS stream is closed",
             )));
         }
-
-        // Back-pressure: if the write buffer is already large, try to drain
-        // it first before accepting more data.
-        if self.write_buf.len() >= MAX_WRITE_BUF {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        loop {
+            let count = match self.connection.write_application(buf) {
+                Ok(count) => count,
+                Err(error) => {
+                    self.fail_io(connection_io_error(error));
+                    return self.poll_read_failure(cx).map(|result| result.map(|()| 0));
+                }
+            };
+            let before = self.connection.output().len();
             let this = &mut *self;
-            flush_write_buf(
-                &mut this.inner,
-                &mut this.write_buf,
-                &mut this.pending_key_update_bytes,
-                cx,
-            )?;
-            if self.write_buf.len() >= MAX_WRITE_BUF {
+            let failure = this
+                .connection
+                .take_write_error()
+                .map(connection_io_error)
+                .or_else(|| {
+                    flush_connection(&mut this.inner, &mut this.connection, false, cx).err()
+                });
+            if let Some(error) = failure {
+                self.connection.discard_output();
+                self.fail_io(error);
+                if count != 0 {
+                    return Poll::Ready(Ok(count));
+                }
+                return self.poll_read_failure(cx).map(|result| result.map(|()| 0));
+            }
+            if count != 0 {
+                return Poll::Ready(Ok(count));
+            }
+            if self.connection.output().len() == before {
                 return Poll::Pending;
             }
         }
-
-        let records = self
-            .writer
-            .write_record(content_type::APPLICATION_DATA, buf)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        self.key_update_without_application_write = false;
-
-        if records.is_empty() {
-            return Poll::Ready(Ok(buf.len()));
-        }
-
-        self.write_buf.extend_from_slice(&records);
-
-        let this = &mut *self;
-        flush_write_buf(
-            &mut this.inner,
-            &mut this.write_buf,
-            &mut this.pending_key_update_bytes,
-            cx,
-        )?;
-
-        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(error) = self.connection.take_write_error() {
+            self.fail_io(connection_io_error(error));
+        }
         if self.read_failure.is_some() {
             return self.poll_read_failure(cx);
         }
-        let coalesced = self.writer.flush();
-        if !coalesced.is_empty() {
-            self.write_buf.extend_from_slice(&coalesced);
-        }
-
         let this = &mut *self;
-        flush_write_buf(
-            &mut this.inner,
-            &mut this.write_buf,
-            &mut this.pending_key_update_bytes,
-            cx,
-        )?;
-        if !this.write_buf.is_empty() {
+        this.connection.flush_buffered_records();
+        if let Some(error) = this
+            .connection
+            .take_write_error()
+            .map(connection_io_error)
+            .or_else(|| flush_connection(&mut this.inner, &mut this.connection, false, cx).err())
+        {
+            this.connection.discard_output();
+            this.fail_io(error);
+            return this.poll_read_failure(cx);
+        }
+        if !this.connection.output().is_empty() {
             return Poll::Pending;
         }
-
-        Pin::new(&mut self.inner).poll_flush(cx)
+        if let Err(error) = std::task::ready!(Pin::new(&mut this.inner).poll_flush(cx)) {
+            this.connection.discard_output();
+            this.fail_io(error);
+            return this.poll_read_failure(cx);
+        }
+        this.connection.acknowledge_flush();
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -967,30 +710,8 @@ impl<S: TlsTransport> AsyncWrite for TlsStream<S> {
             }
             return Poll::Ready(Ok(()));
         }
-        if !self.closed {
-            self.closed = true;
-            let close_notify: &[u8] = &[0x01, 0x00];
-            if let Ok(alert_record) = self.writer.write_record(content_type::ALERT, close_notify) {
-                self.write_buf.extend_from_slice(&alert_record);
-            }
-        }
-
-        let coalesced = self.writer.flush();
-        if !coalesced.is_empty() {
-            self.write_buf.extend_from_slice(&coalesced);
-        }
-
-        let this = &mut *self;
-        flush_write_buf(
-            &mut this.inner,
-            &mut this.write_buf,
-            &mut this.pending_key_update_bytes,
-            cx,
-        )?;
-        if !this.write_buf.is_empty() {
-            return Poll::Pending;
-        }
-
+        self.connection.start_close();
+        std::task::ready!(AsyncWrite::poll_flush(self.as_mut(), cx))?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -1040,76 +761,41 @@ impl<S: TlsTransport> HyperWrite for TlsStream<S> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Try to flush a write buffer to a transport stream.
-fn flush_write_buf<S: TlsTransport>(
+/// Drain committed output without re-running encoding or protocol transitions.
+fn flush_connection<S: TlsTransport>(
     stream: &mut S,
-    write_buf: &mut Vec<u8>,
-    pending_key_update_bytes: &mut usize,
+    connection: &mut ClientConnection,
+    idle: bool,
     cx: &mut Context<'_>,
 ) -> io::Result<()> {
-    flush_write_buf_prefix(stream, write_buf, pending_key_update_bytes, 0, cx)
-}
-
-fn flush_write_buf_prefix<S: TlsTransport>(
-    stream: &mut S,
-    write_buf: &mut Vec<u8>,
-    pending_key_update_bytes: &mut usize,
-    retained_tail: usize,
-    cx: &mut Context<'_>,
-) -> io::Result<()> {
-    while write_buf.len() > retained_tail {
-        let end = write_buf.len() - retained_tail;
-        match Pin::new(&mut *stream).poll_write(cx, &write_buf[..end]) {
+    loop {
+        let output = if idle {
+            connection.idle_output()
+        } else {
+            connection.output()
+        };
+        if output.is_empty() {
+            return Ok(());
+        }
+        match Pin::new(&mut *stream).poll_write(cx, output) {
             Poll::Ready(Ok(0)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "TLS transport accepted no queued bytes",
                 ))
             }
-            Poll::Ready(Ok(n)) => {
-                write_buf.drain(..n);
-                *pending_key_update_bytes = pending_key_update_bytes.saturating_sub(n);
-            }
-            Poll::Ready(Err(e)) => return Err(e),
-            Poll::Pending => break,
+            Poll::Ready(Ok(n)) => connection.consume_output(n),
+            Poll::Ready(Err(error)) => return Err(error),
+            Poll::Pending => return Ok(()),
         }
     }
-    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Post-handshake message framing
-// ---------------------------------------------------------------------------
-
-/// `HelloRequest` (RFC 5246 §7.4.1.1). TLS 1.2 only; TLS 1.3 has no such
-/// post-handshake message.
-const HELLO_REQUEST: u8 = 0x00;
-
-/// `legacy_version` for TLS 1.3; anything below it takes the TLS 1.2 path.
-const TLS13_VERSION: u16 = 0x0304;
-
-/// Upper bound on a partially-received post-handshake handshake message.
-///
-/// `NewSessionTicket` and `KeyUpdate` are small — even a large ticket is a few
-/// KiB. The 3-byte handshake length field allows up to 16 MiB, so without a cap
-/// a peer could pin that much memory per connection by announcing a huge
-/// message and then dribbling bytes.
+#[cfg(test)]
 const MAX_POST_HANDSHAKE_MSG_LEN: usize = 64 * 1024;
 
-fn take_post_handshake_message(buf: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
-    if buf.len() < 4 {
-        return Ok(None);
-    }
-    let length = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
-    if length > MAX_POST_HANDSHAKE_MSG_LEN {
-        return Err(io::Error::other(format!("post-handshake message length {length} exceeds the {MAX_POST_HANDSHAKE_MSG_LEN} byte limit")));
-    }
-    let end = 4 + length;
-    if end > buf.len() {
-        return Ok(None);
-    }
-    Ok(Some(buf.drain(..end).collect()))
-}
+#[cfg(test)]
+use lktls::handshake::framing::HandshakeDeframer;
 
 /// Drain every *complete* handshake message from `buf`, leaving any partial
 /// trailer behind for the next record.
@@ -1118,8 +804,11 @@ fn take_post_handshake_message(buf: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>>
 /// carry several coalesced messages, and one message may span several records.
 #[cfg(test)]
 fn split_post_handshake_messages(buf: &mut Vec<u8>) -> io::Result<Vec<Vec<u8>>> {
+    let mut deframer = HandshakeDeframer::new(MAX_POST_HANDSHAKE_MSG_LEN);
+    deframer.push(buf).map_err(io::Error::other)?;
     let mut messages = Vec::new();
-    while let Some(message) = take_post_handshake_message(buf)? {
+    while let Some(message) = deframer.take_message().map_err(io::Error::other)? {
+        buf.drain(..message.len());
         messages.push(message);
     }
     Ok(messages)
@@ -1128,6 +817,121 @@ fn split_post_handshake_messages(buf: &mut Vec<u8>) -> io::Result<Vec<Vec<u8>>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lktls::handshake::content_type;
+    use lktls::handshake::driver::PostHandshakeState;
+    use lktls::profile::types::TlsClientHelloStyle;
+    use lktls::record::reader::RecordReader;
+    use lktls::record::writer::RecordWriter;
+
+    #[test]
+    fn generated_alpn_overrides_are_per_connection_and_keep_shared_profile() {
+        let compiled = CompiledClientConfig::compile(
+            lktls::profile::presets::chrome_155(),
+            Transport::Tcp,
+            CompileOptions::compatibility(),
+        )
+        .unwrap();
+        let original = compiled.profile().alpn_protocols.clone();
+        let connector = TlsConnector::from_compiled(compiled.clone())
+            .unwrap()
+            .client_hello_overrides(ClientHelloOverrides {
+                alpn_protocols: Some(vec!["http/1.1".into()]),
+                alps_protocols: Some(Vec::new()),
+                ..Default::default()
+            });
+        assert_eq!(connector.profile().alpn_protocols, original);
+        assert!(Arc::ptr_eq(
+            &compiled,
+            &connector.template.compile().unwrap()
+        ));
+        let mut inputs = connector.config.clone();
+        inputs.hostname = "localhost".into();
+        let mut driver =
+            lktls::handshake::driver::HandshakeDriver::from_compiled(compiled, inputs).unwrap();
+        let wire =
+            lktls::handshake::client_hello_wire::ClientHelloWire::parse(&driver.start().unwrap())
+                .unwrap();
+        let ext = wire
+            .extensions
+            .iter()
+            .find(|e| e.extension_type == 16)
+            .unwrap();
+        assert_eq!(
+            &wire.handshake[ext.payload.clone()],
+            &[0, 9, 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']
+        );
+    }
+
+    #[test]
+    fn generated_tai_recovery_reuses_compilation_and_clears_session_store() {
+        use lktls::profile::types::{ExtensionSource, ExtensionSpec};
+        use lktls::trust_anchor::{TrustAnchorId, TrustAnchorObserver, EXTENSION_TYPE};
+        let mut profile = lktls::profile::presets::chrome_155();
+        profile
+            .extensions
+            .retain(|e| e.extension_type != EXTENSION_TYPE);
+        profile.extensions.push(ExtensionSpec {
+            extension_type: EXTENSION_TYPE,
+            source: ExtensionSource::TrustAnchorIds {
+                ids: vec!["01".into()],
+                shuffle: false,
+            },
+        });
+        let compiled =
+            CompiledClientConfig::compile(profile, Transport::Tcp, CompileOptions::compatibility())
+                .unwrap();
+        let connector = TlsConnector::from_compiled(compiled.clone())
+            .unwrap()
+            .session_store(Arc::new(lktls::session_store::InMemorySessionStore::new()));
+        let id = TrustAnchorId::new(vec![2]).unwrap();
+        let observer = TrustAnchorObserver::default();
+        let retry = connector
+            .recovery_with_trust_anchor_ids(vec![id.clone()], observer.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&compiled, &retry.template.compile().unwrap()));
+        assert!(retry.config.session_store.is_none());
+        let mut inputs = retry.config.clone();
+        inputs.hostname = "localhost".into();
+        let mut driver = lktls::handshake::driver::HandshakeDriver::from_compiled(
+            retry.template.compile().unwrap(),
+            inputs,
+        )
+        .unwrap();
+        driver.start().unwrap();
+        assert_eq!(observer.snapshot().requested_ids, [id]);
+        assert!(connector.config.session_store.is_some());
+    }
+
+    #[test]
+    fn raw_tai_recovery_retains_profile_replacement_semantics() {
+        use lktls::profile::types::{ExtensionSource, ExtensionSpec};
+        use lktls::trust_anchor::{TrustAnchorId, TrustAnchorObserver, EXTENSION_TYPE};
+        let mut profile = lktls::profile::presets::chrome_155();
+        profile
+            .extensions
+            .retain(|e| e.extension_type != EXTENSION_TYPE);
+        profile.extensions.push(ExtensionSpec {
+            extension_type: EXTENSION_TYPE,
+            source: ExtensionSource::RawBytes {
+                data: "00020101".into(),
+            },
+        });
+        let compiled =
+            CompiledClientConfig::compile(profile, Transport::Tcp, CompileOptions::compatibility())
+                .unwrap();
+        let connector = TlsConnector::from_compiled(compiled.clone()).unwrap();
+        let retry = connector
+            .recovery_with_trust_anchor_ids(
+                vec![TrustAnchorId::new(vec![2]).unwrap()],
+                TrustAnchorObserver::default(),
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&compiled, &retry.template.compile().unwrap()));
+        assert!(retry.config.hello_overrides.trust_anchor_ids.is_none());
+        assert!(
+            matches!(&retry.profile().extensions.last().unwrap().source, ExtensionSource::TrustAnchorIds { ids, .. } if ids == &["02"])
+        );
+    }
 
     const NEW_SESSION_TICKET: u8 = 0x04;
     const KEY_UPDATE: u8 = 0x18;
@@ -1261,7 +1065,11 @@ mod tests {
 
     #[derive(Default)]
     struct MockTransport {
+        handshake_writer: Option<RecordWriter>,
+        handshake_keys: Option<PostHandshakeState>,
         chunks: std::collections::VecDeque<Vec<u8>>,
+        read_error: Option<io::ErrorKind>,
+        pending_reads: usize,
         polls: usize,
         /// Everything the stream wrote, so a test can inspect the wire.
         written: Vec<u8>,
@@ -1276,10 +1084,18 @@ mod tests {
     impl AsyncRead for MockTransport {
         fn poll_read(
             mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
+            cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             self.polls += 1;
+            if self.pending_reads != 0 {
+                self.pending_reads -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if let Some(kind) = self.read_error.take() {
+                return Poll::Ready(Err(io::Error::new(kind, "scripted read failure")));
+            }
             if let Some(chunk) = self.chunks.pop_front() {
                 buf.put_slice(&chunk);
             }
@@ -1342,40 +1158,97 @@ mod tests {
         record(content_type::ALERT, &[0x01, 0x00])
     }
 
+    #[tokio::test]
+    async fn received_fatal_alert_does_not_wait_for_transport_cleanup() {
+        let mut stream = mock_stream(vec![record(content_type::ALERT, &[2, 116])], false);
+        stream.inner.pending_flushes = usize::MAX;
+        stream.inner.pending_shutdowns = usize::MAX;
+        let mut buf = [0; 1];
+        for _ in 0..2 {
+            let error =
+                tokio::time::timeout(std::time::Duration::from_millis(100), stream.read(&mut buf))
+                    .await
+                    .expect("fatal alert must be returned before teardown finishes")
+                    .unwrap_err();
+            let error = crate::error::Error::from_h1_io(Arc::new(error));
+            assert_eq!(error.as_tls_alert().unwrap().description.as_byte(), 116);
+            assert!(!error.is_safe_to_replay());
+        }
+        assert_eq!(stream.inner.shutdown_calls, 1);
+        assert_eq!(stream.inner.flush_calls, 0);
+    }
+
     fn app_data_record(body: &[u8]) -> Vec<u8> {
         record(content_type::APPLICATION_DATA, body)
     }
 
     fn mock_stream(chunks: Vec<Vec<u8>>, require_close_notify: bool) -> TlsStream<MockTransport> {
-        TlsStream {
+        let mut stream = TlsStream {
             inner: MockTransport {
                 chunks: chunks.into(),
-                polls: 0,
-                written: Vec::new(),
                 ..MockTransport::default()
             },
-            reader: RecordReader::new(),
-            writer: RecordWriter::new(),
-            read_buf: Vec::new(),
-            read_pos: 0,
-            write_buf: Vec::new(),
-            closed: false,
+            connection: mock_connection(TlsClientHelloStyle::Generic, None, false),
             read_failure: None,
-            client_style: TlsClientHelloStyle::Generic,
-            key_update_flush_pending: false,
-            consecutive_key_updates: 0,
-            pending_key_update_bytes: 0,
-            pending_key_update_record_len: 0,
-            key_update_without_application_write: false,
-            negotiated_alpn: None,
-            negotiated_cipher_suite: None,
-            negotiated_version: None,
-            peer_certificates: Vec::new(),
-            post_handshake: None,
-            session_ticket_ctx: None,
-            post_handshake_buf: Vec::new(),
-            received_close_notify: false,
             require_close_notify,
+        };
+        stream.inner.handshake_writer = Some(RecordWriter::new());
+        stream
+    }
+
+    fn mock_connection(
+        style: TlsClientHelloStyle,
+        version: Option<u16>,
+        keys: bool,
+    ) -> ClientConnection {
+        ClientConnection::from_handshake(
+            lktls::handshake::driver::HandshakeResult {
+                reader: RecordReader::new(),
+                writer: RecordWriter::new(),
+                negotiated_alpn: None,
+                negotiated_cipher_suite: None,
+                negotiated_version: version,
+                peer_certificates: Vec::new(),
+                post_handshake: keys.then(mock_post_handshake_state),
+                session_ticket_ctx: None,
+            },
+            style,
+        )
+    }
+
+    fn configure_mock(
+        stream: &mut TlsStream<MockTransport>,
+        style: TlsClientHelloStyle,
+        version: Option<u16>,
+        keys: bool,
+    ) {
+        stream.connection = mock_connection(style, version, keys);
+    }
+
+    impl TlsStream<MockTransport> {
+        fn handle_post_handshake_record(&mut self, payload: &[u8]) -> io::Result<()> {
+            let record = self
+                .inner
+                .handshake_writer
+                .as_mut()
+                .unwrap()
+                .write_record(content_type::HANDSHAKE, payload)
+                .unwrap();
+            self.connection.feed(&record);
+            let result = self.connection.process_read().map_err(connection_io_error);
+            if result.is_ok() && payload.len() == 5 && payload[0] == 24 && payload[4] <= 1 {
+                let keys = self
+                    .inner
+                    .handshake_keys
+                    .get_or_insert_with(mock_post_handshake_state);
+                let cipher = keys.process_key_update().unwrap();
+                self.inner
+                    .handshake_writer
+                    .as_mut()
+                    .unwrap()
+                    .set_keys(cipher);
+            }
+            result.map(|_| ())
         }
     }
 
@@ -1389,105 +1262,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn repeated_requests_do_not_rotate_an_unused_browser_write_key() {
-        for style in [
-            TlsClientHelloStyle::ChromiumBoringssl,
-            TlsClientHelloStyle::FirefoxNss,
-        ] {
-            let mut stream = mock_stream(Vec::new(), false);
-            stream.client_style = style;
-            stream.post_handshake = Some(mock_post_handshake_state());
-            stream
-                .handle_post_handshake_record(&[24, 0, 0, 1, 1])
-                .unwrap();
-            let first_secret = stream
-                .post_handshake
-                .as_ref()
-                .unwrap()
-                .client_app_secret
-                .clone();
-            let first_reply = stream.write_buf.clone();
-            stream
-                .handle_post_handshake_record(&[24, 0, 0, 1, 1])
-                .unwrap();
-            assert_eq!(
-                stream.post_handshake.as_ref().unwrap().client_app_secret,
-                first_secret
-            );
-            assert_eq!(stream.write_buf, first_reply);
-        }
-    }
-
-    #[test]
-    fn chromium_key_update_limit_precedes_validation_without_rotating_rejected_keys() {
-        let mut stream = mock_stream(Vec::new(), false);
-        stream.client_style = TlsClientHelloStyle::ChromiumBoringssl;
-        stream.post_handshake = Some(mock_post_handshake_state());
-        for _ in 0..32 {
-            stream
-                .handle_post_handshake_record(&[24, 0, 0, 1, 0])
-                .unwrap();
-        }
-        let secret = stream
-            .post_handshake
-            .as_ref()
-            .unwrap()
-            .server_app_secret
-            .clone();
-        assert!(stream
-            .handle_post_handshake_record(&[24, 0, 0, 1, 2])
-            .is_err());
-        assert_eq!(
-            stream.post_handshake.as_ref().unwrap().server_app_secret,
-            secret
-        );
-        assert_eq!(stream.consecutive_key_updates, 32);
-        assert!(stream.write_buf.ends_with(&[2, 10]));
-    }
-
     #[tokio::test]
     async fn chromium_reply_suppression_ends_at_the_ku_record_not_the_entire_write_queue() {
         let mut stream = mock_stream(Vec::new(), false);
-        stream.client_style = TlsClientHelloStyle::ChromiumBoringssl;
-        stream.post_handshake = Some(mock_post_handshake_state());
+        configure_mock(
+            &mut stream,
+            TlsClientHelloStyle::ChromiumBoringssl,
+            None,
+            true,
+        );
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
-        let first_secret = stream
-            .post_handshake
-            .as_ref()
-            .unwrap()
-            .client_app_secret
-            .clone();
+        let first_secret = lktls::crypto::hkdf::hkdf_expand_label(
+            lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
+            &[0x33; 32],
+            "traffic upd",
+            &[],
+            32,
+        )
+        .unwrap();
         stream.inner.write_actions = [WriteAction::Limit(3), WriteAction::Pending].into();
         stream.write_all(b"queued").await.unwrap();
-        assert_eq!(stream.pending_key_update_bytes, 7);
+        assert_eq!(stream.inner.written.len(), 3);
+        let queued = stream.connection.output().to_vec();
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
-        assert_eq!(
-            stream.post_handshake.as_ref().unwrap().client_app_secret,
-            first_secret
-        );
+        assert_eq!(stream.connection.output(), queued);
         stream.inner.write_actions = [WriteAction::Limit(7), WriteAction::Pending].into();
         let pending = std::future::poll_fn(|cx| {
             Poll::Ready(AsyncWrite::poll_flush(Pin::new(&mut stream), cx))
         })
         .await;
         assert!(pending.is_pending());
-        assert_eq!(stream.pending_key_update_bytes, 0);
-        assert!(!stream.write_buf.is_empty());
+        assert_eq!(stream.inner.written.len(), 10);
+        assert!(!stream.connection.output().is_empty());
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
-        assert_ne!(
-            stream.post_handshake.as_ref().unwrap().client_app_secret,
-            first_secret
-        );
-        assert_eq!(stream.pending_key_update_bytes, stream.write_buf.len());
+        assert_eq!(stream.connection.output().len(), 28 + 27);
         stream.flush().await.unwrap();
-        assert_eq!(stream.pending_key_update_bytes, 0);
+        assert!(stream.connection.output().is_empty());
         let key = lktls::crypto::hkdf::hkdf_expand_label(
             lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
             &first_secret,
@@ -1524,86 +1340,49 @@ mod tests {
     #[tokio::test]
     async fn firefox_reply_suppression_survives_flush_until_application_write() {
         let mut stream = mock_stream(Vec::new(), false);
-        stream.client_style = TlsClientHelloStyle::FirefoxNss;
-        stream.post_handshake = Some(mock_post_handshake_state());
+        configure_mock(&mut stream, TlsClientHelloStyle::FirefoxNss, None, true);
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
         stream.flush().await.unwrap();
-        let first_secret = stream
-            .post_handshake
-            .as_ref()
-            .unwrap()
-            .client_app_secret
-            .clone();
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
-        assert!(stream.write_buf.is_empty());
-        assert_eq!(
-            stream.post_handshake.as_ref().unwrap().client_app_secret,
-            first_secret
-        );
+        assert!(stream.connection.output().is_empty());
         assert_eq!(stream.inner.written.len(), 10);
         stream.write_all(b"next").await.unwrap();
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
-        assert_ne!(
-            stream.post_handshake.as_ref().unwrap().client_app_secret,
-            first_secret
+        assert!(stream.connection.flush_required());
+        assert_eq!(stream.connection.output().len(), 27);
+        let mut peer = mock_post_handshake_state();
+        let (_, cipher) = peer.build_key_update_response().unwrap();
+        let response = stream.connection.output();
+        assert_eq!(
+            cipher.decrypt(1, &response[..5], &response[5..]).unwrap(),
+            [24, 0, 0, 1, 0, 22]
         );
-        assert!(stream.key_update_flush_pending);
-        assert_eq!(stream.write_buf.len(), 27);
-    }
-
-    #[test]
-    fn malformed_key_update_does_not_change_either_traffic_secret() {
-        for style in [
-            TlsClientHelloStyle::Generic,
-            TlsClientHelloStyle::ChromiumBoringssl,
-            TlsClientHelloStyle::FirefoxNss,
-        ] {
-            let enum_alert = if style == TlsClientHelloStyle::Generic {
-                47
-            } else {
-                50
-            };
-            let cases = [
-                (vec![24, 0, 0, 0], 50),
-                (vec![24, 0, 0, 2, 1, 0], 50),
-                (vec![24, 0, 0, 1, 2], enum_alert),
-                (vec![24, 0, 0, 1, 0, 24, 0, 0, 1, 0], 10),
-                (vec![24, 0, 0, 1, 0, 4], 10),
-                (vec![24, 0, 0, 1, 0, 4, 0xff, 0xff, 0xff], 10),
-                (vec![24, 0, 0, 1, 2, 24, 0, 0, 1, 0], enum_alert),
-            ];
-            for (message, expected) in cases {
-                let mut stream = mock_stream(Vec::new(), false);
-                stream.client_style = style;
-                stream.post_handshake = Some(mock_post_handshake_state());
-                assert!(stream.handle_post_handshake_record(&message).is_err());
-                assert_eq!(
-                    stream.post_handshake.as_ref().unwrap().server_app_secret,
-                    vec![0x22; 32]
-                );
-                assert_eq!(
-                    stream.post_handshake.as_ref().unwrap().client_app_secret,
-                    vec![0x33; 32]
-                );
-                assert!(stream.write_buf.ends_with(&[2, expected]));
-                assert!(!stream.key_update_flush_pending);
-            }
-        }
     }
 
     #[tokio::test]
     async fn chromium_browser_flush_keeps_idle_ku_but_flushes_accepted_application_prefix() {
-        for prefix in [Vec::new(), app_data_record(b"accepted")] {
+        for prefix in [
+            Vec::new(),
+            RecordWriter::new()
+                .write_record(content_type::APPLICATION_DATA, b"accepted")
+                .unwrap(),
+        ] {
             let mut stream = mock_stream(Vec::new(), false);
-            stream.client_style = TlsClientHelloStyle::ChromiumBoringssl;
-            stream.post_handshake = Some(mock_post_handshake_state());
-            stream.write_buf = prefix.clone();
+            configure_mock(
+                &mut stream,
+                TlsClientHelloStyle::ChromiumBoringssl,
+                None,
+                true,
+            );
+            if !prefix.is_empty() {
+                stream.connection.write_application(b"accepted").unwrap();
+            }
             stream
                 .handle_post_handshake_record(&[24, 0, 0, 1, 1])
                 .unwrap();
@@ -1612,8 +1391,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stream.inner.written, prefix);
-            assert_eq!(stream.pending_key_update_bytes, 10);
-            assert_eq!(stream.write_buf.len(), 10);
+            assert!(stream.connection.idle_output().is_empty());
+            assert_eq!(stream.connection.output().len(), 10);
             stream.flush().await.unwrap();
             assert_eq!(&stream.inner.written[prefix.len() + 5..], &[24, 0, 0, 1, 0]);
         }
@@ -1621,11 +1400,22 @@ mod tests {
 
     #[tokio::test]
     async fn chromium_browser_shutdown_discards_only_an_unsent_trailing_key_update() {
-        for prefix in [Vec::new(), app_data_record(b"accepted")] {
+        for prefix in [
+            Vec::new(),
+            RecordWriter::new()
+                .write_record(content_type::APPLICATION_DATA, b"accepted")
+                .unwrap(),
+        ] {
             let mut stream = mock_stream(Vec::new(), false);
-            stream.client_style = TlsClientHelloStyle::ChromiumBoringssl;
-            stream.post_handshake = Some(mock_post_handshake_state());
-            stream.write_buf = prefix.clone();
+            configure_mock(
+                &mut stream,
+                TlsClientHelloStyle::ChromiumBoringssl,
+                None,
+                true,
+            );
+            if !prefix.is_empty() {
+                stream.connection.write_application(b"accepted").unwrap();
+            }
             stream
                 .handle_post_handshake_record(&[24, 0, 0, 1, 1])
                 .unwrap();
@@ -1641,15 +1431,20 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stream.inner.written, prefix);
-            assert!(stream.closed && stream.write_buf.is_empty());
-            assert_eq!(stream.pending_key_update_bytes, 0);
+            assert!(stream.connection.is_closed() && stream.connection.output().is_empty());
+            assert!(stream.connection.idle_output().is_empty());
             assert_eq!(
                 stream.write(b"late").await.unwrap_err().kind(),
                 io::ErrorKind::BrokenPipe
             );
         }
         let mut explicit = mock_stream(Vec::new(), false);
-        explicit.client_style = TlsClientHelloStyle::ChromiumBoringssl;
+        configure_mock(
+            &mut explicit,
+            TlsClientHelloStyle::ChromiumBoringssl,
+            None,
+            false,
+        );
         explicit.shutdown().await.unwrap();
         assert_eq!(&explicit.inner.written[5..], &[1, 0]);
     }
@@ -1658,8 +1453,12 @@ mod tests {
     async fn chromium_browser_shutdown_preserves_partial_ku_and_dependent_application_data() {
         for partial in [false, true] {
             let mut stream = mock_stream(Vec::new(), false);
-            stream.client_style = TlsClientHelloStyle::ChromiumBoringssl;
-            stream.post_handshake = Some(mock_post_handshake_state());
+            configure_mock(
+                &mut stream,
+                TlsClientHelloStyle::ChromiumBoringssl,
+                None,
+                true,
+            );
             stream
                 .handle_post_handshake_record(&[24, 0, 0, 1, 1])
                 .unwrap();
@@ -1670,71 +1469,43 @@ mod tests {
                 })
                 .await;
                 assert!(pending.is_pending());
-                assert_eq!(stream.pending_key_update_bytes, 7);
+                assert_eq!(stream.inner.written.len(), 3);
             } else {
                 stream.inner.write_actions = [WriteAction::Pending].into();
                 stream.write_all(b"after").await.unwrap();
             }
-            let expected = [stream.inner.written.as_slice(), stream.write_buf.as_slice()].concat();
+            let expected = [stream.inner.written.as_slice(), stream.connection.output()].concat();
             std::future::poll_fn(|cx| Pin::new(&mut stream).poll_browser_shutdown(cx))
                 .await
                 .unwrap();
             assert_eq!(stream.inner.written, expected);
-            assert_eq!(stream.pending_key_update_bytes, 0);
-            assert!(stream.closed);
+            assert!(stream.connection.output().is_empty());
+            assert!(stream.connection.is_closed());
         }
     }
 
     #[tokio::test]
     async fn browser_shutdown_still_flushes_terminal_alerts() {
         let mut stream = mock_stream(Vec::new(), false);
-        stream.client_style = TlsClientHelloStyle::ChromiumBoringssl;
-        stream.post_handshake = Some(mock_post_handshake_state());
+        configure_mock(
+            &mut stream,
+            TlsClientHelloStyle::ChromiumBoringssl,
+            None,
+            true,
+        );
         stream
             .handle_post_handshake_record(&[24, 0, 0, 1, 1])
             .unwrap();
-        let error = stream.post_handshake_alert(
-            lktls::error::AlertDescription::RecordOverflow,
-            "oversized record",
-        );
-        stream.fail_read(error);
-        let expected = stream.write_buf.clone();
+        stream.connection.feed(&[22, 3, 3, 0xff, 0xff]);
+        let error = stream.connection.process_read().unwrap_err();
+        stream.fail_read(connection_io_error(error));
+        let expected = stream.connection.output().to_vec();
         std::future::poll_fn(|cx| Pin::new(&mut stream).poll_browser_shutdown(cx))
             .await
             .unwrap();
         assert_eq!(stream.inner.written, expected);
         assert_eq!(stream.inner.shutdown_calls, 1);
         assert!(stream.read(&mut [0; 1]).await.is_err());
-    }
-
-    #[test]
-    fn fragmented_key_update_changes_keys_only_at_the_completed_record_boundary() {
-        let mut stream = mock_stream(Vec::new(), false);
-        stream.post_handshake = Some(mock_post_handshake_state());
-        stream.handle_post_handshake_record(&[24, 0]).unwrap();
-        assert_eq!(
-            stream.post_handshake.as_ref().unwrap().server_app_secret,
-            vec![0x22; 32]
-        );
-        stream.handle_post_handshake_record(&[0, 1, 0]).unwrap();
-        let expected = lktls::crypto::hkdf::hkdf_expand_label(
-            lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
-            &[0x22; 32],
-            "traffic upd",
-            &[],
-            32,
-        )
-        .unwrap();
-        assert_eq!(
-            stream.post_handshake.as_ref().unwrap().server_app_secret,
-            expected
-        );
-        assert_eq!(
-            stream.post_handshake.as_ref().unwrap().client_app_secret,
-            vec![0x33; 32]
-        );
-        assert!(stream.post_handshake_buf.is_empty());
-        assert!(stream.write_buf.is_empty());
     }
 
     #[tokio::test]
@@ -1748,8 +1519,7 @@ mod tests {
                 vec![record(content_type::HANDSHAKE, &[24, 0, 0, 1, 1])],
                 false,
             );
-            stream.client_style = style;
-            stream.post_handshake = Some(mock_post_handshake_state());
+            configure_mock(&mut stream, style, None, true);
             stream.inner.write_actions = [
                 WriteAction::Pending,
                 WriteAction::Limit(2),
@@ -1767,11 +1537,11 @@ mod tests {
             let response = [22, 3, 1, 0, 5, 24, 0, 0, 1, 0];
             if style == TlsClientHelloStyle::FirefoxNss {
                 assert_eq!(stream.inner.written, response);
-                assert!(stream.write_buf.is_empty());
-                assert!(!stream.key_update_flush_pending);
+                assert!(stream.connection.output().is_empty());
+                assert!(!stream.connection.flush_required());
             } else {
                 assert!(stream.inner.written.is_empty());
-                assert_eq!(stream.write_buf, response);
+                assert_eq!(stream.connection.output(), response);
             }
             stream.write_all(b"next").await.unwrap();
             stream.flush().await.unwrap();
@@ -1806,8 +1576,7 @@ mod tests {
             vec![record(content_type::HANDSHAKE, &[24, 0, 0, 1, 1])],
             false,
         );
-        stream.client_style = TlsClientHelloStyle::FirefoxNss;
-        stream.post_handshake = Some(mock_post_handshake_state());
+        configure_mock(&mut stream, TlsClientHelloStyle::FirefoxNss, None, true);
         stream.inner.write_actions = [WriteAction::Limit(0)].into();
         let error =
             tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut [0; 1]))
@@ -1815,7 +1584,7 @@ mod tests {
                 .unwrap()
                 .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-        assert!(stream.closed && stream.write_buf.is_empty());
+        assert!(stream.connection.is_closed() && stream.connection.output().is_empty());
         assert_eq!(
             stream.read(&mut [0; 1]).await.unwrap_err().kind(),
             io::ErrorKind::WriteZero
@@ -1830,8 +1599,7 @@ mod tests {
                 vec![record(content_type::HANDSHAKE, &[24, 0, 0, 1, 1])],
                 false,
             );
-            stream.client_style = TlsClientHelloStyle::FirefoxNss;
-            stream.post_handshake = Some(mock_post_handshake_state());
+            configure_mock(&mut stream, TlsClientHelloStyle::FirefoxNss, None, true);
             stream.inner.write_actions = [WriteAction::Pending].into();
             let pending = std::future::poll_fn(|cx| {
                 let mut bytes = [0; 1];
@@ -1840,7 +1608,7 @@ mod tests {
             })
             .await;
             assert!(pending.is_pending());
-            assert!(stream.key_update_flush_pending);
+            assert!(stream.connection.flush_required());
             stream.inner.write_actions.push_back(WriteAction::Limit(0));
             let error = if shutdown {
                 stream.shutdown().await.unwrap_err()
@@ -1866,7 +1634,7 @@ mod tests {
         let mut body = Vec::new();
         stream.read_to_end(&mut body).await.unwrap();
         assert_eq!(body, b"body");
-        assert!(stream.received_close_notify);
+        assert!(stream.received_close_notify());
     }
 
     #[tokio::test]
@@ -1937,6 +1705,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adapter_copies_authenticated_plaintext_once_into_fragmented_caller_buffers() {
+        use lktls::crypto::aead::{Aead, AeadAlgorithm};
+        use lktls::crypto::tls12_cipher::{Tls12GcmCipher, Tls12RecordCipher};
+
+        for tls12 in [false, true] {
+            for size in [1, 1024, 16384, 32791] {
+                for caller_capacity in [1, 17, 1024] {
+                    let mut reader = RecordReader::new();
+                    let mut peer = RecordWriter::new();
+                    if tls12 {
+                        let cipher = || {
+                            Tls12RecordCipher::Gcm(
+                                Tls12GcmCipher::new(&[0x41; 16], &[0x32; 4], false).unwrap(),
+                            )
+                        };
+                        reader.set_tls12_keys(cipher());
+                        peer.set_tls12_keys(cipher());
+                    } else {
+                        let cipher = || {
+                            Aead::new(AeadAlgorithm::Aes128Gcm, &[0x41; 16], &[0x32; 12]).unwrap()
+                        };
+                        reader.set_keys(cipher());
+                        peer.set_keys(cipher());
+                    }
+                    let expected = vec![0x53; size];
+                    let mut records = peer
+                        .write_record(content_type::APPLICATION_DATA, &expected)
+                        .unwrap();
+                    records.extend(peer.write_record(content_type::ALERT, &[1, 0]).unwrap());
+                    let mut stream =
+                        mock_stream(records.chunks(1024).map(<[u8]>::to_vec).collect(), true);
+                    stream.connection = ClientConnection::from_handshake(
+                        lktls::handshake::driver::HandshakeResult {
+                            reader,
+                            writer: RecordWriter::new(),
+                            negotiated_alpn: None,
+                            negotiated_cipher_suite: None,
+                            negotiated_version: Some(if tls12 { 0x0303 } else { 0x0304 }),
+                            peer_certificates: Vec::new(),
+                            post_handshake: None,
+                            session_ticket_ctx: None,
+                        },
+                        TlsClientHelloStyle::Generic,
+                    );
+                    stream.inner.pending_reads = 1;
+                    let mut caller = vec![0; caller_capacity];
+                    let mut received = Vec::with_capacity(size);
+                    PLAINTEXT_TO_CALLER_BYTES.with(|bytes| bytes.set(0));
+                    loop {
+                        let count = stream.read(&mut caller).await.unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        received.extend_from_slice(&caller[..count]);
+                    }
+                    assert_eq!(received, expected);
+                    assert_eq!(PLAINTEXT_TO_CALLER_BYTES.with(|bytes| bytes.get()), size);
+                    assert!(stream.received_close_notify());
+                    assert!(stream.inner.polls > 1);
+                    assert!(stream.inner.written.is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_transport_read_can_be_retried() {
+        let mut stream = mock_stream(vec![app_data_record(b"ok")], false);
+        stream.inner.read_error = Some(io::ErrorKind::Interrupted);
+        assert_eq!(
+            stream.read(&mut [0; 2]).await.unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!stream.connection.is_closed());
+        let mut bytes = [0; 2];
+        assert_eq!(stream.read(&mut bytes).await.unwrap(), 2);
+        assert_eq!(&bytes, b"ok");
+        assert_eq!(stream.inner.polls, 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_transport_read_errors_and_strict_eof_latch_both_directions() {
+        for kind in [
+            Some(io::ErrorKind::ConnectionReset),
+            Some(io::ErrorKind::TimedOut),
+            None,
+        ] {
+            let mut stream = mock_stream(vec![], kind.is_none());
+            stream.inner.read_error = kind;
+            stream
+                .connection
+                .write_application(b"unsent prefix")
+                .unwrap();
+            let error = stream.read(&mut [0; 16]).await.unwrap_err();
+            assert_eq!(error.kind(), kind.unwrap_or(io::ErrorKind::UnexpectedEof));
+            assert!(stream.connection.is_closed());
+            assert!(stream.connection.output().is_empty());
+            assert!(stream.inner.written.is_empty());
+            assert_eq!(stream.inner.polls, 1);
+            assert_eq!((stream.inner.write_calls, stream.inner.flush_calls), (0, 0));
+            assert_eq!(stream.inner.shutdown_calls, 1);
+
+            stream.inner.chunks.push_back(app_data_record(b"late data"));
+            for later in [
+                stream.read(&mut [0; 16]).await.map(|_| ()),
+                stream.write(b"late write").await.map(|_| ()),
+                stream.flush().await,
+            ] {
+                let later = later.unwrap_err();
+                assert_eq!(later.kind(), error.kind());
+                assert_eq!(later.to_string(), error.to_string());
+            }
+            stream.shutdown().await.unwrap();
+            assert_eq!(stream.inner.polls, 1);
+            assert_eq!((stream.inner.write_calls, stream.inner.flush_calls), (0, 0));
+            assert_eq!(stream.inner.shutdown_calls, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn fatal_read_flushes_partial_alert_writes_before_returning_and_stays_terminal() {
         let mut stream = mock_stream(
             vec![record(0x18, &[1]), app_data_record(b"late data")],
@@ -1963,7 +1851,7 @@ mod tests {
         assert_eq!(stream.inner.written, [21, 3, 1, 0, 2, 2, 10]);
         assert_eq!((stream.inner.write_calls, stream.inner.flush_calls), (5, 2));
         assert_eq!(stream.inner.shutdown_calls, 2);
-        assert!(stream.write_buf.is_empty());
+        assert!(stream.connection.output().is_empty());
         let polls = stream.inner.polls;
         assert_eq!(
             stream.read(&mut buffer).await.unwrap_err().to_string(),
@@ -2002,7 +1890,7 @@ mod tests {
                 stream.inner.written.len(),
                 if expected_writes == 1 { 0 } else { 2 }
             );
-            assert!(stream.write_buf.is_empty());
+            assert!(stream.connection.output().is_empty());
             assert_eq!(
                 stream.read(&mut [0; 1]).await.unwrap_err().to_string(),
                 error.to_string()
@@ -2040,7 +1928,7 @@ mod tests {
             .expect("cancelled fatal read must not spin on WriteZero");
             assert_eq!(result.is_ok(), shutdown);
             assert_eq!(stream.inner.written, [21, 3]);
-            assert!(stream.write_buf.is_empty());
+            assert!(stream.connection.output().is_empty());
             assert!(stream
                 .read(&mut [0; 1])
                 .await
@@ -2055,16 +1943,13 @@ mod tests {
     #[tokio::test]
     async fn fatal_read_preserves_queued_record_order() {
         let mut stream = mock_stream(vec![record(0x18, &[1])], false);
-        stream.write_buf = stream
-            .writer
-            .write_record(content_type::APPLICATION_DATA, b"queued")
-            .unwrap();
+        stream.connection.write_application(b"queued").unwrap();
         stream.inner.write_actions = [WriteAction::Limit(3), WriteAction::Pending].into();
         assert!(stream.read(&mut [0; 1]).await.is_err());
         assert_eq!(&stream.inner.written[..5], &[23, 3, 1, 0, 6]);
         assert_eq!(&stream.inner.written[5..11], b"queued");
         assert_eq!(&stream.inner.written[11..], &[21, 3, 3, 0, 2, 2, 10]);
-        assert!(stream.write_buf.is_empty());
+        assert!(stream.connection.output().is_empty());
     }
 
     #[tokio::test]
@@ -2217,7 +2102,12 @@ mod tests {
 
     fn stream_at_version(version: u16, chunks: Vec<Vec<u8>>) -> TlsStream<MockTransport> {
         let mut stream = mock_stream(chunks, false);
-        stream.negotiated_version = Some(version);
+        configure_mock(
+            &mut stream,
+            TlsClientHelloStyle::Generic,
+            Some(version),
+            false,
+        );
         stream
     }
 
@@ -2225,7 +2115,7 @@ mod tests {
     /// Everything that actually reached the peer, plus anything still queued.
     fn written_bytes(stream: &TlsStream<MockTransport>) -> Vec<u8> {
         let mut out = stream.inner_stream().written.clone();
-        out.extend_from_slice(&stream.write_buf);
+        out.extend_from_slice(stream.connection.output());
         out
     }
 
@@ -2281,24 +2171,20 @@ mod tests {
         );
     }
 
-    /// TLS 1.3 has no `HelloRequest`, and BoringSSL routes >= 1.3 to a different
-    /// post-handshake path entirely. Leave that path alone rather than guessing
-    /// at an alert we have not verified.
+    /// TLS 1.3 rejects HelloRequest as an unexpected handshake message.
     #[tokio::test]
     async fn tls13_does_not_take_the_renegotiation_path() {
         let hello_request = handshake_record(&[0x00, 0x00, 0x00, 0x00]);
         let mut stream = stream_at_version(0x0304, vec![hello_request]);
 
         let mut body = Vec::new();
-        stream
+        let error = stream
             .read_to_end(&mut body)
             .await
-            .expect("TLS 1.3 keeps the previous ignore behaviour");
+            .expect_err("TLS 1.3 must reject HelloRequest");
 
-        assert!(
-            written_bytes(&stream).is_empty(),
-            "no alert should be queued on the TLS 1.3 path"
-        );
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(written_bytes(&stream), &[21, 3, 1, 0, 2, 2, 10]);
     }
 
     /// A HelloRequest arriving before a version is known must not trip the
@@ -2308,7 +2194,7 @@ mod tests {
     async fn unknown_version_keeps_the_previous_behaviour() {
         let hello_request = handshake_record(&[0x00, 0x00, 0x00, 0x00]);
         let mut stream = mock_stream(vec![hello_request], false);
-        assert!(stream.negotiated_version.is_none());
+        assert!(stream.negotiated_version().is_none());
 
         stream
             .read_to_end(&mut Vec::new())

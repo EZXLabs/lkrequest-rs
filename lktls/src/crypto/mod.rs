@@ -13,6 +13,7 @@ pub mod hkdf;
 pub mod kx;
 pub mod prf;
 pub mod quic;
+pub(crate) mod suites;
 pub mod tls12_cipher;
 
 /// Encode a byte slice as a lowercase hex string.

@@ -2,6 +2,16 @@
 
 use super::Extension;
 
+pub(crate) fn validate_payload(payload: &[u8]) -> crate::error::Result<()> {
+    let mut reader = crate::wire::Reader::new(payload);
+    let groups = reader.vector16()?;
+    reader.finish()?;
+    if groups.is_empty() || groups.len() % 2 != 0 {
+        return Err(crate::wire::decode_error("invalid supported_groups vector"));
+    }
+    Ok(())
+}
+
 /// Lists the elliptic curves / DH groups the client supports.
 pub struct SupportedGroups {
     /// Ordered list of NamedGroup code-points.

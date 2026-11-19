@@ -211,17 +211,21 @@ pub struct BufferedProxyProvider {
     buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ProxyConfig>>>,
     capacity: usize,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: std::sync::Arc<std::sync::Condvar>,
 }
 
 impl BufferedProxyProvider {
     /// Create a buffered provider wrapping `inner` with the given buffer capacity.
     ///
-    /// A background thread is spawned immediately to start filling the buffer.
+    /// A background thread fills nonempty providers when capacity is positive.
+    /// Failed generations back off instead of continuously polling the source.
     pub fn new(inner: Box<dyn ProxyProvider>, capacity: usize) -> Self {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::with_capacity(capacity),
         ));
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake = std::sync::Arc::new(std::sync::Condvar::new());
+        let bg_wake = std::sync::Arc::clone(&wake);
 
         // Spawn a background thread (not tokio task) so it works even before
         // the tokio runtime is fully warmed up.
@@ -233,35 +237,50 @@ impl BufferedProxyProvider {
         let inner: std::sync::Arc<Box<dyn ProxyProvider>> = std::sync::Arc::from(inner);
         let bg_inner = std::sync::Arc::clone(&inner);
 
-        std::thread::Builder::new()
-            .name("proxy-buffer-fill".into())
-            .spawn(move || {
-                while !bg_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    let needs_fill = {
-                        let buf = bg_buffer.lock().unwrap();
-                        buf.len() < capacity
-                    };
+        if capacity > 0 && (inner.is_dynamic() || !inner.is_empty()) {
+            std::thread::Builder::new()
+                .name("proxy-buffer-fill".into())
+                .spawn(move || {
+                    while !bg_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        let needs_fill = {
+                            let buf = bg_buffer.lock().unwrap();
+                            buf.len() < capacity
+                        };
 
-                    if needs_fill {
-                        if let Some(config) = bg_inner.next_proxy() {
-                            let mut buf = bg_buffer.lock().unwrap();
-                            if buf.len() < capacity {
-                                buf.push_back(config);
+                        if needs_fill {
+                            if let Some(config) = bg_inner.next_proxy() {
+                                let mut buf = bg_buffer.lock().unwrap();
+                                if buf.len() < capacity {
+                                    buf.push_back(config);
+                                }
+                            } else {
+                                let _wait = bg_wake
+                                    .wait_timeout_while(
+                                        bg_buffer.lock().unwrap(),
+                                        std::time::Duration::from_millis(50),
+                                        |_| !bg_shutdown.load(std::sync::atomic::Ordering::Relaxed),
+                                    )
+                                    .unwrap();
                             }
+                        } else {
+                            let _wait = bg_wake
+                                .wait_while(bg_buffer.lock().unwrap(), |buf| {
+                                    buf.len() >= capacity
+                                        && !bg_shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                                })
+                                .unwrap();
                         }
-                    } else {
-                        // Buffer is full, sleep briefly before checking again
-                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                }
-            })
-            .expect("failed to spawn proxy buffer fill thread");
+                })
+                .expect("failed to spawn proxy buffer fill thread");
+        }
 
         Self {
             inner,
             buffer,
             capacity,
             shutdown,
+            wake,
         }
     }
 }
@@ -272,6 +291,7 @@ impl ProxyProvider for BufferedProxyProvider {
         {
             let mut buf = self.buffer.lock().unwrap();
             if let Some(config) = buf.pop_front() {
+                self.wake.notify_one();
                 return Some(config);
             }
         }
@@ -280,7 +300,11 @@ impl ProxyProvider for BufferedProxyProvider {
     }
 
     fn len(&self) -> usize {
-        self.capacity
+        if self.inner.is_dynamic() {
+            self.capacity.max(1)
+        } else {
+            self.inner.len()
+        }
     }
 
     fn is_dynamic(&self) -> bool {
@@ -294,8 +318,10 @@ impl ProxyProvider for BufferedProxyProvider {
 
 impl Drop for BufferedProxyProvider {
     fn drop(&mut self) {
+        let _buffer = self.buffer.lock().unwrap();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.wake.notify_all();
     }
 }
 

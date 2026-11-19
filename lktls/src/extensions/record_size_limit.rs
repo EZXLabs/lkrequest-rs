@@ -17,6 +17,10 @@
 use super::Extension;
 use crate::error::{AlertDescription, Result, TlsError};
 
+pub(super) fn parse_tls12_server(data: &[u8]) -> Result<super::tls12::ServerValue<'_>> {
+    parse_peer_record_size_limit(data).map(super::tls12::ServerValue::RecordSizeLimit)
+}
+
 /// Smallest value RFC 8449 §4 permits in a `record_size_limit` extension.
 ///
 /// "Endpoints MUST NOT send a 'record_size_limit' extension with a value

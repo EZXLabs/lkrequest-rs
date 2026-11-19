@@ -6,6 +6,13 @@
 
 use super::Extension;
 
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    super::registry::require_empty(data)?;
+    Ok(super::tls12::ServerValue::SessionTicket)
+}
+
 /// Session Ticket extension.
 pub struct SessionTicket {
     /// Ticket data.  Empty for initial ClientHello (indicating support),

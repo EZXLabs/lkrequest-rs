@@ -8,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use lkrequest::TlsConnector;
 use lktls::profile::presets;
 
+#[path = "tls_support/sessions.rs"]
+mod session_fixtures;
 mod tls_support;
 use tls_support::{tls_connect_with_retry, MAX_RETRIES};
 
@@ -84,9 +86,7 @@ impl tokio::io::AsyncWrite for ObservedAsyncSocket {
 async fn local_openssl_hrr_psk_hash_filter_completes_authenticated_http() {
     use lktls::crypto::aead::AeadAlgorithm;
     use lktls::crypto::hkdf::HkdfAlgorithm;
-    use lktls::session_store::{
-        InMemorySessionStore, SessionStore, SessionTicketData, TicketTlsVersion,
-    };
+    use lktls::session_store::{SessionTicketData, TicketTlsVersion};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -100,9 +100,10 @@ async fn local_openssl_hrr_psk_hash_filter_completes_authenticated_http() {
         let anchor = lktls::verify::certchain::parse_trust_anchor_from_der(&certificate).unwrap();
         for profile in [presets::chrome_155(), presets::firefox_156()] {
             for ticket_sha384 in [false, true] {
-                let store = Arc::new(InMemorySessionStore::new());
-                store.store(
-                    &format!("127.0.0.1:{port}"),
+                let (store, anchors) = session_fixtures::seeded_session(
+                    "127.0.0.1",
+                    port,
+                    vec![anchor.clone()],
                     SessionTicketData {
                         ticket: b"local-openssl-hrr-test".to_vec(),
                         resumption_psk: vec![0xa5; if ticket_sha384 { 48 } else { 32 }],
@@ -128,10 +129,11 @@ async fn local_openssl_hrr_psk_hash_filter_completes_authenticated_http() {
                         peer_transport_parameters: None,
                         used_extended_master_secret: None,
                     },
+                    false,
                 );
                 let connector = TlsConnector::new(profile.clone())
                     .session_store(store)
-                    .custom_ca_anchors(Arc::new(vec![anchor.clone()]));
+                    .custom_ca_anchors(anchors);
                 let written = Arc::new(Mutex::new(Vec::new()));
                 let socket = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
                     .await
@@ -661,9 +663,7 @@ async fn local_normal_ccs_waits_for_server_flight_and_completes_http() {
 async fn local_hrr_psk_hash_filter_records_rustls_peer_outcomes() {
     use lktls::crypto::aead::AeadAlgorithm;
     use lktls::crypto::hkdf::HkdfAlgorithm;
-    use lktls::session_store::{
-        InMemorySessionStore, SessionStore, SessionTicketData, TicketTlsVersion,
-    };
+    use lktls::session_store::{SessionTicketData, TicketTlsVersion};
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::time::Duration;
@@ -742,9 +742,8 @@ async fn local_hrr_psk_hash_filter_records_rustls_peer_outcomes() {
                         }
                         (tls.sock.received, failure)
                     });
-                    let store = Arc::new(InMemorySessionStore::new());
-                    store.store(
-                        &format!("127.0.0.1:{}", address.port()),
+                    let (store, anchors) = session_fixtures::seeded_session(
+                        "127.0.0.1", address.port(), vec![anchor],
                         SessionTicketData {
                             ticket: b"local-hrr-test".to_vec(),
                             resumption_psk: vec![0xa5; if ticket_sha384 { 48 } else { 32 }],
@@ -769,11 +768,11 @@ async fn local_hrr_psk_hash_filter_records_rustls_peer_outcomes() {
                             max_early_data_size: 0,
                             peer_transport_parameters: None,
                             used_extended_master_secret: None,
-                        },
+                        }, false,
                     );
                     let connector = TlsConnector::new(profile.clone())
                         .session_store(store)
-                        .custom_ca_anchors(Arc::new(vec![anchor]));
+                        .custom_ca_anchors(anchors);
                     let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
                     let connected = connector.connect("127.0.0.1", address.port(), tcp).await;
                     let compatible = ticket_sha384 == server_sha384;

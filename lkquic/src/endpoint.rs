@@ -289,6 +289,22 @@ where
         &mut self,
         request: ConnectRequest<B::ClientConfig>,
     ) -> Result<StartedConnection<B>, QuicManagerError<B::Error>> {
+        self.start_connect_with_admission(request, || Ok(())).await
+    }
+
+    /// Start a connection after synchronous admission at the backend boundary.
+    ///
+    /// Admission runs once after endpoint initialization succeeds, immediately
+    /// before `QuicBackend::connect`. An admission error prevents that call;
+    /// a backend rejection after admission still represents a started attempt.
+    pub async fn start_connect_with_admission<F>(
+        &mut self,
+        request: ConnectRequest<B::ClientConfig>,
+        admission: F,
+    ) -> Result<StartedConnection<B>, QuicManagerError<B::Error>>
+    where
+        F: FnOnce() -> Result<(), B::Error>,
+    {
         tracing::debug!(
             remote = %request.remote_addr,
             server_name = %request.server_name,
@@ -303,24 +319,18 @@ where
             local_connection_id: self.cid_generator.generate(),
         };
 
-        match self.strategy {
-            QuicEndpointStrategy::PerSession => {
-                let endpoint = Arc::new(self.create_endpoint()?);
-                let connecting = self
-                    .backend
-                    .connect(endpoint.as_ref(), connect_request)
-                    .map_err(QuicManagerError::Backend)?;
-                Ok(StartedConnection::new(connecting, endpoint))
-            }
+        let endpoint = match self.strategy {
+            QuicEndpointStrategy::PerSession => Arc::new(self.create_endpoint()?),
             QuicEndpointStrategy::PerClient | QuicEndpointStrategy::Global => {
-                let endpoint = Arc::clone(self.get_or_init().await?);
-                let connecting = self
-                    .backend
-                    .connect(endpoint.as_ref(), connect_request)
-                    .map_err(QuicManagerError::Backend)?;
-                Ok(StartedConnection::new(connecting, endpoint))
+                Arc::clone(self.get_or_init().await?)
             }
-        }
+        };
+        admission().map_err(QuicManagerError::Backend)?;
+        let connecting = self
+            .backend
+            .connect(endpoint.as_ref(), connect_request)
+            .map_err(QuicManagerError::Backend)?;
+        Ok(StartedConnection::new(connecting, endpoint))
     }
 
     fn create_endpoint(&self) -> Result<B::Endpoint, QuicManagerError<B::Error>> {
@@ -495,6 +505,133 @@ mod tests {
             error,
             QuicManagerError::Backend(StubQuicError::EmptyServerName)
         ));
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum AdmissionError {
+        Endpoint,
+        Denied,
+        Connect,
+    }
+
+    #[derive(Default)]
+    struct AdmissionBackend {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        fail_endpoint: bool,
+        fail_connect: bool,
+    }
+
+    impl QuicBackend for AdmissionBackend {
+        type Endpoint = ();
+        type ClientConfig = ();
+        type Connecting = std::future::Ready<Result<(), AdmissionError>>;
+        type Connection = ();
+        type Error = AdmissionError;
+
+        fn create_endpoint(&self, _: EndpointBootstrap) -> Result<(), AdmissionError> {
+            self.events.lock().unwrap().push("endpoint");
+            if self.fail_endpoint {
+                Err(AdmissionError::Endpoint)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn connect(
+            &self,
+            _: &(),
+            _: BackendConnectRequest<()>,
+        ) -> Result<Self::Connecting, AdmissionError> {
+            self.events.lock().unwrap().push("connect");
+            if self.fail_connect {
+                Err(AdmissionError::Connect)
+            } else {
+                Ok(std::future::ready(Ok(())))
+            }
+        }
+    }
+
+    #[test]
+    fn connection_admission_runs_only_at_the_backend_boundary() {
+        for strategy in [
+            QuicEndpointStrategy::PerSession,
+            QuicEndpointStrategy::PerClient,
+            QuicEndpointStrategy::Global,
+        ] {
+            for (fail_endpoint, deny, fail_connect, expected) in [
+                (true, false, false, vec!["endpoint"]),
+                (false, true, false, vec!["endpoint", "admit"]),
+                (false, false, true, vec!["endpoint", "admit", "connect"]),
+                (false, false, false, vec!["endpoint", "admit", "connect"]),
+            ] {
+                let backend = AdmissionBackend {
+                    fail_endpoint,
+                    fail_connect,
+                    ..Default::default()
+                };
+                let events = Arc::clone(&backend.events);
+                let mut manager = QuicEndpointManager::with_backend(
+                    backend,
+                    ChromeConnectionIdGenerator::default(),
+                )
+                .strategy(strategy);
+                let result = block_on(manager.start_connect_with_admission(
+                    ConnectRequest::new(server_addr(443), "example.test", ()),
+                    || {
+                        events.lock().unwrap().push("admit");
+                        if deny {
+                            Err(AdmissionError::Denied)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                ));
+                let error = result.err().map(|error| match error {
+                    QuicManagerError::Backend(error) => error,
+                    other => panic!("unexpected manager failure: {other:?}"),
+                });
+                assert_eq!(
+                    error,
+                    if fail_endpoint {
+                        Some(AdmissionError::Endpoint)
+                    } else if deny {
+                        Some(AdmissionError::Denied)
+                    } else if fail_connect {
+                        Some(AdmissionError::Connect)
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(*events.lock().unwrap(), expected, "strategy: {strategy:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cached_endpoint_still_requires_admission_for_each_connection() {
+        let backend = AdmissionBackend::default();
+        let events = Arc::clone(&backend.events);
+        let mut manager =
+            QuicEndpointManager::with_backend(backend, ChromeConnectionIdGenerator::default());
+        block_on(manager.get_or_init()).unwrap();
+        for denied in [true, false] {
+            let result = block_on(manager.start_connect_with_admission(
+                ConnectRequest::new(server_addr(443), "example.test", ()),
+                || {
+                    events.lock().unwrap().push("admit");
+                    if denied {
+                        Err(AdmissionError::Denied)
+                    } else {
+                        Ok(())
+                    }
+                },
+            ));
+            assert_eq!(result.is_err(), denied);
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["endpoint", "admit", "admit", "connect"]
+        );
     }
 
     #[derive(Clone, Default)]

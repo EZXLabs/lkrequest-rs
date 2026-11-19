@@ -156,7 +156,7 @@ impl ProxyConfig {
 
         let associate = tokio::time::timeout(
             config.timeout,
-            self.udp_associate(tcp_fingerprint, resolver),
+            self.udp_associate(tcp_fingerprint, resolver, Some(config.timeout)),
         )
         .await
         .map_err(|_| {

@@ -37,12 +37,12 @@ lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs", rev = "<tested-co
 
 同步 API 在库内部创建专用 Tokio runtime。不要从已有异步 runtime 内调用 blocking `send()`：
 
-```rust,ignore
+```rust,no_run
 use lkrequest::{blocking, preset, Client};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let async_client = Client::builder()
-        .preset(preset::chrome_154())
+        .preset(preset::chrome_157())
         .use_native_certs()
         .build();
     let client = blocking::Client::new(async_client);
@@ -64,13 +64,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 应显式选择 preset，而不是依赖内部默认值：
 
-```rust,ignore
+```rust,no_run
 use lkrequest::{preset, Client};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
-        .preset(preset::chrome_154())
+        .preset(preset::chrome_157())
         .use_native_certs()
         .build();
 
@@ -85,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `Client` 保存可共享的指纹和连接配置；`Session` 保存 Cookie、连接池、代理和协议发现状态；`RequestBuilder` 保存单次请求选项。
 
-Firefox 156 可使用 `preset::firefox_156()`，该 preset 提供 TLS/H2，不提供 QUIC/H3。
+以上示例显式选择 Chrome 157；0.3.0 新增的 Chrome 158 可通过 `preset::chrome_158()` 显式选择。未指定 preset 的默认客户端仍使用 Chrome 155。Chrome 完整 preset 在启用 `quic-h3` 时附带 QUIC/H3 配置。
+
+Firefox 156 使用 `preset::firefox_156()`，Safari 26.2 使用 `preset::safari_26()`；两者提供 TLS/H2，不提供 QUIC/H3。
 浏览器版本列表、请求头配置和验证边界见[选择浏览器 preset](guides/choosing-a-preset.md)。
 
 ## Feature 选择
@@ -98,7 +100,7 @@ Firefox 156 可使用 `preset::firefox_156()`，该 preset 提供 TLS/H2，不�
 | `synthetic-fp` | 否 | 仅用于合成指纹研究；输出不代表真实浏览器 |
 | `network-e2e` | 否 | 只编译公网集成测试，不是生产能力 feature |
 
-HTTP/2 始终使用 `lkh2`，无需选择 backend。`h2-native` 当前只为兼容旧版 Cargo 配置而保留，不是用户需要启用、关闭或选择的功能；该兼容名称将在 `0.3.0` 完全删除。旧项目如果显式写了 `features = ["h2-native"]`，应现在直接移除。
+HTTP/2 始终使用 `lkh2`，包括 `default-features = false` 的构建，无需选择 backend。0.3.0 已删除旧后端 feature；旧项目请按[迁移说明](guides/upgrading.md)移除 Cargo 配置中的旧名称。
 
 ## 从源码参与开发
 
@@ -114,13 +116,13 @@ cargo test --workspace
 
 ## 下一步
 
-- 不确定下一步：进入[使用场景导航](guides/README.md)
-- [请求与响应](guides/requests/README.md)
+- 不确定下一步：进入[使用场景导航](guides/)
+- [请求与响应](guides/requests/)
 - [Client、Session 与连接复用](guides/client-session.md)
 - [代理与 DNS](guides/networking.md)
 - [HTTP 协议策略](guides/protocols.md)
 - [选择浏览器 preset](guides/choosing-a-preset.md)
-- [高级应用](guides/advanced/README.md)
+- [高级应用](guides/advanced/)
 - [故障排查](guides/troubleshooting.md)
 - [C ABI 与其他语言绑定](guides/ffi.md)
 - 仅在需要理解状态边界时阅读[Client、Session 与 Request](guides/object-model.md)

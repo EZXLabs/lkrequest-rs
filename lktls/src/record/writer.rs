@@ -21,6 +21,20 @@ use crate::crypto::aead::Aead;
 use crate::error::{Result, TlsError};
 use crate::handshake::content_type;
 
+#[derive(Debug)]
+pub enum WriteStop {
+    Complete,
+    NeedOutputCapacity,
+    Terminal(TlsError),
+}
+
+#[derive(Debug)]
+pub struct WriteProgress {
+    pub accepted_plaintext: usize,
+    pub committed_ciphertext: usize,
+    pub stop: WriteStop,
+}
+
 /// Flush strategy for record output.
 ///
 /// Controls whether records are emitted immediately or coalesced into
@@ -38,8 +52,11 @@ pub enum FlushStrategy {
 
 /// Writes TLS records, encrypting them once keys are established.
 pub struct RecordWriter {
+    poisoned: bool,
     /// Write sequence number (for AEAD nonce construction).
     seq_num: u64,
+    /// Cached per-key encryption budget, selected when keys are installed.
+    record_limit: u64,
     /// TLS 1.3 AEAD encryption key + IV (None before keys are established).
     aead: Option<Aead>,
     /// TLS 1.2 record cipher (None if using TLS 1.3 or plaintext).
@@ -59,19 +76,36 @@ pub struct RecordWriter {
     /// `MAX_RECORD_PAYLOAD`", i.e. byte-for-byte the behaviour that predates
     /// this field.
     peer_record_size_limit: Option<u16>,
+    tls12_session_state: Option<crate::session_store::client::Tls12SessionState>,
 }
 
 impl RecordWriter {
     /// Create a new record writer (plaintext mode — no encryption).
     pub fn new() -> Self {
         Self {
+            poisoned: false,
             seq_num: 0,
+            record_limit: u64::MAX,
             aead: None,
             tls12_cipher: None,
             flush_strategy: FlushStrategy::Immediate,
             coalesce_buf: Vec::new(),
             first_record_sent: false,
             peer_record_size_limit: None,
+            tls12_session_state: None,
+        }
+    }
+
+    pub(crate) fn set_tls12_session_state(
+        &mut self,
+        state: crate::session_store::client::Tls12SessionState,
+    ) {
+        self.tls12_session_state = Some(state);
+    }
+
+    pub(crate) fn invalidate_tls12_session(&self) {
+        if let Some(state) = &self.tls12_session_state {
+            state.invalidate();
         }
     }
 
@@ -165,9 +199,22 @@ impl RecordWriter {
         std::mem::take(&mut self.coalesce_buf)
     }
 
+    #[cfg(test)]
+    pub(super) fn measurement_snapshot(&self) -> super::measurement::BufferSnapshot {
+        super::measurement::BufferSnapshot::new(
+            self.coalesce_buf.capacity(),
+            self.coalesce_buf.len(),
+            0,
+        )
+    }
+
     /// Install TLS 1.3 encryption keys. All subsequent records will be encrypted.
     /// Resets the sequence number to 0.
     pub fn set_keys(&mut self, aead: Aead) {
+        if self.poisoned {
+            return;
+        }
+        self.record_limit = aead.algorithm().tls_record_limits().encrypt;
         self.aead = Some(aead);
         self.tls12_cipher = None;
         self.seq_num = 0;
@@ -176,6 +223,10 @@ impl RecordWriter {
     /// Install TLS 1.2 encryption keys. All subsequent records will be encrypted.
     /// Resets the sequence number to 0.
     pub fn set_tls12_keys(&mut self, cipher: Tls12RecordCipher) {
+        if self.poisoned {
+            return;
+        }
+        self.record_limit = cipher.tls_record_limits().encrypt;
         self.tls12_cipher = Some(cipher);
         self.aead = None;
         self.seq_num = 0;
@@ -193,171 +244,208 @@ impl RecordWriter {
     /// In `Immediate` mode, returns all record bytes concatenated.
     /// In `Coalesce` mode, buffers records internally — call [`Self::flush`] to retrieve.
     pub fn write_record(&mut self, content_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-
-        if payload.is_empty() {
-            let record = self.encode_single_record(content_type, &[])?;
-            match self.flush_strategy {
-                FlushStrategy::Immediate => output.extend_from_slice(&record),
-                FlushStrategy::Coalesce => self.coalesce_buf.extend_from_slice(&record),
-            }
-            return Ok(output);
-        }
-
-        // Split into MAX_RECORD_PAYLOAD-sized chunks, or smaller if the peer
-        // advertised an RFC 8449 `record_size_limit`.
-        for chunk in payload.chunks(self.max_plaintext_chunk(content_type)) {
-            let record = self.encode_single_record(content_type, chunk)?;
-            match self.flush_strategy {
-                FlushStrategy::Immediate => output.extend_from_slice(&record),
-                FlushStrategy::Coalesce => self.coalesce_buf.extend_from_slice(&record),
+        let mut output = if self.flush_strategy == FlushStrategy::Coalesce {
+            std::mem::take(&mut self.coalesce_buf)
+        } else {
+            Vec::new()
+        };
+        let progress = self.write_into(content_type, payload, &mut output, usize::MAX);
+        match progress.stop {
+            WriteStop::Terminal(error) => Err(error),
+            WriteStop::NeedOutputCapacity => unreachable!("unbounded compatibility output"),
+            WriteStop::Complete => {
+                if self.flush_strategy == FlushStrategy::Coalesce {
+                    self.coalesce_buf = output;
+                    Ok(Vec::new())
+                } else {
+                    Ok(output)
+                }
             }
         }
-
-        Ok(output)
     }
 
-    /// Encode a single TLS record.
-    fn encode_single_record(&mut self, actual_content_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
-        if self.tls12_cipher.is_some() {
-            self.encode_tls12_encrypted_record(actual_content_type, payload)
+    pub fn install_keys(&mut self, keys: super::WriteKeys) {
+        match keys.0 {
+            super::protection::Protection::Tls13(key) => self.set_keys(key),
+            super::protection::Protection::Tls12(key) => self.set_tls12_keys(key),
+        }
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Whole records still available under the active write key. The endpoint
+    /// reserves the last one for an old-key KeyUpdate or a TLS 1.2 close alert.
+    /// Plaintext has no cryptographic budget; poisoned writers always return 0.
+    pub(crate) fn remaining_records(&self) -> u64 {
+        if self.poisoned {
+            0
+        } else {
+            self.record_limit.saturating_sub(self.seq_num)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sequence_for_test(&mut self, sequence: u64) {
+        self.seq_num = sequence;
+    }
+
+    /// Append whole records to the endpoint's unsent ciphertext queue.
+    ///
+    /// The limit covers the entire physical Vec, including any consumed prefix
+    /// retained by the caller's cursor. Capacity stops never consume a nonce.
+    /// Terminal failures poison the writer and clear ALL unsent output,
+    /// including earlier calls' ciphertext.
+    /// Accepted plaintext on a terminal result is a prefix, not a delivery promise.
+    /// This primitive ignores the legacy coalescing strategy.
+    pub fn write_into(
+        &mut self,
+        content_type: u8,
+        payload: &[u8],
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> WriteProgress {
+        if content_type == content_type::ALERT && payload.first() == Some(&2) {
+            self.invalidate_tls12_session();
+        }
+        let start = output.len();
+        let mut accepted = 0;
+        loop {
+            if self.poisoned {
+                return self.terminal(
+                    output,
+                    accepted,
+                    TlsError::CryptoError("record writer is poisoned".into()),
+                );
+            }
+            let chunk_len = (payload.len() - accepted).min(self.max_plaintext_chunk(content_type));
+            let chunk = &payload[accepted..accepted + chunk_len];
+            let length = self.encoded_len(chunk_len);
+            if length > limit.saturating_sub(output.len()) {
+                return WriteProgress {
+                    accepted_plaintext: accepted,
+                    committed_ciphertext: output.len() - start,
+                    stop: WriteStop::NeedOutputCapacity,
+                };
+            }
+            if self.remaining_records() == 0 {
+                return self.terminal(
+                    output,
+                    accepted,
+                    TlsError::CryptoError("write record key usage limit exhausted".into()),
+                );
+            }
+            super::reserve_bounded(output, length, limit);
+            if let Err(error) = self.encode_into(content_type, chunk, output) {
+                return self.terminal(output, accepted, error);
+            }
+            accepted += chunk_len;
+            if accepted == payload.len() {
+                return WriteProgress {
+                    accepted_plaintext: accepted,
+                    committed_ciphertext: output.len() - start,
+                    stop: WriteStop::Complete,
+                };
+            }
+        }
+    }
+
+    fn terminal(
+        &mut self,
+        output: &mut Vec<u8>,
+        accepted: usize,
+        error: TlsError,
+    ) -> WriteProgress {
+        self.invalidate_tls12_session();
+        self.poisoned = true;
+        self.aead = None;
+        self.tls12_cipher = None;
+        self.coalesce_buf.clear();
+        output.clear();
+        WriteProgress {
+            accepted_plaintext: accepted,
+            committed_ciphertext: 0,
+            stop: WriteStop::Terminal(error),
+        }
+    }
+
+    fn encoded_len(&self, len: usize) -> usize {
+        5 + if let Some(cipher) = &self.tls12_cipher {
+            cipher.ciphertext_len(len)
         } else if self.aead.is_some() {
-            self.encode_tls13_encrypted_record(actual_content_type, payload)
+            len + 17
         } else {
-            self.encode_plaintext_record(actual_content_type, payload)
+            len
         }
     }
 
-    /// Encode a plaintext (unencrypted) TLS record.
-    fn encode_plaintext_record(&mut self, ct: u8, payload: &[u8]) -> Result<Vec<u8>> {
-        if payload.len() > MAX_RECORD_PAYLOAD {
-            return Err(TlsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "record payload too large",
-            )));
-        }
-
-        // RFC 8446 Section 5.1: initial ClientHello MAY use 0x0301,
-        // all subsequent records MUST use 0x0303.
-        let version = if !self.first_record_sent {
+    fn encode_into(&mut self, ct: u8, payload: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        if let Some(cipher) = &self.tls12_cipher {
+            let header = RecordHeader {
+                content_type: ct,
+                version: 0x0303,
+                length: cipher.ciphertext_len(payload.len()) as u16,
+            };
+            output.extend_from_slice(&header.to_bytes());
+            #[cfg(test)]
+            super::measurement::copied(super::measurement::CopySite::RecordHeader, 5);
+            let mut aad = [0; 13];
+            aad[..8].copy_from_slice(&self.seq_num.to_be_bytes());
+            aad[8] = ct;
+            aad[9..11].copy_from_slice(&[3, 3]);
+            aad[11..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+            match cipher {
+                Tls12RecordCipher::Gcm(cipher) => {
+                    cipher.encrypt_into(self.seq_num, &aad, payload, output)?
+                }
+                Tls12RecordCipher::Chacha20(cipher) => {
+                    cipher.encrypt_into(self.seq_num, &aad, payload, output)?
+                }
+                Tls12RecordCipher::Cbc(cipher) => {
+                    cipher.encrypt_into(self.seq_num, &aad, payload, output)?
+                }
+            }
+            self.seq_num += 1;
+        } else if let Some(aead) = &self.aead {
+            let header = RecordHeader {
+                content_type: content_type::APPLICATION_DATA,
+                version: 0x0303,
+                length: (payload.len() + 17) as u16,
+            }
+            .to_bytes();
+            output.extend_from_slice(&header);
+            #[cfg(test)]
+            super::measurement::copied(super::measurement::CopySite::RecordHeader, header.len());
+            let start = output.len();
+            output.extend_from_slice(payload);
+            #[cfg(test)]
+            super::measurement::copied(super::measurement::CopySite::PlaintextSeal, payload.len());
+            output.push(ct);
+            let tag = aead.seal_in_place(self.seq_num, &header, &mut output[start..])?;
+            output.extend_from_slice(&tag);
+            #[cfg(test)]
+            super::measurement::copied(super::measurement::CopySite::AuthTag, tag.len());
+            self.seq_num += 1;
+        } else {
+            let header = RecordHeader {
+                content_type: ct,
+                version: if self.first_record_sent {
+                    0x0303
+                } else {
+                    0x0301
+                },
+                length: payload.len() as u16,
+            };
+            output.extend_from_slice(&header.to_bytes());
+            #[cfg(test)]
+            super::measurement::copied(super::measurement::CopySite::RecordHeader, 5);
+            output.extend_from_slice(payload);
+            #[cfg(test)]
+            super::measurement::copied(super::measurement::CopySite::PlaintextSeal, payload.len());
             self.first_record_sent = true;
-            0x0301 // TLS 1.0 for initial ClientHello (compat)
-        } else {
-            0x0303 // TLS 1.2 for all subsequent records
-        };
-
-        let header = RecordHeader {
-            content_type: ct,
-            version,
-            length: payload.len() as u16,
-        };
-
-        let mut record = Vec::with_capacity(5 + payload.len());
-        record.extend_from_slice(&header.to_bytes());
-        record.extend_from_slice(payload);
-        Ok(record)
-    }
-
-    /// Encode a TLS 1.3 encrypted record.
-    ///
-    /// Structure:
-    /// - Header: content_type=APPLICATION_DATA, version=0x0303, length
-    /// - Encrypted payload: [actual_payload + inner_content_type] encrypted with AEAD
-    ///
-    /// The inner content type is appended to the plaintext before encryption,
-    /// and the outer content type is always APPLICATION_DATA (0x17).
-    fn encode_tls13_encrypted_record(
-        &mut self,
-        actual_content_type: u8,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        let aead = self.aead.as_ref().unwrap();
-        // Build inner plaintext: payload + content_type byte
-        let mut inner = Vec::with_capacity(payload.len() + 1);
-        inner.extend_from_slice(payload);
-        inner.push(actual_content_type); // TLS 1.3 inner content type
-
-        // The encrypted length = inner plaintext length + AEAD tag (16 bytes)
-        let encrypted_len = inner.len() + aead.algorithm().tag_len();
-
-        // Build the record header (used as AAD)
-        let header = RecordHeader {
-            content_type: content_type::APPLICATION_DATA, // always 0x17 on wire
-            version: 0x0303,                              // TLS 1.2 on wire
-            length: encrypted_len as u16,
-        };
-        let header_bytes = header.to_bytes();
-
-        // Encrypt with AAD = record header
-        let ciphertext = aead.encrypt(self.seq_num, &header_bytes, &inner)?;
-        self.seq_num = self
-            .seq_num
-            .checked_add(1)
-            .ok_or_else(|| TlsError::CryptoError("write sequence number overflow".to_string()))?;
-
-        // Assemble: header + ciphertext
-        let mut record = Vec::with_capacity(5 + ciphertext.len());
-        record.extend_from_slice(&header_bytes);
-        record.extend_from_slice(&ciphertext);
-        Ok(record)
-    }
-
-    /// Encode a TLS 1.2 encrypted record.
-    ///
-    /// Key differences from TLS 1.3:
-    /// - Outer content type is the ORIGINAL type (not APPLICATION_DATA)
-    /// - No inner content type byte
-    /// - AAD = seq_num(8) + content_type(1) + version(2) + plaintext_length(2)
-    /// - GCM: 8-byte explicit nonce prepended to ciphertext
-    /// - ChaCha20: no explicit nonce (nonce = IV XOR seq_num)
-    fn encode_tls12_encrypted_record(
-        &mut self,
-        actual_content_type: u8,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        let cipher = self.tls12_cipher.as_ref().unwrap();
-
-        // TLS 1.2 AAD: seq_num(8) || content_type(1) || version(2) || plaintext_length(2)
-        let mut aad = [0u8; 13];
-        aad[..8].copy_from_slice(&self.seq_num.to_be_bytes());
-        aad[8] = actual_content_type;
-        aad[9] = 0x03;
-        aad[10] = 0x03; // version 0x0303
-        let payload_len = payload.len() as u16;
-        aad[11] = (payload_len >> 8) as u8;
-        aad[12] = payload_len as u8;
-
-        let ciphertext = match cipher {
-            Tls12RecordCipher::Gcm(gcm) => {
-                // GCM: returns explicit_nonce(8) + encrypted + tag(16)
-                gcm.encrypt(self.seq_num, &aad, payload)?
-            }
-            Tls12RecordCipher::Chacha20(chacha) => {
-                // ChaCha20: returns encrypted + tag(16), no explicit nonce
-                chacha.encrypt(self.seq_num, &aad, payload)?
-            }
-            Tls12RecordCipher::Cbc(cbc) => {
-                // CBC: returns iv(16) + encrypted(plaintext + mac + padding)
-                cbc.encrypt(self.seq_num, &aad, payload)?
-            }
-        };
-        self.seq_num = self
-            .seq_num
-            .checked_add(1)
-            .ok_or_else(|| TlsError::CryptoError("write sequence number overflow".to_string()))?;
-
-        // Record header with original content type
-        let header = RecordHeader {
-            content_type: actual_content_type,
-            version: 0x0303,
-            length: ciphertext.len() as u16,
-        };
-        let header_bytes = header.to_bytes();
-
-        let mut record = Vec::with_capacity(5 + ciphertext.len());
-        record.extend_from_slice(&header_bytes);
-        record.extend_from_slice(&ciphertext);
-        Ok(record)
+        }
+        Ok(())
     }
 }
 
@@ -377,6 +465,225 @@ mod tests {
     use crate::crypto::aead::{Aead as AeadCipher, AeadAlgorithm};
     use crate::crypto::tls12_cipher::Tls12GcmCipher;
     use crate::record::reader::RecordReader;
+
+    #[test]
+    fn usage_limit_aes_gcm_rejects_before_sealing_in_both_tls_versions() {
+        for tls12 in [false, true] {
+            for key_len in [16, 32] {
+                let mut writer = RecordWriter::new();
+                if tls12 {
+                    writer.set_tls12_keys(Tls12RecordCipher::Gcm(
+                        Tls12GcmCipher::new(&vec![3; key_len], &[4; 4], key_len == 32).unwrap(),
+                    ));
+                } else {
+                    let algorithm = if key_len == 16 {
+                        AeadAlgorithm::Aes128Gcm
+                    } else {
+                        AeadAlgorithm::Aes256Gcm
+                    };
+                    writer
+                        .set_keys(AeadCipher::new(algorithm, &vec![3; key_len], &[4; 12]).unwrap());
+                }
+                writer.set_sequence_for_test(1 << 24);
+                let mut output = vec![0xab; 10];
+                let progress = writer.write_into(23, b"exhausted", &mut output, usize::MAX);
+                assert!(
+                    matches!(progress.stop, WriteStop::Terminal(_)),
+                    "GCM record budget was not enforced"
+                );
+                assert_eq!(progress.accepted_plaintext, 0);
+                assert!(output.is_empty());
+                assert!(writer.is_poisoned());
+            }
+        }
+    }
+
+    #[test]
+    fn usage_limit_terminal_preserves_prefix_and_discards_all_unsent_records() {
+        let mut writer = RecordWriter::new();
+        writer.set_keys(AeadCipher::new(AeadAlgorithm::Aes128Gcm, &[3; 16], &[4; 12]).unwrap());
+        writer.set_sequence_for_test((1 << 24) - 1);
+        let mut output = vec![0xab; 10];
+        let progress = writer.write_into(
+            23,
+            &vec![7; MAX_RECORD_PAYLOAD + 1],
+            &mut output,
+            usize::MAX,
+        );
+        assert!(
+            matches!(progress.stop, WriteStop::Terminal(_)),
+            "GCM multi-record call crossed its budget"
+        );
+        assert_eq!(progress.accepted_plaintext, MAX_RECORD_PAYLOAD);
+        assert_eq!(progress.committed_ciphertext, 0);
+        assert!(output.is_empty());
+        assert!(writer.is_poisoned());
+    }
+
+    #[test]
+    fn exhausted_writer_cannot_be_revived_by_new_keys() {
+        let mut writer = RecordWriter::new();
+        writer.set_keys(AeadCipher::new(AeadAlgorithm::Aes128Gcm, &[3; 16], &[4; 12]).unwrap());
+        writer.seq_num = u64::MAX;
+        assert!(writer.write_record(23, b"fail").is_err());
+        writer.set_keys(AeadCipher::new(AeadAlgorithm::Aes128Gcm, &[5; 16], &[6; 12]).unwrap());
+        assert!(writer.write_record(23, b"retry").is_err());
+    }
+
+    #[test]
+    fn terminal_write_reports_prefix_but_discards_unsent_output() {
+        let mut writer = RecordWriter::new();
+        writer.set_keys(
+            AeadCipher::new(AeadAlgorithm::Chacha20Poly1305, &[3; 32], &[4; 12]).unwrap(),
+        );
+        writer.seq_num = u64::MAX - 1;
+        let mut output = vec![0xab; 10];
+        let progress = writer.write_into(
+            23,
+            &vec![7; MAX_RECORD_PAYLOAD + 1],
+            &mut output,
+            usize::MAX,
+        );
+        assert_eq!(progress.accepted_plaintext, MAX_RECORD_PAYLOAD);
+        assert_eq!(progress.committed_ciphertext, 0);
+        assert!(matches!(progress.stop, WriteStop::Terminal(_)));
+        assert!(output.is_empty());
+        assert!(writer.is_poisoned());
+        assert!(matches!(
+            writer
+                .write_into(23, b"retry", &mut output, usize::MAX)
+                .stop,
+            WriteStop::Terminal(_)
+        ));
+    }
+
+    #[test]
+    fn usage_limit_capacity_stop_preserves_the_last_record_and_nonce() {
+        for tls12 in [false, true] {
+            let mut writer = RecordWriter::new();
+            if tls12 {
+                writer.set_tls12_keys(Tls12RecordCipher::Gcm(
+                    Tls12GcmCipher::new(&[3; 16], &[4; 4], false).unwrap(),
+                ));
+            } else {
+                writer.set_keys(
+                    AeadCipher::new(AeadAlgorithm::Aes128Gcm, &[3; 16], &[4; 12]).unwrap(),
+                );
+            }
+            writer.set_sequence_for_test((1 << 24) - 1);
+            let mut output = Vec::new();
+            let length = writer.encoded_len(5);
+            let progress = writer.write_into(22, &[24, 0, 0, 1, 0], &mut output, length - 1);
+            assert!(matches!(progress.stop, WriteStop::NeedOutputCapacity));
+            assert_eq!(progress.accepted_plaintext, 0);
+            assert_eq!(writer.remaining_records(), 1);
+            assert!(output.is_empty());
+            assert!(!writer.is_poisoned());
+            let progress = writer.write_into(22, &[24, 0, 0, 1, 0], &mut output, length);
+            assert!(matches!(progress.stop, WriteStop::Complete));
+            assert_eq!(progress.accepted_plaintext, 5);
+            assert_eq!(writer.remaining_records(), 0);
+            assert_eq!(output.len(), length);
+            assert!(!writer.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn usage_limit_exhaustion_cannot_be_revived_by_a_different_cipher() {
+        let mut writer = RecordWriter::new();
+        writer.set_flush_strategy(FlushStrategy::Coalesce);
+        writer.set_keys(AeadCipher::new(AeadAlgorithm::Aes128Gcm, &[3; 16], &[4; 12]).unwrap());
+        writer.write_record(23, b"unsent").unwrap();
+        writer.set_sequence_for_test(1 << 24);
+        assert!(writer.write_record(23, b"exhausted").is_err());
+        assert!(writer.flush().is_empty());
+        writer.install_keys(super::super::WriteKeys::tls12(Tls12RecordCipher::Chacha20(
+            crate::crypto::tls12_cipher::Tls12Chacha20Cipher::new(&[5; 32], &[6; 12]).unwrap(),
+        )));
+        assert_eq!(writer.remaining_records(), 0);
+        assert!(writer.write_record(23, b"retry").is_err());
+    }
+
+    #[test]
+    fn usage_limit_chacha_and_cbc_retain_the_sequence_ceiling() {
+        use crate::crypto::tls12_cipher::{CbcMacAlgorithm, Tls12CbcCipher, Tls12Chacha20Cipher};
+        for kind in 0..3 {
+            let mut writer = RecordWriter::new();
+            match kind {
+                0 => writer.set_keys(
+                    AeadCipher::new(AeadAlgorithm::Chacha20Poly1305, &[3; 32], &[4; 12]).unwrap(),
+                ),
+                1 => writer.set_tls12_keys(Tls12RecordCipher::Chacha20(
+                    Tls12Chacha20Cipher::new(&[3; 32], &[4; 12]).unwrap(),
+                )),
+                _ => writer.set_tls12_keys(Tls12RecordCipher::Cbc(Tls12CbcCipher::new(
+                    &[3; 16],
+                    &[4; 20],
+                    CbcMacAlgorithm::HmacSha1,
+                ))),
+            }
+            assert_eq!(writer.remaining_records(), u64::MAX);
+            writer.set_sequence_for_test(u64::MAX - 1);
+            assert_eq!(writer.remaining_records(), 1);
+            assert!(!writer.write_record(23, b"last").unwrap().is_empty());
+            assert_eq!(writer.remaining_records(), 0);
+            assert!(writer.write_record(23, b"overflow").is_err());
+            assert!(writer.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn usage_limit_key_installation_resets_only_its_direction() {
+        use crate::record::{ReadKeys, WriteKeys};
+        let mut writer = RecordWriter::new();
+        let mut reader = RecordReader::new();
+        writer
+            .install_keys(WriteKeys::tls13(AeadAlgorithm::Aes128Gcm, &[3; 16], &[4; 12]).unwrap());
+        reader.install_keys(ReadKeys::tls13(AeadAlgorithm::Aes128Gcm, &[5; 16], &[6; 12]).unwrap());
+        writer.set_sequence_for_test((1 << 24) - 1);
+        reader.set_sequence_for_test(9);
+
+        writer
+            .install_keys(WriteKeys::tls13(AeadAlgorithm::Aes128Gcm, &[7; 16], &[8; 12]).unwrap());
+        assert_eq!(writer.remaining_records(), 1 << 24);
+        let mut peer_writer = RecordWriter::new();
+        peer_writer
+            .set_keys(AeadCipher::new(AeadAlgorithm::Aes128Gcm, &[5; 16], &[6; 12]).unwrap());
+        peer_writer.set_sequence_for_test(9);
+        reader.feed(&peer_writer.write_record(23, b"old read epoch").unwrap());
+        assert_eq!(
+            reader.next_record().unwrap().unwrap().payload,
+            b"old read epoch"
+        );
+
+        writer.set_sequence_for_test(7);
+        reader
+            .install_keys(ReadKeys::tls13(AeadAlgorithm::Aes256Gcm, &[9; 32], &[10; 12]).unwrap());
+        assert_eq!(writer.remaining_records(), (1 << 24) - 7);
+        peer_writer
+            .set_keys(AeadCipher::new(AeadAlgorithm::Aes256Gcm, &[9; 32], &[10; 12]).unwrap());
+        reader.feed(&peer_writer.write_record(23, b"new read epoch").unwrap());
+        assert_eq!(
+            reader.next_record().unwrap().unwrap().payload,
+            b"new read epoch"
+        );
+    }
+
+    #[test]
+    fn provider_failure_discards_legacy_coalesced_records() {
+        use crate::crypto::tls12_cipher::{CbcMacAlgorithm, Tls12CbcCipher};
+        let mut writer = RecordWriter::new();
+        writer.set_flush_strategy(FlushStrategy::Coalesce);
+        writer.write_record(22, b"hello").unwrap();
+        writer.set_tls12_keys(Tls12RecordCipher::Cbc(Tls12CbcCipher::new(
+            &[1; 15],
+            &[2; 20],
+            CbcMacAlgorithm::HmacSha1,
+        )));
+        assert!(writer.write_record(23, b"fail").is_err());
+        assert!(writer.is_poisoned());
+        assert!(writer.flush().is_empty());
+    }
 
     #[test]
     fn test_write_plaintext_record() {

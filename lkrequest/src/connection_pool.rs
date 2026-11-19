@@ -553,7 +553,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool acquisition may be removed in a future breaking release"
     )]
     pub fn try_acquire(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
         let timeout = self.idle_timeout;
@@ -570,7 +570,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool acquisition may be removed in a future breaking release"
     )]
     pub fn try_acquire_h3_pooled(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
         let timeout = self.idle_timeout;
@@ -588,7 +588,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool acquisition may be removed in a future breaking release"
     )]
     pub fn try_acquire_h2_pooled(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
         let timeout = self.idle_timeout;
@@ -598,7 +598,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool acquisition will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool acquisition may be removed in a future breaking release"
     )]
     pub fn try_acquire_h1_pooled(&mut self, key: &ConnectionKey) -> Option<PooledConnection> {
         self.acquire_legacy_h1(key)
@@ -697,7 +697,7 @@ impl ConnectionPool {
     #[cfg(feature = "quic-h3")]
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool mutation will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool mutation may be removed in a future breaking release"
     )]
     pub fn insert_h3(
         &mut self,
@@ -773,7 +773,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool mutation will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool mutation may be removed in a future breaking release"
     )]
     pub fn insert_h2(
         &mut self,
@@ -861,7 +861,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool mutation will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool mutation may be removed in a future breaking release"
     )]
     pub fn return_h1(
         &mut self,
@@ -888,7 +888,7 @@ impl ConnectionPool {
 
     #[deprecated(
         since = "0.2.1",
-        note = "use Session-managed pooling; direct ConnectionPool mutation will be removed in 0.3.0"
+        note = "use Session-managed pooling; direct ConnectionPool mutation may be removed in a future breaking release"
     )]
     pub fn insert_h1(
         &mut self,

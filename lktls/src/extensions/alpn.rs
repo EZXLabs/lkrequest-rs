@@ -5,6 +5,14 @@
 
 use super::Extension;
 
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    parse_server_alpn_bytes(data)
+        .map(super::tls12::ServerValue::Alpn)
+        .ok_or_else(|| super::tls12::decode_error("invalid server ALPN protocol list"))
+}
+
 /// ALPN extension listing the protocols the client supports (e.g. `h2`, `http/1.1`).
 pub struct Alpn {
     /// Protocol identifier strings.

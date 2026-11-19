@@ -11,8 +11,11 @@ pub struct RequestDiagnostics {
     pub dns_ms: Option<u64>,
     /// TCP connect time in milliseconds, if measured.
     pub tcp_ms: Option<u64>,
-    /// TLS handshake time in milliseconds, if measured.
+    /// TLS-over-TCP handshake time in milliseconds, if measured.
     pub tls_ms: Option<u64>,
+    /// QUIC handshake time including TLS, excluding DNS, proxy setup and H3 setup.
+    /// Absent for reused connections or an uncompleted handshake.
+    pub quic_ms: Option<u64>,
     /// Time-to-first-byte in milliseconds, if measured.
     pub ttfb_ms: Option<u64>,
     /// Total request wall-clock time in milliseconds.
@@ -25,12 +28,79 @@ pub struct RequestDiagnostics {
     pub cipher_suite: Option<String>,
 }
 
+#[derive(Default)]
+struct DiagnosticsState {
+    request: RequestDiagnostics,
+    #[cfg(feature = "quic-h3")]
+    quic_connection: Option<usize>,
+}
+
 tokio::task_local! {
-    static REQUEST_DIAGNOSTICS: RefCell<RequestDiagnostics>;
+    static REQUEST_DIAGNOSTICS: RefCell<DiagnosticsState>;
 }
 
 fn with_diagnostics_mut(f: impl FnOnce(&mut RequestDiagnostics)) {
-    let _ = REQUEST_DIAGNOSTICS.try_with(|cell| f(&mut cell.borrow_mut()));
+    let _ = REQUEST_DIAGNOSTICS.try_with(|cell| f(&mut cell.borrow_mut().request));
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn record_quic_handshake(connection: &quinn::Connection, started: tokio::time::Instant) {
+    let _ = REQUEST_DIAGNOSTICS.try_with(|cell| {
+        let mut state = cell.borrow_mut();
+        state.request.quic_ms = Some(started.elapsed().as_millis() as u64);
+        state.quic_connection = Some(connection.stable_id());
+    });
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn record_h3_connection(connection: &quinn::Connection, remote_dns: bool) {
+    let _ = REQUEST_DIAGNOSTICS.try_with(|cell| {
+        let mut state = cell.borrow_mut();
+        let fresh = state.quic_connection == Some(connection.stable_id());
+        let diag = &mut state.request;
+        if !fresh {
+            diag.dns_ms = None;
+            diag.quic_ms = None;
+        }
+        if remote_dns {
+            diag.dns_ms = None;
+        }
+        diag.tcp_ms = None;
+        diag.tls_ms = None;
+        // Proxy-resolved endpoints can use a synthetic Quinn address.
+        diag.remote_addr = (!remote_dns).then(|| connection.remote_address().to_string());
+        diag.cipher_suite = connection
+            .handshake_data()
+            .and_then(|data| data.downcast::<lktls_quic::HandshakeData>().ok())
+            .and_then(|data| data.cipher_suite)
+            .map(|suite| format!("0x{suite:04x}"));
+    });
+}
+
+/// Race branches must not write into each other's diagnostics while polling.
+#[cfg(feature = "quic-h3")]
+pub(crate) fn isolate<'a, T: Send + 'a>(
+    future: std::pin::Pin<Box<dyn Future<Output = crate::error::Result<T>> + Send + 'a>>,
+) -> std::pin::Pin<Box<dyn Future<Output = crate::error::Result<T>> + Send + 'a>> {
+    let Ok(first_ttfb) = REQUEST_DIAGNOSTICS.try_with(|cell| cell.borrow().request.ttfb_ms) else {
+        return future;
+    };
+    Box::pin(async move {
+        let (result, state) = REQUEST_DIAGNOSTICS
+            .scope(RefCell::default(), async {
+                let result = future.await;
+                let state =
+                    REQUEST_DIAGNOSTICS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+                (result, state)
+            })
+            .await;
+        let _ = REQUEST_DIAGNOSTICS.try_with(|cell| {
+            let mut parent = cell.borrow_mut();
+            *parent = state;
+            parent.request.ttfb_ms = first_ttfb.or(parent.request.ttfb_ms);
+        });
+        result
+    })
 }
 
 pub fn record_trust_anchor(info: lktls::trust_anchor::TrustAnchorInfo) {
@@ -68,7 +138,13 @@ pub fn record_remote_addr(addr: impl Into<String>) {
 
 /// Record the negotiated protocol into the active diagnostics scope (no-op outside one).
 pub fn record_protocol(protocol: impl Into<String>) {
-    with_diagnostics_mut(|diag| diag.protocol = Some(protocol.into()));
+    with_diagnostics_mut(|diag| {
+        let protocol = protocol.into();
+        if protocol != "h3" {
+            diag.quic_ms = None;
+        }
+        diag.protocol = Some(protocol);
+    });
 }
 
 /// Record the negotiated cipher suite into the active diagnostics scope (no-op outside one).
@@ -82,10 +158,10 @@ where
     Fut: Future<Output = T>,
 {
     REQUEST_DIAGNOSTICS
-        .scope(RefCell::new(RequestDiagnostics::default()), async move {
+        .scope(RefCell::default(), async move {
             let started_at = Instant::now();
             let output = future.await;
-            let mut diagnostics = REQUEST_DIAGNOSTICS.with(|cell| cell.borrow().clone());
+            let mut diagnostics = REQUEST_DIAGNOSTICS.with(|cell| cell.borrow().request.clone());
             diagnostics.total_ms = Some(started_at.elapsed().as_millis() as u64);
             (output, diagnostics)
         })
@@ -102,6 +178,7 @@ mod tests {
         assert!(d.dns_ms.is_none());
         assert!(d.tcp_ms.is_none());
         assert!(d.tls_ms.is_none());
+        assert!(d.quic_ms.is_none());
         assert!(d.ttfb_ms.is_none());
         assert!(d.total_ms.is_none());
         assert!(d.remote_addr.is_none());

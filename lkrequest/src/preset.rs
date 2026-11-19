@@ -7,6 +7,18 @@ use crate::network_partition::TlsSessionCachePartitionPolicy;
 use crate::protocol::ProtocolPolicy;
 use crate::QuicProfile;
 
+mod document;
+mod json;
+mod quic_json;
+mod runtime;
+pub(crate) mod validation;
+
+pub use document::{PresetDocument, PresetError, PresetErrorCode, PresetLimits, PresetLoader};
+pub use runtime::{
+    AcquisitionConfig, CachePartitionConfig, FallbackConfig, IntentConfig, PresetRuntime,
+    ProtocolConfig, UpgradeConfig,
+};
+
 /// High-level browser/client preset bundle for [`ClientBuilder`].
 ///
 /// Unlike the lower-level TLS/H2/H3 preset functions in `lktls`, `lkh2`, and
@@ -43,6 +55,21 @@ pub struct ClientPreset {
 }
 
 impl ClientPreset {
+    pub fn from_json_str(json: &str) -> Result<Self, PresetError> {
+        PresetDocument::from_json_str(json).map(PresetDocument::into_preset)
+    }
+
+    pub fn from_json_slice(json: &[u8]) -> Result<Self, PresetError> {
+        PresetDocument::from_json_slice(json).map(PresetDocument::into_preset)
+    }
+
+    pub fn from_json_file(path: impl AsRef<std::path::Path>) -> Result<Self, PresetError> {
+        PresetDocument::from_json_file(path).map(PresetDocument::into_preset)
+    }
+
+    pub fn validate(&self) -> Result<(), PresetError> {
+        validation::validate(self, &PresetLimits::default())
+    }
     /// Apply this preset to a [`ClientBuilder`].
     ///
     /// Later builder calls can still override individual dimensions.
@@ -63,29 +90,22 @@ impl ClientPreset {
             .fingerprint(tls_profile)
             .h2_profile(h2_profile)
             .tls_session_cache_partition_policy(tls_session_cache_partition_policy);
-        if let Some(quic_tls_profile) = quic_tls_profile {
-            builder = builder.quic_fingerprint(quic_tls_profile);
-        }
+        builder = match quic_tls_profile {
+            Some(profile) => builder.quic_fingerprint(profile),
+            None => builder.clear_quic_fingerprint(),
+        };
 
         if let Some(quic_profile) = quic_profile {
             builder = builder.quic_profile(quic_profile);
         } else {
             builder = builder.disable_http3();
         }
-        if let Some(default_protocol_policy) = default_protocol_policy {
-            builder = builder.protocol_policy(default_protocol_policy);
-        }
-        if !header_order.is_empty() {
-            builder = builder.header_order_from_names(header_order);
-        }
-        if let Some(h3_header_order) = h3_header_order {
-            builder = builder.h3_header_order_from_names(h3_header_order);
-        }
-        if let Some(cookie_order) = cookie_order {
-            builder = builder.cookie_order_from_strings(cookie_order);
-        }
-
-        builder
+        builder.preset_templates(
+            header_order,
+            h3_header_order,
+            cookie_order,
+            default_protocol_policy,
+        )
     }
 
     /// Return the header-order template as owned strings.
@@ -223,6 +243,16 @@ fn chrome_157_quic_profile() -> Option<QuicProfile> {
 
 #[cfg(not(feature = "quic-h3"))]
 fn chrome_157_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
+#[cfg(feature = "quic-h3")]
+fn chrome_158_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_158_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_158_quic_profile() -> Option<QuicProfile> {
     None
 }
 
@@ -495,6 +525,25 @@ pub fn chrome_157() -> ClientPreset {
         quic_tls_profile: Some(lktls::profile::presets::chrome_157_quic()),
         h2_profile: crate::h2::profile::chrome_157_h2(),
         quic_profile: chrome_157_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
+/// Chrome 158 client preset, captured from 158.0.8127.37 on Windows.
+///
+/// Fresh TCP TLS/H2 and QUIC/H3 navigation have public capture evidence.
+/// Header values remain caller supplied. Timing, loss, resumption and response
+/// edge-case policies inherit Chrome 157's model.
+pub fn chrome_158() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_158(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_158_quic()),
+        h2_profile: crate::h2::profile::chrome_158_h2(),
+        quic_profile: chrome_158_quic_profile(),
         default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
         tls_session_cache_partition_policy: TlsSessionCachePartitionPolicy::Chromium,
         header_order: header_names(crate::h2::profile::chrome_full_header_order()),
@@ -842,6 +891,34 @@ mod tests {
     }
 
     #[test]
+    fn chrome_158_preset_applies_the_complete_chromium_bundle() {
+        let preset = chrome_158();
+        assert_eq!(preset.tls_profile.name, "Chrome 158");
+        assert!(preset.tls_profile.grease.signature_algorithms);
+        let quic_tls = preset.quic_tls_profile.as_ref().unwrap();
+        assert_eq!(quic_tls.name, "Chrome 158 QUIC");
+        assert!(!quic_tls.grease.signature_algorithms);
+        assert_eq!(quic_tls.signature_algorithms.last(), Some(&0x0201));
+        assert!(!quic_tls.signature_algorithms.contains(&0x0904));
+        assert_eq!(
+            preset.default_protocol_policy,
+            Some(ProtocolPolicy::chrome_standard())
+        );
+        assert_eq!(preset.header_order, chrome_157().header_order);
+        assert_eq!(
+            preset.tls_session_cache_partition_policy,
+            TlsSessionCachePartitionPolicy::Chromium
+        );
+        #[cfg(feature = "quic-h3")]
+        assert_eq!(preset.quic_profile, Some(lkh3::chrome_158_quic()));
+        #[cfg(not(feature = "quic-h3"))]
+        assert!(preset.quic_profile.is_none());
+        let client = crate::Client::builder().preset(preset).build();
+        assert_eq!(client.tls_profile().name, "Chrome 158");
+        assert!(client.default_headers().is_empty());
+    }
+
+    #[test]
     fn firefox_156_preset_uses_capture_profiles_without_claiming_h3() {
         let preset = firefox_156();
         assert_eq!(preset.tls_profile.name, "Firefox 156");
@@ -935,6 +1012,7 @@ mod tests {
             chrome_155(),
             chrome_156(),
             chrome_157(),
+            chrome_158(),
             firefox_133(),
             firefox_147(),
             firefox_156(),

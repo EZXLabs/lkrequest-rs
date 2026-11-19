@@ -68,6 +68,10 @@ impl WsBuilder {
     /// Set the `Sec-WebSocket-Extensions` extension(s).
     ///
     /// Multiple calls accumulate extensions.
+    /// Negotiated `permessage-deflate` supports context takeover, fragmentation,
+    /// and 9-15 bit client compression windows. Decompressed messages are
+    /// limited to 64 MiB. Unsupported or inconsistent server parameters fail
+    /// the handshake. Offers are emitted as supplied; compression is opt-in.
     pub fn extension(mut self, extension: &str) -> Self {
         self.extensions.push(extension.to_string());
         self
@@ -76,16 +80,16 @@ impl WsBuilder {
     /// Establish the WebSocket connection.
     ///
     /// Performs the full connection pipeline:
-    /// 1. Parse the URL (wss:// or ws://)
+    /// 1. Parse a TLS WebSocket URL (wss://; https:// is also accepted)
     /// 2. TCP connection (with optional proxy and TCP fingerprint)
     /// 3. TLS handshake (with fingerprint-controlled ClientHello)
-    /// 4. ALPN-based protocol selection:
-    ///    - HTTP/1.1: sends Upgrade request (RFC 6455)
-    ///    - HTTP/2: sends Extended CONNECT (RFC 8441)
+    /// 4. Send an HTTP/1.1 Upgrade request (RFC 6455) using H1-only ALPN
     /// 5. Returns a `WsConnection` for bidirectional messaging
     ///
-    /// Cookie, proxy, TLS fingerprint, and timeout settings are inherited
-    /// from the session.
+    /// Proxy, TLS fingerprint, CA and connection-phase limits come from the
+    /// session/client. Cookie jar entries must be added explicitly as a header.
+    /// HTTP total, TTFB and read-idle deadlines do not cover the Upgrade exchange
+    /// or subsequent messages. Plain ws:// and H2/H3 WebSockets are unsupported.
     ///
     /// The future is heap-allocated (`Pin<Box<…>>`) to prevent the ~28 KB
     /// async state machine from overflowing the stack in debug builds on
@@ -107,56 +111,81 @@ impl WsBuilder {
                 .session
                 .as_ref()
                 .ok_or_else(|| Error::Http("WebSocket builder requires a session".into()))?;
-
-            let client = session.client();
-
-            let parsed = Url::parse(&self.url).map_err(|e| Error::UrlParse(e.to_string()))?;
-
-            let scheme = parsed.scheme();
-            let is_tls = match scheme {
-                "wss" | "https" => true,
-                "ws" | "http" => false,
-                _ => {
-                    return Err(Error::UrlParse(format!(
-                        "Unsupported WebSocket scheme: {scheme}"
-                    )));
-                }
-            };
-
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| Error::UrlParse("Missing host in WebSocket URL".into()))?
-                .to_string();
-
-            let default_port = if is_tls { 443 } else { 80 };
-            let port = parsed.port().unwrap_or(default_port);
-            let authority = &parsed[url::Position::BeforeHost..url::Position::AfterPort];
-            let path = &parsed[url::Position::BeforePath..url::Position::AfterQuery];
-
-            if !is_tls {
-                return Err(Error::Http(
-                    "Only wss:// (TLS) WebSocket connections are supported".into(),
-                ));
-            }
-
-            // WebSocket uses H1-only ALPN (standard Upgrade requires HTTP/1.1)
-            let mut tls_profile = client.tls_profile().clone();
-            tls_profile.alpn_protocols =
-                crate::session::pipeline::alpn_for_h1_only(&tls_profile.alpn_protocols);
-
-            // H1-only WebSocket upgrade path ⇒ no ALPS.
-            let connect_config = crate::connect::ConnectConfig::https(tls_profile, None);
-
-            let conn = session
-                .establish_connection(&host, port, session.inner.proxy.as_ref(), &connect_config)
-                .await?;
-
-            tracing::debug!(
-                alpn = ?conn.negotiated_alpn(),
-                "ws.alpn_negotiated",
+            let (execution, guard) = crate::session::execution::ConnectionExecution::with_limits(
+                session.effective_attempt_limits()?,
             );
 
-            ws_upgrade_h1(conn.into_tcp_stream()?, authority, path, &self, client).await
+            let result = execution
+                .run(async {
+                    let client = session.client();
+                    session.validate_proxy_config()?;
+
+                    let parsed =
+                        Url::parse(&self.url).map_err(|e| Error::UrlParse(e.to_string()))?;
+
+                    let scheme = parsed.scheme();
+                    let is_tls = match scheme {
+                        "wss" | "https" => true,
+                        "ws" | "http" => false,
+                        _ => {
+                            return Err(Error::UrlParse(format!(
+                                "Unsupported WebSocket scheme: {scheme}"
+                            )));
+                        }
+                    };
+
+                    let host = parsed
+                        .host_str()
+                        .ok_or_else(|| Error::UrlParse("Missing host in WebSocket URL".into()))?
+                        .to_string();
+
+                    let default_port = if is_tls { 443 } else { 80 };
+                    let port = parsed.port().unwrap_or(default_port);
+                    let authority = &parsed[url::Position::BeforeHost..url::Position::AfterPort];
+                    let path = &parsed[url::Position::BeforePath..url::Position::AfterQuery];
+
+                    if !is_tls {
+                        return Err(Error::Http(
+                            "Only wss:// (TLS) WebSocket connections are supported".into(),
+                        ));
+                    }
+
+                    // WebSocket uses H1-only ALPN (standard Upgrade requires HTTP/1.1)
+                    // H1-only WebSocket upgrade path ⇒ no ALPS.
+                    let connect_config = crate::connect::ConnectConfig::https_template(
+                        client.tcp_tls_config(true),
+                        None,
+                    )
+                    .require_profile_alpn();
+
+                    let conn = session
+                        .establish_connection(
+                            &host,
+                            port,
+                            session.inner.proxy.as_ref(),
+                            &connect_config,
+                            &execution,
+                        )
+                        .await?;
+
+                    tracing::debug!(
+                        alpn = ?conn.negotiated_alpn(),
+                        "ws.alpn_negotiated",
+                    );
+
+                    ws_upgrade_h1(conn.into_tcp_stream()?, authority, path, &self, client).await
+                })
+                .await;
+            match result {
+                Ok(connection) => {
+                    guard.publish()?;
+                    Ok(connection)
+                }
+                Err(error) => {
+                    guard.finish_error(&error);
+                    Err(error.into_public_connect_error())
+                }
+            }
         })
     }
 }
@@ -164,6 +193,42 @@ impl WsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_budget_zero_is_inherited_before_websocket_tcp_start() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let session = crate::Client::builder()
+            .attempt_limits(crate::AttemptLimits::default().with_connect_attempts(0))
+            .build()
+            .session()
+            .build();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session
+                .websocket(&format!("wss://{}/", listener.local_addr().unwrap()))
+                .connect(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::ResourceLimitExceeded(_))));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_budget_invalid_session_is_rejected_before_websocket_io() {
+        let session = crate::Client::builder()
+            .attempt_limits(crate::AttemptLimits::default().with_connect_attempts(0))
+            .build()
+            .session()
+            .attempt_limits(crate::AttemptLimits::default().with_connect_attempts(1))
+            .build();
+        let result = session.websocket("wss://127.0.0.1:9/").connect().await;
+        assert!(matches!(result, Err(Error::InvalidConfig(_))));
+    }
 
     // ====================================================================
     // WsBuilder — configuring a WebSocket before connecting

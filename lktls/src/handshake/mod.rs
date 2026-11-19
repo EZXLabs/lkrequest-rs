@@ -9,7 +9,15 @@
 //! The [`content_type`] and [`handshake_type`] sub-modules provide TLS protocol constants.
 
 pub mod client_hello;
+pub mod client_hello_wire;
+#[cfg(test)]
+pub(crate) mod config_measurement;
 pub mod driver;
+mod effects;
+#[doc(hidden)]
+pub mod framing;
+mod initial;
+mod offer;
 pub mod server_hello;
 pub mod tls12;
 pub mod tls13;

@@ -1,13 +1,13 @@
 # HTTP 协议策略
 
-lkrequest 支持 H1、原生 H2，以及 feature-gated H3/QUIC。协议策略表达“使用哪条传输路径”，fingerprint profile 表达“该路径在线缆上如何序列化”，两者不要混为一项配置。
+lkrequest 支持 H1、原生 H2，以及 feature-gated H3/QUIC。H1/H2 始终编译，`default-features = false` 不会关闭 HTTP/2；H2 引擎固定为 `lkh2`，无需后端选择 feature。协议策略表达“使用哪条传输路径”，fingerprint profile 表达“该路径在线缆上如何序列化”，两者不要混为一项配置。
 
 ## 能力矩阵
 
 | 模式 | Feature | 连接 | 典型用途 |
 |---|---|---|---|
-| H1 | 默认 | TCP + TLS | 兼容旧服务、明确禁用 multiplexing |
-| H2 | 默认 | TCP + TLS + ALPN | 默认 TCP HTTP、多路复用和 H2 指纹 |
+| H1 | 无需 feature | TCP + TLS | 兼容旧服务、明确禁用 multiplexing |
+| H2 | 无需 feature | TCP + TLS + ALPN | 默认 TCP HTTP、多路复用和 H2 指纹 |
 | H3 | `quic-h3` | UDP + QUIC TLS | H3 指纹、Alt-Svc upgrade、QUIC 研究 |
 
 ## Session 便捷策略
@@ -24,7 +24,7 @@ let fallback_h3 = client.session().http3_with_fallback().build();
 - `http3_only()` 要求 H3，失败直接返回错误。
 - `http3_with_fallback()` 在允许的 QUIC/H3 建连失败上回退 TCP-based HTTP。
 
-默认模式下，H3 request 已经发送后发生的 stream/header/body 错误不会自动改用 H2 重放，因为这不能证明原请求未被服务端处理。显式的 `H3RetryMode::Chrome155ProtocolErrors` 可对有限缓冲请求启用响应头之前的协议错误重试；它仍遵守协议回退限制，详见[请求配置](requests/README.md#显式-http3-兼容重试)。
+默认模式下，H3 request 已经发送后发生的 stream/header/body 错误不会自动改用 H2 重放，因为这不能证明原请求未被服务端处理。显式的 `H3RetryMode::Chrome155ProtocolErrors` 可对有限缓冲请求启用响应头之前的协议错误重试；它仍遵守协议回退限制，详见[请求配置](requests/#显式-http3-兼容重试)。
 
 ## 默认发现与升级
 
@@ -39,6 +39,14 @@ let fallback_h3 = client.session().http3_with_fallback().build();
 5. Broken QUIC tracker 在 cooldown 内避免反复尝试已失败路径。
 
 默认/自动模式不保证首个请求直接使用 H3。只有明确的 H3-only 策略才把“必须使用 H3”作为成功条件。
+
+## 竞速、回退与次数上限
+
+TCP/H2 与 QUIC/H3 竞速可以为一次请求启动多条候选连接，但落败候选不能再提交该请求或消耗单次上传源。实际启动过的每条连接都占用本次请求的建链次数，复用连接不占用；取消落败连接不会退还已经发生的次数。
+
+`AttemptLimits` 不选择协议，也不授权重放。有限建链上限会抑制可选的后台探测，并可能让候选连接无法启动；请求使用已有连接或剩余允许路径。连接关闭重发和 H2-to-H1 回退默认关闭，需要分别调用 `.retry_on_connection_close(true)`、`.h2_fallback_h1(true)`。这些设置仍受 H2-only 等协议约束以及幂等性、body 可重放检查限制。
+
+配置和共享建链计数见[请求重发上限与统计](client-session.md#请求重发上限与统计)，超时及恢复开关见[超时与显式重试](networking/timeouts.md)。
 
 ## 单次请求覆盖
 

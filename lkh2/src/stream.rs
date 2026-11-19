@@ -54,6 +54,7 @@ pub struct H2Stream {
     send_window: i32,
     recv_window: i32,
     initial_window_size: u32,
+    initial_recv_window_size: u32,
 }
 
 const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65535;
@@ -66,6 +67,7 @@ impl H2Stream {
             send_window: initial_window_size as i32,
             recv_window: initial_window_size as i32,
             initial_window_size,
+            initial_recv_window_size: initial_window_size,
         }
     }
 
@@ -76,6 +78,7 @@ impl H2Stream {
             send_window: send_initial_window as i32,
             recv_window: recv_initial_window as i32,
             initial_window_size: send_initial_window,
+            initial_recv_window_size: recv_initial_window,
         }
     }
 
@@ -101,6 +104,21 @@ impl H2Stream {
 
     pub fn initial_window_size(&self) -> u32 {
         self.initial_window_size
+    }
+
+    pub fn initial_recv_window_size(&self) -> u32 {
+        self.initial_recv_window_size
+    }
+
+    pub(crate) fn apply_initial_recv_window_size(
+        &mut self,
+        new_size: u32,
+    ) -> Result<(), StreamError> {
+        let delta = i64::from(new_size) - i64::from(self.initial_recv_window_size);
+        self.recv_window = i32::try_from(i64::from(self.recv_window) + delta)
+            .map_err(|_| StreamError::WindowOverflow)?;
+        self.initial_recv_window_size = new_size;
+        Ok(())
     }
 
     pub fn open(&mut self) -> Result<(), StreamError> {

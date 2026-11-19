@@ -38,6 +38,7 @@ pub(crate) fn parse_preset_name(name: &str) -> Result<PresetKind, FfiError> {
         "chrome_155" | "default" => Ok(PresetKind::Chrome155),
         "chrome_156" => Ok(PresetKind::Chrome156),
         "chrome_157" => Ok(PresetKind::Chrome157),
+        "chrome_158" => Ok(PresetKind::Chrome158),
         "firefox_133" => Ok(PresetKind::Firefox133),
         "firefox_147" => Ok(PresetKind::Firefox147),
         "firefox_156" => Ok(PresetKind::Firefox156),
@@ -64,6 +65,7 @@ pub(crate) fn preset_bundle(preset: PresetKind) -> lkrequest::preset::ClientPres
         PresetKind::Chrome155 => lkrequest::preset::chrome_155(),
         PresetKind::Chrome156 => lkrequest::preset::chrome_156(),
         PresetKind::Chrome157 => lkrequest::preset::chrome_157(),
+        PresetKind::Chrome158 => lkrequest::preset::chrome_158(),
         PresetKind::Firefox133 => lkrequest::preset::firefox_133(),
         PresetKind::Firefox147 => lkrequest::preset::firefox_147(),
         PresetKind::Firefox156 => lkrequest::preset::firefox_156(),
@@ -115,6 +117,106 @@ fn add_ca_file_to_state(state: &mut ClientBuilderState, path: &str) -> Result<()
 fn add_ca_memory_to_state(state: &mut ClientBuilderState, data: &[u8]) -> Result<(), FfiError> {
     state.ca_der_certs.extend(parse_ca_ders(data)?);
     Ok(())
+}
+
+const MAX_PROFILE_JSON_BYTES: usize = 1024 * 1024;
+
+unsafe fn read_profile_json(
+    json_ptr: *const c_char,
+    json_len: usize,
+    name: &str,
+) -> Result<String, FfiError> {
+    if json_len > MAX_PROFILE_JSON_BYTES {
+        return Err(FfiError::resource_limit_exceeded(format!(
+            "{name} exceeds the 1 MiB input limit"
+        )));
+    }
+    read_string_parts(json_ptr, json_len, name)
+}
+
+fn parse_editable_tls_profile_json(
+    json: &str,
+) -> Result<lkrequest::lktls::profile::TlsProfile, FfiError> {
+    use lkrequest::lktls::profile::types::ExtensionSource;
+
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| FfiError::invalid_config(format!("invalid TLS profile JSON: {err}")))?;
+    if value
+        .get("client_hello_mirror")
+        .is_some_and(|mirror| !mirror.is_null())
+    {
+        return Err(FfiError::invalid_config(
+            "strict ClientHello mirror templates are not supported by the editable profile API",
+        ));
+    }
+    let profile = lkrequest::lktls::profile::loader::from_json_str(json)
+        .map_err(|err| FfiError::invalid_config(format!("invalid TLS profile JSON: {err}")))?;
+    lkrequest::lktls::profile::validate(&profile)
+        .map_err(|err| FfiError::invalid_config(format!("invalid TLS profile: {err}")))?;
+    if profile.session_id_length > 32 {
+        return Err(FfiError::invalid_config(
+            "TLS session_id_length must be at most 32",
+        ));
+    }
+    for ext in &profile.extensions {
+        if let ExtensionSource::RawBytes { data } = &ext.source {
+            if data.len() > 2 * usize::from(u16::MAX)
+                || data.len() % 2 != 0
+                || !data.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(FfiError::invalid_config(
+                    "TLS raw extension data must be even-length hex encoding at most 65535 bytes",
+                ));
+            }
+        }
+    }
+    Ok(profile)
+}
+
+fn parse_h2_profile_json(json: &str) -> Result<lkrequest::h2::H2Profile, FfiError> {
+    let profile: lkrequest::h2::H2Profile = serde_json::from_str(json)
+        .map_err(|err| FfiError::invalid_config(format!("invalid H2 profile JSON: {err}")))?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| FfiError::invalid_config(format!("invalid H2 profile JSON: {err}")))?;
+    if value.get("behavior").is_some() {
+        return Err(FfiError::invalid_config(
+            "H2 behavior is not serializable in the native profile JSON; use an H2 preset for browser runtime policies",
+        ));
+    }
+    lkrequest::lkh2::synthesis::validate(&profile)
+        .map_err(|err| FfiError::invalid_config(format!("invalid H2 profile: {err}")))?;
+    const MAX_STREAM_ID: u32 = 0x7fff_ffff;
+    if profile.priority_config.default_urgency > 7 {
+        return Err(FfiError::invalid_config(
+            "H2 default_urgency must be in the range 0..=7",
+        ));
+    }
+    if let Some(priority) = &profile.headers_priority {
+        if priority.stream_dependency > MAX_STREAM_ID
+            || priority.stream_dependency == profile.initial_stream_id
+        {
+            return Err(FfiError::invalid_config(
+                "invalid H2 HEADERS stream dependency",
+            ));
+        }
+    }
+    for priority in &profile.priority_frames {
+        if priority.stream_id == 0
+            || priority.stream_id > MAX_STREAM_ID
+            || priority.dependency > MAX_STREAM_ID
+            || priority.stream_id == priority.dependency
+        {
+            return Err(FfiError::invalid_config("invalid H2 PRIORITY stream IDs"));
+        }
+    }
+    for setting in &profile.settings {
+        if matches!(setting.id.as_u16(), 0x08 | 0x09) && setting.value > 1 {
+            return Err(FfiError::invalid_config(
+                "H2 boolean SETTINGS must be 0 or 1",
+            ));
+        }
+    }
+    Ok(profile)
 }
 
 fn validate_quic_profile_json(json: &str) -> Result<(), FfiError> {
@@ -169,17 +271,33 @@ fn ffi_layers(bits: u32) -> lkrequest::Layers {
 }
 
 fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShared>, FfiError> {
-    let preset = preset_bundle(state.preset);
+    let preset = state
+        .preset_override
+        .clone()
+        .unwrap_or_else(|| preset_bundle(state.preset));
     let mut builder = lkrequest::Client::builder()
         .preset(preset)
         .verify(state.verify)
         .http1_title_case_headers(state.http1_title_case_headers);
+
+    if let Some(profile) = &state.tls_profile {
+        builder = builder.fingerprint(profile.clone());
+    }
+    if let Some(profile) = &state.quic_tls_profile {
+        builder = match profile {
+            Some(profile) => builder.quic_fingerprint(profile.clone()),
+            None => builder.clear_quic_fingerprint(),
+        };
+    }
 
     if let Some(h2_preset) = state.h2_preset {
         let preset = preset_bundle(h2_preset);
         builder = builder
             .h2_profile(preset.h2_profile)
             .header_order_from_names(preset.header_order);
+    }
+    if let Some(profile) = &state.h2_profile {
+        builder = builder.h2_profile(profile.clone());
     }
 
     match state.randomize_mode {
@@ -248,27 +366,31 @@ fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShare
     let mut timeouts = lkrequest::TimeoutConfig::default();
     let mut custom_timeouts = false;
     if let Some(timeout_ms) = state.dns_timeout_ms {
-        timeouts.dns_timeout = Some(Duration::from_millis(timeout_ms));
+        timeouts.dns_timeout = timeout_ms.map(Duration::from_millis);
         custom_timeouts = true;
     }
     if let Some(timeout_ms) = state.tcp_connect_timeout_ms {
-        timeouts.tcp_connect_timeout = Some(Duration::from_millis(timeout_ms));
+        timeouts.tcp_connect_timeout = timeout_ms.map(Duration::from_millis);
         custom_timeouts = true;
     }
     if let Some(timeout_ms) = state.tls_handshake_timeout_ms {
-        timeouts.tls_handshake_timeout = Some(Duration::from_millis(timeout_ms));
+        timeouts.tls_handshake_timeout = timeout_ms.map(Duration::from_millis);
         custom_timeouts = true;
     }
     if let Some(timeout_ms) = state.quic_connect_timeout_ms {
-        timeouts.quic_connect_timeout = Some(Duration::from_millis(timeout_ms));
+        timeouts.quic_connect_timeout = timeout_ms.map(Duration::from_millis);
         custom_timeouts = true;
     }
     if let Some(timeout_ms) = state.ttfb_timeout_ms {
-        timeouts.ttfb_timeout = Some(Duration::from_millis(timeout_ms));
+        timeouts.ttfb_timeout = timeout_ms.map(Duration::from_millis);
         custom_timeouts = true;
     }
     if let Some(timeout_ms) = state.total_timeout_ms {
-        timeouts.total_timeout = Some(Duration::from_millis(timeout_ms));
+        timeouts.total_timeout = timeout_ms.map(Duration::from_millis);
+        custom_timeouts = true;
+    }
+    if let Some(timeout_ms) = state.read_idle_timeout_ms {
+        timeouts.read_idle_timeout = Some(Duration::from_millis(timeout_ms));
         custom_timeouts = true;
     }
     if custom_timeouts {
@@ -323,6 +445,12 @@ fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShare
     if let Some(session_resumption) = &state.session_resumption {
         builder = builder.session_resumption(session_resumption.clone());
     }
+    if let Some(enabled) = state.tls_session_cache_enabled {
+        builder = builder.tls_session_cache_enabled(enabled);
+    }
+    if let Some(ttl_ms) = state.tls_session_cache_ttl_ms {
+        builder = builder.tls_session_cache_ttl(Duration::from_millis(ttl_ms));
+    }
     if let Some(ja4t) = &state.tcp_fingerprint_ja4t {
         let fingerprint = lkrequest::TcpFingerprint::from_ja4t(ja4t).map_err(|err| {
             FfiError::invalid_config(format!("invalid JA4T fingerprint '{ja4t}': {err}"))
@@ -376,7 +504,9 @@ fn build_client_from_state(state: &ClientBuilderState) -> Result<Arc<ClientShare
 
     Ok(Arc::new(ClientShared {
         client: {
-            builder = builder.trust_anchor_policy(state.trust_anchor_policy);
+            builder = builder
+                .attempt_limits(state.attempt_limits)
+                .trust_anchor_policy(state.trust_anchor_policy);
             for binding in &state.trust_anchor_bindings {
                 builder = builder.trust_anchor_binding(binding.clone());
             }
@@ -500,9 +630,15 @@ pub extern "C" fn lk_client_fingerprint_info_json(
                 .unwrap_or(serde_json::Value::Null);
             let value = serde_json::json!({
                 "tls": c.tls_profile(),
+                "quic_tls": c.quic_tls_profile(),
                 "h2": c.h2_profile(),
                 "quic": quic_value,
                 "tcp": tcp_value,
+                "tls_session_cache": {
+                    "enabled": c.tls_session_cache_enabled(),
+                    "ttl_ms": c.tls_session_cache_ttl()
+                        .map(|ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)),
+                },
             });
             let mut bytes = serde_json::to_vec(&value).expect("serialize fingerprint info");
             bytes.push(0);
@@ -534,6 +670,7 @@ pub extern "C" fn lk_client_builder_set_preset(
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
         builder.state.preset = parse_preset_name(&read_c_string(preset_name, "preset_name")?)?;
+        builder.state.preset_override = None;
         Ok(())
     })
 }
@@ -550,6 +687,114 @@ pub extern "C" fn lk_client_builder_set_h2_preset(
             "preset_name",
         )?)?);
         Ok(())
+    })
+}
+
+/// Load a serialized native TlsProfile JSON object.
+/// The input is copied; strict ClientHello mirror
+/// templates are rejected. NULL / 0 clears the override. The custom TLS profile
+/// overrides the preset's TLS profile regardless of setter order; other preset
+/// layers and explicit runtime settings retain their existing behavior.
+/// Inputs are limited to 1 MiB and checked for TLS structural validity.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_tls_profile_json(
+    builder: *mut lk_client_builder_t,
+    json_ptr: *const c_char,
+    json_len: usize,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        if json_ptr.is_null() && json_len == 0 {
+            builder.state.tls_profile = None;
+            return Ok(());
+        }
+        let json = read_profile_json(json_ptr, json_len, "TLS profile JSON")?;
+        let profile = parse_editable_tls_profile_json(&json)?;
+        builder.state.tls_profile = Some(profile);
+        Ok(())
+    })
+}
+
+/// Set a custom HTTP/2 profile, corresponding to Rust ClientBuilder::h2_profile.
+/// Input is copied, limited to 1 MiB and validated before replacing the override.
+/// NULL / 0 restores the selected H2 preset (or the client's preset).
+/// The override takes precedence over both preset setters regardless of order.
+/// Native H2 JSON only describes data fields: it uses baseline runtime behavior,
+/// and an explicit `behavior` field is rejected rather than silently ignored.
+/// Other protocol profiles and header-order configuration are unchanged.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_h2_profile_json(
+    builder: *mut lk_client_builder_t,
+    json_ptr: *const c_char,
+    json_len: usize,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        if json_ptr.is_null() && json_len == 0 {
+            builder.state.h2_profile = None;
+            return Ok(());
+        }
+        let json = read_profile_json(json_ptr, json_len, "H2 profile JSON")?;
+        let profile = parse_h2_profile_json(&json)?;
+        builder.state.h2_profile = Some(profile);
+        Ok(())
+    })
+}
+
+/// Set an independent QUIC TLS profile (Rust ClientBuilder::quic_fingerprint).
+/// Requires quic-h3. The input is copied, limited to 1 MiB and validated as TLS
+/// with TLS 1.3 enabled. NULL / 0 restores the selected preset's QUIC TLS profile.
+/// Custom profile overrides take precedence over presets regardless of order.
+/// This does not enable H3 or change the TCP TLS / QUIC transport profiles.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_quic_tls_profile_json(
+    builder: *mut lk_client_builder_t,
+    json_ptr: *const c_char,
+    json_len: usize,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let _builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        #[cfg(feature = "quic-h3")]
+        {
+            if json_ptr.is_null() && json_len == 0 {
+                _builder.state.quic_tls_profile = None;
+                return Ok(());
+            }
+            let json = read_profile_json(json_ptr, json_len, "QUIC TLS profile JSON")?;
+            let profile = parse_editable_tls_profile_json(&json)?;
+            if profile.tls_max_version != lkrequest::lktls::profile::types::TlsVersion::Tls13 {
+                return Err(FfiError::invalid_config("QUIC requires TLS 1.3"));
+            }
+            _builder.state.quic_tls_profile = Some(Some(profile));
+            Ok(())
+        }
+        #[cfg(not(feature = "quic-h3"))]
+        {
+            let _ = (json_ptr, json_len);
+            Err(FfiError::invalid_config(
+                "QUIC/H3 support is not compiled in; enable the `quic-h3` feature",
+            ))
+        }
+    })
+}
+
+/// Use the effective TCP TLS profile for QUIC, overriding a preset's separate
+/// QUIC TLS profile (Rust ClientBuilder::clear_quic_fingerprint). Requires quic-h3.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_clear_quic_fingerprint(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let _builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        #[cfg(feature = "quic-h3")]
+        {
+            _builder.state.quic_tls_profile = Some(None);
+            Ok(())
+        }
+        #[cfg(not(feature = "quic-h3"))]
+        Err(FfiError::invalid_config(
+            "QUIC/H3 support is not compiled in; enable the `quic-h3` feature",
+        ))
     })
 }
 
@@ -591,7 +836,7 @@ pub extern "C" fn lk_client_builder_set_timeout_dns(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        builder.state.dns_timeout_ms = Some(timeout_ms);
+        builder.state.dns_timeout_ms = Some(Some(timeout_ms));
         Ok(())
     })
 }
@@ -603,7 +848,7 @@ pub extern "C" fn lk_client_builder_set_timeout_tcp_connect(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        builder.state.tcp_connect_timeout_ms = Some(timeout_ms);
+        builder.state.tcp_connect_timeout_ms = Some(Some(timeout_ms));
         Ok(())
     })
 }
@@ -615,7 +860,7 @@ pub extern "C" fn lk_client_builder_set_timeout_tls_handshake(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        builder.state.tls_handshake_timeout_ms = Some(timeout_ms);
+        builder.state.tls_handshake_timeout_ms = Some(Some(timeout_ms));
         Ok(())
     })
 }
@@ -627,7 +872,7 @@ pub extern "C" fn lk_client_builder_set_timeout_quic_connect(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        builder.state.quic_connect_timeout_ms = Some(timeout_ms);
+        builder.state.quic_connect_timeout_ms = Some(Some(timeout_ms));
         Ok(())
     })
 }
@@ -639,11 +884,13 @@ pub extern "C" fn lk_client_builder_set_timeout_ttfb(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        builder.state.ttfb_timeout_ms = Some(timeout_ms);
+        builder.state.ttfb_timeout_ms = Some(Some(timeout_ms));
         Ok(())
     })
 }
 
+/// Set the overall deadline in milliseconds (default: 120000).
+/// Zero is an immediate timeout; use disable_timeout_total to disable it.
 #[no_mangle]
 pub extern "C" fn lk_client_builder_set_timeout_total(
     builder: *mut lk_client_builder_t,
@@ -651,7 +898,105 @@ pub extern "C" fn lk_client_builder_set_timeout_total(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        builder.state.total_timeout_ms = Some(timeout_ms);
+        builder.state.total_timeout_ms = Some(Some(timeout_ms));
+        Ok(())
+    })
+}
+
+/// Disable the client DNS deadline. Resolver-specific limits remain independent.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_dns(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.dns_timeout_ms = Some(None);
+        Ok(())
+    })
+}
+
+/// Disable the TCP/proxy connection deadline.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_tcp_connect(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.tcp_connect_timeout_ms = Some(None);
+        Ok(())
+    })
+}
+
+/// Disable the TLS handshake deadline.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_tls_handshake(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.tls_handshake_timeout_ms = Some(None);
+        Ok(())
+    })
+}
+
+/// Disable the QUIC handshake and HTTP/3 setup deadlines.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_quic_connect(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.quic_connect_timeout_ms = Some(None);
+        Ok(())
+    })
+}
+
+/// Disable the response-header deadline, including its upload accounting.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_ttfb(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.ttfb_timeout_ms = Some(None);
+        Ok(())
+    })
+}
+
+/// Disable the overall deadline, including for long-lived streaming responses.
+/// Phase timeouts remain active. Setting the total timeout enables it again.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_total(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.total_timeout_ms = Some(None);
+        Ok(())
+    })
+}
+
+/// Limit each pending response body read, in milliseconds. Disabled by default.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_timeout_read_idle(
+    builder: *mut lk_client_builder_t,
+    timeout_ms: u64,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.read_idle_timeout_ms = Some(timeout_ms);
+        Ok(())
+    })
+}
+
+/// Disable the response body read-idle timer without changing the total deadline.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_disable_timeout_read_idle(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.read_idle_timeout_ms = None;
         Ok(())
     })
 }
@@ -920,7 +1265,7 @@ pub extern "C" fn lk_client_builder_set_quic_profile_json(
 ) -> lk_status_t {
     catch_status(null_error_out(), || unsafe {
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
-        let json = read_string_parts(json_ptr, json_len, "quic profile json")?;
+        let json = read_profile_json(json_ptr, json_len, "QUIC profile JSON")?;
         validate_quic_profile_json(&json)?;
         builder.state.quic_profile_json = Some(Some(json));
         Ok(())
@@ -948,6 +1293,49 @@ pub extern "C" fn lk_client_builder_set_session_resumption_json(
         let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
         let json = read_string_parts(json_ptr, json_len, "session resumption json")?;
         builder.state.session_resumption = Some(parse_session_resumption_json(&json)?);
+        Ok(())
+    })
+}
+
+/// Enable or disable TLS/QUIC session caching. Enabled by default.
+/// Disabling forces full handshakes on new connections; pooled connections
+/// and the profile's advertised extensions are unaffected.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_tls_session_cache_enabled(
+    builder: *mut lk_client_builder_t,
+    enabled: bool,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.tls_session_cache_enabled = Some(enabled);
+        Ok(())
+    })
+}
+
+/// Override TLS/QUIC cache TTL in milliseconds. Zero prevents caching.
+/// Shorter server lifetimes and TLS 1.3's seven-day protocol limit still apply.
+/// Does not re-enable a disabled cache or reset TLS 1.2's original secret age.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_tls_session_cache_ttl(
+    builder: *mut lk_client_builder_t,
+    ttl_ms: u64,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.tls_session_cache_ttl_ms = Some(ttl_ms);
+        Ok(())
+    })
+}
+
+/// Restore default cache TTLs: TLS 1.2 one hour; TLS 1.3/QUIC up to seven days.
+/// Does not change the cache enable switch.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_reset_tls_session_cache_ttl(
+    builder: *mut lk_client_builder_t,
+) -> lk_status_t {
+    catch_status(null_error_out(), || unsafe {
+        let builder = require_handle_mut::<ClientBuilderHandle, lk_client_builder_t>(builder)?;
+        builder.state.tls_session_cache_ttl_ms = None;
         Ok(())
     })
 }
@@ -1099,6 +1487,7 @@ pub extern "C" fn lk_client_builder_set_max_connections_per_session(
     })
 }
 
+/// Authorize H2-to-H1 request fallback (default: disabled).
 #[no_mangle]
 pub extern "C" fn lk_client_builder_set_fallback_h2_to_h1(
     builder: *mut lk_client_builder_t,
@@ -1128,6 +1517,8 @@ pub extern "C" fn lk_client_builder_set_fallback_proxy_to_direct(
     })
 }
 
+/// Authorize bounded closed-connection recovery and QUIC 0-RTT replay.
+/// Disabled by default; request replay safety checks still apply.
 #[no_mangle]
 pub extern "C" fn lk_client_builder_set_retry_on_connection_close(
     builder: *mut lk_client_builder_t,
@@ -1158,6 +1549,105 @@ pub extern "C" fn lk_client_builder_free(builder: *mut lk_client_builder_t) {
     catch_value((), || unsafe {
         handle_drop::<ClientBuilderHandle, lk_client_builder_t>(builder);
     });
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn ffi_timeout_controls_reach_the_rust_client_and_can_be_reset() {
+        let builder = lk_client_builder_new();
+        assert_eq!(
+            lk_client_builder_set_use_native_certs(builder, false),
+            lk_status_t::LK_OK
+        );
+        let inspect = || unsafe {
+            let handle =
+                require_handle::<ClientBuilderHandle, lk_client_builder_t>(builder).unwrap();
+            build_client_from_state(&handle.state).unwrap()
+        };
+        let defaults = inspect();
+        assert_eq!(
+            defaults.client.timeouts().total_timeout,
+            Some(Duration::from_secs(120))
+        );
+        assert!(!defaults.client.fallback().retry_on_connection_close);
+        assert!(!defaults.client.fallback().h2_to_h1);
+        assert_eq!(
+            lk_client_builder_set_timeout_read_idle(builder, 200),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lk_client_builder_disable_timeout_total(builder),
+            lk_status_t::LK_OK
+        );
+        let disabled = inspect();
+        assert_eq!(disabled.client.timeouts().total_timeout, None);
+        assert_eq!(
+            disabled.client.timeouts().read_idle_timeout,
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            lk_client_builder_set_timeout_total(builder, 50),
+            lk_status_t::LK_OK
+        );
+        assert_eq!(
+            lk_client_builder_disable_timeout_read_idle(builder),
+            lk_status_t::LK_OK
+        );
+        let reset = inspect();
+        assert_eq!(
+            reset.client.timeouts().total_timeout,
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(reset.client.timeouts().read_idle_timeout, None);
+        let disable: [extern "C" fn(*mut lk_client_builder_t) -> lk_status_t; 5] = [
+            lk_client_builder_disable_timeout_dns,
+            lk_client_builder_disable_timeout_tcp_connect,
+            lk_client_builder_disable_timeout_tls_handshake,
+            lk_client_builder_disable_timeout_quic_connect,
+            lk_client_builder_disable_timeout_ttfb,
+        ];
+        for disable in disable {
+            assert_eq!(disable(builder), lk_status_t::LK_OK);
+        }
+        let disabled = inspect();
+        let timeouts = disabled.client.timeouts();
+        assert_eq!(
+            [
+                timeouts.dns_timeout,
+                timeouts.tcp_connect_timeout,
+                timeouts.tls_handshake_timeout,
+                timeouts.quic_connect_timeout,
+                timeouts.ttfb_timeout,
+            ],
+            [None; 5]
+        );
+        let enable: [extern "C" fn(*mut lk_client_builder_t, u64) -> lk_status_t; 5] = [
+            lk_client_builder_set_timeout_dns,
+            lk_client_builder_set_timeout_tcp_connect,
+            lk_client_builder_set_timeout_tls_handshake,
+            lk_client_builder_set_timeout_quic_connect,
+            lk_client_builder_set_timeout_ttfb,
+        ];
+        for enable in enable {
+            assert_eq!(enable(builder, 50), lk_status_t::LK_OK);
+        }
+        let enabled = inspect();
+        let timeouts = enabled.client.timeouts();
+        assert_eq!(
+            [
+                timeouts.dns_timeout,
+                timeouts.tcp_connect_timeout,
+                timeouts.tls_handshake_timeout,
+                timeouts.quic_connect_timeout,
+                timeouts.ttfb_timeout,
+            ],
+            [Some(Duration::from_millis(50)); 5]
+        );
+        lk_client_builder_free(builder);
+    }
 }
 
 #[cfg(all(test, feature = "synthetic-fp"))]

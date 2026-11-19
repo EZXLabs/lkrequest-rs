@@ -89,6 +89,7 @@ where
     for (name, value) in builder.extra_headers.iter() {
         req.headers_mut().insert(name.clone(), value.clone());
     }
+    let offered_headers = req.headers().clone();
 
     // Perform the HTTP/1.1 handshake using hyper
     let io = TokioIo::new(tls_stream);
@@ -116,6 +117,7 @@ where
     // 101 would all satisfy it. `Sec-WebSocket-Accept` is what proves the peer
     // read our key and actually speaks WebSocket.
     validate_upgrade_response(resp.headers(), resp.status(), &expected_accept, builder)?;
+    let deflate = super::deflate::negotiate(&offered_headers, resp.headers())?;
 
     // Extract the upgraded stream
     let upgraded = hyper::upgrade::on(resp)
@@ -123,7 +125,10 @@ where
         .map_err(|e| Error::Http(format!("WebSocket upgrade extraction failed: {e}")))?;
 
     let ws_stream = TokioIo::new(upgraded);
-    Ok(WsConnection::new(ws_stream, builder.url.clone()))
+    match deflate {
+        Some(negotiated) => WsConnection::with_deflate(ws_stream, builder.url.clone(), &negotiated),
+        None => Ok(WsConnection::new(ws_stream, builder.url.clone())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,12 +138,6 @@ where
 /// Split a comma-separated header value into trimmed, non-empty items.
 fn comma_items(value: &str) -> impl Iterator<Item = &str> {
     value.split(',').map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// The name of an extension offer/acceptance, i.e. the token before any
-/// parameters (`permessage-deflate; client_max_window_bits` → `permessage-deflate`).
-fn extension_name(value: &str) -> &str {
-    value.split(';').next().unwrap_or(value).trim()
 }
 
 /// Validate a WebSocket handshake response.
@@ -200,25 +199,8 @@ fn validate_upgrade_response(
         )));
     }
 
-    // §4.1/8: an extension the client did not offer MUST fail the connection.
-    if let Some(value) = headers
-        .get("sec-websocket-extensions")
-        .and_then(|v| v.to_str().ok())
-    {
-        let offered: Vec<&str> = builder
-            .extensions
-            .iter()
-            .map(|e| extension_name(e))
-            .collect();
-        for negotiated in comma_items(value).map(extension_name) {
-            if !offered.iter().any(|o| o.eq_ignore_ascii_case(negotiated)) {
-                return Err(Error::Http(format!(
-                    "WebSocket upgrade failed: server enabled extension `{negotiated}`, which \
-                     was not offered"
-                )));
-            }
-        }
-    }
+    // Extension parameters are checked by deflate::negotiate against the
+    // actual request headers, after defaults and caller overrides are merged.
 
     // §4.1/9: a subprotocol the client did not offer MUST fail the connection.
     if let Some(value) = headers
@@ -271,7 +253,16 @@ mod tests {
     }
 
     fn validate(headers: &http::HeaderMap, builder: &WsBuilder) -> Result<()> {
-        validate_upgrade_response(headers, StatusCode::SWITCHING_PROTOCOLS, ACCEPT, builder)
+        validate_upgrade_response(headers, StatusCode::SWITCHING_PROTOCOLS, ACCEPT, builder)?;
+        let mut offers = http::HeaderMap::new();
+        if !builder.extensions.is_empty() {
+            offers.insert(
+                "sec-websocket-extensions",
+                builder.extensions.join(", ").parse().unwrap(),
+            );
+        }
+        offers.extend(builder.extra_headers.clone());
+        super::super::deflate::negotiate(&offers, headers).map(|_| ())
     }
 
     #[test]
@@ -374,7 +365,7 @@ mod tests {
         );
 
         // Offered — and parameters on the acceptance do not change the name.
-        let with_offer = builder().extension("permessage-deflate");
+        let with_offer = builder().extension("permessage-deflate; client_max_window_bits");
         let mut headers = ok_headers();
         headers.insert(
             "sec-websocket-extensions",

@@ -2,6 +2,10 @@
 
 本目录保存随公开源码发布的正式文档，分为两册：**用户手册**（`guides/` 与 `reference/`，重点是应用与场景）和**开发者手册**（`development/`，重点是架构与实现）。文档中的行为说明必须与当前代码、测试和发布能力一致，并随相关实现一起评审。
 
+本文档对应 0.3.0 源码。从 0.2.x 升级时，先阅读[版本升级与迁移](guides/upgrading.md)：旧 H2 feature 已删除，连接关闭重发和 H2-to-H1 回退需要显式开启，新增请求次数上限默认不启用。
+
+当前各系列最新 preset 为 Chrome 158、Firefox 156 和 Safari 26.2，默认仍为 Chrome 155。完整名称、协议范围与证据等级见[指纹支持矩阵](reference/presets.md)。
+
 ## 面向用户
 
 用户文档以“要完成什么任务”为入口，示例优先，概念只用于解释正确的对象和行为边界。
@@ -10,14 +14,17 @@
 
 - [项目概览与快速开始](https://github.com/EZXLabs/lkrequest-rs/blob/main/README-zh.md)
 - [完整快速开始](getting-started.md)
-- [使用场景导航](guides/README.md)
+- [同步调用](guides/blocking.md)
+- [使用场景导航](guides/)
+- [功能与配置入口（Rust/C）](reference/configuration.md)
 
 ### 请求与网络
 
-- [请求配置](guides/requests/README.md)
+- [请求配置](guides/requests/)
 - [流式上传](guides/requests/streaming-upload.md)
 - [Client、Session 与连接复用](guides/client-session.md)
 - [代理与 DNS](guides/networking.md)
+- [超时与显式重试](guides/networking/timeouts.md)
 - [Trust Anchor Identifiers (TAI)](guides/networking/trust-anchor-identifiers.md)
 - [HTTP 协议策略](guides/protocols.md)
 - [TCP 指纹的平台支持与限制](reference/tcp-fingerprint.md)

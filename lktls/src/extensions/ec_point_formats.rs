@@ -5,6 +5,24 @@
 
 use super::Extension;
 
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    let Some((&length, formats)) = data.split_first() else {
+        return Err(super::tls12::decode_error("missing point formats vector"));
+    };
+    if length == 0 || length as usize != formats.len() {
+        return Err(super::tls12::decode_error("invalid point formats vector"));
+    }
+    if !formats.contains(&0) {
+        return Err(crate::error::TlsError::local_alert(
+            crate::error::AlertDescription::IllegalParameter,
+            "server point formats omit uncompressed points",
+        ));
+    }
+    Ok(super::tls12::ServerValue::PointFormats)
+}
+
 /// EC Point Formats extension.
 pub struct EcPointFormats {
     /// List of supported point format codes (e.g. `[0x00]` for uncompressed).

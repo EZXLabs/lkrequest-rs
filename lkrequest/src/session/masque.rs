@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
+use super::execution::ConnectionExecution;
 use crate::error::Result;
 use crate::proxy::masque::{MasqueConnection, MasqueOuterConfig};
 use crate::proxy::ProxyConfig;
@@ -76,6 +77,7 @@ impl MasquePool {
         proxy: &ProxyConfig,
         proxy_addr: SocketAddr,
         config: &MasqueOuterConfig,
+        execution: &ConnectionExecution,
     ) -> Result<MasqueConnection> {
         let slot = {
             let mut slots = self.slots.lock();
@@ -94,7 +96,10 @@ impl MasquePool {
             let connection = match reusable {
                 Some(connection) => connection,
                 None => {
-                    let connection = MasqueConnection::connect(proxy, proxy_addr, config).await?;
+                    let connection = MasqueConnection::connect_with_execution(
+                        proxy, proxy_addr, config, execution,
+                    )
+                    .await?;
                     state.connection = Some(connection.clone());
                     connection
                 }

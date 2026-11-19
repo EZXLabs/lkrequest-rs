@@ -13,6 +13,7 @@
 //! | [`chrome_148`] | **Verified (capture)** | `profile-collector` real Chrome 148 capture | none |
 //! | [`chrome_156`] | **Verified (capture)** | public Cloudflare and example.com Wireshark captures | `fingerprint_regression.rs` |
 //! | [`chrome_157`] | **Verified (capture)** | public Cloudflare and example.com Wireshark captures | `fingerprint_regression.rs` |
+//! | [`chrome_158`] | **Verified (capture)** | public Cloudflare Wireshark capture | `fingerprint_regression.rs` |
 //! | [`firefox_147`] | **Verified** | `tlsleak/firefox147.0.3_tlsleak.json` | `e2e_firefox_fingerprint.rs` |
 //! | [`firefox_156`] | **Verified (capture)** | public Cloudflare Wireshark capture | `fingerprint_regression.rs` |
 //! | [`safari_26`] | **Verified** | `tlsleak/safari26.2_tlsleak.json` | `e2e_safari_fingerprint.rs` |
@@ -321,6 +322,27 @@ pub fn chrome_157() -> TlsProfile {
 /// QUIC retains the classic nine signatures without TCP's ML-DSA or TLS GREASE.
 pub fn chrome_157_quic() -> TlsProfile {
     let mut profile = chromium_quic_profile(chrome_157(), "Chrome 157 QUIC");
+    profile.grease = GreaseConfig::default();
+    profile.randomization = Some(RandomizationConfig {
+        shuffle_extensions: true,
+    });
+    profile
+        .signature_algorithms
+        .retain(|algorithm| !matches!(*algorithm, 0x0904..=0x0906));
+    profile
+}
+
+/// Chrome 158.0.8127.37 TCP profile captured on Windows on 2026-11-18.
+/// Stable fields and sorted trust-anchor IDs match Chrome 157.
+pub fn chrome_158() -> TlsProfile {
+    serde_json::from_str(include_str!("../../profiles/chrome_158.json"))
+        .expect("built-in chrome_158 profile should be valid")
+}
+
+/// Chrome 158 QUIC ClientHello captured against public Cloudflare.
+/// Classic signatures omit TCP's ML-DSA and ordinary TLS GREASE slots.
+pub fn chrome_158_quic() -> TlsProfile {
+    let mut profile = chromium_quic_profile(chrome_158(), "Chrome 158 QUIC");
     profile.grease = GreaseConfig::default();
     profile.randomization = Some(RandomizationConfig {
         shuffle_extensions: true,

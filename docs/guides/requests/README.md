@@ -105,7 +105,36 @@ for cookie in session.get_cookies_with_attrs("https://example.com/api/users") {
 ```
 
 持久化登录态时用 `get_all_cookies()`：它跨域名返回，跳过已过期的条目，并按创建时间
-排序。按这个顺序写回一个新 Session，重建出的 jar 会发送完全相同的 `Cookie` 头。
+排序。恢复时需保留 domain/host-only、path、安全属性与有效期，并按此顺序写回；仅恢复
+name/value 不能保留原 Cookie 的作用域。Cookie 在恢复前过期时应丢弃。
+
+### 写入、恢复与删除
+
+```rust
+let session = lkrequest::Client::builder().build().session().build();
+session.set_cookie_with_attrs(
+    "https://example.com/api", "token", "value",
+    Some("/api"), None, true, true,
+);
+session.set_cookie_raw(
+    "https://example.com", "locale=zh-CN; Path=/; Secure; SameSite=Lax",
+);
+assert_eq!(session.get_cookie("https://example.com", "locale").as_deref(), Some("zh-CN"));
+session.remove_cookie("https://example.com", "locale");
+session.clear_cookies();
+```
+
+`set_cookie_with_attrs()` 可设置 path/domain/Secure/HttpOnly，但不接收 SameSite 或 expiry；
+需要这些属性时使用合法的 `Set-Cookie` 字符串和 `set_cookie_raw()`。host-only Cookie
+应省略 Domain，恢复持久 Cookie 时保留绝对 Expires，不能重新赋予原 Max-Age 时长。
+raw 入口与服务端 `Set-Cookie` 一样校验 Secure 和 `__Host-` / `__Secure-` 前缀规则；
+typed setter 用于调用方显式导入，不执行同样的前缀检查。这些 setter 不返回 Result，
+需要确认写入结果时读取 jar。
+
+`remove_cookie(url, name)` 删除该主机的 `/` 路径条目，不是按名称删除全部 domain/path
+变体。删除特定变体可用带相同 Domain/Path 且 `Max-Age=0` 的 raw Set-Cookie；清空整个
+Session 用 `clear_cookies()`。C ABI 有属性写入、读取与清理入口，但没有 raw Set-Cookie
+写入接口，不能据此宣称可以无损导入所有 Cookie 属性。
 
 ### 发送顺序
 
@@ -126,6 +155,27 @@ Cookie 仍按上述规则排在它们之后。
 - 对带幂等键的 POST，可使用 `idempotency(Idempotency::Idempotent)` 明确声明可重放；声明错误可能造成重复写入。
 - `send_streaming()` 不执行普通 `send()` 的自动 redirect 和 Session retry 流程。
 
+## 请求优先级
+
+```rust,no_run
+use lkrequest::{Client, lkh2::RequestPriority};
+
+# async fn example() -> Result<(), lkrequest::error::Error> {
+let session = Client::builder().build().session().build();
+let response = session.get("https://example.com/image.png")
+    .priority(RequestPriority::image())
+    .send().await?;
+# Ok(())
+# }
+```
+
+`priority()` 设置 HTTP priority 及 profile 定义的 urgency-to-weight 映射；启用对应行为的
+H3 profile 也用它生成请求流 PRIORITY_UPDATE。默认由 profile 决定，设置它不是本地任务
+调度优先级。`h2_priority_weight(0..=255)` 独立覆盖 H2 HEADERS 中的原始 weight，不改
+HTTP priority、dependency 或 exclusive；没有 legacy priority 的 profile 不会因此添加它，
+H1/H3 不受影响。C ABI 提供 `lk_request_set_h2_priority_weight`，没有等价的
+`RequestPriority` setter；单独写 `Priority` header 不等于控制这些帧级行为。
+
 ### 显式 HTTP/3 兼容重试
 
 启用 `quic-h3` 后，可以为 Session 选择 `H3RetryMode::Chrome155ProtocolErrors`：
@@ -143,6 +193,6 @@ let session = client.session()
 
 内部已经解码但尚未交给请求事务的早期响应头，不等于事务已经收到响应。响应正文或 trailer 阶段的协议错误不会触发此模式，一次性 streaming upload 也不会重放。`send()` 和 `send_streaming()` 都支持上述响应头之前的兼容重试；后者仍不执行普通 redirect 或状态码重试。
 
-严格 H3 请求继续使用 H3。其他请求只有在 `FallbackPolicy::AllowFallback` 且代理路由允许 TCP 时，才会在重试中暂时禁用该 hop 的 H3，并通过 TCP 协商 H1/H2。`NoFallback` 或仅允许网络错误回退的策略不会因此被放宽。重定向的新 hop 恢复原协议配置并获得独立预算，整条重定向链仍共用原总截止时间；外层 `RetryPolicy` 不会再次扩大已由此模式处理的重试链。该模式不改变 POST 的 0-RTT 发送资格，也不等同于 Chrome 的全部重试策略或完整连接选择行为。
+严格 H3 请求继续使用 H3。其他请求只有在 `FallbackPolicy::AllowFallback` 且代理路由允许 TCP 时，才会在重试中暂时禁用该 hop 的 H3，并通过 TCP 协商 H1/H2。`NoFallback` 或仅允许网络错误回退的策略不会因此被放宽。重定向的新 hop 恢复原协议配置和该模式的局部重试额度，但整条重定向链仍共用请求级 `AttemptLimits` 与原总截止时间；外层 `RetryPolicy` 不会再次扩大已由此模式处理的重试链。该模式不改变 POST 的 0-RTT 发送资格，也不等同于 Chrome 的全部重试策略或完整连接选择行为。
 
 请求体和响应读取分别见：[请求体](bodies.md)、[响应处理](responses.md)。

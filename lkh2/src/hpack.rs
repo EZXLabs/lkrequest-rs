@@ -6,6 +6,14 @@
 
 use crate::hpack_enc;
 
+/// Encoded byte length of an HPACK Huffman string, including EOS padding.
+///
+/// Encoding policies can use this to choose raw values when Huffman does not
+/// reduce their length, without duplicating the RFC 7541 code table.
+pub fn huffman_encoded_len(value: &[u8]) -> usize {
+    hpack_enc::huffman::encoded_len(value)
+}
+
 /// Convert `Vec<u8>` to `String`, reusing the allocation when valid UTF-8
 /// (the common case for HTTP/2 headers). Falls back to lossy replacement only
 /// for non-UTF-8 bytes.

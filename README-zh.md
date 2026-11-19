@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.5" src="https://img.shields.io/badge/version-0.2.5-4c1.svg">
+  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-4c1.svg">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
   <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
   <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
@@ -42,7 +42,8 @@
 
 ## 项目状态
 
-- 当前工作区发布版本：**0.2.5**。
+- 当前工作区发布版本：**0.3.0**。
+- **0.3.0 升级提示：** 从 Cargo 配置中移除旧 H2 后端 feature；需要连接关闭重发或 H2-to-H1 回退时显式开启。请求执行新增可选的 HTTP/建链次数上限和诊断，详见[迁移说明](CHANGELOG.md#upgrade-from-025)。
 - **0.2.3 Rust 升级提示：** 代理配置与 H3/QUIC profile 的构造方式有源码级不兼容变化；从 0.2.2 升级前请阅读[迁移说明](CHANGELOG.md#upgrade-from-022)。
 - API 已可使用，但在 1.0 前仍可能演进。
 - 当前通过 Cargo Git 依赖集成；只有贡献者修改 workspace 时才需要手动 clone。
@@ -154,7 +155,7 @@ cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 
 | 浏览器家族 | 预设 | TLS / H2 | QUIC / H3 |
 |---|---|---|---|
-| Chrome | `chrome_131`、`chrome_144`–`chrome_157` | 支持 | 需要 `quic-h3` |
+| Chrome | `chrome_131`、`chrome_144`–`chrome_158` | 支持 | 需要 `quic-h3` |
 | Firefox | `firefox_133`、`firefox_147`、`firefox_156` | 支持 | 未提供 |
 | Safari | `safari_18`、`safari_26` | 支持 | 未提供 |
 
@@ -167,6 +168,7 @@ preset 增加 QUIC/H3 指纹。各协议层的证据见[支持与验证矩阵](d
 | `chrome_155` | Chrome 155.0.8059.40，Windows | 公网被动抓包验证 TLS/H2/QUIC；直接观察到 H3 SETTINGS 和 HTTP 200 |
 | `chrome_156` | Chrome 156.0.8078.48，Windows | 公网被动抓包验证 TLS/H2/QUIC/H3 并返回 200；传输及响应边界行为继承 Chrome 155 |
 | `chrome_157` | Chrome 157.0.8103.39，Windows | 公网抓包验证 TLS/H2/QUIC/H3 并返回 200；trust-anchor ID 保留排序，其他行为策略继承 156 |
+| `chrome_158` | Chrome 158.0.8127.37，Windows | 公网抓包验证 TLS/H2/QUIC/H3 并返回 200；稳定字段与 157 一致，行为边界策略继承 157 |
 | `firefox_156` | Firefox 156.0.1，Windows | TLS/H2 已抓包；完整 preset 实测 H2 返回 HTTP 200；未提供 QUIC/H3 preset |
 
 为保证可复现性，建议明确指定版本：
@@ -304,7 +306,7 @@ let stats = session.pool_stats();
 println!("physical connections: {}/{}", stats.total, stats.max_total);
 ```
 
-0.2.0 已发布的低层 `ConnectionPool` 获取与写入方法在 0.2.1 中继续保持源码兼容，但已标记为 deprecated，因此 IDE 会提示迁移。现有调用方可以先升级版本再逐步改造；新集成应直接使用 Session 管理的连接池。这些兼容入口计划在 0.3.0 移除。
+0.2.0 已发布的低层 `ConnectionPool` 获取与写入方法在 0.3.0 中继续保持源码兼容，但已标记为 deprecated，因此 IDE 会提示迁移。现有调用方可以先升级版本再逐步改造；新集成应直接使用 Session 管理的连接池。这些兼容入口的移除延后至未来的不兼容版本。
 
 相关示例：
 

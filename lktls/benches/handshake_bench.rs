@@ -8,8 +8,90 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
+use lktls::config::{CompileOptions, CompiledClientConfig, ConnectionInputs, Transport};
 use lktls::handshake::client_hello::ClientHelloBuilder;
+use lktls::handshake::driver::HandshakeDriver;
+use lktls::handshake::framing::{message_length, HandshakeDeframer, INPUT_FRAGMENT};
 use lktls::profile::presets;
+
+fn bench_compiled_config(c: &mut Criterion) {
+    let profile = std::sync::Arc::new(presets::chrome_155());
+    let compiled = CompiledClientConfig::compile(
+        profile.clone(),
+        Transport::Tcp,
+        CompileOptions::compatibility(),
+    )
+    .unwrap();
+    let mut group = c.benchmark_group("compiled_config");
+    group.bench_function("cold_compile", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                CompiledClientConfig::compile(
+                    profile.clone(),
+                    Transport::Tcp,
+                    CompileOptions::compatibility(),
+                )
+                .unwrap(),
+            );
+        })
+    });
+    group.bench_function("cold_compile_and_start", |b| {
+        b.iter(|| {
+            let config = CompiledClientConfig::compile(
+                profile.clone(),
+                Transport::Tcp,
+                CompileOptions::compatibility(),
+            )
+            .unwrap();
+            let mut inputs = ConnectionInputs::new("www.example.com", 443);
+            inputs.alps_payload = Some(Vec::new());
+            let mut driver = HandshakeDriver::from_compiled(config, inputs).unwrap();
+            std::hint::black_box(driver.start().unwrap());
+        })
+    });
+    group.bench_function("shared_config_and_start", |b| {
+        b.iter(|| {
+            let mut inputs = ConnectionInputs::new("www.example.com", 443);
+            inputs.alps_payload = Some(Vec::new());
+            let mut driver = HandshakeDriver::from_compiled(compiled.clone(), inputs).unwrap();
+            std::hint::black_box(driver.start().unwrap());
+        })
+    });
+    group.finish();
+}
+
+fn bench_handshake_framing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("handshake_framing");
+    // Same payload copies in both paths; only queued-prefix handling differs.
+    for count in [16, 1024] {
+        let input = [4, 0, 0, 4, 1, 2, 3, 4].repeat(count);
+        group.throughput(criterion::Throughput::Bytes(input.len() as u64));
+        group.bench_function(format!("prefix_drain/{count}"), |b| {
+            b.iter(|| {
+                let mut buffer = Vec::new();
+                for fragment in input.chunks(INPUT_FRAGMENT) {
+                    buffer.extend_from_slice(fragment);
+                    while let Some(length) = message_length(&buffer, 64 * 1024).unwrap() {
+                        let message: Vec<_> = buffer.drain(..length).collect();
+                        std::hint::black_box(message);
+                    }
+                }
+            });
+        });
+        group.bench_function(format!("cursor/{count}"), |b| {
+            b.iter(|| {
+                let mut buffer = HandshakeDeframer::new(64 * 1024);
+                for fragment in input.chunks(INPUT_FRAGMENT) {
+                    buffer.push(fragment).unwrap();
+                    while let Some(message) = buffer.take_message().unwrap() {
+                        std::hint::black_box(message);
+                    }
+                }
+            });
+        });
+    }
+    group.finish();
+}
 
 // ---------------------------------------------------------------------------
 // ClientHello building
@@ -90,6 +172,8 @@ criterion_group! {
         .sample_size(100)
         .measurement_time(std::time::Duration::from_secs(5));
     targets =
+        bench_handshake_framing,
+        bench_compiled_config,
         bench_client_hello_build,
         bench_server_hello_parse
 }

@@ -58,6 +58,36 @@ impl lkrequest::DnsResolver for LocalIpv4Dns {
 }
 
 #[tokio::test]
+async fn failed_quic_tls_setup_does_not_exhaust_shared_endpoint_cids() {
+    let mut quic = lkh3::chrome_158_quic();
+    // A small nonzero CID space exposes retained IDs without a long-running test.
+    quic.connection_id_length = 1;
+    let mut tls = lktls::profile::presets::chrome_158_quic();
+    tls.cipher_suites.clear();
+    let client = lkrequest::Client::builder()
+        .quic_profile(quic)
+        .quic_fingerprint(tls)
+        .try_build()
+        .unwrap();
+    let session = client.session().http3_only().build();
+    for attempt in 1..=256 {
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.get("https://127.0.0.1:443/cid-cleanup").send(),
+        )
+        .await
+        .expect("TLS configuration error must not wait for the network")
+        .expect_err("empty cipher suites must fail TLS initialization");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid cipher suite vector length"),
+            "attempt {attempt} must preserve the TLS configuration error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn lkrequest_http3_only_reaches_local_h3_server() {
     ensure_rustls_provider();
     let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -444,6 +474,7 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
         .quic_fingerprint(lktls::profile::presets::chrome_155_quic())
         .h2_profile(h2_profile)
         .quic_profile(quic_profile)
+        .retry_on_connection_close(true)
         .add_ca_cert_der(cert_der.as_ref())
         .dns_resolver(Arc::new(LocalIpv4Dns))
         .build();
@@ -467,15 +498,24 @@ async fn lkrequest_http3_get_replays_when_zero_rtt_is_rejected() {
     drop(session);
 
     let session = client.session().http3_only().build();
-    let second = session.get(&url).send().await.unwrap_or_else(|error| {
-        let mut events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            events.push(event);
-        }
-        panic!("second h3 request failed: {error}; server events: {events:?}");
-    });
+    let second = session
+        .get(&url)
+        .collect_diagnostics(true)
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            let mut events = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+            panic!("second h3 request failed: {error}; server events: {events:?}");
+        });
     assert_eq!(second.status(), StatusCode::OK);
     assert_eq!(second.version(), lkrequest::HttpVersion::H3);
+    let diagnostics = second.diagnostics().unwrap();
+    assert!(diagnostics.quic_ms.is_some());
+    assert!(diagnostics.cipher_suite.is_some());
+    assert!(diagnostics.tls_ms.is_none());
     assert_eq!(second.text().unwrap(), "zero-rtt-ok");
     let second_seen = stream_rx.recv().await.unwrap();
     assert_eq!(second_seen.0, 2);
@@ -736,6 +776,7 @@ async fn lkrequest_http3_emits_chrome_control_stream_frames() {
         (lkrequest::preset::chrome_155(), "chrome_155_quic"),
         (lkrequest::preset::chrome_156(), "chrome_156_quic"),
         (lkrequest::preset::chrome_157(), "chrome_157_quic"),
+        (lkrequest::preset::chrome_158(), "chrome_158_quic"),
     ] {
         let control = captured_h3_control_stream(preset).await;
         assert_eq!(

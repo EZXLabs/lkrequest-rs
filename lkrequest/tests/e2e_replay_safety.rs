@@ -25,6 +25,10 @@ impl lkrequest::DnsResolver for LocalDns {
 
 fn local_client() -> Client {
     Client::builder()
+        .retry_on_connection_close(true)
+        .h2_fallback_h1(true)
+        .retry_on_connection_close(true)
+        .h2_fallback_h1(true)
         .preset(lkrequest::preset::chrome_150())
         .dns_resolver(Arc::new(LocalDns))
         .verify(false)
@@ -202,6 +206,33 @@ async fn pooled_connection_recovery_respects_post_replay_safety() {
                 "HTTP/2={http2}, idempotency={idempotency:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn default_h2_failure_is_returned_without_replay_even_when_idempotent() {
+    for streaming in [false, true] {
+        let server = recovery_server_with_mode(None, Some(1)).await;
+        let session = Client::builder()
+            .preset(lkrequest::preset::chrome_150())
+            .dns_resolver(Arc::new(LocalDns))
+            .verify(false)
+            .build()
+            .session()
+            .http2_only()
+            .build();
+        session.get(&server.url).send().await.unwrap();
+        let request = session
+            .post(&server.url)
+            .body("one-mutation")
+            .idempotency(Idempotency::Idempotent);
+        let result = if streaming {
+            request.send_streaming().await.map(|_| ())
+        } else {
+            request.send().await.map(|_| ())
+        };
+        assert!(result.is_err());
+        assert_eq!(server.counts.post.load(Ordering::SeqCst), 1);
     }
 }
 

@@ -9,6 +9,7 @@ use crate::profile::H3Profile;
 pub struct H3Sender {
     profile: H3Profile,
     inner: LiveSendRequest,
+    connection: h3_quinn::quinn::Connection,
 }
 
 /// Resolved control-stream priority, independent of automatic HTTP header
@@ -185,8 +186,21 @@ impl H3Sender {
         ))
     }
 
-    pub(crate) fn new(profile: H3Profile, inner: LiveSendRequest) -> Self {
-        Self { profile, inner }
+    pub(crate) fn new(
+        profile: H3Profile,
+        inner: LiveSendRequest,
+        connection: h3_quinn::quinn::Connection,
+    ) -> Self {
+        Self {
+            profile,
+            inner,
+            connection,
+        }
+    }
+
+    /// The transport used by this sender, including pooled sender clones.
+    pub fn quic_connection(&self) -> &h3_quinn::quinn::Connection {
+        &self.connection
     }
 
     /// Returns the immutable fingerprint profile attached to this sender.

@@ -30,6 +30,38 @@ use std::time::Duration;
 use http::StatusCode;
 use thiserror::Error;
 
+#[derive(Debug, Clone)]
+pub(crate) struct SharedIoError(pub std::sync::Arc<std::io::Error>);
+
+impl fmt::Display for SharedIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SharedIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn tls_cause<'a>(
+    mut error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a lktls::error::TlsError> {
+    loop {
+        if let Some(tls) = error.downcast_ref::<lktls::error::TlsError>() {
+            return Some(tls);
+        }
+        // io::Error::source can skip its directly wrapped error.
+        error = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            io.get_ref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static))?
+        } else {
+            error.source()?
+        };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connection phase diagnostics
 // ---------------------------------------------------------------------------
@@ -315,6 +347,10 @@ impl std::error::Error for H3RequestContext {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Internal connection admission result, restored to its prior error at
+    /// public operation boundaries. It never authorizes retry or quarantine.
+    #[error("{0}")]
+    ConnectAttemptDenied(Box<ConnectAttemptDenial>),
     #[error("trust anchor recovery failed: {source}")]
     TrustAnchorRecovery {
         #[source]
@@ -405,7 +441,7 @@ pub enum Error {
     /// Indicates which step in the connection pipeline (DNS, TCP, TLS, etc.)
     /// failed, making diagnostics easier.
     #[error("{0}")]
-    Connection(Box<ConnectionError>),
+    Connection(#[source] Box<ConnectionError>),
 
     /// A timeout was reached.
     ///
@@ -454,7 +490,121 @@ pub enum Error {
     },
 }
 
+/// Structured connection admission refusal with an optional preceding error.
+/// Fields are private so admission metadata can evolve without changing layouts.
+#[derive(Debug, Error)]
+#[error("connection attempt allowance exhausted")]
+pub struct ConnectAttemptDenial {
+    limit: Option<u64>,
+    #[source]
+    prior: Option<Error>,
+}
+
+impl ConnectAttemptDenial {
+    /// The finite limit, or `None` if the accounting counter itself overflowed.
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct ConnectExecutionIo(#[source] Error);
+
+pub(crate) fn connect_execution_io(error: Error) -> std::io::Error {
+    std::io::Error::other(ConnectExecutionIo(error))
+}
+
+pub(crate) fn take_connect_execution_io(
+    error: std::io::Error,
+) -> std::result::Result<Error, std::io::Error> {
+    if !error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ConnectExecutionIo>())
+    {
+        return Err(error);
+    }
+    let source = error.into_inner().expect("checked execution source");
+    Ok(source
+        .downcast::<ConnectExecutionIo>()
+        .expect("checked execution type")
+        .0)
+}
+
 impl Error {
+    pub(crate) fn connect_attempt_denied(limit: Option<u64>) -> Self {
+        Self::ConnectAttemptDenied(Box::new(ConnectAttemptDenial { limit, prior: None }))
+    }
+
+    pub(crate) fn is_connect_attempt_denied(&self) -> bool {
+        matches!(self.unwrapped(), Self::ConnectAttemptDenied(_))
+    }
+
+    pub(crate) fn connect_denial_reason(&self) -> Option<crate::AttemptDenialReason> {
+        match self.unwrapped() {
+            Self::ConnectAttemptDenied(denial) => Some(if denial.limit.is_some() {
+                crate::AttemptDenialReason::ConnectLimit
+            } else {
+                crate::AttemptDenialReason::CounterExhausted
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn with_connect_prior(self, prior: Error) -> Self {
+        match self {
+            Self::ConnectAttemptDenied(mut denial) => {
+                if denial.prior.is_none() {
+                    if prior.is_connect_attempt_denied() {
+                        return prior;
+                    }
+                    denial.prior = Some(prior);
+                }
+                Self::ConnectAttemptDenied(denial)
+            }
+            Self::TrustAnchorRecovery { source, info } => Self::TrustAnchorRecovery {
+                source: Box::new(source.with_connect_prior(prior)),
+                info,
+            },
+            Self::H3RequestContext(mut context) => {
+                context.source = Box::new(context.source.with_connect_prior(prior));
+                Self::H3RequestContext(context)
+            }
+            other => other,
+        }
+    }
+
+    pub(crate) fn map_connect_prior(mut self, map: impl FnOnce(Error) -> Error) -> Self {
+        if let Self::ConnectAttemptDenied(denial) = &mut self {
+            denial.prior = denial.prior.take().map(map);
+        }
+        self
+    }
+
+    pub(crate) fn into_public_connect_error(self) -> Self {
+        match self {
+            Self::ConnectAttemptDenied(denial) => denial.prior.map_or_else(
+                || {
+                    Self::ResourceLimitExceeded(if denial.limit.is_some() {
+                        "connection attempt limit exhausted".into()
+                    } else {
+                        "connection attempt counter exhausted".into()
+                    })
+                },
+                Self::into_public_connect_error,
+            ),
+            Self::TrustAnchorRecovery { source, info } => Self::TrustAnchorRecovery {
+                source: Box::new(source.into_public_connect_error()),
+                info,
+            },
+            Self::H3RequestContext(mut context) => {
+                context.source = Box::new(context.source.into_public_connect_error());
+                Self::H3RequestContext(context)
+            }
+            other => other,
+        }
+    }
+
     /// Returns the H3 caller/backend provenance attached by an opt-in request mode.
     pub fn h3_request_context(&self) -> Option<&H3RequestContext> {
         match self {
@@ -543,6 +693,11 @@ impl Error {
             return false;
         }
         if self.is_address_family_mismatch() {
+            return false;
+        }
+        if self.phase() == Some(ConnectionPhase::HttpRequest)
+            && tls_cause(self.unwrapped()).is_some()
+        {
             return false;
         }
         matches!(
@@ -701,10 +856,7 @@ impl Error {
 
     /// Returns the TLS alert if this error originated from a TLS alert.
     pub fn as_tls_alert(&self) -> Option<&lktls::error::TlsAlert> {
-        match self.unwrapped() {
-            Error::Tls(tls_err) => tls_err.as_alert(),
-            _ => None,
-        }
+        tls_cause(self.unwrapped()).and_then(lktls::error::TlsError::as_alert)
     }
 
     /// Returns the proxy error details if this is a proxy error.
@@ -840,6 +992,13 @@ impl Error {
     /// Preserve hyper's typed I/O cause before its display text loses it.
     pub(crate) fn from_h1_error(error: hyper::Error, context: &str) -> Self {
         use std::error::Error as _;
+        if let Some(tls) = tls_cause(&error) {
+            return Self::connection(
+                ConnectionPhase::HttpRequest,
+                format!("{context}: {tls}"),
+                Some(Box::new(error)),
+            );
+        }
         let message = format!("{context}: {error}");
         let kind = if error.is_canceled() || error.is_closed() {
             Some(ConnectionClosedKind::ChannelClosed)
@@ -875,6 +1034,32 @@ impl Error {
             None if error.is_user() || error.is_parse() => Self::Http(message),
             None => Self::http_or_connection_closed(ConnectionPhase::HttpRequest, message),
         }
+    }
+
+    pub(crate) fn from_h1_io(error: std::sync::Arc<std::io::Error>) -> Self {
+        if tls_cause(error.as_ref()).is_none() {
+            let kind = match error.kind() {
+                std::io::ErrorKind::ConnectionReset => Some(ConnectionClosedKind::Reset),
+                std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof => {
+                    Some(ConnectionClosedKind::Eof)
+                }
+                std::io::ErrorKind::BrokenPipe => Some(ConnectionClosedKind::BrokenPipe),
+                std::io::ErrorKind::NotConnected => Some(ConnectionClosedKind::NotConnected),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return Self::connection_closed(
+                    ConnectionPhase::HttpRequest,
+                    kind,
+                    error.to_string(),
+                );
+            }
+        }
+        Self::connection(
+            ConnectionPhase::HttpRequest,
+            format!("HTTP/1.1 transport failed: {error}"),
+            Some(Box::new(SharedIoError(error))),
+        )
     }
 
     /// Attach typed retry provenance without changing the default error mapping.
@@ -1102,6 +1287,10 @@ fn classify_connection_closed_message(message: &str) -> Option<ConnectionClosedK
         None
     }
 }
+
+#[cfg(test)]
+#[path = "error/connect_admission_tests.rs"]
+mod connect_admission_tests;
 
 #[cfg(test)]
 mod tests {

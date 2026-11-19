@@ -32,6 +32,7 @@ pub enum PresetKind {
     Chrome155,
     Chrome156,
     Chrome157,
+    Chrome158,
     Firefox133,
     Firefox147,
     Firefox156,
@@ -40,16 +41,22 @@ pub enum PresetKind {
 }
 
 pub struct ClientBuilderState {
+    pub attempt_limits: lkrequest::AttemptLimits,
     pub trust_anchor_policy: lkrequest::TrustAnchorPolicy,
     pub trust_anchor_bindings: Vec<lkrequest::TrustAnchorBinding>,
     pub preset: PresetKind,
+    pub preset_override: Option<lkrequest::preset::ClientPreset>,
+    pub tls_profile: Option<lkrequest::lktls::profile::TlsProfile>,
+    pub quic_tls_profile: Option<Option<lkrequest::lktls::profile::TlsProfile>>,
     pub h2_preset: Option<PresetKind>,
-    pub dns_timeout_ms: Option<u64>,
-    pub tcp_connect_timeout_ms: Option<u64>,
-    pub tls_handshake_timeout_ms: Option<u64>,
-    pub quic_connect_timeout_ms: Option<u64>,
-    pub ttfb_timeout_ms: Option<u64>,
-    pub total_timeout_ms: Option<u64>,
+    pub h2_profile: Option<lkrequest::h2::H2Profile>,
+    pub dns_timeout_ms: Option<Option<u64>>,
+    pub tcp_connect_timeout_ms: Option<Option<u64>>,
+    pub tls_handshake_timeout_ms: Option<Option<u64>>,
+    pub quic_connect_timeout_ms: Option<Option<u64>>,
+    pub ttfb_timeout_ms: Option<Option<u64>>,
+    pub total_timeout_ms: Option<Option<u64>>,
+    pub read_idle_timeout_ms: Option<u64>,
     pub verify: bool,
     pub use_native_certs: bool,
     pub dns_source: Option<ClientDnsSource>,
@@ -63,6 +70,8 @@ pub struct ClientBuilderState {
     pub ech_config: Option<Vec<u8>>,
     pub quic_profile_json: Option<Option<String>>,
     pub session_resumption: Option<lkrequest::lktls::profile::types::SessionResumptionConfig>,
+    pub tls_session_cache_enabled: Option<bool>,
+    pub tls_session_cache_ttl_ms: Option<u64>,
     pub tcp_fingerprint_ja4t: Option<String>,
     pub max_response_body_size: Option<usize>,
     pub max_header_count: Option<usize>,
@@ -89,16 +98,22 @@ pub struct ClientBuilderState {
 impl Default for ClientBuilderState {
     fn default() -> Self {
         Self {
+            attempt_limits: Default::default(),
             trust_anchor_policy: Default::default(),
             trust_anchor_bindings: Vec::new(),
             preset: PresetKind::default(),
+            preset_override: None,
+            tls_profile: None,
+            quic_tls_profile: None,
             h2_preset: None,
+            h2_profile: None,
             dns_timeout_ms: None,
             tcp_connect_timeout_ms: None,
             tls_handshake_timeout_ms: None,
             quic_connect_timeout_ms: None,
             ttfb_timeout_ms: None,
             total_timeout_ms: None,
+            read_idle_timeout_ms: None,
             verify: true,
             use_native_certs: true,
             dns_source: None,
@@ -112,6 +127,8 @@ impl Default for ClientBuilderState {
             ech_config: None,
             quic_profile_json: None,
             session_resumption: None,
+            tls_session_cache_enabled: None,
+            tls_session_cache_ttl_ms: None,
             tcp_fingerprint_ja4t: None,
             max_response_body_size: None,
             max_header_count: None,
@@ -203,6 +220,7 @@ impl SessionHandle {
 }
 
 pub struct SessionBuilderState {
+    pub attempt_limits: lkrequest::AttemptLimits,
     pub client: Arc<ClientShared>,
     pub proxy: Option<String>,
     /// Set by `lk_session_builder_set_proxy_config`; takes precedence over
@@ -246,6 +264,7 @@ pub enum SessionRetryPolicy {
 impl SessionBuilderState {
     pub fn new(client: Arc<ClientShared>) -> Self {
         Self {
+            attempt_limits: Default::default(),
             client,
             proxy: None,
             proxy_config: None,
@@ -277,6 +296,8 @@ pub enum RequestBody {
 }
 
 pub struct RequestConfig {
+    pub attempt_limits: lkrequest::AttemptLimits,
+    pub observe_attempts: bool,
     pub h2_priority_weight: Option<u8>,
     pub method: http::Method,
     pub url: String,
@@ -301,6 +322,8 @@ pub struct RequestConfig {
 impl RequestConfig {
     pub fn new(method: http::Method, url: String) -> Self {
         Self {
+            attempt_limits: Default::default(),
+            observe_attempts: false,
             h2_priority_weight: None,
             method,
             url,
@@ -368,6 +391,7 @@ pub struct RequestHandle {
 }
 
 pub struct ResponseHandle {
+    pub observer: Option<lkrequest::AttemptObserver>,
     pub response: lkrequest::Response,
     pub diagnostics: FfiDiagnostics,
     pub diagnostics_json: std::sync::OnceLock<Vec<u8>>,
@@ -395,6 +419,7 @@ pub struct StreamingShared {
 }
 
 pub struct StreamingResponseHandle {
+    pub observer: Option<lkrequest::AttemptObserver>,
     pub client: Arc<ClientShared>,
     pub shared: Arc<StreamingShared>,
     pub status: u16,
@@ -405,6 +430,7 @@ pub struct StreamingResponseHandle {
 }
 
 pub struct ErrorHandle {
+    pub observer: Option<lkrequest::AttemptObserver>,
     pub error: FfiError,
     pub diagnostics: FfiDiagnostics,
     pub diagnostics_json: std::sync::OnceLock<Vec<u8>>,
@@ -855,6 +881,7 @@ impl Default for OpShared {
 }
 
 pub struct OpHandle {
+    pub observer: Option<lkrequest::AttemptObserver>,
     pub client: Option<Arc<ClientShared>>,
     pub shared: Arc<OpShared>,
     pub counted: bool,

@@ -214,11 +214,15 @@ async fn fallback_waiters(
                     .post(&url)
                     .idempotency(lkrequest::Idempotency::NotIdempotent);
                 let request = if raced {
-                    request.protocol_policy(ProtocolPolicy::chrome_standard().with_acquisition(
-                        AcquisitionPolicy::Race(
-                            lkrequest::RacePolicy::chrome_like().with_tcp_delay(Duration::ZERO),
-                        ),
-                    ))
+                    // Count foreground acquisition only; a TCP win must not
+                    // start an independent background upgrade probe here.
+                    request.protocol_policy(
+                        ProtocolPolicy::chrome_standard()
+                            .with_acquisition(AcquisitionPolicy::Race(
+                                lkrequest::RacePolicy::chrome_like().with_tcp_delay(Duration::ZERO),
+                            ))
+                            .with_upgrade(lkrequest::UpgradePolicy::Off),
+                    )
                 } else {
                     request
                 };
@@ -247,13 +251,14 @@ async fn fallback_waiters(
         }
         reject_tx.send(()).unwrap();
         if race {
-            fast_seen.recv().await.unwrap();
+            // The TCP racer and QUIC fallback share the pending handshake.
+            // Release it before waiting for either request to reach H2.
             tcp_release.send(()).unwrap();
+            fast_seen.recv().await.unwrap();
             assert!(
-                !tcp_outcome.await.unwrap(),
-                "the losing TCP job must not send another POST"
+                tcp_outcome.await.unwrap(),
+                "the shared TCP handshake must serve the winning race job"
             );
-            assert_eq!(requests.load(Ordering::SeqCst), 2);
             assert!(!leader.is_finished());
             release.send(true).unwrap();
         }
@@ -269,10 +274,10 @@ async fn fallback_waiters(
         if !race {
             assert!(!leader.is_finished());
         }
-        assert_eq!(requests.load(Ordering::SeqCst), if race { 2 } else { 3 });
-        assert_eq!(session.pool_stats().total, 1);
         release.send(true).unwrap();
         assert_eq!(leader.await.unwrap().unwrap().bytes(), b"ok");
+        assert_eq!(session.pool_stats().total, 1);
+        assert_eq!(requests.load(Ordering::SeqCst), if race { 2 } else { 3 });
         (
             quic_attempts.load(Ordering::SeqCst),
             tcp_connections.load(Ordering::SeqCst),
@@ -304,5 +309,5 @@ async fn coalesced_fallback_reuses_h2_before_response_body() {
 
 #[tokio::test]
 async fn coalesced_fallback_preserves_protocol_race_single_send() {
-    assert_eq!(fallback_waiters(false, false, true).await, (1, 3));
+    assert_eq!(fallback_waiters(false, false, true).await, (1, 2));
 }

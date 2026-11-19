@@ -43,6 +43,7 @@ pub mod engine;
 pub mod hpack;
 mod hpack_enc;
 pub mod policy;
+mod request_warnings;
 pub mod stream;
 
 pub const CONNECTION_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

@@ -2,6 +2,17 @@
 
 use super::Extension;
 
+pub(super) fn validate_payload(data: &[u8]) -> crate::error::Result<()> {
+    let mut input = crate::wire::Reader::new(data);
+    let algorithms = input.vector16()?;
+    if algorithms.is_empty() || !algorithms.len().is_multiple_of(2) {
+        return Err(crate::wire::decode_error(
+            "signature_algorithms must contain a nonempty list of SignatureScheme values",
+        ));
+    }
+    input.finish()
+}
+
 /// Lists the signature algorithms the client supports.
 pub struct SignatureAlgorithms {
     /// Ordered list of SignatureScheme code-points.

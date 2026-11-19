@@ -16,6 +16,9 @@ members = [
     "lkquic",
 ]
 exclude = [
+    "deps/hickory-proto",
+    "deps/hickory-net",
+    "deps/hickory-resolver",
     "deps/h3/h3",
     "deps/h3/h3-datagram",
     "deps/h3/h3-quinn",
@@ -113,7 +116,7 @@ base64 = "0.22"
 bitflags = "2"
 
 # DNS
-hickory-resolver = { version = "0.26", default-features = false, features = [
+hickory-resolver = { path = "deps/hickory-resolver", version = "0.26.3", default-features = false, features = [
     "tokio",
     "tls-aws-lc-rs",
     "rustls-platform-verifier",

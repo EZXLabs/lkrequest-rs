@@ -148,6 +148,7 @@ async fn late_h2_failure_reuses_replacement_and_preserves_accepted_responses() {
                 old.await.unwrap();
             });
             let client = lkrequest::Client::builder()
+                .retry_on_connection_close(true)
                 .preset(lkrequest::preset::chrome_155())
                 .add_ca_cert_der(cert.cert.der())
                 .build();

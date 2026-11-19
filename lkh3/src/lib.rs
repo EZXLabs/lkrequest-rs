@@ -38,10 +38,10 @@ pub use profile::{
     chrome_146_h3, chrome_146_quic, chrome_150_h3, chrome_150_quic, chrome_151_h3, chrome_151_quic,
     chrome_152_h3, chrome_152_quic, chrome_153_h3, chrome_153_quic, chrome_154_h3, chrome_154_quic,
     chrome_155_h3, chrome_155_quic, chrome_156_h3, chrome_156_quic, chrome_157_h3, chrome_157_quic,
-    chrome_h3, chrome_quic, encode_alps_h3_settings, firefox_h3, H3Profile, InitialFrameElement,
-    InitialFrameLayoutProfile, InitialPacketLayoutProfile, PseudoHeaderId,
-    QuicPacketizationProfile, QuicProfile, QuicTransportParams, SETTINGS_H3_DATAGRAM,
-    SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
+    chrome_158_h3, chrome_158_quic, chrome_h3, chrome_quic, encode_alps_h3_settings, firefox_h3,
+    H3Profile, InitialFrameElement, InitialFrameLayoutProfile, InitialPacketLayoutProfile,
+    PseudoHeaderId, QuicPacketizationProfile, QuicProfile, QuicTransportParams,
+    SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
     SETTINGS_QPACK_MAX_TABLE_CAPACITY,
 };
 pub use sender::{H3Sender, RequestPriorityUpdate};

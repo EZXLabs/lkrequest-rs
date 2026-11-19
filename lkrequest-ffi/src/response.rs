@@ -45,6 +45,7 @@ pub(crate) fn make_response_handle(
     diagnostics: FfiDiagnostics,
 ) -> ResponseHandle {
     ResponseHandle {
+        observer: None,
         response,
         diagnostics,
         diagnostics_json: std::sync::OnceLock::new(),

@@ -5,6 +5,30 @@
 
 use super::Extension;
 
+pub(super) fn validate_client_payload(data: &[u8]) -> crate::error::Result<()> {
+    super::registry::require_empty(data)
+}
+
+pub(super) fn parse_tls12_server(
+    mut data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    use bytes::Buf;
+    if data.remaining() < 2 || data.get_u16() as usize != data.remaining() || data.is_empty() {
+        return Err(super::tls12::decode_error("invalid SCT list length"));
+    }
+    while !data.is_empty() {
+        if data.remaining() < 2 {
+            return Err(super::tls12::decode_error("truncated SCT entry length"));
+        }
+        let length = data.get_u16() as usize;
+        if length == 0 || length > data.remaining() {
+            return Err(super::tls12::decode_error("invalid SCT entry length"));
+        }
+        data.advance(length);
+    }
+    Ok(super::tls12::ServerValue::SignedCertificateTimestamps)
+}
+
 /// Signed Certificate Timestamp extension.
 ///
 /// Sent with an empty payload in the ClientHello to request that the

@@ -9,7 +9,9 @@ use crate::protocol::ProtocolPolicy;
 use crate::proxy::ProxyConfig;
 use crate::response::{BodyStream, StreamingResponse};
 
+use super::execution::{HttpAttempt, HttpPermit, RecoveryOwner};
 use super::pipeline;
+use super::recovery::{self, ReplayFacts};
 use super::{PreferredHttpVersion, Session};
 
 /// Internal builder used by [`super::RequestBuilder::send_streaming`].
@@ -19,6 +21,8 @@ use super::{PreferredHttpVersion, Session};
 #[derive(Clone)]
 pub(crate) struct StreamRequestBuilder {
     pub(crate) session: Session,
+    pub(crate) execution: super::execution::RequestExecution,
+    pub(crate) attempt: HttpAttempt,
     pub(crate) method: http::Method,
     pub(crate) url: String,
     pub(crate) headers: HeaderMap,
@@ -39,7 +43,7 @@ pub(crate) struct StreamRequestBuilder {
     pub(crate) h2_priority_weight: Option<u8>,
     pub(crate) idempotency: super::Idempotency,
     #[cfg(feature = "quic-h3")]
-    pub(crate) race_send_gate: Option<pipeline::RaceSendGate>,
+    pub(crate) race_send_gates: Vec<pipeline::RaceSendGate>,
 }
 
 impl StreamRequestBuilder {
@@ -48,51 +52,92 @@ impl StreamRequestBuilder {
     /// Heap-allocated future to avoid stack overflow (see `establish_and_send`).
     pub(crate) fn send_streaming_inner(
         self,
+        owner: RecoveryOwner,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send>>
     {
+        let execution = self.execution.clone();
+        Box::pin(async move {
+            let active = self.send_streaming_active(owner);
+            tokio::pin!(active);
+            execution.run(&mut active).await
+        })
+    }
+
+    async fn send_streaming_active(self, owner: RecoveryOwner) -> Result<StreamingResponse> {
         #[cfg(feature = "quic-h3")]
         if self.session.h3_retry_mode() == crate::retry::H3RetryMode::Chrome155ProtocolErrors {
-            return Box::pin(async move {
-                let mut request = self;
-                let mut retries = 0;
-                loop {
-                    let result = request.clone().send_streaming_with_pool_retry(true).await;
-                    if let Err(ref error) = result {
-                        if crate::retry::chrome_h3_owns_error(
-                            request.session.h3_retry_mode(),
-                            error,
-                        ) && crate::retry::chrome_h3_can_retry(
-                            error,
+            let mut request = self;
+            let mut recovery = recovery::ProtocolRecovery::new(owner);
+            let mut prior: Option<Box<Error>> = None;
+            loop {
+                let before = request
+                    .execution
+                    .has_connect_limit()
+                    .then(|| request.execution.submissions());
+                let result = request.clone().send_streaming_with_pool_retry(true).await;
+                let result = match (result, prior.take()) {
+                    (Err(error), Some(prior))
+                        if error.is_connect_attempt_denied()
+                            && before == Some(request.execution.submissions()) =>
+                    {
+                        Err(error.with_connect_prior(*prior))
+                    }
+                    (result, _) => result,
+                };
+                if let Err(ref error) = result {
+                    let policy = request.effective_protocol_policy();
+                    let route = pipeline::chrome_h3_retry_route(
+                        &policy,
+                        request.effective_http_version(&policy),
+                        request.effective_proxy(),
+                    );
+                    if let Some(retry) = recovery.retry(
+                        request.session.h3_retry_mode(),
+                        error,
+                        ReplayFacts::new(
+                            &request.method,
                             request.idempotency,
                             request.body.as_ref(),
-                            retries,
-                        ) {
-                            let policy = request.effective_protocol_policy();
-                            if let Some(route) = pipeline::chrome_h3_retry_route(
-                                &policy,
-                                request.effective_http_version(&policy),
-                                request.effective_proxy(),
-                            ) {
-                                retries += 1;
-                                if route == pipeline::ProtocolDecision::Tcp {
-                                    request.protocol_policy_override =
-                                        Some(pipeline::chrome_h3_retry_tcp_policy());
-                                    request.version_override = Some(PreferredHttpVersion::Auto);
-                                }
-                                tracing::debug!(
-                                    retry = retries,
-                                    protocol = route.as_str(),
-                                    "h3.chrome_protocol_error_retry",
-                                );
-                                continue;
-                            }
+                        ),
+                        route,
+                        None,
+                    ) {
+                        request.attempt = retry.attempt;
+                        if retry.route == pipeline::ProtocolDecision::Tcp {
+                            request.protocol_policy_override =
+                                Some(pipeline::chrome_h3_retry_tcp_policy());
+                            request.version_override = Some(PreferredHttpVersion::Auto);
                         }
+                        if before.is_some() {
+                            prior = result.err().map(Box::new);
+                        }
+                        continue;
                     }
-                    return result;
                 }
-            });
+                return result;
+            }
         }
-        self.send_streaming_with_pool_retry(true)
+        #[cfg(not(feature = "quic-h3"))]
+        let _ = owner;
+        self.send_streaming_with_pool_retry(true).await
+    }
+
+    fn with_attempt(mut self, attempt: HttpAttempt) -> Self {
+        self.attempt = attempt;
+        self
+    }
+
+    #[cfg(feature = "quic-h3")]
+    async fn acquire_send_gates(&self) {
+        for gate in &self.race_send_gates {
+            gate.acquired().await;
+        }
+    }
+
+    async fn acquire_http_permit(&self) -> Result<HttpPermit> {
+        #[cfg(feature = "quic-h3")]
+        self.acquire_send_gates().await;
+        self.attempt.take()
     }
 
     fn send_streaming_with_pool_retry(
@@ -101,6 +146,7 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send>>
     {
         Box::pin(async move {
+            self.execution.ensure_active()?;
             let effective_proxy = self.effective_proxy();
             let protocol_policy = self.effective_protocol_policy();
             protocol_policy.validate()?;
@@ -137,39 +183,43 @@ impl StreamRequestBuilder {
                     }
 
                     match result {
-                        Err(ref e)
-                            if retry_pooled
-                                && !crate::retry::chrome_h3_owns_error(
-                                    self.session.h3_retry_mode(),
-                                    e,
-                                )
-                                && e.is_connection_closed()
-                                && crate::retry::retry_is_replay_safe(
-                                    &self.method,
-                                    self.idempotency,
-                                    e,
-                                )
-                                && self
-                                    .session
-                                    .inner
-                                    .client
-                                    .fallback()
-                                    .retry_on_connection_close
-                                && self
-                                    .body
-                                    .as_ref()
-                                    .is_none_or(crate::body::RequestBody::can_replay) =>
-                        {
-                            tracing::debug!(
-                                host = %target.host,
-                                error = %e,
-                                "connection.pooled_h3_closed_retrying",
-                            );
-                            {
-                                let mut pool = self.session.inner.pool.lock();
-                                pool.remove_acquired(&target.conn_key, &token);
+                        Err(error) => {
+                            if !crate::retry::chrome_h3_owns_error(
+                                self.session.h3_retry_mode(),
+                                &error,
+                            ) {
+                                if let Some(attempt) = recovery::connection_retry(
+                                    retry_pooled,
+                                    self.session
+                                        .inner
+                                        .client
+                                        .fallback()
+                                        .retry_on_connection_close,
+                                    ReplayFacts::new(
+                                        &self.method,
+                                        self.idempotency,
+                                        self.body.as_ref(),
+                                    ),
+                                    &error,
+                                    &self.attempt,
+                                ) {
+                                    tracing::debug!(
+                                        host = %target.host,
+                                        error = %error,
+                                        "connection.pooled_h3_closed_retrying",
+                                    );
+                                    {
+                                        let mut pool = self.session.inner.pool.lock();
+                                        pool.remove_acquired(&target.conn_key, &token);
+                                    }
+                                    return self
+                                        .with_attempt(attempt)
+                                        .send_streaming_with_pool_retry(false)
+                                        .await
+                                        .map_err(|next| next.with_connect_prior(error));
+                                }
                             }
-                            self.send_streaming_with_pool_retry(false).await
+                            Err(error)
                         }
                         other => other,
                     }
@@ -182,49 +232,57 @@ impl StreamRequestBuilder {
                         let result = self.send_h2_streaming(sender, &target).await;
 
                         match result {
-                            Err(ref e)
-                                if retry_pooled
-                                    && e.is_connection_closed()
-                                    && crate::retry::retry_is_replay_safe(
-                                        &self.method,
-                                        self.idempotency,
-                                        e,
-                                    )
-                                    && self
-                                        .session
+                            Err(error) => {
+                                if let Some(attempt) = recovery::connection_retry(
+                                    retry_pooled,
+                                    self.session
                                         .inner
                                         .client
                                         .fallback()
-                                        .retry_on_connection_close
-                                    && self
-                                        .body
-                                        .as_ref()
-                                        .is_none_or(crate::body::RequestBody::can_replay) =>
-                            {
-                                tracing::debug!(
-                                    host = %target.host,
-                                    error = %e,
-                                    "connection.pooled_h2_closed_retrying",
-                                );
-                                {
-                                    let mut pool = self.session.inner.pool.lock();
-                                    pool.remove_acquired(&target.conn_key, &token);
+                                        .retry_on_connection_close,
+                                    ReplayFacts::new(
+                                        &self.method,
+                                        self.idempotency,
+                                        self.body.as_ref(),
+                                    ),
+                                    &error,
+                                    &self.attempt,
+                                ) {
+                                    tracing::debug!(
+                                        host = %target.host,
+                                        error = %error,
+                                        "connection.pooled_h2_closed_retrying",
+                                    );
+                                    {
+                                        let mut pool = self.session.inner.pool.lock();
+                                        pool.remove_acquired(&target.conn_key, &token);
+                                    }
+                                    return self
+                                        .with_attempt(attempt)
+                                        .send_streaming_with_pool_retry(false)
+                                        .await
+                                        .map_err(|next| next.with_connect_prior(error));
                                 }
-                                self.send_streaming_with_pool_retry(false).await
+                                Err(error)
                             }
                             other => other,
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         {
                             let mut pool = self.session.inner.pool.lock();
                             pool.remove_acquired(&target.conn_key, &token);
                         }
-                        if retry_pooled {
+                        let prior = Error::h2_or_connection_closed(
+                            ConnectionPhase::HttpRequest,
+                            format!("pooled H2 connection unavailable: {error}"),
+                        );
+                        let result = if retry_pooled {
                             self.send_streaming_with_pool_retry(false).await
                         } else {
                             self.establish_and_send_streaming(&target, None).await
-                        }
+                        };
+                        result.map_err(|next| next.with_connect_prior(prior))
                     }
                 },
                 Some(AcquiredConnection::H1 {
@@ -232,39 +290,44 @@ impl StreamRequestBuilder {
                     conn_task,
                     permit,
                 }) => {
-                    if sender.ready().await.is_err() {
+                    if let Err(error) = sender.ready().await {
                         conn_task.abort();
                         drop(permit);
-                        return if retry_pooled {
+                        let prior = error;
+                        let result = if retry_pooled {
                             self.send_streaming_with_pool_retry(false).await
                         } else {
                             self.establish_and_send_streaming(&target, None).await
                         };
+                        return result.map_err(|next| next.with_connect_prior(prior));
                     }
                     let result = self
                         .send_h1_streaming(sender, conn_task, permit, &target)
                         .await;
                     match result {
-                        Err(ref error)
-                            if retry_pooled
-                                && error.is_connection_closed()
-                                && crate::retry::retry_is_replay_safe(
-                                    &self.method,
-                                    self.idempotency,
-                                    error,
-                                )
-                                && self
-                                    .session
+                        Err(error) => {
+                            if let Some(attempt) = recovery::connection_retry(
+                                retry_pooled,
+                                self.session
                                     .inner
                                     .client
                                     .fallback()
-                                    .retry_on_connection_close
-                                && self
-                                    .body
-                                    .as_ref()
-                                    .is_none_or(crate::body::RequestBody::can_replay) =>
-                        {
-                            self.send_streaming_with_pool_retry(false).await
+                                    .retry_on_connection_close,
+                                ReplayFacts::new(
+                                    &self.method,
+                                    self.idempotency,
+                                    self.body.as_ref(),
+                                ),
+                                &error,
+                                &self.attempt,
+                            ) {
+                                return self
+                                    .with_attempt(attempt)
+                                    .send_streaming_with_pool_retry(false)
+                                    .await
+                                    .map_err(|next| next.with_connect_prior(error));
+                            }
+                            Err(error)
                         }
                         other => other,
                     }
@@ -305,6 +368,7 @@ impl StreamRequestBuilder {
         sender: lkh2::H2ReadySender,
         target: &pipeline::ParsedTarget,
     ) -> Result<StreamingResponse> {
+        let permit = self.acquire_http_permit().await?;
         let client = &self.session.inner.client;
         let end_stream = self.body.is_none();
         let mut request = pipeline::prepare_h2_request(
@@ -319,10 +383,14 @@ impl StreamRequestBuilder {
         let resp_future = if let Some(body) = self.body.as_ref().filter(|body| body.is_streaming())
         {
             body.prepare_headers(request.headers_mut())?;
-            sender.send_streaming_request(request, body.clone().into_upload()?)
+            let upload = body.clone().into_upload()?;
+            let submission = permit.commit("h2")?;
+            submission.submit(|| sender.send_streaming_request(request, upload))
         } else {
-            let (resp_future, mut send_stream) =
-                sender.send_request(request, end_stream).map_err(|e| {
+            let submission = permit.commit("h2")?;
+            let (resp_future, mut send_stream) = submission
+                .submit(|| sender.send_request(request, end_stream))
+                .map_err(|e| {
                     Error::h2_or_connection_closed(
                         ConnectionPhase::HttpRequest,
                         format!("failed to send H2 request: {e}"),
@@ -385,9 +453,11 @@ impl StreamRequestBuilder {
         sender: &mut lkh3::H3Sender,
         target: &pipeline::ParsedTarget,
     ) -> Result<StreamingResponse> {
-        if let Some(gate) = &self.race_send_gate {
-            gate.acquired().await;
-        }
+        let permit = self.acquire_http_permit().await?;
+        crate::diagnostics::record_h3_connection(
+            sender.quic_connection(),
+            crate::protocol::proxy_uses_remote_dns(self.effective_proxy()),
+        );
         let client = &self.session.inner.client;
         let mut request =
             pipeline::prepare_h3_request(&self.request_head_input(target), self.body.clone())?;
@@ -405,12 +475,16 @@ impl StreamRequestBuilder {
             .and_then(crate::body::RequestBody::buffered)
             .cloned();
         let request = request.map(|_| ());
-        let response = pipeline::await_response_headers(client, async {
-            match upload {
-                Some(upload) => sender.send_streaming_request(request, upload).await,
-                None => sender.send_request(request.map(|_| buffered)).await,
-            }
-        })
+        let submission = permit.commit("h3")?;
+        let response = pipeline::await_response_headers(
+            client,
+            submission.submit(|| async {
+                match upload {
+                    Some(upload) => sender.send_streaming_request(request, upload).await,
+                    None => sender.send_request(request.map(|_| buffered)).await,
+                }
+            }),
+        )
         .await?
         .map_err(|e| pipeline::h3_request_error(&self.session, e, false))?;
         crate::diagnostics::record_ttfb_ms(ttfb_started.elapsed().as_millis() as u64);
@@ -455,6 +529,7 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send + 'a>>
     {
         Box::pin(async move {
+            self.execution.ensure_active()?;
             if self.body.as_ref().is_some_and(|body| !body.can_replay()) {
                 return Err(Error::Http(
                     "cannot replay consumed streaming request body".into(),
@@ -527,6 +602,7 @@ impl StreamRequestBuilder {
                             target.conn_key.clone(),
                             quic_discovery.clone(),
                             effective_proxy.clone(),
+                            &self.execution.connection(),
                         );
                     }
                     result
@@ -608,9 +684,9 @@ impl StreamRequestBuilder {
             );
             let (quic_gate, tcp_gate, selected) = pipeline::RaceSendGate::pair();
             let mut quic_request = self.clone();
-            quic_request.race_send_gate = Some(quic_gate);
+            quic_request.race_send_gates.push(quic_gate);
             let mut tcp_request = self.clone();
-            tcp_request.race_send_gate = Some(tcp_gate);
+            tcp_request.race_send_gates.push(tcp_gate);
             let quic_future = quic_request.establish_and_send_streaming_quic(
                 target,
                 discovery,
@@ -638,6 +714,7 @@ impl StreamRequestBuilder {
                         self.session.spawn_background_tcp_probe(
                             target.host.clone(), target.port, target.scheme, target.conn_key.clone(),
                             effective_proxy_owned.clone(), http_version_pref,
+                            &self.execution.connection(),
                         );
                     }
                     pipeline::RaceEvent::Won(pipeline::ProtocolDecision::Tcp)
@@ -646,6 +723,7 @@ impl StreamRequestBuilder {
                         self.session.spawn_background_quic_probe(
                             target.host.clone(), target.port, target.conn_key.clone(),
                             discovery.clone(), effective_proxy_owned.clone(),
+                            &self.execution.connection(),
                         );
                     }
                     pipeline::RaceEvent::Failed { protocol, stage, error } => match (protocol, stage) {
@@ -683,12 +761,80 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send + 'a>>
     {
         Box::pin(async move {
+            self.execution.ensure_active()?;
             if self.body.as_ref().is_some_and(|body| !body.can_replay()) {
                 return Err(Error::Http(
                     "cannot replay consumed streaming request body".into(),
                 ));
             }
 
+            let in_flight_guard = loop {
+                self.execution.ensure_active()?;
+                // Preserve independent streaming acquisition unless limits opt in.
+                if !self.execution.has_connect_limit() {
+                    break None;
+                }
+                match self
+                    .session
+                    .inner
+                    .acquisition
+                    .quic
+                    .try_start(&target.conn_key)
+                {
+                    Ok(guard) => {
+                        let pooled = self
+                            .session
+                            .inner
+                            .pool
+                            .lock()
+                            .try_acquire_h3_pooled_internal(&target.conn_key);
+                        if let Some(AcquiredConnection::H3 {
+                            mut sender,
+                            token,
+                            cleanup,
+                        }) = pooled
+                        {
+                            drop(guard);
+                            let result = self.send_h3_streaming(&mut sender, target).await;
+                            if let Err(ref error) = result {
+                                pipeline::finish_closed_h3_attempt(
+                                    &self.session,
+                                    &target.conn_key,
+                                    &token,
+                                    &cleanup,
+                                    error,
+                                )
+                                .await;
+                            }
+                            return result;
+                        }
+                        break Some(guard);
+                    }
+                    Err(mut wait) => {
+                        let _ = wait.changed().await;
+                        let tracker = self.session.broken_quic_tracker();
+                        let skip = if tracker.is_route_broken(&discovery.route) {
+                            Some(pipeline::QuicSkipReason::ProxyUdpUnavailable)
+                        } else if tracker.is_broken_for_route(&discovery.route, &discovery.origin) {
+                            Some(pipeline::QuicSkipReason::BrokenOrigin)
+                        } else {
+                            None
+                        };
+                        if let Some(skip) = skip {
+                            let mut updated = discovery.clone();
+                            updated.skip_reason = Some(skip);
+                            if pipeline::decide_protocol(
+                                http_version_pref,
+                                protocol_policy,
+                                &updated,
+                            ) == pipeline::ProtocolDecision::Tcp
+                            {
+                                return self.clone().send_streaming_with_pool_retry(true).await;
+                            }
+                        }
+                    }
+                }
+            };
             let permit = self.session.reserve_connection()?;
             let h3_conn = match self
                 .session
@@ -698,6 +844,7 @@ impl StreamRequestBuilder {
                     discovery.advertised_host.as_deref(),
                     discovery.advertised_port,
                     proxy,
+                    &self.execution.connection(),
                 )
                 .await
             {
@@ -731,6 +878,7 @@ impl StreamRequestBuilder {
                             "quic.handshake_failed_fallback_tcp",
                         );
                         drop(permit);
+                        drop(in_flight_guard);
                         return self
                             .establish_and_send_streaming_tcp(
                                 target,
@@ -739,7 +887,8 @@ impl StreamRequestBuilder {
                                 http_version_pref,
                                 connect_start,
                             )
-                            .await;
+                            .await
+                            .map_err(|next| next.with_connect_prior(error));
                     }
                     tracing::warn!(
                         route = %discovery.route,
@@ -768,6 +917,7 @@ impl StreamRequestBuilder {
                 let mut pool = self.session.inner.pool.lock();
                 pool.insert_h3_reserved(target.conn_key.clone(), sender, driver, permit)
             };
+            drop(in_flight_guard);
 
             tracing::debug!(
                 route = %target.conn_key.route,
@@ -802,12 +952,23 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send + 'a>>
     {
         Box::pin(async move {
+            self.execution.ensure_active()?;
             if self.body.as_ref().is_some_and(|body| !body.can_replay()) {
                 return Err(Error::Http(
                     "cannot replay consumed streaming request body".into(),
                 ));
             }
 
+            let mut tcp_guard = match self
+                .session
+                .acquire_tcp(&target.conn_key, http_version_pref)
+                .await?
+            {
+                super::tcp_acquisition::TcpAcquisition::Ready(sender) => {
+                    return self.send_h2_streaming(sender, target).await;
+                }
+                super::tcp_acquisition::TcpAcquisition::Connect(guard) => guard,
+            };
             let permit = self.session.reserve_connection()?;
             let client = &self.session.inner.client;
             let connect_config =
@@ -819,13 +980,12 @@ impl StreamRequestBuilder {
                     target.port,
                     effective_proxy.as_ref(),
                     &connect_config,
+                    &self.execution.connection(),
                 )
                 .await?;
 
             #[cfg(feature = "quic-h3")]
-            if let Some(gate) = &self.race_send_gate {
-                gate.acquired().await;
-            }
+            self.acquire_send_gates().await;
 
             let use_h2 = if target.scheme == crate::connection_pool::Scheme::Http {
                 match http_version_pref {
@@ -850,6 +1010,8 @@ impl StreamRequestBuilder {
                     )
                     .await?;
 
+                    drop(tcp_guard.take());
+
                     tracing::debug!(
                         route = %target.conn_key.route,
                         path = "new_h2",
@@ -864,20 +1026,16 @@ impl StreamRequestBuilder {
 
                 match h2_result {
                     Ok(resp) => Ok(resp),
-                    Err(e)
-                        if http_version_pref != PreferredHttpVersion::Http2Only
-                            && client.fallback().h2_to_h1
-                            && self
-                                .body
-                                .as_ref()
-                                .is_none_or(crate::body::RequestBody::can_replay)
-                            && (matches!(e, Error::H2(_)) || e.is_connection_closed())
-                            && crate::retry::retry_is_replay_safe(
-                                &self.method,
-                                self.idempotency,
-                                &e,
-                            ) =>
-                    {
+                    Err(e) => {
+                        let Some(attempt) = recovery::h2_fallback(
+                            http_version_pref != PreferredHttpVersion::Http2Only
+                                && client.fallback().h2_to_h1,
+                            ReplayFacts::new(&self.method, self.idempotency, self.body.as_ref()),
+                            &e,
+                            &self.attempt,
+                        ) else {
+                            return Err(e);
+                        };
                         tracing::warn!(
                             error = %e,
                             fallback = "h2_to_h1",
@@ -885,6 +1043,9 @@ impl StreamRequestBuilder {
                         );
 
                         let fallback_permit = self.session.reserve_connection()?;
+                        if let Some(guard) = tcp_guard.take() {
+                            guard.release_h1();
+                        }
                         let h1_config =
                             pipeline::build_h1_only_connect_config(client, target.scheme);
                         let conn2 = self
@@ -894,8 +1055,10 @@ impl StreamRequestBuilder {
                                 target.port,
                                 effective_proxy.as_ref(),
                                 &h1_config,
+                                &self.execution.connection(),
                             )
-                            .await?;
+                            .await
+                            .map_err(|next| next.with_connect_prior(e))?;
 
                         let (sender, conn_task) =
                             pipeline::handshake_h1(client, conn2.into_tcp_stream()?).await?;
@@ -908,13 +1071,17 @@ impl StreamRequestBuilder {
                             "connection.established_via_fallback",
                         );
 
-                        self.send_h1_streaming(sender, conn_task, fallback_permit, target)
+                        self.clone()
+                            .with_attempt(attempt)
+                            .send_h1_streaming(sender, conn_task, fallback_permit, target)
                             .await
                     }
-                    Err(e) => Err(e),
                 }
             } else {
                 let negotiated_alpn = conn.negotiated_alpn();
+                if let Some(guard) = tcp_guard.take() {
+                    guard.release_h1();
+                }
                 if negotiated_alpn != Some("http/1.1")
                     && negotiated_alpn.is_some()
                     && http_version_pref != PreferredHttpVersion::Http1Only
@@ -949,14 +1116,18 @@ impl StreamRequestBuilder {
         permit: ConnectionPermit,
         target: &pipeline::ParsedTarget,
     ) -> Result<StreamingResponse> {
+        let http_permit = self.acquire_http_permit().await?;
         let client = &self.session.inner.client;
         let mut request = self.build_h1_request_obj(target)?;
         let upload_guard = pipeline::H1UploadGuard::new(conn_task.clone(), request.body());
         request.body_mut().validate_empty().await?;
         let ttfb_started = std::time::Instant::now();
-        let resp = pipeline::await_response_headers(client, sender.send_request(request))
-            .await?
-            .map_err(|e| Error::from_h1_error(e, "HTTP/1.1 request failed"))?;
+        let submission = http_permit.commit("http/1.1")?;
+        let resp = pipeline::await_response_headers(
+            client,
+            submission.submit(|| sender.send_request(request)),
+        )
+        .await??;
         crate::diagnostics::record_ttfb_ms(ttfb_started.elapsed().as_millis() as u64);
         crate::diagnostics::record_protocol("http/1.1");
 
@@ -991,7 +1162,9 @@ impl StreamRequestBuilder {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(format!("error reading H1 body stream: {e}")))
+                            .send(Err(
+                                Error::from_h1_error(e, "error reading H1 body stream").to_string()
+                            ))
                             .await;
                         break;
                     }
@@ -1303,3 +1476,9 @@ mod tests {
         assert!(target.contains_key("accept"));
     }
 }
+
+#[cfg(all(test, feature = "quic-h3"))]
+mod race_tests;
+
+#[cfg(all(test, feature = "quic-h3"))]
+mod connect_budget_tests;

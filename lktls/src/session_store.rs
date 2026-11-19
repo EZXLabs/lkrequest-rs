@@ -8,10 +8,16 @@
 //! # Architecture
 //!
 //! ```text
-//! SessionStore (trait)
-//!   └── InMemorySessionStore (HashMap<String, VecDeque<SessionTicketData>>)
-//!         └── per-host FIFO queue (max N tickets per host)
+//! SessionStore -- optional ClientSessionStore interface
+//!   InMemorySessionStore: bounded per-host queues, latest ticket taken first
+//!   ClientSession: version-specific secrets and authentication context
 //! ```
+//!
+//! Handshake drivers resume only engine-issued [`ClientSession`] values. Legacy
+//! [`SessionTicketData`] remains available for inspection and low-level APIs;
+//! inserting it directly does not establish authentication provenance.
+//! Custom stores preserve resumption by implementing [`ClientSessionStore`]
+//! and returning it from [`SessionStore::client_sessions`].
 //!
 //! # Usage
 //!
@@ -29,6 +35,10 @@ use std::time::{Duration, Instant};
 
 use crate::crypto::aead::AeadAlgorithm;
 use crate::crypto::hkdf::HkdfAlgorithm;
+
+pub(crate) mod client;
+pub(crate) mod ticket;
+pub use client::{ClientSession, ClientSessionStore};
 
 // ---------------------------------------------------------------------------
 // Session ticket data
@@ -55,6 +65,8 @@ pub enum AlpsSessionState {
 /// Data stored for a single TLS session ticket.
 ///
 /// Supports both TLS 1.3 (PSK-based) and TLS 1.2 (session ticket) resumption.
+/// This legacy representation has no authentication provenance. Handshake
+/// drivers use opaque [`ClientSession`] values through [`ClientSessionStore`].
 #[derive(Clone, Debug)]
 pub struct SessionTicketData {
     /// The opaque ticket bytes sent by the server.
@@ -137,27 +149,22 @@ pub enum TicketTlsVersion {
 /// an instruction — a server that sends `0xFFFFFFFF` (≈136 years) does not get
 /// to pin a resumption secret in the client for that long.
 ///
-/// TLS 1.2 tickets (RFC 5077 §3.3) carry a `ticket_lifetime_hint` with weaker
-/// semantics — it is only "a hint from the server about how long the ticket
-/// should be stored", with no normative ceiling. RFC 5077 does say the client
-/// "MAY delete the ticket earlier based on local policy", so the same 7-day
-/// bound is applied to TLS 1.2 tickets as *local policy* rather than as a
-/// protocol requirement. Both versions cache a long-lived symmetric secret
-/// that is worth exactly as much to an attacker, so they get the same cap.
-///
-/// The lower bound is left alone: a shorter server lifetime always wins, and
-/// the TLS 1.3 "value of zero means discard immediately" rule falls out of the
-/// comparison in [`SessionTicketData::is_expired`].
+/// TLS 1.2 uses the shorter [`MAX_TLS12_SESSION_LIFETIME_SECS`] local policy.
 pub const MAX_TICKET_LIFETIME_SECS: u32 = 604_800;
 
+/// Default Chromium-compatible cap for TLS 1.2 tickets and session IDs: one hour.
+/// A zero RFC 5077 lifetime hint is unspecified and uses this cap; shorter
+/// nonzero server lifetimes take precedence. This is not a protocol ceiling.
+pub const MAX_TLS12_SESSION_LIFETIME_SECS: u32 = 3_600;
+
 impl SessionTicketData {
-    /// The lifetime this client actually honours for the ticket, in seconds.
+    /// Effective lifetime under the default local policy, in seconds.
     ///
-    /// This is the server-advertised [`Self::lifetime_secs`] clamped to
-    /// [`MAX_TICKET_LIFETIME_SECS`]; see that constant for why the clamp
-    /// applies to both TLS 1.3 and TLS 1.2 tickets.
+    /// TLS 1.2 zero uses the one-hour local cap. Nonzero lifetimes are capped
+    /// at one hour for TLS 1.2 and seven days for TLS 1.3. Stores with an
+    /// explicit TTL apply that policy instead when storing and taking values.
     pub fn effective_lifetime_secs(&self) -> u32 {
-        self.lifetime_secs.min(MAX_TICKET_LIFETIME_SECS)
+        effective_lifetime_secs(self.tls_version, self.lifetime_secs)
     }
 
     /// Check if this ticket has expired.
@@ -185,6 +192,34 @@ impl SessionTicketData {
     }
 }
 
+pub(crate) fn effective_lifetime_secs(version: TicketTlsVersion, lifetime: u32) -> u32 {
+    effective_cache_lifetime(version, lifetime, None).as_secs() as u32
+}
+
+pub(crate) fn cache_lifetime(version: TicketTlsVersion, ttl: Option<Duration>) -> Duration {
+    ttl.unwrap_or_else(|| {
+        Duration::from_secs(match version {
+            TicketTlsVersion::Tls12 => MAX_TLS12_SESSION_LIFETIME_SECS,
+            TicketTlsVersion::Tls13 => MAX_TICKET_LIFETIME_SECS,
+        } as u64)
+    })
+}
+
+pub(crate) fn effective_cache_lifetime(
+    version: TicketTlsVersion,
+    lifetime: u32,
+    ttl: Option<Duration>,
+) -> Duration {
+    let local = cache_lifetime(version, ttl);
+    match version {
+        TicketTlsVersion::Tls12 if lifetime == 0 => local,
+        TicketTlsVersion::Tls12 => local.min(Duration::from_secs(lifetime as u64)),
+        TicketTlsVersion::Tls13 => local.min(Duration::from_secs(
+            lifetime.min(MAX_TICKET_LIFETIME_SECS) as u64,
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionStore trait
 // ---------------------------------------------------------------------------
@@ -193,16 +228,32 @@ impl SessionTicketData {
 ///
 /// Implementations must be `Send + Sync` for use across async tasks.
 pub trait SessionStore: Send + Sync + std::fmt::Debug {
+    /// Override the local cache lifetime for engine-issued sessions.
+    /// `None` uses one hour for TLS 1.2 and seven days for TLS 1.3.
+    /// Server lifetimes and the TLS 1.3 seven-day protocol limit still apply.
+    /// Zero prevents caching. TLS 1.2 renewal retains the original secret age.
+    fn session_cache_ttl(&self) -> Option<Duration> {
+        None
+    }
+
     /// Store a session ticket for the given host.
     ///
     /// `host` is typically `hostname:port` (e.g. `"example.com:443"`).
     fn store(&self, host: &str, ticket: SessionTicketData);
 
-    /// Take a session ticket for the given host, removing it from the store.
+    /// Take a session ticket for the given host.
     ///
+    /// TLS 1.3 tickets are removed; TLS 1.2 sessions may be reused until expiry.
     /// Returns `None` if no valid (non-expired) ticket is available.
     /// Expired tickets are silently discarded.
     fn take(&self, host: &str) -> Option<SessionTicketData>;
+
+    /// Additive interface for engine-issued sessions with authentication
+    /// provenance. Legacy-only stores remain source-compatible but their
+    /// values cannot authorize resumption in the handshake drivers.
+    fn client_sessions(&self) -> Option<&dyn ClientSessionStore> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,9 +269,43 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
 #[derive(Debug)]
 pub struct InMemorySessionStore {
     /// Per-host ticket queues.
-    store: std::sync::Mutex<std::collections::HashMap<String, VecDeque<SessionTicketData>>>,
+    store: std::sync::Mutex<std::collections::HashMap<String, VecDeque<CachedSession>>>,
     /// Maximum tickets stored per host (default: 2, matching Chrome).
     max_tickets_per_host: usize,
+    cache_ttl: Option<Duration>,
+}
+
+#[derive(Debug)]
+enum CachedSession {
+    Legacy(SessionTicketData),
+    Bound(ClientSession),
+}
+
+impl CachedSession {
+    fn clone_tls12(&self) -> Option<Self> {
+        match self {
+            Self::Legacy(ticket) if ticket.tls_version == TicketTlsVersion::Tls12 => {
+                Some(Self::Legacy(ticket.clone()))
+            }
+            Self::Bound(session) => session.clone_tls12().map(Self::Bound),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_expired(&self) -> bool {
+        self.is_expired_with_ttl(None)
+    }
+
+    fn is_expired_with_ttl(&self, ttl: Option<Duration>) -> bool {
+        match self {
+            Self::Legacy(ticket) => {
+                ticket.received_at.elapsed()
+                    >= effective_cache_lifetime(ticket.tls_version, ticket.lifetime_secs, ttl)
+            }
+            Self::Bound(session) => session.is_expired() || session.is_expired_with_ttl(ttl),
+        }
+    }
 }
 
 impl InMemorySessionStore {
@@ -229,6 +314,7 @@ impl InMemorySessionStore {
         Self {
             store: std::sync::Mutex::new(std::collections::HashMap::new()),
             max_tickets_per_host: 2,
+            cache_ttl: None,
         }
     }
 
@@ -237,7 +323,15 @@ impl InMemorySessionStore {
         Self {
             store: std::sync::Mutex::new(std::collections::HashMap::new()),
             max_tickets_per_host,
+            cache_ttl: None,
         }
+    }
+
+    /// Override the local cache TTL. Zero disables storage and resumption.
+    /// Shorter server lifetimes and the TLS 1.3 protocol limit still apply.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = Some(ttl);
+        self
     }
 }
 
@@ -248,7 +342,49 @@ impl Default for InMemorySessionStore {
 }
 
 impl SessionStore for InMemorySessionStore {
+    fn session_cache_ttl(&self) -> Option<Duration> {
+        self.cache_ttl
+    }
+
     fn store(&self, host: &str, ticket: SessionTicketData) {
+        self.insert(host, CachedSession::Legacy(ticket));
+    }
+
+    fn take(&self, host: &str) -> Option<SessionTicketData> {
+        self.pop(host, true).map(|value| match value {
+            CachedSession::Legacy(ticket) => ticket,
+            CachedSession::Bound(session) => session.into_legacy(),
+        })
+    }
+
+    fn client_sessions(&self) -> Option<&dyn ClientSessionStore> {
+        Some(self)
+    }
+}
+
+impl ClientSessionStore for InMemorySessionStore {
+    fn store_session(&self, host: &str, session: ClientSession) {
+        self.insert(host, CachedSession::Bound(session));
+    }
+
+    fn take_session(&self, host: &str) -> Option<ClientSession> {
+        while let Some(value) = self.pop(host, false) {
+            match value {
+                CachedSession::Bound(session) => return Some(session),
+                CachedSession::Legacy(_) => {
+                    tracing::debug!("tls.session_cache_legacy_value_discarded")
+                }
+            }
+        }
+        None
+    }
+}
+
+impl InMemorySessionStore {
+    fn insert(&self, host: &str, ticket: CachedSession) {
+        if self.max_tickets_per_host == 0 || ticket.is_expired_with_ttl(self.cache_ttl) {
+            return;
+        }
         let mut map = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let queue = map.entry(host.to_string()).or_default();
 
@@ -266,13 +402,18 @@ impl SessionStore for InMemorySessionStore {
         );
     }
 
-    fn take(&self, host: &str) -> Option<SessionTicketData> {
+    fn pop(&self, host: &str, reuse_legacy: bool) -> Option<CachedSession> {
         let mut map = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let queue = map.get_mut(host)?;
 
         // Pop from back (most recent ticket first) and skip expired ones
         while let Some(ticket) = queue.pop_back() {
-            if !ticket.is_expired() {
+            if !ticket.is_expired_with_ttl(self.cache_ttl) {
+                if reuse_legacy || matches!(ticket, CachedSession::Bound(_)) {
+                    if let Some(reusable) = ticket.clone_tls12() {
+                        queue.push_back(reusable);
+                    }
+                }
                 tracing::debug!(
                     host = host,
                     remaining = queue.len(),
@@ -308,98 +449,17 @@ pub fn parse_tls13_new_session_ticket(
     cipher_suite: u16,
     alpn: Option<String>,
 ) -> std::result::Result<SessionTicketData, String> {
-    use crate::crypto::hkdf::hkdf_expand_label;
-
-    let data = if payload.len() > 4 && payload[0] == 0x04 {
-        &payload[4..]
-    } else {
-        payload
-    };
-
-    if data.len() < 12 {
-        return Err("NewSessionTicket too short".into());
-    }
-
-    let mut pos = 0;
-
-    let lifetime = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    pos += 4;
-
-    let age_add = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    pos += 4;
-
-    if pos >= data.len() {
-        return Err("NewSessionTicket truncated at nonce length".into());
-    }
-    let nonce_len = data[pos] as usize;
-    pos += 1;
-    if pos + nonce_len > data.len() {
-        return Err("NewSessionTicket truncated at nonce data".into());
-    }
-    let ticket_nonce = &data[pos..pos + nonce_len];
-    pos += nonce_len;
-
-    if pos + 2 > data.len() {
-        return Err("NewSessionTicket truncated at ticket length".into());
-    }
-    let ticket_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-    if pos + ticket_len > data.len() {
-        return Err("NewSessionTicket truncated at ticket data".into());
-    }
-    let ticket = data[pos..pos + ticket_len].to_vec();
-    pos += ticket_len;
-
-    let mut max_early_data_size = 0u32;
-    if pos + 2 <= data.len() {
-        let ext_total = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-        let ext_end = (pos + ext_total).min(data.len());
-
-        while pos + 4 <= ext_end {
-            let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
-            let ext_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
-            pos += 4;
-            if pos + ext_len > ext_end {
-                break;
-            }
-            if ext_type == 0x002a && ext_len >= 4 {
-                max_early_data_size =
-                    u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            }
-            pos += ext_len;
-        }
-    }
-
-    let hash_len = hkdf_algorithm.hash_len();
-    let resumption_psk = hkdf_expand_label(
-        hkdf_algorithm,
-        resumption_master_secret,
-        "resumption",
-        ticket_nonce,
-        hash_len,
-    )
-    .map_err(|e| format!("failed to derive resumption PSK: {e}"))?;
-
-    Ok(SessionTicketData {
-        ticket,
-        resumption_psk,
-        tls_version: TicketTlsVersion::Tls13,
-        // EMS is a TLS 1.2 concept; the TLS 1.3 key schedule binds the
-        // handshake transcript unconditionally.
-        used_extended_master_secret: None,
-        cipher_suite,
-        lifetime_secs: lifetime,
-        age_add,
-        received_at: Instant::now(),
-        alpn,
-        alps: AlpsSessionState::Unknown,
-        hkdf_algorithm,
-        aead_algorithm,
-        master_secret: Vec::new(),
-        max_early_data_size,
-        peer_transport_parameters: None,
-    })
+    let ticket =
+        ticket::Tls13Ticket::parse_legacy_payload(payload).map_err(|error| error.to_string())?;
+    ticket
+        .into_session(
+            resumption_master_secret,
+            hkdf_algorithm,
+            aead_algorithm,
+            cipher_suite,
+            alpn,
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// Parse a TLS 1.2 NewSessionTicket message into a [`SessionTicketData`].
@@ -412,67 +472,16 @@ pub fn parse_tls12_new_session_ticket(
     negotiated_suite: Option<crate::crypto::tls12_cipher::Tls12CipherSuite>,
     used_extended_master_secret: Option<bool>,
 ) -> std::result::Result<SessionTicketData, String> {
-    let data = if payload.len() > 4 && payload[0] == 0x04 {
-        &payload[4..]
-    } else {
-        payload
-    };
-
-    if data.len() < 6 {
-        return Err("TLS 1.2 NewSessionTicket too short".into());
-    }
-
-    let lifetime_hint = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    let ticket_len = u16::from_be_bytes([data[4], data[5]]) as usize;
-
-    if 6 + ticket_len > data.len() {
-        return Err("TLS 1.2 NewSessionTicket truncated".into());
-    }
-
-    let ticket = data[6..6 + ticket_len].to_vec();
-
-    let (cipher_suite_code, hkdf_alg, aead_alg) = match negotiated_suite {
-        Some(suite) => {
-            use crate::crypto::prf::PrfAlgorithm;
-            let hkdf = match suite.prf_algorithm() {
-                PrfAlgorithm::Sha256 => HkdfAlgorithm::Sha256,
-                PrfAlgorithm::Sha384 => HkdfAlgorithm::Sha384,
-            };
-            let aead = if suite.is_aead() {
-                match suite.enc_key_len() {
-                    32 if matches!(
-                        suite,
-                        crate::crypto::tls12_cipher::Tls12CipherSuite::EcdheEcdsaChacha20Poly1305
-                            | crate::crypto::tls12_cipher::Tls12CipherSuite::EcdheRsaChacha20Poly1305
-                    ) => AeadAlgorithm::Chacha20Poly1305,
-                    32 => AeadAlgorithm::Aes256Gcm,
-                    _ => AeadAlgorithm::Aes128Gcm,
-                }
-            } else {
-                AeadAlgorithm::Aes128Gcm
-            };
-            (suite.code_point(), hkdf, aead)
-        }
-        None => (0u16, HkdfAlgorithm::Sha256, AeadAlgorithm::Aes128Gcm),
-    };
-
-    Ok(SessionTicketData {
-        ticket,
-        resumption_psk: Vec::new(),
-        tls_version: TicketTlsVersion::Tls12,
-        used_extended_master_secret,
-        cipher_suite: cipher_suite_code,
-        lifetime_secs: lifetime_hint,
-        age_add: 0,
-        received_at: Instant::now(),
-        alpn,
-        alps: AlpsSessionState::NotNegotiated,
-        hkdf_algorithm: hkdf_alg,
-        aead_algorithm: aead_alg,
-        master_secret: master_secret.to_vec(),
-        max_early_data_size: 0,
-        peer_transport_parameters: None,
-    })
+    ticket::Tls12Ticket::parse_legacy_payload(payload)
+        .map(|ticket| {
+            ticket.into_session(
+                master_secret,
+                alpn,
+                negotiated_suite,
+                used_extended_master_secret,
+            )
+        })
+        .map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +491,35 @@ pub fn parse_tls12_new_session_ticket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_cache_ttl_applies_to_legacy_tickets_and_protocol_limits() {
+        for tls12 in [false, true] {
+            for (ttl, age, expected) in [(60, 61, false), (7200, 3601, true), (0, 0, false)] {
+                let store = InMemorySessionStore::new().with_ttl(Duration::from_secs(ttl));
+                let mut value = if tls12 {
+                    make_tls12_ticket(86_400)
+                } else {
+                    make_ticket(86_400)
+                };
+                value.received_at = Instant::now() - Duration::from_secs(age);
+                store.store("example.com:443", value);
+                assert_eq!(store.take("example.com:443").is_some(), expected);
+            }
+        }
+        for (version, server, expected) in [
+            (TicketTlsVersion::Tls12, 0, 1_000_000),
+            (TicketTlsVersion::Tls12, 30, 30),
+            (TicketTlsVersion::Tls13, 0, 0),
+            (TicketTlsVersion::Tls13, 30, 30),
+            (TicketTlsVersion::Tls13, u32::MAX, 604_800),
+        ] {
+            assert_eq!(
+                effective_cache_lifetime(version, server, Some(Duration::from_secs(1_000_000))),
+                Duration::from_secs(expected)
+            );
+        }
+    }
 
     fn make_ticket(lifetime_secs: u32) -> SessionTicketData {
         SessionTicketData {
@@ -510,7 +548,7 @@ mod tests {
     #[test]
     fn tls12_ticket_carries_the_extended_master_secret_flag() {
         // NewSessionTicket body: lifetime(4) + ticket length(2) + ticket.
-        let mut payload = vec![0x04, 0x00, 0x00, 0x0b];
+        let mut payload = vec![0x04, 0x00, 0x00, 0x09];
         payload.extend_from_slice(&3600u32.to_be_bytes());
         payload.extend_from_slice(&3u16.to_be_bytes());
         payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
@@ -700,14 +738,19 @@ mod tests {
         }
     }
 
-    /// RFC 5077 §3.3's `ticket_lifetime_hint` is only a hint, and the client
-    /// "MAY delete the ticket earlier based on local policy" — so the same
-    /// 7-day ceiling is applied to TLS 1.2 tickets.
     #[test]
-    fn tls12_ticket_lifetime_hint_is_clamped_to_seven_days() {
-        let ticket = make_tls12_ticket(u32::MAX);
-        assert_eq!(ticket.tls_version, TicketTlsVersion::Tls12);
-        assert_eq!(ticket.effective_lifetime_secs(), MAX_TICKET_LIFETIME_SECS);
+    fn tls12_sessions_are_capped_at_one_hour() {
+        for lifetime in [0, 1, 60, 3600, 7200, u32::MAX] {
+            let ticket = make_tls12_ticket(lifetime);
+            assert_eq!(
+                ticket.effective_lifetime_secs(),
+                if lifetime == 0 {
+                    MAX_TLS12_SESSION_LIFETIME_SECS
+                } else {
+                    lifetime.min(MAX_TLS12_SESSION_LIFETIME_SECS)
+                }
+            );
+        }
     }
 
     /// A lifetime at or below the ceiling is honoured verbatim — the clamp is
@@ -726,18 +769,17 @@ mod tests {
     /// The ceiling actually governs expiry: a ticket whose server lifetime is
     /// effectively unbounded still expires once it is older than 7 days.
     #[test]
-    fn overlong_lifetime_still_expires_after_seven_days() {
-        let cap = Duration::from_secs(MAX_TICKET_LIFETIME_SECS as u64);
-
+    fn overlong_lifetime_still_expires_at_the_version_specific_cap() {
         for ticket in [make_ticket(u32::MAX), make_tls12_ticket(u32::MAX)] {
+            let cap = Duration::from_secs(ticket.effective_lifetime_secs() as u64);
             assert!(
                 !ticket.is_expired_at_age(cap),
-                "{:?}: exactly 7 days old is still usable",
+                "{:?}: exactly at the cap is still usable",
                 ticket.tls_version
             );
             assert!(
                 ticket.is_expired_at_age(cap + Duration::from_secs(1)),
-                "{:?}: past 7 days the ticket must be treated as expired \
+                "{:?}: past the cap the ticket must be treated as expired \
                  regardless of the server's lifetime",
                 ticket.tls_version
             );

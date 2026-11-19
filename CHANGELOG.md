@@ -6,6 +6,160 @@ All important changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixes
+
+- Complete P-521 key exchange, TLS 1.2/1.3 handshake signature verification,
+  and certificate-chain verification for Firefox and Safari profiles.
+- Preserve post-handshake TLS alerts through HTTP/1.1 request errors, including
+  the original source and alert code. Fatal alerts do not wait for transport
+  cleanup or grant replay permission; C callers receive `LK_ERR_TLS` with the
+  HTTP request phase.
+- Add `quic_ms` to Rust and FFI JSON request diagnostics. H3 reports connection
+  metadata on fresh and reused connections, measures local resolution and QUIC
+  handshakes, and isolates the diagnostic state of protocol race candidates.
+
+## lkrequest 0.3.0
+
+### Features
+
+- Add the complete `chrome_158` preset from Windows Chrome 158.0.8127.37,
+  with public TLS/H2/QUIC/H3 capture evidence, Rust and C FFI registration,
+  collector export and independent browser-derived TLS/H2 regression fixtures.
+  Stable fields match 157; the default remains Chrome 155. Application header
+  values remain caller supplied and behavior edge-case policies inherit 157.
+- Add request-scoped HTTP recovery and connection-attempt accounting, with
+  optional `AttemptLimits` at Client, Session and Request scope. Limits are
+  disabled by default; finite child settings can only tighten inherited caps.
+  Concurrent requests keep independent counters even when sharing a Client
+  or Session; shared connection starts are charged to their initiating request.
+- Add bounded attempt summaries and cancellation observers in Rust, with C
+  setters, effective-limit getters, capability discovery and operation/response
+  summaries. Existing response and C ABI layouts remain compatible.
+- Configure TLS/QUIC session-cache enablement and local TTL through Rust and
+  C FFI, including restoring default lifetimes. Respect shorter server limits,
+  TLS 1.3's seven-day cap and the original TLS 1.2 secret age on renewal.
+- Load, validate and export complete v2 profile bundles with explicit runtime
+  policy, bounded JSON input and structured validation errors. Add C ABI setters
+  for individual TLS, HTTP/2 and QUIC TLS profiles; independent component
+  overrides remain distinct from complete bundle configuration.
+- Add an optional response read-idle timeout and C APIs to disable individual
+  phase and total deadlines. Streaming reads retain the original total deadline.
+- Support opt-in WebSocket permessage-deflate with negotiated window/context
+  settings, fragmented messages and a decompressed message-size limit.
+- Expose shared compiled TLS configuration and TCP/QUIC connection state machines
+  for low-level integrations, with capability diagnostics and explicit admission
+  and security policies.
+
+### Fixes
+
+- Pin the release C header generator to cbindgen 0.29.2 on Windows, glibc
+  and musl, and regenerate cached headers before packaging so the shared
+  header asset has matching contents and checksums across platforms.
+- Upgrade Hickory to 0.26.3 and rustix to 1.1.6. Backport QUIC Initial-token,
+  MAX_STREAM_DATA limit and Unix truncated-datagram receive fixes into the
+  fingerprint fork (quinn-proto 0.11.19, quinn-udp 0.5.16).
+- Release issued QUIC connection IDs when local TLS initialization fails,
+  preventing failed starts from accumulating IDs or exhausting short CID
+  spaces on shared endpoints. Wake parked Quinn endpoint idle waiters when
+  their driver exits; retain the existing packetization and fingerprint policy.
+- Bound DNS question-count allocation in the bundled Hickory parser, closing
+  a remaining 0.26.3 path where a 12-byte malformed response allocated 5.5 MiB.
+  Add regressions for DNS allocation, malformed TSIG and wrong-ID UDP packets,
+  plus upstream QUIC token, close-frame, stream-limit and UDP receive tests.
+- Unify request authorization across buffered/streaming sends, redirects,
+  protocol recovery and TCP/QUIC races. Cancelled or completed requests cannot
+  authorize further submissions; retries retain the original total deadline.
+- Prevent a losing streaming TCP race candidate from submitting through a
+  newly pooled H2 connection or consuming its single-use upload body.
+- Restore HTTP/3 0-RTT and rejection recovery independently of the
+  connection-close retry flag, retaining method/idempotency safety checks.
+  Restore QUIC resumption tests to the all-features CI gate.
+- Generate fresh TLS 1.2 session IDs for ticket attempts, revoke cached
+  sessions after fatal TLS errors, and default TLS 1.2 sessions to one hour
+  without extending the original secrets' lifetime on ticket renewal.
+- Format timeout durations without `Some(...)`. Document the current
+  P-384/ECDSA-SHA1 strict-verification limitation in the TLS support notes.
+- Accept an omitted TLS 1.2 CertificateStatus after status_request negotiation.
+  Restore insecure handshakes for advertised legacy signature schemes and add
+  strict RSA/SHA-1, ECDSA/SHA-1 and ECDSA/SHA-512 handshake verification.
+- Treat a zero TLS 1.2 ticket lifetime as unspecified, retain reusable TLS 1.2
+  sessions until their original expiry, and support session-ID resumption,
+  including Safari profiles without the session_ticket extension. TLS 1.3
+  tickets remain single-use and zero-lifetime TLS 1.3 tickets are discarded.
+- Implement the three legacy 3DES-CBC suites advertised by Safari 26, preserving
+  the captured ClientHello profile. Unsupported-suite errors include the code.
+- Base HTTP/2 receive-window replenishment on the local receive window. This
+  fixes Firefox downloads stalling after 128 KiB when the peer advertises a
+  larger send window and corrects WINDOW_UPDATE thresholds for other profiles.
+
+### Compatibility
+
+- Keep the local Hickory allocation patch in Git/path and FFI builds. Block
+  crates.io publication until a fixed published dependency is available,
+  because registry packaging removes local dependency paths.
+  Advanced Rust DNS configuration must import types from the new
+  `lkrequest::dns::hickory` re-export instead of a separate registry dependency.
+- Remove the deprecated `h2-native` feature from `lkrequest` and `lkh2`,
+  including default-feature and forwarding references. HTTP/2 remains available
+  through `lkh2` without a backend-selection feature, including builds with
+  `default-features = false`.
+- Keep deprecated low-level `ConnectionPool` wrappers in this release; their
+  previously announced 0.3.0 removal is deferred. Internal FFI Handle/State Rust
+  structs gain fields, while opaque C handles and ABI version 1 remain unchanged.
+- Increase the default total HTTP timeout from 60 to 120 seconds. `None` now
+  disables its deadline without substituting a finite default. `TimeoutConfig`
+  gains `read_idle_timeout`; exhaustive old Rust struct literals must add it or
+  use `..TimeoutConfig::default()`.
+- Automatic replay after a pooled connection closes and H2-to-H1 fallback are
+  now disabled by default. Enable `.retry_on_connection_close(true)` and
+  `.h2_fallback_h1(true)` explicitly to retain those recovery behaviors.
+  C callers use `lk_client_builder_set_retry_on_connection_close` and
+  `lk_client_builder_set_fallback_h2_to_h1`. Idempotency alone does not enable
+  connection-failure replay. Safe HTTP/3 0-RTT and recovery after early-data
+  rejection remain enabled independently. See the
+  [timeout guide](docs/guides/networking/timeouts.md) for the related explicit
+  retry policy.
+
+### Performance
+
+- Reduce redundant execution-reference cloning and cancellation registration.
+  Pin and borrow large workflows to reduce temporary QUIC connection and
+  streaming allocations while retaining Windows stack protection. These changes
+  do not establish a universal throughput improvement over 0.2.5.
+
+### Documentation
+
+- Document request lifetimes, shared connection establishment, TCP/QUIC races,
+  attempt-limit inheritance, cancellation and the distinction between recovery
+  authorization, HTTP submissions and connection starts.
+- Expand Rust/C configuration and diagnostics guides with attempt summaries,
+  cache enablement/TTL, explicit retry controls and 0.3.0 migration steps.
+- Refresh preset selection and quick-start examples for Chrome 157, Firefox 156
+  and Safari 26.2, preserving the Chrome 155 default and existing evidence grades.
+- Audit current capabilities beyond this release's additions: add a Rust/C
+  configuration index and blocking guide, and document component profile inputs,
+  Cookie mutation, compression negotiation, priority, H2 tuning and FFI discovery.
+  Correct WebSocket protocol, Cookie and timeout boundaries in guides and rustdoc.
+- Correct preconnect result examples and Cookie FFI ownership notes. Fix API
+  documentation links and book navigation, including timeout, Trust Anchor
+  Identifier and profile-bundle guides; document how to validate guide examples
+  with workspace dependencies.
+
+### Upgrade From 0.2.5
+
+- Remove `h2-native` from dependency feature lists and any wrapper-crate feature
+  forwarding, including `lkrequest/h2-native` and `lkh2/h2-native`. Keep the
+  `lkh2` dependency when using HTTP/2; no replacement feature is needed.
+- Enable connection-close replay or H2-to-H1 fallback explicitly if required,
+  and review application retry policy and body replay safety independently.
+- Attempt caps are optional and do not enable retries or add timeouts. Initial
+  requests and normal redirects do not consume extra-HTTP allowance; actual
+  connection starts have a separate budget. Pool reuse and shared waiters do not
+  consume another connection start.
+- Use the supported Rust/C APIs instead of constructing FFI internal structs.
+  See the [migration guide](docs/guides/upgrading.md) and
+  [Client/Session configuration](docs/guides/client-session.md) for details.
+
 ## lkrequest 0.2.5
 
 ### Features

@@ -1,8 +1,12 @@
+mod allocations;
 mod client;
 mod config;
+mod fixture_server;
 mod metrics;
 mod runner;
 mod server;
+#[cfg(feature = "quic-h3")]
+mod tls_server;
 
 use std::error::Error;
 

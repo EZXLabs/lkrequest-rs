@@ -5,7 +5,7 @@
 //! RFC 7541 and is modelled after the `h2` crate's HPACK encoder.
 
 pub(crate) mod decoder;
-mod huffman;
+pub(crate) mod huffman;
 mod table;
 
 use crate::policy::HpackEncodePolicy;

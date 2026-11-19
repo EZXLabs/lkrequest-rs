@@ -27,13 +27,15 @@ pub(crate) enum RaceEvent<'a> {
 
 /// Own both attempts so selecting a protocol immediately cancels its peer.
 /// Only the six direct-success exits emit `Won`; callers apply the probe flags.
-pub(crate) async fn run_protocol_race<'a, T>(
+pub(crate) async fn run_protocol_race<'a, T: Send + 'a>(
     config: ChromeLikeProtocolConfig,
     mut selected: watch::Receiver<Option<ProtocolDecision>>,
-    mut quic_future: RaceFuture<'a, T>,
+    quic_future: RaceFuture<'a, T>,
     mut tcp_factory: impl FnMut() -> RaceFuture<'a, T>,
     mut on_event: impl for<'event> FnMut(RaceEvent<'event>),
 ) -> Result<T> {
+    let mut quic_future = crate::diagnostics::isolate(quic_future);
+    let mut tcp_factory = || crate::diagnostics::isolate(tcp_factory());
     if !config.tcp_main_job_delay.is_zero() {
         let mut tcp_delay = std::pin::pin!(tokio::time::sleep(config.tcp_main_job_delay));
         tokio::select! {
@@ -149,7 +151,7 @@ async fn finish_failed_race<'a, T>(
     selected: &watch::Receiver<Option<ProtocolDecision>>,
     tcp_factory: &mut impl FnMut() -> RaceFuture<'a, T>,
 ) -> Result<T> {
-    if !is_connection_limit_error(&tcp_error) {
+    if !is_connection_limit_error(&tcp_error) || quic_error.is_connect_attempt_denied() {
         return Err(protocol_race_error(tcp_error, quic_error));
     }
     tcp_factory().await.map_err(|retry_error| {
@@ -300,6 +302,52 @@ mod tests {
         match error {
             Error::Connection(error) => (error.phase, error.message),
             other => panic!("expected combined race error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_belong_to_the_winning_branch() {
+        for quic_wins in [false, true] {
+            let (_selected_tx, selected) = watch::channel(None);
+            let (wake, ready) = tokio::sync::oneshot::channel();
+            let mut wake = Some(wake);
+            let (result, diag) =
+                crate::diagnostics::capture_request_diagnostics(run_protocol_race(
+                    config(Duration::ZERO),
+                    selected,
+                    Box::pin(async move {
+                        crate::diagnostics::record_dns_ms(11);
+                        crate::diagnostics::record_remote_addr("quic");
+                        let _ = ready.await;
+                        if quic_wins {
+                            Ok(1)
+                        } else {
+                            std::future::pending().await
+                        }
+                    }),
+                    || {
+                        let wake = wake.take().unwrap();
+                        Box::pin(async move {
+                            crate::diagnostics::record_tcp_ms(22);
+                            crate::diagnostics::record_remote_addr("tcp");
+                            let _ = wake.send(());
+                            if quic_wins {
+                                std::future::pending().await
+                            } else {
+                                Ok(2)
+                            }
+                        })
+                    },
+                    |_| {},
+                ))
+                .await;
+            assert_eq!(result.unwrap(), if quic_wins { 1 } else { 2 });
+            assert_eq!(
+                diag.remote_addr.as_deref(),
+                Some(if quic_wins { "quic" } else { "tcp" })
+            );
+            assert_eq!(diag.dns_ms, quic_wins.then_some(11));
+            assert_eq!(diag.tcp_ms, (!quic_wins).then_some(22));
         }
     }
 

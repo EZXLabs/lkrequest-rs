@@ -46,6 +46,9 @@ pub type KeyLogCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// non-blocking. Observation/diagnostics only — it cannot alter the handshake.
 pub type ClientHelloCallback = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
+mod behavior;
+pub mod config;
+pub mod connection;
 pub mod crypto;
 pub mod ech;
 pub mod error;
@@ -56,3 +59,4 @@ pub mod record;
 pub mod session_store;
 pub mod trust_anchor;
 pub mod verify;
+mod wire;

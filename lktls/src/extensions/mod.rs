@@ -48,6 +48,7 @@ pub mod pre_shared_key;
 pub mod psk_key_exchange_modes;
 pub mod quic_transport_params;
 pub mod record_size_limit;
+pub(crate) mod registry;
 pub mod renegotiation_info;
 pub mod sct;
 pub mod session_ticket;
@@ -56,6 +57,8 @@ pub mod sni;
 pub mod status_request;
 pub mod supported_groups;
 pub mod supported_versions;
+pub(crate) mod tls12;
+pub(crate) mod tls13;
 
 /// Trait that all TLS extension encoders must implement.
 ///

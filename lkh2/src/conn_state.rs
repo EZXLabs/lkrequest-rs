@@ -395,6 +395,11 @@ impl ConnState {
         if settings.ack {
             if !self.pending_settings.is_empty() {
                 let pending = self.pending_settings.remove(0);
+                for stream in self.streams.values_mut() {
+                    stream
+                        .apply_initial_recv_window_size(pending.initial_window_size)
+                        .map_err(|e| ConnectionError::FlowControlError(e.to_string()))?;
+                }
                 // P1: sync decoder table size when our SETTINGS is ACKed
                 if pending.header_table_size != self.local_settings.header_table_size {
                     self.hpack_decoder

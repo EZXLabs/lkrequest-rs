@@ -8,6 +8,9 @@
 //! inlined in the I/O adapter layer.
 
 use std::sync::Arc;
+use std::time::Instant;
+
+use crate::config::{CompileError, CompileOptions, CompiledClientConfig, ConnectionInputs};
 
 use crate::crypto::aead::{Aead, AeadAlgorithm};
 use crate::crypto::hkdf::HkdfAlgorithm;
@@ -15,15 +18,19 @@ use crate::crypto::to_hex;
 use crate::error::{AlertDescription, AlertLevel, Result, TlsError};
 use crate::extensions::quic_transport_params::QuicTransportParams;
 use crate::handshake::content_type;
+use crate::handshake::effects::{Epoch, RecordEffect, RecordEffects};
+use crate::handshake::framing::HandshakeDeframer;
 use crate::handshake::server_hello::{check_downgrade_sentinel, detect_version_for_style};
 use crate::handshake::tls12::{Tls12Handshake, Tls12HandshakeAction, Tls12State, Tls12TrafficKeys};
 use crate::handshake::tls13::{
-    client_hello_extensions, HandshakeAction, HandshakeComplete, HandshakeKeys, Tls13Handshake,
-    TrafficSecrets,
+    HandshakeAction, HandshakeComplete, HandshakeKeys, Tls13Handshake, TrafficSecrets,
 };
 use crate::profile::types::TlsProfile;
 use crate::record::reader::RecordReader;
 use crate::record::writer::RecordWriter;
+use crate::record::{ReadKeys, WriteKeys};
+use crate::session_store::client::{SessionScope, Transport};
+use crate::session_store::ClientSession;
 use crate::session_store::{AlpsSessionState, SessionStore, TicketTlsVersion};
 use crate::verify::policy::VerificationPolicy;
 use crate::{ClientHelloCallback, KeyLogCallback};
@@ -136,24 +143,33 @@ pub struct SessionTicketContext {
 impl SessionTicketContext {
     /// Parse and store a post-handshake NewSessionTicket message.
     pub fn process_new_session_ticket(&self, payload: &[u8]) {
-        match crate::session_store::parse_tls13_new_session_ticket(
-            payload,
+        let result = crate::session_store::ticket::Tls13Ticket::parse_legacy_payload(payload)
+            .and_then(|ticket| self.store_ticket(ticket));
+        if let Err(error) = result {
+            tracing::warn!(error = %error, "tls.session_ticket_parse_failed");
+        }
+    }
+
+    pub(crate) fn store_ticket(
+        &self,
+        ticket: crate::session_store::ticket::Tls13Ticket<'_>,
+    ) -> Result<()> {
+        // RFC 8446 section 4.6.1: discard unusable lifetimes without failing TLS.
+        if ticket.lifetime == 0 || ticket.lifetime > 7 * 24 * 60 * 60 {
+            return Ok(());
+        }
+        let mut data = ticket.into_session(
             &self.resumption_master_secret,
             self.hkdf_algorithm,
             self.aead_algorithm,
             self.cipher_suite,
             self.alpn.clone(),
-        ) {
-            Ok(mut ticket_data) => {
-                ticket_data.alps = self.alps.clone();
-                ticket_data.peer_transport_parameters = self.peer_transport_parameters.clone();
-                self.store.store(&self.host_key, ticket_data);
-                tracing::debug!(host = %self.host_key, "tls.session_ticket_stored");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "tls.session_ticket_parse_failed");
-            }
-        }
+        )?;
+        data.alps = self.alps.clone();
+        data.peer_transport_parameters = self.peer_transport_parameters.clone();
+        self.store.store(&self.host_key, data);
+        tracing::debug!(host = %self.host_key, "tls.session_ticket_stored");
+        Ok(())
     }
 }
 
@@ -196,7 +212,7 @@ impl PostHandshakeState {
     }
 
     /// Build a KeyUpdate response message and derive a new client (write-side)
-    /// AEAD.  Called when the server sends KeyUpdate with `update_requested`.
+    /// AEAD. Used for a peer request or to respect the write key's usage limit.
     ///
     /// Returns `(key_update_message, new_write_aead)`:
     /// - `key_update_message`: the handshake message bytes (type 0x18 + body)
@@ -281,6 +297,130 @@ impl HandshakeConfig {
     }
 }
 
+struct DriverConfig {
+    profile: Arc<TlsProfile>,
+    compiled: std::result::Result<Arc<CompiledClientConfig>, CompileError>,
+    verification_policy: VerificationPolicy,
+    custom_ca_anchors: Option<Arc<Vec<rustls_pki_types::TrustAnchor<'static>>>>,
+    inputs: ConnectionInputs,
+}
+
+impl std::ops::Deref for DriverConfig {
+    type Target = ConnectionInputs;
+    fn deref(&self) -> &Self::Target {
+        &self.inputs
+    }
+}
+
+impl DriverConfig {
+    fn legacy(config: HandshakeConfig, transport: Transport) -> Self {
+        let profile = Arc::new(config.profile);
+        let options = CompileOptions {
+            verification: config.verification_policy,
+            custom_ca_anchors: config.custom_ca_anchors.clone(),
+            ..CompileOptions::compatibility()
+        };
+        let compiled = CompiledClientConfig::compile(profile.clone(), transport, options);
+        Self {
+            profile,
+            compiled,
+            verification_policy: config.verification_policy,
+            custom_ca_anchors: config.custom_ca_anchors,
+            inputs: ConnectionInputs {
+                hostname: config.hostname,
+                port: config.port,
+                required_alpn: None,
+                hello_overrides: Default::default(),
+                alps_payload: config.alps_payload,
+                session_store: config.session_store,
+                ech_config_list: config.ech_config_list,
+                keylog_callback: config.keylog_callback,
+                client_hello_callback: config.client_hello_callback,
+                trust_anchor_observer: config.trust_anchor_observer,
+            },
+        }
+    }
+
+    fn compiled(
+        config: Arc<CompiledClientConfig>,
+        inputs: ConnectionInputs,
+        transport: Transport,
+    ) -> Result<Self> {
+        if config.transport != transport {
+            return Err(TlsError::InvalidProfile(
+                "compiled TLS transport does not match driver".into(),
+            ));
+        }
+        Ok(Self {
+            profile: config.profile.clone(),
+            verification_policy: config.options.verification,
+            custom_ca_anchors: config.options.custom_ca_anchors.clone(),
+            compiled: Ok(config),
+            inputs,
+        })
+    }
+
+    fn session_scope(&self, transport: Transport) -> SessionScope {
+        match &self.compiled {
+            Ok(config) => SessionScope::from_compiled(&self.hostname, self.port, config),
+            Err(_) => SessionScope::new(
+                &self.hostname,
+                self.port,
+                transport,
+                self.verification_policy,
+                self.custom_ca_anchors.as_deref().map(Vec::as_slice),
+            ),
+        }
+    }
+
+    fn handshake(&self) -> Result<Tls13Handshake> {
+        let (compiled, overlay) = self.validated_hello_config()?;
+        let mut handshake = Tls13Handshake::from_compiled(compiled, &self.hostname);
+        handshake.set_overlay(overlay);
+        Ok(handshake)
+    }
+
+    fn validated_hello_config(
+        &self,
+    ) -> Result<(
+        Arc<CompiledClientConfig>,
+        Option<Arc<crate::config::ConnectionOverlay>>,
+    )> {
+        let compiled = self.compiled.clone().map_err(TlsError::from)?;
+        let overlay = compiled.resolve_overlay(&self.inputs)?;
+        compiled.validate_connection_with_overlay(&self.inputs, overlay.as_deref())?;
+        Ok((compiled, overlay))
+    }
+
+    fn select_tls13(&self, initial: super::initial::ClientStart) -> Result<Tls13Handshake> {
+        let mut handshake = Tls13Handshake::from_compiled(initial.compiled, &self.hostname);
+        handshake.set_overlay(initial.overlay);
+        handshake.set_verification_policy(self.verification_policy);
+        if let Some(observer) = &self.trust_anchor_observer {
+            handshake.set_trust_anchor_observer(observer.clone());
+        }
+        if let Some(anchors) = &self.custom_ca_anchors {
+            handshake.set_custom_ca_anchors(anchors.clone());
+        }
+        if let Some(payload) = &self.alps_payload {
+            handshake.set_alps_payload(payload.clone());
+        }
+        if let Some(ech) = &self.ech_config_list {
+            handshake.set_ech_config(ech.clone());
+        }
+        if let Some(callback) = &self.keylog_callback {
+            handshake.set_keylog_callback(callback.clone());
+        }
+        handshake.install_initial_hello(initial.hello)?;
+        Ok(handshake)
+    }
+}
+
+struct QuicDriverConfig {
+    tls: DriverConfig,
+    transport_parameters: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 // DriverState
 // ---------------------------------------------------------------------------
@@ -288,8 +428,10 @@ impl HandshakeConfig {
 enum DriverState {
     Start,
     WaitServerHello {
+        initial: super::initial::ClientStart,
+    },
+    RetryServerHello {
         handshake: Tls13Handshake,
-        ch_msg: Vec<u8>,
     },
     Tls13Encrypted {
         handshake: Tls13Handshake,
@@ -329,24 +471,20 @@ enum QuicDriverState {
 ///    - `NeedData` → read more, `feed()`, then `progress()`.
 ///    - `Done { to_send, result }` → send `to_send`, use `result`.
 pub struct HandshakeDriver {
-    config: HandshakeConfig,
+    config: DriverConfig,
     state: DriverState,
     reader: RecordReader,
     writer: RecordWriter,
-    /// Reassembly buffer for the TLS 1.3 encrypted handshake flight.
-    ///
-    /// A handshake message MAY be fragmented across several records (RFC 8446
-    /// §5.1: "Handshake messages MAY be … fragmented across several records"),
-    /// and server Certificate flights routinely are. Decrypted handshake bytes
-    /// are appended here and only *complete* messages are handed to the state
-    /// machine, with any partial trailer carried to the next record — the same
-    /// buffering the QUIC CRYPTO path already does, and what BoringSSL does with
-    /// its handshake buffer (`ssl3_read_handshake_bytes`).
-    hs_buffer: Vec<u8>,
+    effects: RecordEffects,
+    /// Shared TLS 1.2/1.3 reassembly, including the initial ServerHello.
+    /// Protocol states enforce empty buffers at flight/key epoch boundaries.
+    hs_buffer: HandshakeDeframer,
     /// Original session ticket taken from the store during `start()`.
     /// Preserved so that if the server negotiates TLS 1.2 instead of 1.3,
     /// the ticket can be used for TLS 1.2 session resumption.
-    original_ticket: Option<crate::session_store::SessionTicketData>,
+    original_ticket: Option<ClientSession>,
+    tls12_session_state: Option<crate::session_store::client::Tls12SessionState>,
+    session_scope: SessionScope,
     /// A real ECH offer was rejected by selection of TLS 1.2. The outer
     /// handshake authenticates only the public name and cannot yield traffic.
     tls12_ech_rejected: bool,
@@ -363,7 +501,28 @@ pub struct HandshakeDriver {
 }
 
 impl HandshakeDriver {
+    fn apply_record(&mut self, effect: RecordEffect<'_>, output: &mut Vec<u8>) -> Result<()> {
+        self.effects
+            .apply(effect, &mut self.reader, &mut self.writer, output)
+    }
+
     pub fn new(config: HandshakeConfig) -> Self {
+        Self::with_config(DriverConfig::legacy(config, Transport::Tcp))
+    }
+
+    /// Reuse compiled static configuration while keeping attempt state local.
+    pub fn from_compiled(
+        config: Arc<CompiledClientConfig>,
+        inputs: ConnectionInputs,
+    ) -> Result<Self> {
+        Ok(Self::with_config(DriverConfig::compiled(
+            config,
+            inputs,
+            Transport::Tcp,
+        )?))
+    }
+
+    fn with_config(config: DriverConfig) -> Self {
         let mut reader = RecordReader::new();
         // RFC 8449 §4: the `record_size_limit` this profile puts in the
         // ClientHello bounds the records the *peer* may send us, and "an
@@ -375,13 +534,17 @@ impl HandshakeDriver {
         // from the server's extension instead.
         reader.set_own_record_size_limit(config.profile.record_size_limit);
         reader.set_client_style(config.profile.tls_client_hello_style);
+        let session_scope = config.session_scope(Transport::Tcp);
         Self {
             config,
             state: DriverState::Start,
             reader,
             writer: RecordWriter::new(),
-            hs_buffer: Vec::new(),
+            effects: RecordEffects::default(),
+            hs_buffer: HandshakeDeframer::default(),
             original_ticket: None,
+            tls12_session_state: None,
+            session_scope,
             tls12_ech_rejected: false,
             pending_alert: None,
             pending_tls13_ccs: Vec::new(),
@@ -391,106 +554,98 @@ impl HandshakeDriver {
 
     /// Build and return the initial ClientHello record bytes.
     pub fn start(&mut self) -> Result<Vec<u8>> {
-        let host_key = format!("{}:{}", self.config.hostname, self.config.port);
-
-        let mut hs = Tls13Handshake::new(self.config.profile.clone(), &self.config.hostname);
-        hs.set_verification_policy(self.config.verification_policy);
-        if let Some(observer) = &self.config.trust_anchor_observer {
-            hs.set_trust_anchor_observer(observer.clone());
+        if !matches!(self.state, DriverState::Start) {
+            return Err(TlsError::HandshakeFailure(
+                "handshake already started".into(),
+            ));
         }
-        if let Some(ref a) = self.config.custom_ca_anchors {
-            hs.set_custom_ca_anchors(Arc::clone(a));
-        }
-        if let Some(ref p) = self.config.alps_payload {
-            hs.set_alps_payload(p.clone());
-        }
-        if let Some(ref e) = self.config.ech_config_list {
-            hs.set_ech_config(e.clone());
-        }
-        if let Some(ref cb) = self.config.keylog_callback {
-            hs.set_keylog_callback(Arc::clone(cb));
-        }
-        let resumption_cfg = &self.config.profile.session_resumption;
-        if resumption_cfg.any_enabled() {
-            if let Some(ref store) = self.config.session_store {
-                if let Some(ticket) = store.take(&host_key) {
-                    tracing::debug!(
-                        host = %self.config.hostname,
-                        ticket_len = ticket.ticket.len(),
-                        tls_version = ?ticket.tls_version,
-                        "tls.attempting_session_resumption",
-                    );
-                    match ticket.tls_version {
-                        TicketTlsVersion::Tls13 if resumption_cfg.tls13_psk => {
-                            let alpn_compatible =
-                                match (&ticket.alpn, &self.config.profile.alpn_protocols) {
-                                    (None, _) => true,
-                                    (Some(alpn), protos) if protos.iter().any(|p| p == alpn) => {
-                                        true
-                                    }
-                                    _ => false,
-                                };
-                            if alpn_compatible {
-                                self.original_ticket = Some(ticket.clone());
-                                hs.set_psk_ticket(ticket);
-                            } else {
-                                tracing::debug!(
-                                    host = %self.config.hostname,
-                                    ticket_alpn = ?ticket.alpn,
-                                    "tls.psk_ticket_alpn_mismatch — skipping resumption",
-                                );
+        self.state = DriverState::Complete;
+        // Validation precedes the single cache take. Version-specific protocol
+        // state is constructed only after a complete ServerHello selects it.
+        let (compiled, overlay) = self.config.validated_hello_config()?;
+        let mut psk_ticket = None;
+        let mut tls12_ticket = None;
+        let mut tls12_session_id = None;
+        let resumption = &self.config.profile.session_resumption;
+        if resumption.any_enabled() {
+            if let Some(store) = &self.config.session_store {
+                if let Some(ticket) = self.session_scope.take(store.as_ref()) {
+                    let alpn_compatible = ticket.alpn().is_none_or(|alpn| {
+                        compiled.offers_alpn(alpn.as_bytes(), overlay.as_deref())
+                    });
+                    if alpn_compatible {
+                        match ticket.tls_version() {
+                            TicketTlsVersion::Tls13 if resumption.tls13_psk => {
+                                psk_ticket = Some(ticket.into_legacy());
                             }
-                        }
-                        TicketTlsVersion::Tls12
-                            if resumption_cfg.tls12_session_ticket
-                                && self.config.ech_config_list.is_none() =>
-                        {
-                            let alpn_compatible =
-                                match (&ticket.alpn, &self.config.profile.alpn_protocols) {
-                                    (None, _) => true,
-                                    (Some(alpn), protos) if protos.iter().any(|p| p == alpn) => {
-                                        true
-                                    }
-                                    _ => false,
-                                };
-                            if alpn_compatible {
-                                self.original_ticket = Some(ticket.clone());
-                                hs.set_tls12_session_ticket(ticket.ticket.clone());
-                            } else {
-                                tracing::debug!(
-                                    host = %self.config.hostname,
-                                    ticket_alpn = ?ticket.alpn,
-                                    "tls12.session_ticket_alpn_mismatch — skipping resumption",
-                                );
+                            TicketTlsVersion::Tls12
+                                if resumption.tls12_session_ticket
+                                    && self.config.ech_config_list.is_none()
+                                    && self
+                                        .config
+                                        .profile
+                                        .cipher_suites
+                                        .contains(&ticket.cipher_suite()) =>
+                            {
+                                let offers_ticket = compiled
+                                    .profile
+                                    .extensions
+                                    .iter()
+                                    .any(|e| e.extension_type == 35);
+                                if offers_ticket && !ticket.ticket().is_empty() {
+                                    tls12_ticket = Some(ticket.ticket().to_vec());
+                                } else {
+                                    tls12_session_id =
+                                        ticket.tls12_session_id().map(<[u8]>::to_vec);
+                                }
+                                if tls12_ticket.is_some() || tls12_session_id.is_some() {
+                                    self.tls12_session_state = ticket.tls12_state();
+                                    self.original_ticket = Some(ticket);
+                                }
                             }
-                        }
-                        _ => {
-                            tracing::debug!(
-                                host = %self.config.hostname,
-                                tls_version = ?ticket.tls_version,
-                                "tls.session_resumption_disabled_for_version",
-                            );
+                            _ => {}
                         }
                     }
                 }
             }
         }
-
-        let ch_msg = hs.build_client_hello()?;
-        // Observe the exact ClientHello handshake message (0x01-prefixed, before
-        // TLS-record framing) the moment it is produced. Honoured here so the hook
-        // works for direct lktls users too, not just lkrequest's connector.
-        if let Some(ref cb) = self.config.client_hello_callback {
-            cb(&ch_msg);
+        let hello = super::initial::PreparedHello::build(
+            super::initial::HelloInputs {
+                profile: &compiled.profile,
+                hello_profile: &compiled.hello_profile,
+                compiled: Some(&compiled),
+                overlay: overlay.as_deref(),
+                hostname: &self.config.hostname,
+                alps_payload: self.config.alps_payload.as_deref(),
+                ech_config: self.config.ech_config_list.as_deref(),
+                tls12_ticket,
+                tls12_session_id,
+                quic_parameters: None,
+                quic: false,
+            },
+            psk_ticket,
+        )?;
+        let ch_msg = hello.offer.bytes();
+        if let Some(observer) = &self.config.trust_anchor_observer {
+            let ids = hello
+                .offer
+                .payload(crate::profile::types::ext_type::TRUST_ANCHOR_IDS)
+                .and_then(|payload| crate::trust_anchor::decode_list(payload, true).ok())
+                .unwrap_or_default();
+            observer.update(|info| info.requested_ids = ids);
         }
-        let ch_record = self.writer.write_record(content_type::HANDSHAKE, &ch_msg)?;
-        tracing::debug!("tls.client_hello_sent");
-
+        if let Some(callback) = &self.config.client_hello_callback {
+            callback(ch_msg);
+        }
+        let record = self.writer.write_record(content_type::HANDSHAKE, ch_msg)?;
         self.state = DriverState::WaitServerHello {
-            handshake: hs,
-            ch_msg,
+            initial: super::initial::ClientStart {
+                compiled,
+                overlay,
+                hello,
+            },
         };
-        Ok(ch_record)
+        Ok(record)
     }
 
     /// Feed raw bytes received from the transport.
@@ -498,11 +653,24 @@ impl HandshakeDriver {
         self.reader.feed(data);
     }
 
+    pub(crate) fn feed_bounded(&mut self, data: &[u8], limit: usize) -> usize {
+        self.reader.feed_bounded(data, limit)
+    }
+
+    pub(crate) fn buffered_input(&self) -> usize {
+        self.reader.buffered_len()
+    }
+
     /// Drive the handshake forward. Call in a loop after each `feed()`.
     pub fn progress(&mut self) -> Result<HandshakeOutput> {
         match self.progress_inner() {
             Ok(output) => Ok(output),
             Err(error) => {
+                if !matches!(&error, TlsError::Alert(alert) if !alert.is_fatal()) {
+                    if let Some(state) = &self.tls12_session_state {
+                        state.invalidate();
+                    }
+                }
                 if let Some(observer) = &self.config.trust_anchor_observer {
                     observer.record_error(&error);
                 }
@@ -554,21 +722,24 @@ impl HandshakeDriver {
                 Ok(Some(r)) => r,
                 Ok(None) => return Ok(HandshakeOutput::NeedData),
                 Err(error) => {
-                    self.initial_alert_version = matches!(&self.state,
-                        DriverState::WaitServerHello { handshake, .. } if !handshake.has_received_hrr())
-                        && matches!(
-                            self.config.profile.tls_client_hello_style,
-                            crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl
-                                | crate::profile::types::TlsClientHelloStyle::FirefoxNss
-                        );
+                    self.initial_alert_version =
+                        matches!(&self.state, DriverState::WaitServerHello { .. })
+                            && matches!(
+                                self.config.profile.tls_client_hello_style,
+                                crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl
+                                    | crate::profile::types::TlsClientHelloStyle::FirefoxNss
+                            );
                     return Err(error);
                 }
             };
 
             if record.content_type == content_type::CHANGE_CIPHER_SPEC {
-                if let DriverState::WaitServerHello { handshake, .. } = &self.state {
+                if matches!(
+                    &self.state,
+                    DriverState::WaitServerHello { .. } | DriverState::RetryServerHello { .. }
+                ) {
                     let style = self.config.profile.tls_client_hello_style;
-                    let after_hrr = handshake.has_received_hrr();
+                    let after_hrr = matches!(&self.state, DriverState::RetryServerHello { .. });
                     let browser_style = matches!(
                         style,
                         crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl
@@ -595,9 +766,14 @@ impl HandshakeDriver {
                     }
                 }
                 if let DriverState::Tls12ServerFlight { ref handshake, .. } = self.state {
-                    if handshake.state() == Tls12State::WaitCertificateOrAbbreviated {
-                        return self.handle_tls12_abbreviated_ccs();
+                    if handshake.state() != Tls12State::WaitCertificateOrAbbreviated
+                        || record.payload != [1]
+                        || !self.hs_buffer.is_empty()
+                    {
+                        return Err(TlsError::local_alert(AlertDescription::UnexpectedMessage,
+                            "unexpected TLS 1.2 ChangeCipherSpec or incomplete prior handshake message"));
                     }
+                    return self.handle_tls12_abbreviated_ccs();
                 }
                 continue;
             }
@@ -619,13 +795,23 @@ impl HandshakeDriver {
 
             let state = std::mem::replace(&mut self.state, DriverState::Complete);
             match state {
-                DriverState::WaitServerHello { handshake, ch_msg } => {
-                    if handshake.has_received_hrr() {
-                        return self.begin_tls13(handshake, &record.payload);
-                    }
+                DriverState::RetryServerHello { handshake } => {
+                    self.hs_buffer.push(&record.payload)?;
+                    let Some(server_hello) = self.hs_buffer.take_message()? else {
+                        self.state = DriverState::RetryServerHello { handshake };
+                        continue;
+                    };
+                    return self.begin_tls13(handshake, &server_hello);
+                }
+                DriverState::WaitServerHello { initial } => {
+                    self.hs_buffer.push(&record.payload)?;
+                    let Some(server_hello) = self.hs_buffer.take_message()? else {
+                        self.state = DriverState::WaitServerHello { initial };
+                        continue;
+                    };
                     let style = self.config.profile.tls_client_hello_style;
                     let (version, version_extension) =
-                        match detect_version_for_style(&record.payload, style, false) {
+                        match detect_version_for_style(&server_hello, style, false) {
                             Ok(selected) => selected,
                             Err(error) => {
                                 self.initial_alert_version =
@@ -643,17 +829,7 @@ impl HandshakeDriver {
                             "server selected a TLS version outside configured bounds",
                         ));
                     }
-                    let offered = client_hello_extensions(&ch_msg).ok_or_else(|| {
-                        TlsError::InvalidProfile("cannot parse ClientHello version offer".into())
-                    })?;
-                    let version_offered = match offered.iter().find(|(kind, _)| *kind == 43) {
-                        Some((_, payload)) => {
-                            crate::extensions::supported_versions::parse_client_versions(payload)
-                                .is_some_and(|versions| versions.contains(&version))
-                        }
-                        None => version <= u16::from_be_bytes([ch_msg[4], ch_msg[5]]),
-                    };
-                    if !version_offered {
+                    if !initial.hello.offer.offers_version(version) {
                         return Err(TlsError::local_alert(AlertDescription::ProtocolVersion, "server selected a TLS version absent from the actual ClientHello offer"));
                     }
                     if version_extension && version < 0x0304 {
@@ -668,10 +844,13 @@ impl HandshakeDriver {
                     );
 
                     if version == 0x0304 {
-                        return self.begin_tls13(handshake, &record.payload);
+                        self.original_ticket = None;
+                        self.tls12_session_state = None;
+                        let handshake = self.config.select_tls13(initial)?;
+                        return self.begin_tls13(handshake, &server_hello);
                     } else if version == 0x0303 {
-                        let public_name = handshake.ech_rejection_public_name();
-                        match self.begin_tls12(ch_msg, &record.payload, public_name)? {
+                        let public_name = initial.hello.ech_public_name();
+                        match self.begin_tls12(initial.hello.offer, &server_hello, public_name)? {
                             HandshakeOutput::NeedData => continue,
                             other => return Ok(other),
                         }
@@ -688,9 +867,8 @@ impl HandshakeDriver {
                     // complete messages, carrying any partial trailer to the
                     // next record. Multiple coalesced messages in one record are
                     // handled the same way.
-                    self.hs_buffer.extend_from_slice(&record.payload);
-                    let Some(messages) = take_complete_handshake_messages(&mut self.hs_buffer)?
-                    else {
+                    self.hs_buffer.push(&record.payload)?;
+                    let Some(messages) = self.hs_buffer.take_complete()? else {
                         // No complete message yet — wait for the next record.
                         self.state = DriverState::Tls13Encrypted { handshake };
                         continue;
@@ -700,7 +878,15 @@ impl HandshakeDriver {
                             self.state = DriverState::Tls13Encrypted { handshake };
                             continue;
                         }
-                        HandshakeAction::Complete(c) => return self.finish_tls13(*c),
+                        HandshakeAction::Complete(c) => {
+                            if !self.hs_buffer.is_empty() {
+                                return Err(TlsError::local_alert(
+                                    AlertDescription::UnexpectedMessage,
+                                    "TLS 1.3 Finished must end at a record boundary",
+                                ));
+                            }
+                            return self.finish_tls13(*c);
+                        }
                         _ => {
                             return Err(TlsError::HandshakeFailure(
                                 "unexpected action during encrypted handshake".into(),
@@ -716,9 +902,8 @@ impl HandshakeDriver {
                     // also span several records (RFC 8446 §5.1 applies to 1.2's
                     // record layer too) — buffer and process only complete
                     // messages, mirroring the TLS 1.3 path above.
-                    self.hs_buffer.extend_from_slice(&record.payload);
-                    let Some(messages) = take_complete_handshake_messages(&mut self.hs_buffer)?
-                    else {
+                    self.hs_buffer.push(&record.payload)?;
+                    let Some(messages) = self.hs_buffer.take_complete()? else {
                         self.state = DriverState::Tls12ServerFlight {
                             handshake,
                             client_random,
@@ -770,7 +955,14 @@ impl HandshakeDriver {
             == crate::profile::types::TlsClientHelloStyle::ChromiumBoringssl
             && !handshake.has_received_hrr()
             && crate::handshake::server_hello::tls13_failure_ccs_eligible(server_hello);
-        let result = handshake.process_handshake_record(server_hello);
+        let result = if self.hs_buffer.is_empty() {
+            handshake.process_handshake_record(server_hello)
+        } else {
+            Err(TlsError::local_alert(
+                AlertDescription::UnexpectedMessage,
+                "TLS 1.3 ServerHello must end at a record boundary",
+            ))
+        };
         if ccs_before_failure && matches!(&result, Err(TlsError::LocalAlert { .. })) {
             self.pending_alert = Some(
                 self.writer
@@ -793,16 +985,28 @@ impl HandshakeDriver {
                 ) {
                     self.pending_tls13_ccs = std::mem::take(&mut ccs);
                 }
-                self.reader.set_keys(Aead::new(
-                    keys.aead_algorithm,
-                    &keys.server_key,
-                    &keys.server_iv,
-                )?);
-                self.writer.set_keys(Aead::new(
-                    keys.aead_algorithm,
-                    &keys.client_key,
-                    &keys.client_iv,
-                )?);
+                self.apply_record(
+                    RecordEffect::InstallRead {
+                        epoch: Epoch::Handshake,
+                        keys: ReadKeys::tls13(
+                            keys.aead_algorithm,
+                            &keys.server_key,
+                            &keys.server_iv,
+                        )?,
+                    },
+                    &mut ccs,
+                )?;
+                self.apply_record(
+                    RecordEffect::InstallWrite {
+                        epoch: Epoch::Handshake,
+                        keys: WriteKeys::tls13(
+                            keys.aead_algorithm,
+                            &keys.client_key,
+                            &keys.client_iv,
+                        )?,
+                    },
+                    &mut ccs,
+                )?;
                 self.state = DriverState::Tls13Encrypted { handshake };
                 Ok(HandshakeOutput::SendData(ccs))
             }
@@ -818,10 +1022,7 @@ impl HandshakeDriver {
                 let mut buf = ccs;
                 buf.extend_from_slice(&ch2_record);
 
-                self.state = DriverState::WaitServerHello {
-                    handshake,
-                    ch_msg: ch2,
-                };
+                self.state = DriverState::RetryServerHello { handshake };
                 Ok(HandshakeOutput::SendData(buf))
             }
             _ => Err(TlsError::HandshakeFailure(
@@ -835,30 +1036,59 @@ impl HandshakeDriver {
 
         if let Some(ref early) = complete.client_end_of_early_data {
             let mut early_writer = RecordWriter::new();
-            early_writer.set_keys(Aead::new(
-                early.aead_algorithm,
-                &early.client_key,
-                &early.client_iv,
-            )?);
-            send_buf.extend_from_slice(
-                &early_writer.write_record(content_type::HANDSHAKE, &early.message)?,
-            );
+            let mut early_effects = RecordEffects::default();
+            early_effects.apply(
+                RecordEffect::InstallWrite {
+                    epoch: Epoch::EarlyData,
+                    keys: WriteKeys::tls13(
+                        early.aead_algorithm,
+                        &early.client_key,
+                        &early.client_iv,
+                    )?,
+                },
+                &mut self.reader,
+                &mut early_writer,
+                &mut send_buf,
+            )?;
+            early_effects.apply(
+                RecordEffect::Emit {
+                    epoch: Epoch::EarlyData,
+                    content_type: content_type::HANDSHAKE,
+                    bytes: &early.message,
+                },
+                &mut self.reader,
+                &mut early_writer,
+                &mut send_buf,
+            )?;
         }
         if let Some(ref cee) = complete.client_encrypted_extensions {
-            send_buf.extend_from_slice(&self.writer.write_record(content_type::HANDSHAKE, cee)?);
+            self.apply_record(
+                RecordEffect::Emit {
+                    epoch: Epoch::Handshake,
+                    content_type: content_type::HANDSHAKE,
+                    bytes: cee,
+                },
+                &mut send_buf,
+            )?;
         }
         if let Some(ref certificate) = complete.client_certificate {
-            send_buf.extend_from_slice(
-                &self
-                    .writer
-                    .write_record(content_type::HANDSHAKE, certificate)?,
-            );
+            self.apply_record(
+                RecordEffect::Emit {
+                    epoch: Epoch::Handshake,
+                    content_type: content_type::HANDSHAKE,
+                    bytes: certificate,
+                },
+                &mut send_buf,
+            )?;
         }
-        send_buf.extend_from_slice(
-            &self
-                .writer
-                .write_record(content_type::HANDSHAKE, &complete.client_finished)?,
-        );
+        self.apply_record(
+            RecordEffect::Emit {
+                epoch: Epoch::Handshake,
+                content_type: content_type::HANDSHAKE,
+                bytes: &complete.client_finished,
+            },
+            &mut send_buf,
+        )?;
 
         // ECH offered but not accepted: the outer handshake exists only to
         // authenticate the `public_name` (already done during certificate
@@ -900,12 +1130,22 @@ impl HandshakeDriver {
             });
         }
 
-        let ts = &complete.traffic_secrets;
-        self.reader
-            .set_keys(Aead::new(ts.aead_algorithm, &ts.server_key, &ts.server_iv)?);
+        let ts = complete.traffic_secrets;
+        self.apply_record(
+            RecordEffect::InstallRead {
+                epoch: Epoch::Application,
+                keys: ReadKeys::tls13(ts.aead_algorithm, &ts.server_key, &ts.server_iv)?,
+            },
+            &mut send_buf,
+        )?;
         self.reader.finish_tls13_handshake();
-        self.writer
-            .set_keys(Aead::new(ts.aead_algorithm, &ts.client_key, &ts.client_iv)?);
+        self.apply_record(
+            RecordEffect::InstallWrite {
+                epoch: Epoch::Application,
+                keys: WriteKeys::tls13(ts.aead_algorithm, &ts.client_key, &ts.client_iv)?,
+            },
+            &mut send_buf,
+        )?;
         // RFC 8449: the server's `record_size_limit` from EncryptedExtensions
         // bounds the application records we send. Installed after the client
         // flight above so the handshake records stay byte-identical.
@@ -935,14 +1175,14 @@ impl HandshakeDriver {
                 .session_store
                 .as_ref()
                 .map(|store| SessionTicketContext {
-                    resumption_master_secret: complete.resumption_master_secret.clone(),
+                    resumption_master_secret: complete.resumption_master_secret,
                     hkdf_algorithm: ts.hkdf_algorithm,
                     aead_algorithm: ts.aead_algorithm,
                     cipher_suite: complete.negotiated_cipher_suite,
                     alpn: complete.negotiated_alpn.clone(),
                     alps: complete.alps.clone(),
                     peer_transport_parameters: None,
-                    store: Arc::clone(store),
+                    store: self.session_scope.completed_store(Arc::clone(store)),
                     host_key,
                 })
         } else {
@@ -960,11 +1200,11 @@ impl HandshakeDriver {
                 negotiated_version: Some(0x0304),
                 peer_certificates: complete.server_certificates,
                 post_handshake: Some(PostHandshakeState {
-                    server_app_secret: ts.server_app_secret.clone(),
-                    client_app_secret: ts.client_app_secret.clone(),
+                    server_app_secret: ts.server_app_secret,
+                    client_app_secret: ts.client_app_secret,
                     hkdf_algorithm: ts.hkdf_algorithm,
                     aead_algorithm: ts.aead_algorithm,
-                    exporter_master_secret: ts.exporter_master_secret.clone(),
+                    exporter_master_secret: ts.exporter_master_secret,
                 }),
                 session_ticket_ctx: st_ctx,
             }),
@@ -977,7 +1217,7 @@ impl HandshakeDriver {
 
     fn begin_tls12(
         &mut self,
-        ch_msg: Vec<u8>,
+        ch_msg: super::offer::OfferSnapshot,
         server_hello: &[u8],
         ech_public_name: Option<String>,
     ) -> Result<HandshakeOutput> {
@@ -991,7 +1231,7 @@ impl HandshakeDriver {
             check_downgrade_sentinel(server_hello)?;
         }
 
-        let client_random: [u8; 32] = ch_msg[4 + 2..4 + 2 + 32]
+        let client_random: [u8; 32] = ch_msg.bytes()[4 + 2..4 + 2 + 32]
             .try_into()
             .map_err(|_| TlsError::HandshakeFailure("ClientHello too short".into()))?;
 
@@ -1009,28 +1249,31 @@ impl HandshakeDriver {
         }
 
         if let Some(ticket) = self.original_ticket.take() {
-            if ticket.tls_version == TicketTlsVersion::Tls12 && !ticket.master_secret.is_empty() {
+            let session_id_only = ticket.ticket().is_empty()
+                || !self
+                    .config
+                    .profile
+                    .extensions
+                    .iter()
+                    .any(|e| e.extension_type == 35);
+            if let Some(session) = ticket.into_tls12() {
                 tracing::debug!(host = %self.config.hostname, "tls12.attempting_session_ticket_resumption");
                 // Carry the stored EMS flag so RFC 7627 §5.3 can be checked
                 // once the server commits to resuming.
-                tls12.set_session_ticket_resumption(
-                    ticket.master_secret.clone(),
-                    ticket.used_extended_master_secret,
-                );
+                tls12.set_resumption_session(session, session_id_only);
             }
         }
 
-        tls12.feed_client_hello(&ch_msg);
+        tls12.feed_client_hello(ch_msg.bytes());
         // The first server record may coalesce ServerHello with (part of) the
         // Certificate flight, and a handshake message may be fragmented across
         // records (RFC 8446 §5.1). Process the complete messages here and carry
         // any partial trailer into `hs_buffer` for the Tls12ServerFlight state.
-        let mut initial = server_hello.to_vec();
-        let action = match take_complete_handshake_messages(&mut initial)? {
-            Some(msgs) => tls12.process_handshake_record(&msgs)?,
-            None => Tls12HandshakeAction::ContinueReading,
-        };
-        self.hs_buffer = initial;
+        let mut messages = server_hello.to_vec();
+        if let Some(rest) = self.hs_buffer.take_complete()? {
+            messages.extend_from_slice(&rest);
+        }
+        let action = tls12.process_handshake_record(&messages)?;
         match action {
             Tls12HandshakeAction::ContinueReading => {
                 self.state = DriverState::Tls12ServerFlight {
@@ -1067,68 +1310,72 @@ impl HandshakeDriver {
         };
 
         let tk = handshake.accept_abbreviated_ccs()?;
-        tk.install_on_reader(&mut self.reader)?;
+        self.apply_record(
+            RecordEffect::InstallRead {
+                epoch: Epoch::Application,
+                keys: ReadKeys::tls12(
+                    tk.to_record_cipher_with_mode(false, handshake.cbc_mac_mode())?,
+                ),
+            },
+            &mut Vec::new(),
+        )?;
 
-        // Try to read server Finished from buffered data
-        loop {
-            match self.reader.next_record()? {
-                Some(rec) if rec.content_type == content_type::CHANGE_CIPHER_SPEC => continue,
-                Some(rec) if rec.content_type == content_type::HANDSHAKE => {
-                    return self.complete_tls12_abbreviated(handshake, client_random, &rec.payload);
-                }
-                Some(rec) => {
-                    return Err(TlsError::UnexpectedMessage(format!(
-                        "expected server Finished, got 0x{:02x}",
-                        rec.content_type
-                    )));
-                }
-                None => {
-                    // Need more data — transition to a waiting state.
-                    // Re-use Tls12WaitServerFinished with a flag.
-                    self.state = DriverState::Tls12WaitServerFinished {
-                        handshake,
-                        client_random,
-                        traffic_keys: tk,
-                        server_ccs_received: true,
-                    };
-                    return Ok(HandshakeOutput::NeedData);
-                }
-            }
-        }
+        self.state = DriverState::Tls12WaitServerFinished {
+            handshake,
+            client_random,
+            traffic_keys: tk,
+            server_ccs_received: true,
+        };
+        self.progress_tls12_wait_finished()
     }
 
     fn complete_tls12_abbreviated(
         &mut self,
         mut handshake: Tls12Handshake,
         client_random: [u8; 32],
+        traffic_keys: Tls12TrafficKeys,
         finished_payload: &[u8],
     ) -> Result<HandshakeOutput> {
-        let abbr_flight = handshake.process_abbreviated_server_finished(finished_payload)?;
+        let client_finished = handshake.finish_resumed(finished_payload)?;
 
-        let ccs = self
-            .writer
-            .write_record(content_type::CHANGE_CIPHER_SPEC, &[0x01])?;
-        abbr_flight
-            .traffic_keys
-            .install_on_writer(&mut self.writer)?;
+        let mut send_buf = Vec::new();
+        self.apply_record(
+            RecordEffect::Emit {
+                epoch: Epoch::Plaintext,
+                content_type: content_type::CHANGE_CIPHER_SPEC,
+                bytes: &[1],
+            },
+            &mut send_buf,
+        )?;
+        self.apply_record(
+            RecordEffect::InstallWrite {
+                epoch: Epoch::Application,
+                keys: WriteKeys::tls12(
+                    traffic_keys.to_record_cipher_with_mode(true, handshake.cbc_mac_mode())?,
+                ),
+            },
+            &mut send_buf,
+        )?;
         // RFC 8449: honour the server's ServerHello `record_size_limit`.
         // Resumption renegotiates the limit, so it is read from this
         // handshake's ServerHello rather than carried over.
         self.writer
             .set_peer_record_size_limit(handshake.peer_record_size_limit());
-        let fin = self
-            .writer
-            .write_record(content_type::HANDSHAKE, &abbr_flight.client_finished)?;
-
-        let mut send_buf = Vec::with_capacity(ccs.len() + fin.len());
-        send_buf.extend_from_slice(&ccs);
-        send_buf.extend_from_slice(&fin);
+        self.apply_record(
+            RecordEffect::Emit {
+                epoch: Epoch::Application,
+                content_type: content_type::HANDSHAKE,
+                bytes: &client_finished,
+            },
+            &mut send_buf,
+        )?;
 
         self.emit_tls12_keylog(&handshake, &client_random);
+        self.commit_tls12_session_ticket(&mut handshake);
 
         let alpn = handshake.negotiated_alpn().map(|s| s.to_string());
         tracing::debug!(
-            version = "TLS1.2", cipher = ?abbr_flight.traffic_keys.cipher_suite,
+            version = "TLS1.2", cipher = ?traffic_keys.cipher_suite,
             alpn = ?alpn, abbreviated = true, "tls.handshake_complete",
         );
 
@@ -1139,7 +1386,7 @@ impl HandshakeDriver {
                 reader: std::mem::take(&mut self.reader),
                 writer: std::mem::take(&mut self.writer),
                 negotiated_alpn: alpn,
-                negotiated_cipher_suite: Some(abbr_flight.traffic_keys.cipher_suite.code_point()),
+                negotiated_cipher_suite: Some(traffic_keys.cipher_suite.code_point()),
                 negotiated_version: Some(0x0303),
                 peer_certificates: handshake.server_certificates().to_vec(),
                 post_handshake: None,
@@ -1154,30 +1401,61 @@ impl HandshakeDriver {
         client_random: [u8; 32],
         flight: crate::handshake::tls12::Tls12ClientFlight,
     ) -> Result<HandshakeOutput> {
-        let certificate = match flight.client_certificate.as_deref() {
-            Some(message) => self.writer.write_record(content_type::HANDSHAKE, message)?,
-            None => Vec::new(),
-        };
-        let cke = self
-            .writer
-            .write_record(content_type::HANDSHAKE, &flight.client_key_exchange)?;
-        let ccs = self
-            .writer
-            .write_record(content_type::CHANGE_CIPHER_SPEC, &[0x01])?;
-        flight.traffic_keys.install_on_writer(&mut self.writer)?;
+        if !self.hs_buffer.is_empty() {
+            return Err(TlsError::local_alert(
+                AlertDescription::UnexpectedMessage,
+                "incomplete message after TLS 1.2 ServerHelloDone",
+            ));
+        }
+        let mut send_buf = Vec::new();
+        if let Some(message) = flight.client_certificate.as_deref() {
+            self.apply_record(
+                RecordEffect::Emit {
+                    epoch: Epoch::Plaintext,
+                    content_type: content_type::HANDSHAKE,
+                    bytes: message,
+                },
+                &mut send_buf,
+            )?;
+        }
+        self.apply_record(
+            RecordEffect::Emit {
+                epoch: Epoch::Plaintext,
+                content_type: content_type::HANDSHAKE,
+                bytes: &flight.client_key_exchange,
+            },
+            &mut send_buf,
+        )?;
+        self.apply_record(
+            RecordEffect::Emit {
+                epoch: Epoch::Plaintext,
+                content_type: content_type::CHANGE_CIPHER_SPEC,
+                bytes: &[1],
+            },
+            &mut send_buf,
+        )?;
+        self.apply_record(
+            RecordEffect::InstallWrite {
+                epoch: Epoch::Application,
+                keys: WriteKeys::tls12(
+                    flight
+                        .traffic_keys
+                        .to_record_cipher_with_mode(true, handshake.cbc_mac_mode())?,
+                ),
+            },
+            &mut send_buf,
+        )?;
         // RFC 8449: honour the server's ServerHello `record_size_limit`.
         self.writer
             .set_peer_record_size_limit(handshake.peer_record_size_limit());
-        let fin = self
-            .writer
-            .write_record(content_type::HANDSHAKE, &flight.client_finished)?;
-
-        let mut send_buf =
-            Vec::with_capacity(certificate.len() + cke.len() + ccs.len() + fin.len());
-        send_buf.extend_from_slice(&certificate);
-        send_buf.extend_from_slice(&cke);
-        send_buf.extend_from_slice(&ccs);
-        send_buf.extend_from_slice(&fin);
+        self.apply_record(
+            RecordEffect::Emit {
+                epoch: Epoch::Application,
+                content_type: content_type::HANDSHAKE,
+                bytes: &flight.client_finished,
+            },
+            &mut send_buf,
+        )?;
 
         self.state = DriverState::Tls12WaitServerFinished {
             handshake,
@@ -1213,46 +1491,12 @@ impl HandshakeDriver {
             };
 
             if record.content_type == content_type::CHANGE_CIPHER_SPEC {
-                if !server_ccs_received {
-                    // Install read keys: need to take ownership of traffic_keys temporarily
-                    // to call install_on_reader (which borrows &mut self.reader).
-                    let state = std::mem::replace(&mut self.state, DriverState::Complete);
-                    if let DriverState::Tls12WaitServerFinished {
-                        handshake,
-                        client_random,
-                        traffic_keys,
-                        ..
-                    } = state
-                    {
-                        traffic_keys.install_on_reader(&mut self.reader)?;
-                        self.state = DriverState::Tls12WaitServerFinished {
-                            handshake,
-                            client_random,
-                            traffic_keys,
-                            server_ccs_received: true,
-                        };
-                    }
+                if server_ccs_received || record.payload != [1] || !self.hs_buffer.is_empty() {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::UnexpectedMessage,
+                        "unexpected TLS 1.2 ChangeCipherSpec or incomplete prior handshake message",
+                    ));
                 }
-                continue;
-            }
-
-            if record.content_type == content_type::HANDSHAKE {
-                let msg_type = record.payload.first().copied().unwrap_or(0);
-
-                if !server_ccs_received {
-                    // Pre-CCS handshake message (e.g. NewSessionTicket)
-                    self.try_store_tls12_session_ticket(msg_type, &record.payload);
-
-                    if let DriverState::Tls12WaitServerFinished {
-                        ref mut handshake, ..
-                    } = self.state
-                    {
-                        handshake.feed_handshake_message(&record.payload);
-                    }
-                    continue;
-                }
-
-                // Post-CCS: this should be server Finished
                 let state = std::mem::replace(&mut self.state, DriverState::Complete);
                 if let DriverState::Tls12WaitServerFinished {
                     mut handshake,
@@ -1261,8 +1505,69 @@ impl HandshakeDriver {
                     ..
                 } = state
                 {
-                    handshake.notify_server_ccs_received();
-                    handshake.process_server_finished(&record.payload)?;
+                    handshake.receive_server_ccs()?;
+                    self.apply_record(
+                        RecordEffect::InstallRead {
+                            epoch: Epoch::Application,
+                            keys: ReadKeys::tls12(
+                                traffic_keys
+                                    .to_record_cipher_with_mode(false, handshake.cbc_mac_mode())?,
+                            ),
+                        },
+                        &mut Vec::new(),
+                    )?;
+                    self.state = DriverState::Tls12WaitServerFinished {
+                        handshake,
+                        client_random,
+                        traffic_keys,
+                        server_ccs_received: true,
+                    };
+                }
+                continue;
+            }
+
+            if record.content_type == content_type::HANDSHAKE {
+                self.hs_buffer.push(&record.payload)?;
+                let Some(messages) = self.hs_buffer.take_complete()? else {
+                    continue;
+                };
+                if !server_ccs_received {
+                    if let DriverState::Tls12WaitServerFinished {
+                        ref mut handshake, ..
+                    } = self.state
+                    {
+                        handshake.process_handshake_record(&messages)?;
+                    }
+                    continue;
+                }
+
+                // Completion cannot leave unprocessed handshake bytes behind.
+                if messages.len() != 16
+                    || messages[..4] != [20, 0, 0, 12]
+                    || !self.hs_buffer.is_empty()
+                {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::UnexpectedMessage,
+                        "expected exactly one TLS 1.2 Finished message",
+                    ));
+                }
+                let state = std::mem::replace(&mut self.state, DriverState::Complete);
+                if let DriverState::Tls12WaitServerFinished {
+                    mut handshake,
+                    client_random,
+                    traffic_keys,
+                    ..
+                } = state
+                {
+                    if handshake.is_abbreviated() {
+                        return self.complete_tls12_abbreviated(
+                            handshake,
+                            client_random,
+                            traffic_keys,
+                            &messages,
+                        );
+                    }
+                    handshake.finish_full(&messages)?;
 
                     self.emit_tls12_keylog(&handshake, &client_random);
 
@@ -1280,6 +1585,7 @@ impl HandshakeDriver {
                     }
 
                     let alpn = handshake.negotiated_alpn().map(|s| s.to_string());
+                    self.commit_tls12_session_ticket(&mut handshake);
                     tracing::debug!(
                         version = "TLS1.2", cipher = ?traffic_keys.cipher_suite,
                         alpn = ?alpn, "tls.handshake_complete",
@@ -1300,47 +1606,37 @@ impl HandshakeDriver {
                         }),
                     });
                 }
+            } else {
+                return Err(TlsError::local_alert(
+                    AlertDescription::UnexpectedMessage,
+                    "expected a TLS 1.2 handshake record while waiting for Finished",
+                ));
             }
         }
     }
 
-    /// Try to parse and store a TLS 1.2 NewSessionTicket from a pre-CCS handshake message.
-    fn try_store_tls12_session_ticket(&self, msg_type: u8, payload: &[u8]) {
-        if self.tls12_ech_rejected {
+    fn commit_tls12_session_ticket(&mut self, handshake: &mut Tls12Handshake) {
+        let state = if handshake.is_abbreviated() {
+            self.tls12_session_state.clone()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| crate::session_store::client::Tls12SessionState::new(Instant::now()));
+        self.reader.set_tls12_session_state(state.clone());
+        self.writer.set_tls12_session_state(state.clone());
+        if self.tls12_ech_rejected || !self.config.profile.session_resumption.store_tickets {
             return;
         }
-        if msg_type != 0x04 {
-            return;
-        }
-        if !self.config.profile.session_resumption.store_tickets {
-            return;
-        }
-        let DriverState::Tls12WaitServerFinished { ref handshake, .. } = self.state else {
-            return;
-        };
         let Some(ref store) = self.config.session_store else {
             return;
         };
-        let Some(ms) = handshake.master_secret() else {
+        let Some((ticket, session_id)) = handshake.take_session() else {
             return;
         };
-        let host_key = format!("{}:{}", self.config.hostname, self.config.port);
-        match crate::session_store::parse_tls12_new_session_ticket(
-            payload,
-            ms,
-            handshake.negotiated_alpn().map(|s| s.to_string()),
-            handshake.negotiated_cipher_suite(),
-            // RFC 7627 §5.4: persist the EMS flag so §5.3 can be checked when
-            // this ticket is later used to resume.
-            Some(handshake.used_extended_master_secret()),
-        ) {
-            Ok(td) => {
-                store.store(&host_key, td);
-                tracing::debug!(host = %host_key, "tls12.session_ticket_stored");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "tls12.session_ticket_parse_failed");
-            }
+        if !ticket.ticket.is_empty() || !session_id.is_empty() {
+            self.session_scope
+                .store_tls12_completed(store.as_ref(), ticket, session_id, state);
+            tracing::debug!(host = %self.config.hostname, "tls12.session_ticket_stored");
         }
     }
 
@@ -1359,27 +1655,53 @@ impl HandshakeDriver {
 
 /// Sans-I/O QUIC-TLS handshake driver.
 pub struct QuicHandshakeDriver {
-    config: QuicHandshakeConfig,
+    config: QuicDriverConfig,
     state: QuicDriverState,
-    input: Vec<u8>,
+    input: HandshakeDeframer,
+    input_error: Option<TlsError>,
     handshake_secrets: Option<QuicTrafficSecrets>,
+    session_scope: SessionScope,
 }
 
 impl QuicHandshakeDriver {
     pub fn new(config: QuicHandshakeConfig) -> Self {
+        Self::with_config(QuicDriverConfig {
+            tls: DriverConfig::legacy(config.tls, Transport::Quic),
+            transport_parameters: config.transport_parameters,
+        })
+    }
+
+    pub fn from_compiled(
+        config: Arc<CompiledClientConfig>,
+        inputs: ConnectionInputs,
+        transport_parameters: Vec<u8>,
+    ) -> Result<Self> {
+        Ok(Self::with_config(QuicDriverConfig {
+            tls: DriverConfig::compiled(config, inputs, Transport::Quic)?,
+            transport_parameters,
+        }))
+    }
+
+    fn with_config(config: QuicDriverConfig) -> Self {
+        let session_scope = config.tls.session_scope(Transport::Quic);
         Self {
             config,
             state: QuicDriverState::Start,
-            input: Vec::new(),
+            input: HandshakeDeframer::default(),
+            input_error: None,
             handshake_secrets: None,
+            session_scope,
         }
     }
 
     pub fn start(&mut self) -> Result<Vec<u8>> {
-        let host_key = format!("{}:{}", self.config.tls.hostname, self.config.tls.port);
-
-        let mut hs =
-            Tls13Handshake::new(self.config.tls.profile.clone(), &self.config.tls.hostname);
+        if !matches!(self.state, QuicDriverState::Start) {
+            return Err(TlsError::HandshakeFailure(
+                "handshake already started".into(),
+            ));
+        }
+        self.state = QuicDriverState::Complete;
+        let mut hs = self.config.tls.handshake()?;
         hs.enable_quic_mode();
         hs.set_quic_transport_parameters(self.config.transport_parameters.clone());
         if let Some(ref p) = self.config.tls.alps_payload {
@@ -1402,16 +1724,13 @@ impl QuicHandshakeDriver {
         let resumption_cfg = &self.config.tls.profile.session_resumption;
         if resumption_cfg.tls13_psk {
             if let Some(ref store) = self.config.tls.session_store {
-                if let Some(ticket) = store.take(&host_key) {
-                    if ticket.tls_version == TicketTlsVersion::Tls13 {
-                        let alpn_compatible =
-                            match (&ticket.alpn, &self.config.tls.profile.alpn_protocols) {
-                                (None, _) => true,
-                                (Some(alpn), protos) if protos.iter().any(|p| p == alpn) => true,
-                                _ => false,
-                            };
+                if let Some(ticket) = self.session_scope.take(store.as_ref()) {
+                    if ticket.tls_version() == TicketTlsVersion::Tls13 {
+                        let alpn_compatible = ticket
+                            .alpn()
+                            .is_none_or(|alpn| hs.offers_alpn(alpn.as_bytes()));
                         if alpn_compatible {
-                            hs.set_psk_ticket(ticket);
+                            hs.set_psk_ticket(ticket.into_legacy());
                         }
                     }
                 }
@@ -1444,8 +1763,21 @@ impl QuicHandshakeDriver {
         }
     }
 
+    /// The validated session actually offered in the initial ClientHello.
+    /// The driver owns the cache take; adapters must not take another ticket.
+    pub fn resumption_ticket(&self) -> Option<&crate::session_store::SessionTicketData> {
+        match &self.state {
+            QuicDriverState::WaitServerHello { handshake } => {
+                handshake.resumption_offer().map(|(ticket, _)| ticket)
+            }
+            _ => None,
+        }
+    }
+
     pub fn feed(&mut self, data: &[u8]) {
-        self.input.extend_from_slice(data);
+        if self.input_error.is_none() {
+            self.input_error = self.input.push(data).err().map(TlsError::from);
+        }
     }
 
     pub fn progress(&mut self) -> Result<QuicHandshakeOutput> {
@@ -1457,6 +1789,10 @@ impl QuicHandshakeDriver {
     }
 
     fn progress_inner(&mut self) -> Result<QuicHandshakeOutput> {
+        if let Some(error) = self.input_error.take() {
+            self.state = QuicDriverState::Complete;
+            return Err(error);
+        }
         loop {
             let state = std::mem::replace(&mut self.state, QuicDriverState::Complete);
             match state {
@@ -1469,7 +1805,7 @@ impl QuicHandshakeDriver {
                     ));
                 }
                 QuicDriverState::WaitServerHello { handshake } => {
-                    let Some(server_hello) = take_next_handshake_message(&mut self.input)? else {
+                    let Some(server_hello) = self.input.take_message()? else {
                         self.state = QuicDriverState::WaitServerHello { handshake };
                         return Ok(QuicHandshakeOutput::NeedData);
                     };
@@ -1491,7 +1827,7 @@ impl QuicHandshakeDriver {
                     return self.begin_quic_tls13(handshake, &server_hello);
                 }
                 QuicDriverState::Tls13Encrypted { mut handshake } => {
-                    let Some(messages) = take_complete_handshake_messages(&mut self.input)? else {
+                    let Some(messages) = self.input.take_complete()? else {
                         self.state = QuicDriverState::Tls13Encrypted { handshake };
                         return Ok(QuicHandshakeOutput::NeedData);
                     };
@@ -1502,6 +1838,12 @@ impl QuicHandshakeDriver {
                             continue;
                         }
                         HandshakeAction::Complete(complete) => {
+                            if !self.input.is_empty() {
+                                return Err(TlsError::local_alert(
+                                    AlertDescription::UnexpectedMessage,
+                                    "incomplete handshake message after QUIC Finished",
+                                ));
+                            }
                             return self.finish_quic_tls13(*complete);
                         }
                         _ => {
@@ -1520,6 +1862,12 @@ impl QuicHandshakeDriver {
         mut handshake: Tls13Handshake,
         server_hello: &[u8],
     ) -> Result<QuicHandshakeOutput> {
+        if !self.input.is_empty() {
+            return Err(TlsError::local_alert(
+                AlertDescription::UnexpectedMessage,
+                "QUIC ServerHello must end at an encryption-level boundary",
+            ));
+        }
         match handshake.process_handshake_record(server_hello)? {
             HandshakeAction::InstallHandshakeKeys(keys) => {
                 let secrets = quic_secrets_from_handshake_keys(&keys);
@@ -1583,7 +1931,7 @@ impl QuicHandshakeDriver {
                         .peer_quic_transport_params
                         .as_ref()
                         .map(crate::extensions::quic_transport_params::encode_transport_params),
-                    store: Arc::clone(store),
+                    store: self.session_scope.completed_store(Arc::clone(store)),
                     host_key,
                 })
         } else {
@@ -1637,50 +1985,26 @@ fn quic_secrets_from_traffic_secrets(secrets: &TrafficSecrets) -> QuicTrafficSec
     }
 }
 
+#[cfg(test)]
 fn take_complete_handshake_messages(input: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
-    let mut pos = 0usize;
-    while pos < input.len() {
-        if input.len() - pos < 4 {
-            break;
-        }
-
-        let length = ((input[pos + 1] as usize) << 16)
-            | ((input[pos + 2] as usize) << 8)
-            | (input[pos + 3] as usize);
-        let Some(msg_end) = pos.checked_add(4 + length) else {
-            return Err(TlsError::UnexpectedMessage(
-                "handshake message length overflow".to_string(),
-            ));
-        };
-        if msg_end > input.len() {
-            break;
-        }
-        pos = msg_end;
+    let mut deframer = HandshakeDeframer::default();
+    deframer.push(input)?;
+    let messages = deframer.take_complete()?;
+    if let Some(messages) = &messages {
+        input.drain(..messages.len());
     }
-
-    if pos == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(input.drain(..pos).collect()))
+    Ok(messages)
 }
 
+#[cfg(test)]
 fn take_next_handshake_message(input: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
-    if input.len() < 4 {
-        return Ok(None);
+    let mut deframer = HandshakeDeframer::default();
+    deframer.push(input)?;
+    let message = deframer.take_message()?;
+    if let Some(message) = &message {
+        input.drain(..message.len());
     }
-
-    let length = ((input[1] as usize) << 16) | ((input[2] as usize) << 8) | (input[3] as usize);
-    let Some(end) = 4usize.checked_add(length) else {
-        return Err(TlsError::UnexpectedMessage(
-            "handshake message length overflow".to_string(),
-        ));
-    };
-    if end > input.len() {
-        return Ok(None);
-    }
-
-    Ok(Some(input.drain(..end).collect()))
+    Ok(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -1705,7 +2029,7 @@ mod tests {
     // A handshake message MAY be fragmented across several TLS records, and
     // several messages MAY be coalesced into one. The TLS 1.2 and 1.3 driver
     // paths both feed decrypted record payloads through
-    // `take_complete_handshake_messages`, which drains only *complete* messages
+    // `HandshakeDeframer`, which yields only *complete* messages
     // and retains any partial trailer for the next record. These tests lock in
     // that behaviour — the exact scenario that made Facebook (a fragmented
     // Certificate flight) fail with "truncated handshake message in record".
@@ -1980,7 +2304,7 @@ mod tests {
     fn make_quic_early_data_ticket() -> SessionTicketData {
         SessionTicketData {
             alpn: Some("h3".to_string()),
-            max_early_data_size: 16_384,
+            max_early_data_size: u32::MAX,
             peer_transport_parameters: Some(vec![0x0f, 0x00]),
             used_extended_master_secret: None,
             ..make_tls13_ticket()
@@ -2003,7 +2327,7 @@ mod tests {
             master_secret: vec![0xBB; 48],
             max_early_data_size: 0,
             peer_transport_parameters: None,
-            used_extended_master_secret: None,
+            used_extended_master_secret: Some(false),
         }
     }
 
@@ -2021,6 +2345,74 @@ mod tests {
             keylog_callback: None,
             client_hello_callback: None,
             trust_anchor_observer: None,
+        }
+    }
+
+    fn store_test_ticket(store: &InMemorySessionStore, ticket: SessionTicketData) {
+        let transport = if ticket.peer_transport_parameters.is_some() {
+            Transport::Quic
+        } else {
+            Transport::Tcp
+        };
+        let scope = SessionScope::new(
+            "example.com",
+            443,
+            transport,
+            VerificationPolicy::Strict,
+            None,
+        );
+        scope.store_completed(store, ticket);
+    }
+
+    fn store_test_ticket_for_config(config: &HandshakeConfig, ticket: SessionTicketData) {
+        let scope = SessionScope::new(
+            &config.hostname,
+            config.port,
+            Transport::Quic,
+            config.verification_policy,
+            config.custom_ca_anchors.as_deref().map(Vec::as_slice),
+        );
+        scope.store_completed(config.session_store.as_ref().unwrap().as_ref(), ticket);
+    }
+
+    #[test]
+    fn tls12_session_id_is_offered_and_requires_an_exact_server_echo() {
+        for echoed in [false, true] {
+            let store = Arc::new(InMemorySessionStore::new());
+            let mut config = make_config_with_store(store.clone());
+            config.profile = crate::profile::presets::safari_26();
+            config.profile.tls_max_version = crate::profile::types::TlsVersion::Tls12;
+            let mut ticket = make_tls12_ticket();
+            ticket.ticket.clear();
+            let scope = SessionScope::new(
+                "example.com",
+                443,
+                Transport::Tcp,
+                VerificationPolicy::Strict,
+                None,
+            );
+            scope.store_tls12_completed(
+                store.as_ref(),
+                ticket,
+                vec![0xa5; 32],
+                crate::session_store::client::Tls12SessionState::new(Instant::now()),
+            );
+            let mut driver = HandshakeDriver::new(config);
+            let hello = driver.start().unwrap();
+            assert_eq!(hello[5 + 38], 32);
+            assert_eq!(&hello[5 + 39..5 + 71], &[0xa5; 32]);
+            driver.feed(&scalar_test_tls12_server_hello(
+                0xc02f,
+                0,
+                if echoed { 32 } else { 31 },
+            ));
+            assert!(matches!(
+                driver.progress().unwrap(),
+                HandshakeOutput::NeedData
+            ));
+            driver.feed(&[20, 3, 3, 0, 1, 1]);
+            let outcome = driver.progress();
+            assert_eq!(outcome.is_ok(), echoed, "{:?}", outcome.as_ref().err());
         }
     }
 
@@ -2046,7 +2438,7 @@ mod tests {
             let store = Arc::new(InMemorySessionStore::new());
             let ticket = make_tls12_ticket();
             let expected_length = ticket.ticket.len();
-            store.store("example.com:443", ticket);
+            store_test_ticket(&store, ticket);
             let mut config = make_config_with_store(store);
             if real_ech {
                 config.ech_config_list = Some(ticket_test_ech_config());
@@ -2339,7 +2731,7 @@ mod tests {
     #[test]
     fn tls13_ticket_uses_psk_not_session_ticket() {
         let store = Arc::new(InMemorySessionStore::new());
-        store.store("example.com:443", make_tls13_ticket());
+        store_test_ticket(&store, make_tls13_ticket());
 
         let mut driver = HandshakeDriver::new(make_config_with_store(store));
         let ch = driver.start().unwrap();
@@ -2389,7 +2781,7 @@ mod tests {
     #[test]
     fn tls12_ticket_uses_session_ticket_not_psk() {
         let store = Arc::new(InMemorySessionStore::new());
-        store.store("example.com:443", make_tls12_ticket());
+        store_test_ticket(&store, make_tls12_ticket());
 
         let mut driver = HandshakeDriver::new(make_config_with_store(store));
         let ch = driver.start().unwrap();
@@ -2406,11 +2798,282 @@ mod tests {
     }
 
     #[test]
+    fn tls12_ticket_offer_survives_tls13_version_selection_and_hrr() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let ticket = make_tls12_ticket();
+        let expected = ticket.ticket.clone();
+        store_test_ticket(&store, ticket);
+        let mut driver = HandshakeDriver::new(make_config_with_store(store));
+        let first = driver.start().unwrap();
+        assert_eq!(scan_ch_extensions(&first).0, expected.len());
+        let hello = &first[5..];
+        let sid = &hello[39..39 + usize::from(hello[38])];
+        let retry = hrr_message(sid, 0x1301, &[0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 24]);
+        driver.feed(
+            &RecordWriter::new()
+                .write_record(content_type::HANDSHAKE, &retry)
+                .unwrap(),
+        );
+        let HandshakeOutput::SendData(flight) = driver.progress().unwrap() else {
+            panic!("HRR must emit the retry flight");
+        };
+        let mut reader = RecordReader::new();
+        reader.feed(&flight);
+        assert_eq!(
+            reader.next_record().unwrap().unwrap().content_type,
+            content_type::CHANGE_CIPHER_SPEC
+        );
+        let second = reader.next_record().unwrap().unwrap();
+        let extensions = parse_raw_client_hello_extensions(&second.payload);
+        assert!(driver.original_ticket.is_none());
+        assert_eq!(
+            extensions.iter().find(|(code, _)| *code == 35).unwrap().1,
+            expected
+        );
+        assert!(!extensions.iter().any(|(code, _)| *code == 41));
+    }
+
+    #[test]
+    fn tls12_cached_session_must_resume_with_its_original_suite() {
+        let store = Arc::new(InMemorySessionStore::new());
+        store_test_ticket(&store, make_tls12_ticket());
+        let mut driver = HandshakeDriver::new(make_config_with_store(store));
+        let hello = driver.start().unwrap();
+        assert!(scan_ch_extensions(&hello).0 > 0);
+        // Both suites have the same PRF and AEAD, but a TLS 1.2 session binds
+        // the complete suite, including its authentication family.
+        driver.feed(&scalar_test_tls12_server_hello(0xc02b, 0, 0));
+        assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+        driver.feed(&[20, 3, 3, 0, 1, 1]);
+        assert!(
+            matches!(driver.progress(), Err(TlsError::LocalAlert { alert, .. })
+            if alert.description == AlertDescription::IllegalParameter)
+        );
+    }
+
+    fn tls12_resumed_finished_fixture() -> (HandshakeDriver, RecordWriter, Vec<u8>) {
+        let store = Arc::new(InMemorySessionStore::new());
+        store_test_ticket(&store, make_tls12_ticket());
+        let mut driver = HandshakeDriver::new(make_config_with_store(store));
+        let hello = driver.start().unwrap();
+        let server_hello = scalar_test_tls12_server_hello(0xc02f, 0, 0);
+        let client_random = hello[11..43].try_into().unwrap();
+        let mut peer =
+            Tls12Handshake::new(client_random, "example.com", VerificationPolicy::Strict);
+        peer.set_session_ticket_resumption(vec![0xbb; 48], Some(false));
+        peer.feed_client_hello(&hello[5..]);
+        peer.process_handshake_record(&server_hello[5..]).unwrap();
+        let keys = peer.accept_abbreviated_ccs().unwrap();
+        let mut writer = RecordWriter::new();
+        writer.set_tls12_keys(keys.to_record_cipher(false).unwrap());
+        let mut transcript = hello[5..].to_vec();
+        transcript.extend_from_slice(&server_hello[5..]);
+        let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &transcript);
+        let verify = crate::crypto::prf::compute_verify_data(
+            crate::crypto::prf::PrfAlgorithm::Sha256,
+            &[0xbb; 48],
+            "server finished",
+            hash.as_ref(),
+        )
+        .unwrap();
+        let mut finished = vec![20, 0, 0, 12];
+        finished.extend_from_slice(&verify);
+        driver.feed(&server_hello);
+        assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+        (driver, writer, finished)
+    }
+
+    #[test]
+    fn tls12_resumed_finished_reassembles_records_with_separate_or_coalesced_ccs() {
+        for coalesced in [false, true] {
+            let (mut driver, mut writer, finished) = tls12_resumed_finished_fixture();
+            let first = writer
+                .write_record(content_type::HANDSHAKE, &finished[..3])
+                .unwrap();
+            let last = writer
+                .write_record(content_type::HANDSHAKE, &finished[3..])
+                .unwrap();
+            driver.feed(&[20, 3, 3, 0, 1, 1]);
+            if !coalesced {
+                assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+            }
+            driver.feed(&first);
+            assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+            driver.feed(&last);
+            assert!(matches!(
+                driver.progress(),
+                Ok(HandshakeOutput::Done { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn tls12_resumption_rejects_ccs_across_a_partial_message_or_after_ccs() {
+        for after_ccs in [false, true] {
+            let (mut driver, mut writer, _) = tls12_resumed_finished_fixture();
+            if after_ccs {
+                driver.feed(&[20, 3, 3, 0, 1, 1]);
+                assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+                driver.feed(
+                    &writer
+                        .write_record(content_type::CHANGE_CIPHER_SPEC, &[1])
+                        .unwrap(),
+                );
+            } else {
+                driver.feed(&[22, 3, 3, 0, 3, 4, 0, 0]);
+                assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+                driver.feed(&[20, 3, 3, 0, 1, 1]);
+            }
+            assert!(
+                matches!(driver.progress(), Err(TlsError::LocalAlert { alert, .. })
+                if alert.description == AlertDescription::UnexpectedMessage)
+            );
+        }
+    }
+
+    #[test]
+    fn tls12_finished_cannot_discard_a_partial_trailing_message() {
+        let (mut driver, mut writer, mut finished) = tls12_resumed_finished_fixture();
+        finished.extend_from_slice(&[0, 0]);
+        driver.feed(&[20, 3, 3, 0, 1, 1]);
+        driver.feed(
+            &writer
+                .write_record(content_type::HANDSHAKE, &finished)
+                .unwrap(),
+        );
+        assert!(
+            matches!(driver.progress(), Err(TlsError::LocalAlert { alert, .. })
+            if alert.description == AlertDescription::UnexpectedMessage)
+        );
+    }
+
+    fn tls13_resumed_finished_fixture() -> (HandshakeDriver, RecordWriter, Vec<u8>) {
+        use crate::crypto::hkdf::hkdf_expand_label;
+        use crate::crypto::kx::{generate_key_pair, KxGroup};
+
+        let store = Arc::new(InMemorySessionStore::new());
+        store_test_ticket(&store, make_tls13_ticket());
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = make_config_with_store(store);
+        let capture = captured.clone();
+        config.keylog_callback = Some(Arc::new(move |line| {
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            if fields[0] == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
+                *capture.lock().unwrap() =
+                    crate::handshake::client_hello::decode_hex(fields[2]).unwrap();
+            }
+        }));
+        let mut driver = HandshakeDriver::new(config);
+        let hello = driver.start().unwrap()[5..].to_vec();
+        let key = generate_key_pair(KxGroup::X25519).unwrap();
+        let mut extensions = vec![0, 43, 0, 2, 3, 4, 0, 51, 0, 36, 0, 29, 0, 32];
+        extensions.extend_from_slice(&key.public_key);
+        extensions.extend_from_slice(&[0, 41, 0, 2, 0, 0]);
+        let mut server_hello =
+            hrr_message(&hello[39..39 + hello[38] as usize], 0x1301, &extensions);
+        server_hello[6..38].fill(0x55);
+        driver.feed(
+            &RecordWriter::new()
+                .write_record(content_type::HANDSHAKE, &server_hello)
+                .unwrap(),
+        );
+        assert!(matches!(
+            driver.progress(),
+            Ok(HandshakeOutput::SendData(_))
+        ));
+        let secret = captured.lock().unwrap().clone();
+        assert_eq!(secret.len(), 32);
+        let key = hkdf_expand_label(HkdfAlgorithm::Sha256, &secret, "key", &[], 16).unwrap();
+        let iv = hkdf_expand_label(HkdfAlgorithm::Sha256, &secret, "iv", &[], 12).unwrap();
+        let mut writer = RecordWriter::new();
+        writer.set_keys(Aead::new(AeadAlgorithm::Aes128Gcm, &key, &iv).unwrap());
+        let ee = quic_certificate_message(8, &[0, 9, 0, 16, 0, 5, 0, 3, 2, b'h', b'2']);
+        driver.feed(&writer.write_record(content_type::HANDSHAKE, &ee).unwrap());
+        assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+        let transcript = [hello, server_hello, ee].concat();
+        let finished =
+            quic_certificate_message(20, &quic_certificate_finished(&secret, &transcript));
+        (driver, writer, finished)
+    }
+
+    #[test]
+    fn tls13_finished_reassembles_before_changing_record_keys() {
+        for split in [1, 3, 4, 17, 35] {
+            let (mut driver, mut writer, finished) = tls13_resumed_finished_fixture();
+            driver.feed(
+                &writer
+                    .write_record(content_type::HANDSHAKE, &finished[..split])
+                    .unwrap(),
+            );
+            assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+            driver.feed(
+                &writer
+                    .write_record(content_type::HANDSHAKE, &finished[split..])
+                    .unwrap(),
+            );
+            assert!(matches!(
+                driver.progress(),
+                Ok(HandshakeOutput::Done { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn tls13_finished_cannot_discard_a_trailing_message() {
+        for trailer in [&[4, 0][..], &[4, 0, 0, 8, 0][..], &[4, 0, 0, 0][..]] {
+            let (mut driver, mut writer, mut finished) = tls13_resumed_finished_fixture();
+            finished.extend_from_slice(trailer);
+            driver.feed(
+                &writer
+                    .write_record(content_type::HANDSHAKE, &finished)
+                    .unwrap(),
+            );
+            assert!(
+                matches!(driver.progress(), Err(TlsError::LocalAlert { alert, .. })
+                if alert.description == AlertDescription::UnexpectedMessage)
+            );
+        }
+    }
+
+    #[test]
+    fn quic_finished_cannot_discard_a_trailing_message() {
+        for trailer in [
+            &[][..],
+            &[4, 0][..],
+            &[4, 0, 0, 8, 0][..],
+            &[4, 0, 0, 0][..],
+        ] {
+            let store = Arc::new(InMemorySessionStore::new());
+            let mut config = make_config_with_store(store);
+            config.profile = crate::profile::presets::chrome_155_quic();
+            store_test_ticket_for_config(&config, make_quic_early_data_ticket());
+            let mut driver = QuicHandshakeDriver::new(config.into_quic(Vec::new()));
+            let hello = driver.start().unwrap();
+            let (mut transcript, secrets) = alps_ticket_begin_peer(&mut driver, &hello, true);
+            let mut flight = alps_ticket_ee(0x44cd, None, false);
+            transcript.extend_from_slice(&flight);
+            flight.extend_from_slice(&quic_certificate_message(
+                20,
+                &quic_certificate_finished(&secrets.server_secret, &transcript),
+            ));
+            flight.extend_from_slice(trailer);
+            driver.feed(&flight);
+            let result = driver.progress();
+            if trailer.is_empty() {
+                assert!(matches!(result, Ok(QuicHandshakeOutput::Done { .. })));
+            } else {
+                assert!(matches!(result, Err(TlsError::LocalAlert { alert, .. })
+                    if alert.description == AlertDescription::UnexpectedMessage));
+            }
+        }
+    }
+
+    #[test]
     fn alpn_mismatch_skips_tls13_ticket() {
         let store = Arc::new(InMemorySessionStore::new());
         let mut ticket = make_tls13_ticket();
         ticket.alpn = Some("h2".to_string());
-        store.store("example.com:443", ticket);
+        store_test_ticket(&store, ticket);
 
         let mut config = make_config_with_store(store);
         config.profile.alpn_protocols = vec!["http/1.1".to_string()];
@@ -2431,7 +3094,7 @@ mod tests {
         let store = Arc::new(InMemorySessionStore::new());
         let mut ticket = make_tls12_ticket();
         ticket.alpn = Some("h2".to_string());
-        store.store("example.com:443", ticket);
+        store_test_ticket(&store, ticket);
 
         let mut config = make_config_with_store(store);
         config.profile.alpn_protocols = vec!["http/1.1".to_string()];
@@ -2442,6 +3105,72 @@ mod tests {
 
         assert_eq!(st_len, 0, "session_ticket must be empty on ALPN mismatch");
         assert!(driver.original_ticket.is_none());
+    }
+
+    #[test]
+    fn ticket_selection_uses_raw_alpn_offer_for_tcp_and_quic() {
+        for (quic, tls12) in [(false, false), (false, true), (true, false)] {
+            for compatible in [false, true] {
+                let store = Arc::new(InMemorySessionStore::new());
+                let mut config = make_config_with_store(store.clone());
+                if quic {
+                    config.profile = crate::profile::presets::chrome_155_quic();
+                }
+                let raw_name = if quic { "h3-custom" } else { "http/1.1" };
+                let profile_name = if quic { "h3" } else { "h2" };
+                config.profile.alpn_protocols = vec![profile_name.into()];
+                let mut payload = Vec::new();
+                crate::extensions::Extension::encode_payload(
+                    &crate::extensions::alpn::Alpn {
+                        protocols: vec![raw_name.to_owned()],
+                    },
+                    &mut payload,
+                );
+                config
+                    .profile
+                    .extensions
+                    .iter_mut()
+                    .find(|extension| extension.extension_type == 16)
+                    .unwrap()
+                    .source = crate::profile::types::ExtensionSource::RawBytes {
+                    data: crate::crypto::to_hex(&payload),
+                };
+                let mut ticket = if tls12 {
+                    make_tls12_ticket()
+                } else {
+                    make_tls13_ticket()
+                };
+                ticket.alpn = Some(if compatible { raw_name } else { profile_name }.into());
+                if quic {
+                    ticket.peer_transport_parameters = Some(vec![0x0f, 0]);
+                }
+                store_test_ticket(&store, ticket);
+                let message = if quic {
+                    QuicHandshakeDriver::new(config.into_quic(Vec::new()))
+                        .start()
+                        .unwrap()
+                } else {
+                    HandshakeDriver::new(config).start().unwrap()[5..].to_vec()
+                };
+                let extensions = parse_raw_client_hello_extensions(&message);
+                assert_eq!(
+                    extensions.iter().find(|(code, _)| *code == 16).unwrap().1,
+                    payload
+                );
+                let offered = if tls12 {
+                    extensions
+                        .iter()
+                        .find(|(code, _)| *code == 35)
+                        .is_some_and(|(_, bytes)| !bytes.is_empty())
+                } else {
+                    extensions.iter().any(|(code, _)| *code == 41)
+                };
+                assert_eq!(
+                    offered, compatible,
+                    "quic={quic}, tls12={tls12}, compatible={compatible}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2498,7 +3227,7 @@ mod tests {
                 Vec::new(),
             )]));
         let store = Arc::new(InMemorySessionStore::new());
-        store.store("example.com:443", make_quic_early_data_ticket());
+        store_test_ticket(&store, make_quic_early_data_ticket());
         let mut config = make_config_with_store(store);
         config.profile = crate::profile::presets::chrome_146_quic();
         config.alps_payload = Some(vec![0x01, 0x40, 0x00]);
@@ -2657,6 +3386,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn driver_start_is_single_use_for_tcp_and_quic() {
+        let mut tcp = HandshakeDriver::new(make_config());
+        tcp.start().unwrap();
+        assert!(
+            tcp.start().is_err(),
+            "TCP start must not repeat session take or ClientHello"
+        );
+        let mut config = make_config();
+        config.profile = crate::profile::presets::chrome_155_quic();
+        let mut quic = QuicHandshakeDriver::new(config.into_quic(Vec::new()));
+        quic.start().unwrap();
+        assert!(
+            quic.start().is_err(),
+            "QUIC start must not repeat session take or ClientHello"
+        );
+    }
+
+    #[test]
+    fn common_start_retains_one_offer_until_fragmented_version_selection() {
+        let mut driver = HandshakeDriver::new(make_config());
+        let record = driver.start().unwrap();
+        let (pointer, random, key_count) = match &driver.state {
+            DriverState::WaitServerHello { initial } => {
+                assert_eq!(initial.hello.offer.bytes(), &record[5..]);
+                (
+                    initial.hello.offer.bytes().as_ptr(),
+                    initial.hello.random,
+                    initial.hello.key_pairs.len(),
+                )
+            }
+            _ => panic!("initial flight must be owned before selecting TLS 1.2 or TLS 1.3"),
+        };
+        assert!(key_count > 0);
+        let server_hello = scalar_test_tls12_server_hello(0xc02f, 0, 0);
+        let mut peer = RecordWriter::new();
+        driver.feed(
+            &peer
+                .write_record(content_type::HANDSHAKE, &server_hello[5..8])
+                .unwrap(),
+        );
+        assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+        match &driver.state {
+            DriverState::WaitServerHello { initial } => {
+                assert_eq!(initial.hello.offer.bytes().as_ptr(), pointer);
+                assert_eq!(initial.hello.key_pairs.len(), key_count);
+                assert_eq!(initial.hello.random, random);
+            }
+            _ => panic!("partial ServerHello must not select a version"),
+        }
+        driver.feed(
+            &peer
+                .write_record(content_type::HANDSHAKE, &server_hello[8..])
+                .unwrap(),
+        );
+        assert!(matches!(driver.progress(), Ok(HandshakeOutput::NeedData)));
+        assert!(
+            matches!(&driver.state, DriverState::Tls12ServerFlight { client_random, .. } if *client_random == random)
+        );
+    }
+
     fn make_handshake_complete(peer_record_size_limit: Option<u16>) -> HandshakeComplete {
         HandshakeComplete {
             client_end_of_early_data: None,
@@ -2689,8 +3479,21 @@ mod tests {
         }
     }
 
+    fn install_test_handshake_write_keys(driver: &mut HandshakeDriver, key: &[u8], iv: &[u8]) {
+        driver
+            .apply_record(
+                RecordEffect::InstallWrite {
+                    epoch: Epoch::Handshake,
+                    keys: WriteKeys::tls13(AeadAlgorithm::Aes128Gcm, key, iv).unwrap(),
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+    }
+
     fn completed_writer_limit(peer_record_size_limit: Option<u16>) -> Option<u16> {
         let mut driver = HandshakeDriver::new(make_config());
+        install_test_handshake_write_keys(&mut driver, &[0xa1; 16], &[0xa2; 12]);
         let output = driver
             .finish_tls13(make_handshake_complete(peer_record_size_limit))
             .expect("TLS 1.3 completion");
@@ -2723,9 +3526,7 @@ mod tests {
         let key = [0xa1; 16];
         let iv = [0xa2; 12];
         let mut driver = HandshakeDriver::new(make_config());
-        driver
-            .writer
-            .set_keys(Aead::new(AeadAlgorithm::Aes128Gcm, &key, &iv).unwrap());
+        install_test_handshake_write_keys(&mut driver, &key, &iv);
         let mut complete = make_handshake_complete(None);
         complete.client_encrypted_extensions = Some(vec![8, 0, 0, 6, 0, 4, 0x44, 0xcd, 0, 0]);
         complete.client_certificate = Some(vec![11, 0, 0, 4, 0, 0, 0, 0]);
@@ -2804,11 +3605,11 @@ mod tests {
         let store = Arc::new(InMemorySessionStore::new());
         let mut ticket = make_quic_early_data_ticket();
         ticket.max_early_data_size = u32::MAX;
-        store.store("example.com:443", ticket);
         let mut config = make_config_with_store(store);
         config.profile = crate::profile::presets::chrome_155_quic();
         config.alps_payload = alps.then(Vec::new);
         config.custom_ca_anchors = Some(Arc::new(vec![anchor]));
+        store_test_ticket_for_config(&config, ticket);
         let mut driver = QuicHandshakeDriver::new(config.into_quic(Vec::new()));
         let hello = driver.start().unwrap();
         assert!(driver.early_data_offer().is_some());
@@ -2946,6 +3747,13 @@ mod tests {
     const ALPS_TICKET_LOCAL_B: &[u8] = &[6, 0x40, 0x80];
     const ALPS_TICKET_PEER_PARAMS: &[u8] = &[0x0f, 0x00];
 
+    fn alps_ticket_identity() -> &'static rcgen::CertifiedKey<rcgen::KeyPair> {
+        static IDENTITY: std::sync::OnceLock<rcgen::CertifiedKey<rcgen::KeyPair>> =
+            std::sync::OnceLock::new();
+        IDENTITY
+            .get_or_init(|| rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap())
+    }
+
     fn alps_ticket_config(
         store: Arc<InMemorySessionStore>,
         settings: &[u8],
@@ -2961,6 +3769,12 @@ mod tests {
             .unwrap()
             .extension_type = code_point;
         config.alps_payload = Some(settings.to_vec());
+        config.custom_ca_anchors = Some(Arc::new(vec![
+            crate::verify::certchain::parse_trust_anchor_from_der(
+                alps_ticket_identity().cert.der(),
+            )
+            .unwrap(),
+        ]));
         config
     }
 
@@ -3060,15 +3874,9 @@ mod tests {
     ) -> Arc<InMemorySessionStore> {
         use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
         let store = Arc::new(InMemorySessionStore::new());
-        let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let certificate = rcgen::CertificateParams::new(vec!["example.com".into()])
-            .unwrap()
-            .self_signed(&signing_key)
-            .unwrap();
-        let anchor =
-            crate::verify::certchain::parse_trust_anchor_from_der(certificate.der()).unwrap();
-        let mut config = alps_ticket_config(store.clone(), local_settings, code_point);
-        config.custom_ca_anchors = Some(Arc::new(vec![anchor]));
+        let signing_key = &alps_ticket_identity().signing_key;
+        let certificate = &alps_ticket_identity().cert;
+        let config = alps_ticket_config(store.clone(), local_settings, code_point);
         let mut driver = QuicHandshakeDriver::new(config.into_quic(Vec::new()));
         let hello = driver.start().unwrap();
         let offered = parse_raw_client_hello_extensions(&hello);
@@ -3167,7 +3975,7 @@ mod tests {
             stored.peer_transport_parameters.as_deref(),
             Some(ALPS_TICKET_PEER_PARAMS)
         );
-        store.store("example.com:443", stored);
+        context.store.store("example.com:443", stored);
     }
 
     fn alps_ticket_assert_real_identity(hello: &[u8]) {
@@ -3278,8 +4086,8 @@ mod tests {
         let mut ticket = make_quic_early_data_ticket();
         ticket.max_early_data_size = u32::MAX;
         assert_eq!(ticket.alps, AlpsSessionState::Unknown);
-        store.store("example.com:443", ticket);
         let config = alps_ticket_config(store.clone(), ALPS_TICKET_LOCAL_B, 0x44cd);
+        store_test_ticket_for_config(&config, ticket);
         let mut driver = QuicHandshakeDriver::new(config.into_quic(Vec::new()));
         let hello = driver.start().unwrap();
         assert!(driver.early_data_offer().is_some());

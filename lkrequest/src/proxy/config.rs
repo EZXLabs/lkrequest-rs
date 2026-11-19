@@ -201,6 +201,16 @@ pub trait ProxyAuthenticator: Send + Sync + 'static {
     /// The authorization header **value** to send (e.g. `"Bearer abc123"`), or
     /// `None` to send no credentials on this attempt.
     fn authorization_value(&self) -> Option<String>;
+
+    /// Respond to a 407 challenge on a newly connected retry attempt.
+    ///
+    /// Values are the complete `Proxy-Authenticate` fields, preserving realm,
+    /// nonce and multiple challenges. Called at most once per CONNECT retry;
+    /// return `None` to decline. The default preserves existing authenticators.
+    fn authorization_for_challenge(&self, challenges: &[&str]) -> Option<String> {
+        let _ = challenges;
+        self.authorization_value()
+    }
 }
 
 /// The credential a proxy authenticates with.

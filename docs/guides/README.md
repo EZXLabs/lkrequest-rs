@@ -7,7 +7,7 @@
 | 目标 | 从这里开始 | 示例重点 |
 |---|---|---|
 | 完成第一个同步或异步请求 | [快速开始](../getting-started.md) | Cargo 依赖、blocking、Tokio、浏览器 preset |
-| 配置 method、header、query 和 body | [请求配置](requests/README.md) | GET、JSON、form、multipart |
+| 配置 method、header、query 和 body | [请求配置](requests/) | GET、JSON、form、multipart |
 | 读取、解码或流式处理响应 | [响应处理](requests/responses.md) | status、headers、text、JSON、streaming |
 | 保留 Cookie 和连接复用 | [Client、Session 与连接复用](client-session.md) | 长期 Session、身份隔离、连接预算 |
 | 携带 Basic/Bearer 凭据或信任自定义 CA | [认证与证书](auth-and-certificates.md) | `basic_auth`、`bearer_auth`、CA、证书校验 |
@@ -45,13 +45,22 @@
 
 从 [C ABI 与其他语言绑定](ffi.md) 开始。FFI 的 Client、Session、Request 和 Response 与 Rust 高层对象对应，但还需要遵守 handle 所有权和异步操作规则。
 
+同步 Rust 程序见[同步调用](blocking.md)。查找某项能力应该在哪一层配置、有没有 C 接口，
+见[功能与配置入口](../reference/configuration.md)；加载外部指纹配置见
+[加载与导出 Profile Bundle](loading-profiles.md)。
+
 ## 我需要设定防护边界
 
 | 目标 | 从这里开始 | 示例重点 |
 |---|---|---|
 | 限制响应体大小、响应头数量或最低传输速率 | [资源限制与安全边界](limits.md) | `ResourceLimits`、慢速传输 |
+| 限制一次请求的重发和建链次数 | [请求重发上限与统计](client-session.md#请求重发上限与统计) | `AttemptLimits`、配置继承、共享建链 |
+| 设置总超时、读取空闲超时或显式重试 | [超时与显式重试](networking/timeouts.md) | 总 deadline、retry policy、恢复开关 |
+| 关闭 TLS/QUIC 缓存或调整有效期 | [会话缓存](client-session.md#tlsquic-会话缓存) | 启停、TTL、恢复默认期限 |
 | 控制 HSTS 升级行为 | [资源限制与安全边界](limits.md) | `NoHsts`、`StaticHsts`、`DynamicHsts` |
 | 配置 TLS 会话恢复、0-RTT 与票据分区 | [资源限制与安全边界](limits.md) | 恢复策略、重放边界、分区模型 |
+
+需要判断一次请求为什么重发、建了几次连接或为何被拒绝时，查看[请求尝试摘要](advanced/observability.md#请求尝试摘要)。从旧版本迁移见[升级指南](upgrading.md)。
 
 ## 遇到问题
 

@@ -5,6 +5,7 @@
 # 用户手册
 
 - [快速开始](getting-started.md)
+- [同步调用](guides/blocking.md)
 - [使用场景导航](guides/README.md)
 - [理解 Client、Session 与 Request](guides/object-model.md)
 - [请求配置](guides/requests/README.md)
@@ -13,8 +14,11 @@
   - [响应处理](guides/requests/responses.md)
 - [Client、Session 与连接复用](guides/client-session.md)
 - [代理与 DNS](guides/networking.md)
+  - [超时与显式重试](guides/networking/timeouts.md)
+  - [Trust Anchor Identifiers](guides/networking/trust-anchor-identifiers.md)
 - [HTTP 协议策略](guides/protocols.md)
 - [选择浏览器 preset](guides/choosing-a-preset.md)
+  - [加载与导出 Profile Bundle](guides/loading-profiles.md)
 - [WebSocket](guides/websocket.md)
 - [认证与证书](guides/auth-and-certificates.md)
 - [资源限制与安全边界](guides/limits.md)
@@ -31,6 +35,7 @@
 
 # 规格参考
 
+- [功能与配置入口](reference/configuration.md)
 - [Preset 支持与验证矩阵](reference/presets.md)
 - [TCP 指纹的平台支持与限制](reference/tcp-fingerprint.md)
 - [功能与协议能力](reference/capabilities.md)
@@ -45,6 +50,7 @@
 - [HTTP/2 性能分析](development/http2-performance.md)
 - [HTTP/2 Write Batching 与指纹边界](development/h2-write-batching.md)
 - [测试策略与环境](development/testing.md)
+  - [Trust Anchor Identifiers 测试与互操作](development/trust-anchor-testing.md)
 - [Benchmark 方法与发布门槛](development/benchmarks/methodology.md)
   - [标准 benchmark 场景](development/benchmarks/scenarios.md)
   - [Benchmark 历史与状态](development/benchmarks/history.md)

@@ -5,9 +5,39 @@ use tokio::net::TcpStream;
 use tracing::Instrument;
 
 use crate::error::{Error, ProxyErrorKind, Result};
+use crate::session::execution::ConnectionExecution;
 
-use super::config::{ProxyAuth, ProxyConfig, ProxyScheme};
+use super::config::{ProxyAuth, ProxyConfig, ProxyCredential, ProxyScheme};
 use super::socks5_udp::SocksTarget;
+
+fn challenge_has_scheme(value: &str, scheme: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    // Commas inside quoted realm/nonce values are not challenge boundaries.
+    value
+        .split(|ch| {
+            if escaped {
+                escaped = false;
+                return false;
+            }
+            if quoted && ch == '\\' {
+                escaped = true;
+                return false;
+            }
+            if ch == '"' {
+                quoted = !quoted;
+            }
+            ch == ',' && !quoted
+        })
+        .any(|part| {
+            let part = part.trim();
+            let token_end = part
+                .find(|ch: char| ch.is_ascii_whitespace() || ch == '=')
+                .unwrap_or(part.len());
+            part[..token_end].eq_ignore_ascii_case(scheme)
+                && !part[token_end..].trim_start().starts_with('=')
+        })
+}
 
 fn connect_authority(host: &str, port: u16) -> String {
     match crate::dns::literal_ip(host) {
@@ -34,25 +64,38 @@ impl ProxyConfig {
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
     ) -> Result<TcpStream> {
-        self.connect_with_budget(
-            target_host,
-            target_port,
-            tcp_fingerprint,
-            resolver,
-            std::time::Duration::from_secs(10),
-            None,
-        )
-        .await
+        let (execution, guard) = ConnectionExecution::new();
+        let result = execution
+            .run(self.connect_with_budget(
+                target_host,
+                target_port,
+                tcp_fingerprint,
+                resolver,
+                Some(std::time::Duration::from_secs(10)),
+                None,
+                &execution,
+            ))
+            .await
+            .and_then(|stream| {
+                guard.publish()?;
+                Ok(stream)
+            });
+        if let Err(error) = &result {
+            guard.finish_error(error);
+        }
+        result.map_err(Error::into_public_connect_error)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_budget(
         &self,
         target_host: &str,
         target_port: u16,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
-        connect_timeout: std::time::Duration,
+        connect_timeout: Option<std::time::Duration>,
         connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+        execution: &ConnectionExecution,
     ) -> Result<TcpStream> {
         self.validate()?;
         if !self.chain.is_empty() {
@@ -64,6 +107,7 @@ impl ProxyConfig {
                     resolver,
                     connect_timeout,
                     connection_budget,
+                    execution,
                 )
                 .await;
         }
@@ -78,6 +122,7 @@ impl ProxyConfig {
                     resolver,
                     connect_timeout,
                     connection_budget,
+                    execution,
                 )
                 .await
             }
@@ -96,6 +141,7 @@ impl ProxyConfig {
                     resolver,
                     connect_timeout,
                     connection_budget,
+                    execution,
                 )
                 .await
             }
@@ -111,14 +157,16 @@ impl ProxyConfig {
     /// transparently over the established stream. The TCP fingerprint applies
     /// only to the first-hop SYN — the only SYN this client emits (every
     /// downstream SYN is emitted by a proxy's own kernel).
+    #[allow(clippy::too_many_arguments)]
     async fn connect_chain(
         &self,
         target_host: &str,
         target_port: u16,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
-        connect_timeout: std::time::Duration,
+        connect_timeout: Option<std::time::Duration>,
         connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+        execution: &ConnectionExecution,
     ) -> Result<TcpStream> {
         let hops: Vec<&ProxyConfig> = self.chain.iter().chain(std::iter::once(self)).collect();
         let (first_host, first_port) = hops[0].host_port();
@@ -157,6 +205,7 @@ impl ProxyConfig {
         }
 
         let mut failures = Vec::new();
+        let mut previous = None;
         for final_target in final_targets {
             let mut stream = connect_tcp_to_proxy_with_budget(
                 &first_host,
@@ -165,8 +214,13 @@ impl ProxyConfig {
                 resolver,
                 connect_timeout,
                 connection_budget.clone(),
+                execution,
             )
-            .await?;
+            .await
+            .map_err(|error| match previous.take() {
+                Some(prior) => error.with_connect_prior(prior),
+                None => error,
+            })?;
 
             let mut failed = None;
             for i in 0..hops.len() {
@@ -199,6 +253,7 @@ impl ProxyConfig {
                         && is_retryable_socks5_target_error(&error) =>
                 {
                     failures.push(format!("{}: {error}", final_target.unwrap()));
+                    previous = Some(error);
                 }
                 Some((_, error)) => return Err(error),
             }
@@ -301,8 +356,9 @@ impl ProxyConfig {
         target_port: u16,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
-        connect_timeout: std::time::Duration,
+        connect_timeout: Option<std::time::Duration>,
         connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+        execution: &ConnectionExecution,
     ) -> Result<TcpStream> {
         let span = tracing::debug_span!(
             "proxy.tunnel",
@@ -322,6 +378,7 @@ impl ProxyConfig {
                 resolver,
                 connect_timeout,
                 connection_budget.clone(),
+                execution,
             )
             .await?;
 
@@ -337,12 +394,23 @@ impl ProxyConfig {
 
             if status_code == 407 {
                 let response_str_full = String::from_utf8_lossy(&response_bytes);
-                let supports_basic = response_str_full.lines().any(|l| {
-                    let lower = l.to_ascii_lowercase();
-                    lower.starts_with("proxy-authenticate:") && lower.contains("basic")
-                });
+                let challenges: Vec<&str> = response_str_full.lines().filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("proxy-authenticate").then_some(value.trim())
+                }).collect();
+                let credential = self.resolved_credential();
+                let can_retry = match &credential {
+                    Some(ProxyCredential::Custom(_)) => !challenges.is_empty(),
+                    Some(ProxyCredential::UserPass { .. }) => challenges.iter().any(|value| {
+                        challenge_has_scheme(value, "Basic")
+                    }),
+                    Some(ProxyCredential::Http { scheme, .. }) => challenges.iter().any(|value| {
+                        challenge_has_scheme(value, scheme)
+                    }),
+                    None => false,
+                };
 
-                if self.http_auth_header().is_some() && supports_basic {
+                if can_retry {
                     tracing::warn!(
                         status = 407,
                         "proxy.407_retrying_with_auth — reconnecting with credentials"
@@ -356,9 +424,20 @@ impl ProxyConfig {
                         resolver,
                         connect_timeout,
                         connection_budget.clone(),
+                        execution,
                     )
                     .await
                     .map_err(|e| {
+                        if e.is_connect_attempt_denied() {
+                            return e.with_connect_prior(Error::proxy(
+                                ProxyErrorKind::AuthenticationRequired,
+                                "proxy requires authentication (407)",
+                                None,
+                            ));
+                        }
+                        if !matches!(&e, Error::Proxy(_)) {
+                            return e;
+                        }
                         Error::proxy(
                             ProxyErrorKind::TcpConnectFailed,
                             format!("failed to reconnect to proxy {proxy_addr} for 407 retry: {e}"),
@@ -366,9 +445,18 @@ impl ProxyConfig {
                         )
                     })?;
 
-                    let (retry_code, _) =
-                        send_connect_request(&mut stream2, &target, self.http_auth_header())
-                            .await?;
+                    let value = match credential.as_ref() {
+                        Some(ProxyCredential::Custom(auth)) => auth.authorization_for_challenge(&challenges),
+                        Some(credential) => credential.authorization_value(),
+                        None => None,
+                    }.ok_or_else(|| Error::proxy(
+                        ProxyErrorKind::AuthenticationRequired,
+                        "proxy authentication challenge was declined",
+                        None,
+                    ))?;
+                    let (retry_code, _) = send_connect_request(
+                        &mut stream2, &target, Some((self.auth_header.header_name(), value)),
+                    ).await?;
 
                     if connect_tunnel_established(retry_code) {
                         tracing::debug!(
@@ -437,8 +525,9 @@ impl ProxyConfig {
         remote_dns: bool,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
-        connect_timeout: std::time::Duration,
+        connect_timeout: Option<std::time::Duration>,
         connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+        execution: &ConnectionExecution,
     ) -> Result<TcpStream> {
         let span = tracing::debug_span!(
             "proxy.tunnel",
@@ -457,6 +546,7 @@ impl ProxyConfig {
             resolver,
             connect_timeout,
             connection_budget,
+            execution,
         )
         .instrument(span)
         .await
@@ -473,8 +563,9 @@ impl ProxyConfig {
         remote_dns: bool,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
-        connect_timeout: std::time::Duration,
+        connect_timeout: Option<std::time::Duration>,
         connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+        execution: &ConnectionExecution,
     ) -> Result<TcpStream> {
         if remote_dns {
             let mut stream = connect_tcp_to_proxy_with_budget(
@@ -484,6 +575,7 @@ impl ProxyConfig {
                 resolver,
                 connect_timeout,
                 connection_budget,
+                execution,
             )
             .await?;
             socks5_handshake(&mut stream, self.socks5_user_pass().as_ref()).await?;
@@ -513,6 +605,7 @@ impl ProxyConfig {
         }
 
         let mut failures = Vec::new();
+        let mut previous = None;
         for target in addresses {
             let mut stream = connect_tcp_to_proxy_with_budget(
                 proxy_host,
@@ -521,14 +614,20 @@ impl ProxyConfig {
                 resolver,
                 connect_timeout,
                 connection_budget.clone(),
+                execution,
             )
-            .await?;
+            .await
+            .map_err(|error| match previous.take() {
+                Some(prior) => error.with_connect_prior(prior),
+                None => error,
+            })?;
             socks5_handshake(&mut stream, self.socks5_user_pass().as_ref()).await?;
             socks5_send_connect_address(&mut stream, target).await?;
             match socks5_read_response(&mut stream, "connect").await {
                 Ok(_) => return Ok(stream),
                 Err(error) if is_retryable_socks5_target_error(&error) => {
                     failures.push(format!("{target}: {error}"));
+                    previous = Some(error);
                 }
                 Err(error) => return Err(error),
             }
@@ -557,10 +656,39 @@ impl ProxyConfig {
         &self,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: Option<std::time::Duration>,
+    ) -> Result<UdpAssociation> {
+        let (execution, guard) = ConnectionExecution::new();
+        let result = execution
+            .run(self.udp_associate_with_execution(
+                tcp_fingerprint,
+                resolver,
+                connect_timeout,
+                &execution,
+            ))
+            .await
+            .and_then(|association| {
+                guard.publish()?;
+                Ok(association)
+            });
+        if let Err(error) = &result {
+            guard.finish_error(error);
+        }
+        result.map_err(Error::into_public_connect_error)
+    }
+
+    pub(crate) async fn udp_associate_with_execution(
+        &self,
+        tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
+        resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: Option<std::time::Duration>,
+        execution: &ConnectionExecution,
     ) -> Result<UdpAssociation> {
         self.validate()?;
         if !self.chain.is_empty() {
-            return self.udp_associate_chain(tcp_fingerprint, resolver).await;
+            return self
+                .udp_associate_chain(tcp_fingerprint, resolver, connect_timeout, execution)
+                .await;
         }
         if !matches!(self.scheme, ProxyScheme::Socks5 { .. }) {
             return Err(Error::proxy(
@@ -579,18 +707,26 @@ impl ProxyConfig {
         );
 
         async {
-            let mut stream =
-                connect_tcp_to_proxy(&proxy_host, proxy_port, tcp_fingerprint, resolver)
-                    .await
-                    .map_err(|e| {
-                        Error::proxy(
-                            ProxyErrorKind::TcpConnectFailed,
-                            format!(
-                                "failed to connect to SOCKS5 proxy {proxy_host}:{proxy_port}: {e}"
-                            ),
-                            Some(Box::new(e)),
-                        )
-                    })?;
+            let mut stream = connect_tcp_to_proxy_with_budget(
+                &proxy_host,
+                proxy_port,
+                tcp_fingerprint,
+                resolver,
+                connect_timeout,
+                None,
+                execution,
+            )
+            .await
+            .map_err(|e| {
+                if !matches!(&e, Error::Proxy(_)) {
+                    return e;
+                }
+                Error::proxy(
+                    ProxyErrorKind::TcpConnectFailed,
+                    format!("failed to connect to SOCKS5 proxy {proxy_host}:{proxy_port}: {e}"),
+                    Some(Box::new(e)),
+                )
+            })?;
 
             tracing::debug!("proxy.tcp_connected");
 
@@ -627,6 +763,8 @@ impl ProxyConfig {
         &self,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: Option<std::time::Duration>,
+        execution: &ConnectionExecution,
     ) -> Result<UdpAssociation> {
         // Ordered hops: the upstream chain, then `self` (final hop → target).
         let hops: Vec<&ProxyConfig> = self.chain.iter().chain(std::iter::once(self)).collect();
@@ -657,9 +795,12 @@ impl ProxyConfig {
                 // through hop1..hop_{i-1} to reach hop i's SOCKS listener.
                 let (first_host, first_port) = hops[0].host_port();
                 let mut stream =
-                    connect_tcp_to_proxy(first_host, first_port, tcp_fingerprint, resolver)
+                    connect_tcp_to_proxy_with_budget(first_host, first_port, tcp_fingerprint, resolver, connect_timeout, None, execution)
                         .await
                         .map_err(|e| {
+                            if !matches!(&e, Error::Proxy(_)) {
+                                return e;
+                            }
                             Error::proxy(
                                 ProxyErrorKind::TcpConnectFailed,
                                 format!(
@@ -1138,30 +1279,14 @@ fn resolve_inner_relay(raw: SocketAddr, hop: &ProxyConfig) -> SocksTarget {
 }
 
 /// TCP connect to a proxy server, mapping errors to proxy-specific types.
-async fn connect_tcp_to_proxy(
-    proxy_host: &str,
-    proxy_port: u16,
-    tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
-    resolver: &dyn crate::dns::DnsResolver,
-) -> Result<TcpStream> {
-    connect_tcp_to_proxy_with_budget(
-        proxy_host,
-        proxy_port,
-        tcp_fingerprint,
-        resolver,
-        std::time::Duration::from_secs(10),
-        None,
-    )
-    .await
-}
-
 async fn connect_tcp_to_proxy_with_budget(
     proxy_host: &str,
     proxy_port: u16,
     tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
-    connect_timeout: std::time::Duration,
+    connect_timeout: Option<std::time::Duration>,
     connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+    execution: &ConnectionExecution,
 ) -> Result<TcpStream> {
     crate::tcp_fingerprint::connect_tcp_with_fingerprint(
         proxy_host,
@@ -1170,15 +1295,24 @@ async fn connect_tcp_to_proxy_with_budget(
         resolver,
         connect_timeout,
         connection_budget,
+        execution,
     )
     .await
-    .map_err(|e| {
-        Error::proxy(
-            ProxyErrorKind::TcpConnectFailed,
-            format!("failed to connect to proxy {proxy_host}:{proxy_port}: {e}"),
-            Some(Box::new(e)),
-        )
+    .map_err(|e| match crate::error::take_connect_execution_io(e) {
+        Ok(error) => error.map_connect_prior(|prior| match prior {
+            Error::Io(error) => proxy_tcp_error(proxy_host, proxy_port, error),
+            other => other,
+        }),
+        Err(error) => proxy_tcp_error(proxy_host, proxy_port, error),
     })
+}
+
+fn proxy_tcp_error(proxy_host: &str, proxy_port: u16, error: std::io::Error) -> Error {
+    Error::proxy(
+        ProxyErrorKind::TcpConnectFailed,
+        format!("failed to connect to proxy {proxy_host}:{proxy_port}: {error}"),
+        Some(Box::new(error)),
+    )
 }
 /// The error for asking a MASQUE proxy to carry a TCP stream.
 ///
@@ -1227,6 +1361,9 @@ async fn send_connect_request(
     let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
 
     if let Some((name, value)) = auth_header {
+        http::HeaderValue::from_str(&value).map_err(|_| {
+            Error::InvalidConfig("proxy authenticator returned an invalid header value".into())
+        })?;
         use std::fmt::Write;
         let _ = write!(request, "{name}: {value}\r\n");
         tracing::trace!(header = name, "proxy.auth_header_added");
@@ -1277,7 +1414,39 @@ async fn send_connect_request(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_scheme_matching_handles_combined_fields_and_quoted_commas() {
+        assert!(super::challenge_has_scheme(
+            "Digest realm=\"a,b\", nonce=\"x\", Basic realm=\"c\"",
+            "basic"
+        ));
+        assert!(super::challenge_has_scheme("Negotiate, Basic", "Basic"));
+        assert!(!super::challenge_has_scheme(
+            "Digest realm=\"Basic\", nonce=\"a, Basic x\"",
+            "Basic"
+        ));
+        assert!(!super::challenge_has_scheme(
+            "Digest Basic =\"x\", Basic=1",
+            "Basic"
+        ));
+    }
     use super::*;
+
+    fn limited_execution(
+        limit: u64,
+    ) -> (
+        crate::session::execution::RequestExecution,
+        crate::session::execution::ExecutionGuard,
+    ) {
+        let limits = crate::AttemptLimits::default()
+            .with_connect_attempts(limit)
+            .resolve(None, crate::AttemptLimitScope::Client)
+            .unwrap();
+        crate::session::execution::RequestExecution::with_limits(
+            crate::timeout::RequestTimeout::default(),
+            Some(limits),
+        )
+    }
 
     struct StaticResolver {
         addresses: Vec<SocketAddr>,
@@ -1369,6 +1538,128 @@ mod tests {
 
         drop(stream);
         assert_eq!(server.await.unwrap(), 0x03);
+    }
+
+    #[tokio::test]
+    async fn socks5_address_retry_denial_preserves_proxy_reply() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            serve_socks_attempt(&listener, 0x03).await;
+            listener
+        });
+        let proxy = ProxyConfig::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: vec![
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+            ],
+        };
+        let (request, _guard) = limited_execution(1);
+        let error = proxy
+            .connect_with_budget(
+                "target.test",
+                443,
+                None,
+                &resolver,
+                Some(std::time::Duration::from_secs(5)),
+                None,
+                &request.connection(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is_connect_attempt_denied());
+        assert_eq!(
+            error
+                .into_public_connect_error()
+                .as_proxy_error()
+                .unwrap()
+                .kind,
+            ProxyErrorKind::Socks5Error { code: 0x03 }
+        );
+        assert_eq!(request.snapshot_summary().connect_initiations(), 1);
+        let listener = server.await.unwrap();
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_proxy_scope_is_not_reclassified_as_proxy_failure() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy =
+            ProxyConfig::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+        let (execution, guard) = ConnectionExecution::new();
+        drop(guard);
+        let error = proxy
+            .connect_with_budget("target.test", 443, None, &resolver, None, None, &execution)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Http(_)),
+            "execution cancellation must retain its type"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_chain_charges_each_local_control_connection() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut command = [0; 10];
+            stream.read_exact(&mut command).await.unwrap();
+            assert_eq!(
+                command[1], 3,
+                "first control connection performs UDP ASSOCIATE"
+            );
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0x27, 0x0f])
+                .await
+                .unwrap();
+            (listener, stream)
+        });
+        let proxy = ProxyConfig::parse_chain(&[
+            format!("socks5://127.0.0.1:{port}"),
+            "socks5://127.0.0.1:1081".to_string(),
+        ])
+        .unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+        let (request, _guard) = limited_execution(1);
+        let result = proxy
+            .udp_associate_with_execution(
+                None,
+                &resolver,
+                Some(std::time::Duration::from_secs(5)),
+                &request.connection(),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("second control socket must be denied"),
+        };
+        assert!(
+            error.is_connect_attempt_denied(),
+            "UDP wrapper must preserve admission marker"
+        );
+        assert_eq!(request.snapshot_summary().connect_initiations(), 1);
+        let (listener, _stream) = server.await.unwrap();
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
     }
 
     fn socks_error(code: u8) -> Error {
@@ -1861,6 +2152,49 @@ mod tests {
                 "the 407 retry must carry credentials: {second_request}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn http_407_reconnect_denial_preserves_authentication_error() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            serve_connect_exchange(&mut stream,
+                "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n").await;
+            listener
+        });
+        let proxy = ProxyConfig::parse(&format!("http://user:pass@127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+        let (request, _guard) = limited_execution(1);
+        let error = proxy
+            .connect_with_budget(
+                "target.test",
+                443,
+                None,
+                &resolver,
+                Some(std::time::Duration::from_secs(5)),
+                None,
+                &request.connection(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is_connect_attempt_denied());
+        assert_eq!(
+            error
+                .into_public_connect_error()
+                .as_proxy_error()
+                .unwrap()
+                .kind,
+            ProxyErrorKind::AuthenticationRequired
+        );
+        assert_eq!(request.snapshot_summary().connect_initiations(), 1);
+        let listener = server.await.unwrap();
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
     }
 
     #[tokio::test]

@@ -35,6 +35,11 @@ captured on 2026-11-05. Fresh QUIC transport, H3 SETTINGS and navigation/favicon
 priority match 156, with HTTP 200 responses. Timing, loss, STOP, resumption
 and response edge-case policies inherit 156.
 
+`chrome_158_quic()` and `chrome_158_h3()` add Windows Chrome 158.0.8127.37,
+captured on 2026-11-18. Public QUIC transport, H3 SETTINGS and navigation/favicon
+priorities match 157, with HTTP 200 responses. Timing, loss, STOP, resumption
+and response edge-case policies retain 157's model.
+
 Chrome 155 also emits a control-stream `PRIORITY_UPDATE` for each allocated
 request stream before HEADERS, including pooled requests and streaming uploads.
 Preconnect sends SETTINGS and GREASE without targeting an unallocated request.

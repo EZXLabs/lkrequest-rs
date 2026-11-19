@@ -105,7 +105,8 @@ pub extern "C" fn lk_op_take_response(
         let mut state = op.shared.state.lock();
         let result = std::mem::replace(&mut state.result, OpResult::Consumed);
         match result {
-            OpResult::CompletedOk(Some(OpSuccess::Response(response))) => {
+            OpResult::CompletedOk(Some(OpSuccess::Response(mut response))) => {
+                response.observer = op.observer.clone();
                 *out_response = box_into_handle(response);
                 Ok(())
             }
@@ -175,7 +176,8 @@ pub extern "C" fn lk_op_take_error(op: *mut lk_op_t, out_err: *mut *mut lk_error
         let mut state = op.shared.state.lock();
         let result = std::mem::replace(&mut state.result, OpResult::Consumed);
         match result {
-            OpResult::CompletedErr(Some(err)) => {
+            OpResult::CompletedErr(Some(mut err)) => {
+                err.observer = op.observer.clone();
                 *out_err = box_into_handle(err);
                 Ok(())
             }
@@ -217,7 +219,8 @@ pub extern "C" fn lk_op_take_streaming_response(
         let mut state = op.shared.state.lock();
         let result = std::mem::replace(&mut state.result, OpResult::Consumed);
         match result {
-            OpResult::CompletedOk(Some(OpSuccess::Streaming(stream))) => {
+            OpResult::CompletedOk(Some(OpSuccess::Streaming(mut stream))) => {
+                stream.observer = op.observer.clone();
                 *out_stream =
                     box_into_handle::<StreamingResponseHandle, lk_streaming_response_t>(stream);
                 Ok(())

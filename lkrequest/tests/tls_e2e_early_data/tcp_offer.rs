@@ -120,10 +120,13 @@ async fn tcp_early_data_offer_scenario(
     drop(first);
 
     let host_key = format!("127.0.0.1:{}", addr.port());
-    let ticket = store.take(&host_key).expect("real server ticket");
-    assert!(ticket.max_early_data_size > 0);
-    assert_eq!(ticket.cipher_suite, u16::from(cipher));
-    store.store(&host_key, ticket);
+    let versioned = store.client_sessions().unwrap();
+    let ticket = versioned
+        .take_session(&host_key)
+        .expect("real server ticket");
+    assert!(ticket.max_early_data_size() > 0);
+    assert_eq!(ticket.cipher_suite(), u16::from(cipher));
+    versioned.store_session(&host_key, ticket);
 
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let resumed = connector.connect("127.0.0.1", addr.port(), tcp).await;

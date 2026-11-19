@@ -1,10 +1,15 @@
 //! TLS session-cache partitioning policies.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lktls::session_store::{SessionStore, SessionTicketData};
 
-/// Controls whether TLS 1.3 session tickets are cached and offered as PSKs.
+#[cfg(test)]
+#[path = "../tests/tls_support/sessions.rs"]
+mod session_fixtures;
+
+/// Controls caching and resumption for TLS 1.2, TLS 1.3 and QUIC.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TlsSessionResumptionPolicy {
     /// Browser-oriented default: keep two tickets per server and consume the
@@ -19,10 +24,10 @@ pub enum TlsSessionResumptionPolicy {
 }
 
 impl TlsSessionResumptionPolicy {
-    pub(crate) fn create_store(self) -> Arc<dyn SessionStore> {
-        match self {
-            Self::BrowserDefault => Arc::new(lktls::session_store::InMemorySessionStore::new()),
-            Self::Disabled => Arc::new(DisabledSessionStore),
+    pub(crate) fn create_store(self, ttl: Option<Duration>) -> Arc<dyn SessionStore> {
+        let store = match self {
+            Self::BrowserDefault => lktls::session_store::InMemorySessionStore::new(),
+            Self::Disabled => return Arc::new(DisabledSessionStore),
             Self::Enabled {
                 max_tickets_per_server,
             } => {
@@ -30,13 +35,13 @@ impl TlsSessionResumptionPolicy {
                     max_tickets_per_server > 0,
                     "max_tickets_per_server must be greater than zero"
                 );
-                Arc::new(
-                    lktls::session_store::InMemorySessionStore::with_max_tickets(
-                        max_tickets_per_server,
-                    ),
-                )
+                lktls::session_store::InMemorySessionStore::with_max_tickets(max_tickets_per_server)
             }
-        }
+        };
+        Arc::new(match ttl {
+            Some(ttl) => store.with_ttl(ttl),
+            None => store,
+        })
     }
 }
 
@@ -170,12 +175,36 @@ impl PartitionedSessionStore {
 }
 
 impl SessionStore for PartitionedSessionStore {
+    fn session_cache_ttl(&self) -> Option<Duration> {
+        self.inner.session_cache_ttl()
+    }
+
     fn store(&self, host: &str, ticket: SessionTicketData) {
         self.inner.store(&self.store_key(host), ticket);
     }
 
     fn take(&self, host: &str) -> Option<SessionTicketData> {
         self.inner.take(&self.store_key(host))
+    }
+
+    fn client_sessions(&self) -> Option<&dyn lktls::session_store::ClientSessionStore> {
+        self.inner
+            .client_sessions()
+            .map(|_| self as &dyn lktls::session_store::ClientSessionStore)
+    }
+}
+
+impl lktls::session_store::ClientSessionStore for PartitionedSessionStore {
+    fn store_session(&self, host: &str, session: lktls::session_store::ClientSession) {
+        if let Some(store) = self.inner.client_sessions() {
+            store.store_session(&self.store_key(host), session);
+        }
+    }
+
+    fn take_session(&self, host: &str) -> Option<lktls::session_store::ClientSession> {
+        self.inner
+            .client_sessions()?
+            .take_session(&self.store_key(host))
     }
 }
 
@@ -186,6 +215,29 @@ mod tests {
     use lktls::crypto::hkdf::HkdfAlgorithm;
     use lktls::session_store::{InMemorySessionStore, TicketTlsVersion};
     use std::time::Instant;
+
+    #[test]
+    fn versioned_sessions_keep_the_network_partition_and_are_consumed_once() {
+        use lktls::session_store::ClientSessionStore;
+        let (inner, _) =
+            session_fixtures::seeded_session("example.com", 443, Vec::new(), ticket(42), false);
+        let session = inner.take_session("example.com:443").unwrap();
+        let a = PartitionedSessionStore {
+            inner: inner.clone(),
+            partition: "site-a".into(),
+        };
+        let b = PartitionedSessionStore {
+            inner,
+            partition: "site-b".into(),
+        };
+        a.store_session("example.com:443", session);
+        assert!(b.take_session("example.com:443").is_none());
+        assert_eq!(
+            a.take_session("example.com:443").unwrap().cipher_suite(),
+            0x1301
+        );
+        assert!(a.take_session("example.com:443").is_none());
+    }
 
     fn ticket(marker: u8) -> SessionTicketData {
         SessionTicketData {
@@ -354,7 +406,7 @@ mod tests {
 
     #[test]
     fn disabled_resumption_store_never_returns_psk_tickets() {
-        let store = TlsSessionResumptionPolicy::Disabled.create_store();
+        let store = TlsSessionResumptionPolicy::Disabled.create_store(None);
         store.store("example.test:443", ticket(1));
         assert!(store.take("example.test:443").is_none());
     }
@@ -364,7 +416,7 @@ mod tests {
         let store = TlsSessionResumptionPolicy::Enabled {
             max_tickets_per_server: 1,
         }
-        .create_store();
+        .create_store(None);
         store.store("example.test:443", ticket(1));
         store.store("example.test:443", ticket(2));
 

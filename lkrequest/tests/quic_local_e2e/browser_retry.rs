@@ -45,6 +45,7 @@ struct Peer {
     endpoint: Endpoint,
     certificate: Vec<u8>,
     attempts: Arc<Mutex<Vec<Attempt>>>,
+    connection_count: Arc<AtomicUsize>,
     ready: mpsc::UnboundedReceiver<Ready>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -82,19 +83,19 @@ impl Peer {
         config.transport_config(Arc::new(transport));
         let endpoint = Endpoint::server(config, localhost_addr(0)).unwrap();
         let attempts = Arc::new(Mutex::new(Vec::new()));
+        let connection_count = Arc::new(AtomicUsize::new(0));
         let (ready_tx, ready) = mpsc::unbounded_channel();
         let task = tokio::spawn({
             let endpoint = endpoint.clone();
             let attempts = attempts.clone();
+            let connection_count = connection_count.clone();
             async move {
                 let mut connections = JoinSet::new();
-                let mut next_connection = 0;
                 loop {
                     tokio::select! {
                         incoming = endpoint.accept() => {
                             let Some(incoming) = incoming else { break; };
-                            let connection_id = next_connection;
-                            next_connection += 1;
+                            let connection_id = connection_count.fetch_add(1, Ordering::SeqCst);
                             let attempts = attempts.clone();
                             let ready_tx = ready_tx.clone();
                             connections.spawn(async move {
@@ -134,6 +135,7 @@ impl Peer {
             endpoint,
             certificate,
             attempts,
+            connection_count,
             ready,
             task,
         }
@@ -285,6 +287,8 @@ struct Case {
     forbid_replay: bool,
     outer_policy: bool,
     max_connections: Option<usize>,
+    extra_limit: Option<u64>,
+    connect_limit: Option<u64>,
 }
 impl Case {
     fn post(stimulus: Stimulus, opt_in: bool, streaming_response: bool) -> Self {
@@ -297,6 +301,8 @@ impl Case {
             forbid_replay: false,
             outer_policy: false,
             max_connections: None,
+            extra_limit: None,
+            connect_limit: None,
         }
     }
 }
@@ -304,6 +310,8 @@ struct Outcome {
     attempts: Vec<Attempt>,
     result: lkrequest::error::Result<(StatusCode, Vec<u8>)>,
     producer: Arc<ProducerState>,
+    summary: lkrequest::AttemptSummary,
+    connection_count: usize,
 }
 
 async fn warmed_session(peer: &Peer, case: &Case) -> (lkrequest::Session, String) {
@@ -390,6 +398,15 @@ async fn run(case: Case) -> Outcome {
     if case.forbid_replay {
         request = request.idempotency(lkrequest::Idempotency::NotIdempotent);
     }
+    let mut limits = lkrequest::AttemptLimits::default();
+    if let Some(limit) = case.extra_limit {
+        limits = limits.with_extra_http_attempts(limit);
+    }
+    if let Some(limit) = case.connect_limit {
+        limits = limits.with_connect_attempts(limit);
+    }
+    request = request.attempt_limits(limits);
+    let (request, observer) = request.observe_attempts();
     let streaming = case.streaming_response;
     let mut response = tokio::spawn(async move {
         if streaming {
@@ -448,11 +465,98 @@ async fn run(case: Case) -> Outcome {
         "browser retry {:?}, opt_in={}, streaming={streaming}: {attempts:?}; result={result:?}",
         case.stimulus, case.opt_in
     );
+    let connection_count = peer.connection_count.load(Ordering::SeqCst);
     shutdown(peer, session).await;
     Outcome {
         attempts,
         result,
         producer,
+        summary: observer.snapshot(),
+        connection_count,
+    }
+}
+
+#[tokio::test]
+async fn zero_connect_limit_reuses_warm_h3_in_both_public_entries() {
+    for streaming in [false, true] {
+        let mut case = Case::post(Stimulus::Complete, true, streaming);
+        case.connect_limit = Some(0);
+        let outcome = run(case).await;
+        assert_eq!(
+            outcome.result.unwrap(),
+            (StatusCode::OK, b"complete".to_vec())
+        );
+        assert_eq!(outcome.summary.connect_initiations(), 0);
+        assert_eq!(outcome.summary.http_submissions(), 1);
+        assert_eq!(outcome.summary.denial_reason(), None);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(
+            outcome.connection_count, 1,
+            "only the warmup opened a connection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconnect_denial_preserves_the_original_h3_protocol_error() {
+    for streaming in [false, true] {
+        let mut case = Case::post(Stimulus::NoHeadersClose, true, streaming);
+        case.method = http::Method::GET;
+        case.outer_policy = true;
+        case.connect_limit = Some(0);
+        let outcome = run(case).await;
+        let error = outcome.result.unwrap_err();
+        assert!(
+            error.h3_request_context().is_some(),
+            "original H3 error lost: {error:?}"
+        );
+        assert!(!matches!(
+            error.unwrapped(),
+            lkrequest::error::Error::ResourceLimitExceeded(_)
+        ));
+        assert_eq!(
+            outcome.summary.denial_reason(),
+            Some(lkrequest::AttemptDenialReason::ConnectLimit)
+        );
+        assert_eq!(outcome.summary.connect_initiations(), 0);
+        assert_eq!(outcome.summary.http_submissions(), 1);
+        assert_eq!(outcome.summary.extra_http_submissions(), 0);
+        assert_eq!(
+            outcome.attempts.len(),
+            1,
+            "no additional request reached the peer"
+        );
+        assert_eq!(
+            outcome.connection_count, 1,
+            "no replacement connection reached the peer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn aggregate_limit_caps_protocol_recovery_in_both_public_entries() {
+    for streaming in [false, true] {
+        for limit in [0, 1, 4] {
+            let mut case = Case::post(Stimulus::NoHeadersClose, true, streaming);
+            case.method = http::Method::GET;
+            case.outer_policy = true;
+            case.extra_limit = Some(limit);
+            let outcome = run(case).await;
+            assert!(outcome.result.unwrap_err().h3_request_context().is_some());
+            let extra = limit.min(2);
+            assert_eq!(outcome.attempts.len() as u64, 1 + extra);
+            assert_eq!(outcome.summary.http_submissions(), 1 + extra);
+            assert_eq!(outcome.summary.extra_http_submissions(), extra);
+            assert_eq!(outcome.summary.outcome(), lkrequest::AttemptOutcome::Failed);
+            assert_eq!(
+                outcome.summary.denial_reason(),
+                Some(if limit < 2 {
+                    lkrequest::AttemptDenialReason::ExtraHttpLimit
+                } else {
+                    lkrequest::AttemptDenialReason::ProtocolOwnerExhausted
+                })
+            );
+        }
     }
 }
 

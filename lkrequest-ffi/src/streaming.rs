@@ -10,7 +10,7 @@ use crate::handles::{
     StreamLifecycle, StreamingResponseHandle, StreamingShared, StreamingState,
 };
 use crate::panic::{catch_status, catch_value};
-use crate::request::{build_request_builder, take_request_config};
+use crate::request::{prepare_request, take_request_config};
 use crate::runtime::runtime;
 use crate::types::lk_chunk_view_t;
 
@@ -30,6 +30,7 @@ fn make_streaming_handle(
     let status = response.status().as_u16();
     let headers = snapshot_headers(response.headers());
     StreamingResponseHandle {
+        observer: None,
         client,
         shared: Arc::new(StreamingShared {
             state: parking_lot::Mutex::new(StreamingState {
@@ -47,16 +48,6 @@ fn make_streaming_handle(
         diagnostics,
         diagnostics_json: std::sync::OnceLock::new(),
     }
-}
-
-async fn execute_streaming_request(
-    session: lkrequest::Session,
-    config: crate::handles::RequestConfig,
-) -> Result<lkrequest::StreamingResponse, FfiError> {
-    build_request_builder(&session, config)
-        .send_streaming()
-        .await
-        .map_err(map_stream_error)
 }
 
 fn map_stream_error(error: lkrequest::error::Error) -> FfiError {
@@ -135,7 +126,8 @@ pub extern "C" fn lk_request_send_streaming(
     out_stream: *mut *mut lk_streaming_response_t,
     out_err: *mut *mut lk_error_t,
 ) -> lk_status_t {
-    catch_status(out_err, || unsafe {
+    let mut observer = None;
+    let status = catch_status(out_err, || unsafe {
         if out_stream.is_null() {
             return Err(FfiError::invalid_argument("out_stream is null"));
         }
@@ -145,27 +137,33 @@ pub extern "C" fn lk_request_send_streaming(
         let config = take_request_config(request)?;
         let session = crate::request::clone_request_session(&request.owner)?;
         let auto_decompress = config.auto_decompress;
-        let (result, diagnostics) =
-            runtime().block_on(lkrequest::diagnostics::capture_request_diagnostics(
-                execute_streaming_request(session.clone(), config),
-            ));
+        let (builder, observed) = prepare_request(&session, config);
+        observer = observed;
+        let (result, diagnostics) = runtime().block_on(
+            lkrequest::diagnostics::capture_request_diagnostics(builder.send_streaming()),
+        );
         let diagnostics = FfiDiagnostics::from(diagnostics);
         match result {
             Ok(response) => {
-                *out_stream = box_into_handle(make_streaming_handle(
+                let mut stream = make_streaming_handle(
                     Arc::clone(&request.client),
                     response,
                     auto_decompress,
                     diagnostics,
-                ));
+                );
+                stream.observer = observer.clone();
+                *out_stream = box_into_handle(stream);
                 Ok(())
             }
-            Err(mut err) => {
+            Err(err) => {
+                let mut err = map_stream_error(err);
                 err.diagnostics = Some(Box::new(diagnostics));
                 Err(err)
             }
         }
-    })
+    });
+    crate::attempts::attach_error_observer(out_err, observer);
+    status
 }
 
 #[no_mangle]
@@ -204,8 +202,10 @@ pub extern "C" fn lk_request_send_streaming_async(
             }
         };
         let client = Arc::clone(&request.client);
+        let (builder, observer) = prepare_request(&session, config);
         let op_shared = Arc::new(crate::handles::OpShared::default());
         let op_handle = OpHandle {
+            observer,
             client: Some(Arc::clone(&client)),
             shared: Arc::clone(&op_shared),
             counted: true,
@@ -214,10 +214,8 @@ pub extern "C" fn lk_request_send_streaming_async(
 
         let shared = Arc::clone(&op_shared);
         let join = runtime().spawn(async move {
-            let (result, diagnostics) = lkrequest::diagnostics::capture_request_diagnostics(
-                execute_streaming_request(session, config),
-            )
-            .await;
+            let (result, diagnostics) =
+                lkrequest::diagnostics::capture_request_diagnostics(builder.send_streaming()).await;
             let diagnostics = FfiDiagnostics::from(diagnostics);
             let mut state = shared.state.lock();
             if matches!(state.result, OpResult::InProgress) {
@@ -230,7 +228,10 @@ pub extern "C" fn lk_request_send_streaming_async(
                             diagnostics,
                         ))))
                     }
-                    Err(err) => OpResult::CompletedErr(Some(make_error_handle(err, diagnostics))),
+                    Err(err) => OpResult::CompletedErr(Some(make_error_handle(
+                        map_stream_error(err),
+                        diagnostics,
+                    ))),
                 };
             }
             shared.cv.notify_all();
@@ -247,13 +248,15 @@ pub extern "C" fn lk_stream_read(
     out_chunk: *mut lk_chunk_view_t,
     out_err: *mut *mut lk_error_t,
 ) -> lk_status_t {
-    catch_status(out_err, || unsafe {
+    let mut observer = None;
+    let status = catch_status(out_err, || unsafe {
         if out_chunk.is_null() {
             return Err(FfiError::invalid_argument("out_chunk is null"));
         }
         *out_chunk = lk_chunk_view_t::default();
 
         let stream = require_handle::<StreamingResponseHandle, lk_streaming_response_t>(stream)?;
+        observer = stream.observer.clone();
         let response = {
             let mut state = stream.shared.state.lock();
             match state.lifecycle {
@@ -318,7 +321,9 @@ pub extern "C" fn lk_stream_read(
                 Err(ffi_err)
             }
         }
-    })
+    });
+    crate::attempts::attach_error_observer(out_err, observer);
+    status
 }
 
 #[no_mangle]
@@ -342,13 +347,15 @@ pub extern "C" fn lk_stream_read_async(
     out_op: *mut *mut lk_op_t,
     out_err: *mut *mut lk_error_t,
 ) -> lk_status_t {
-    catch_status(out_err, || unsafe {
+    let mut observer = None;
+    let status = catch_status(out_err, || unsafe {
         if out_op.is_null() {
             return Err(FfiError::invalid_argument("out_op is null"));
         }
         *out_op = ptr::null_mut();
 
         let stream = require_handle::<StreamingResponseHandle, lk_streaming_response_t>(stream)?;
+        observer = stream.observer.clone();
         let maybe_immediate_chunk = {
             let state = stream.shared.state.lock();
             match state.lifecycle {
@@ -388,6 +395,7 @@ pub extern "C" fn lk_stream_read_async(
 
         if let Some(chunk) = maybe_immediate_chunk {
             let op_handle = OpHandle {
+                observer: stream.observer.clone(),
                 client: Some(Arc::clone(&stream.client)),
                 shared: Arc::new(crate::handles::OpShared {
                     state: parking_lot::Mutex::new(crate::handles::OpState {
@@ -434,6 +442,7 @@ pub extern "C" fn lk_stream_read_async(
         let cleanup_stream = Arc::clone(&shared_stream);
         let op_shared = Arc::new(crate::handles::OpShared::default());
         let op_handle = OpHandle {
+            observer: stream.observer.clone(),
             client: Some(Arc::clone(&stream.client)),
             shared: Arc::clone(&op_shared),
             counted: true,
@@ -515,7 +524,9 @@ pub extern "C" fn lk_stream_read_async(
         op_handle.shared.state.lock().join = Some(join);
         *out_op = box_into_handle(op_handle);
         Ok(())
-    })
+    });
+    crate::attempts::attach_error_observer(out_err, observer);
+    status
 }
 
 #[no_mangle]

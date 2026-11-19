@@ -35,7 +35,7 @@
 //! "外层连接"). Only the inner connection carries a browser profile.
 //!
 //! DNS for the proxy host is the caller's job: [`MasqueConnection::connect`]
-//! takes an already-resolved [`SocketAddr`](std::net::SocketAddr). The session
+//! takes an already-resolved [`std::net::SocketAddr`]. The session
 //! layer already owns a resolver, and duplicating one here would be a second
 //! policy for happy eyeballs, DoH and the rest.
 
@@ -65,6 +65,7 @@ use lkmasque::tunnel::{
 
 use crate::error::{Error, ProxyErrorKind, Result};
 use crate::proxy::{ProxyConfig, ProxyScheme};
+use crate::session::execution::ConnectionExecution;
 
 /// ALPN of the outer connection to the proxy. RFC 9298 rides on HTTP/3.
 const OUTER_ALPN: &[u8] = b"h3";
@@ -853,6 +854,28 @@ impl MasqueConnection {
         proxy_addr: SocketAddr,
         config: &MasqueOuterConfig,
     ) -> Result<Self> {
+        let (execution, guard) = ConnectionExecution::new();
+        let result = execution
+            .run(Self::connect_with_execution(
+                proxy, proxy_addr, config, &execution,
+            ))
+            .await
+            .and_then(|connection| {
+                guard.publish()?;
+                Ok(connection)
+            });
+        if let Err(error) = &result {
+            guard.finish_error(error);
+        }
+        result.map_err(Error::into_public_connect_error)
+    }
+
+    pub(crate) async fn connect_with_execution(
+        proxy: &ProxyConfig,
+        proxy_addr: SocketAddr,
+        config: &MasqueOuterConfig,
+        execution: &ConnectionExecution,
+    ) -> Result<Self> {
         if !matches!(proxy.scheme, ProxyScheme::Masque { .. }) {
             return Err(Error::InvalidConfig(format!(
                 "proxy {proxy} is not a MASQUE proxy; CONNECT-UDP needs a `masque://` scheme"
@@ -881,6 +904,7 @@ impl MasqueConnection {
             .server_name
             .clone()
             .unwrap_or_else(|| host.to_string());
+        execution.commit_start("quic")?;
         let quic = endpoint
             .connect_with(client_config, proxy_addr, &server_name)
             .map_err(|e| outer_error(&proxy_label, "QUIC connect rejected", e))?

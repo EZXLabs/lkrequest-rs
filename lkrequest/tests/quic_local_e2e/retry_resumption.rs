@@ -14,6 +14,9 @@ use std::sync::{
 use std::time::Duration;
 use tracing_subscriber::prelude::*;
 
+#[path = "retry_resumption/connect_limits.rs"]
+mod connect_limits;
+
 const LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]

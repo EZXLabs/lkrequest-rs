@@ -7,6 +7,119 @@ use crate::client::{parse_preset_name, preset_bundle};
 use crate::error::FfiError;
 use crate::panic::catch_status;
 
+/// Load a complete v2 bundle. NULL/0 removes the bundle override and restores
+/// the selected named preset. Explicit component overrides remain in effect.
+/// Failure leaves the builder unchanged. Structured errors are available in
+/// lk_error_get_diagnostics_json under preset_error (code, path, message).
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_preset_json(
+    builder: *mut crate::handles::lk_client_builder_t,
+    json_ptr: *const c_char,
+    json_len: usize,
+    out_err: *mut *mut crate::handles::lk_error_t,
+) -> crate::abi::lk_status_t {
+    catch_status(out_err, || unsafe {
+        let builder =
+            crate::handles::require_handle_mut::<crate::handles::ClientBuilderHandle, _>(builder)?;
+        if json_ptr.is_null() && json_len == 0 {
+            builder.state.preset_override = None;
+            return Ok(());
+        }
+        let limit = lkrequest::preset::PresetLimits::default().max_bytes;
+        if json_len > limit {
+            return Err(FfiError::from_preset(lkrequest::preset::PresetError {
+                code: lkrequest::preset::PresetErrorCode::ResourceLimit,
+                path: "/".into(),
+                message: "preset JSON exceeds 1 MiB".into(),
+            }));
+        }
+        let bytes = crate::conv::read_bytes(json_ptr.cast::<u8>(), json_len, "preset JSON")?;
+        let preset = lkrequest::preset::ClientPreset::from_json_slice(&bytes)
+            .map_err(FfiError::from_preset)?;
+        builder.state.preset_override = Some(preset);
+        Ok(())
+    })
+}
+
+/// Read only the caller-supplied UTF-8 file path and load a complete v2 bundle.
+/// The file is bounded to 1 MiB; JSON cannot request additional file/network I/O.
+#[no_mangle]
+pub extern "C" fn lk_client_builder_set_preset_file(
+    builder: *mut crate::handles::lk_client_builder_t,
+    path_ptr: *const c_char,
+    path_len: usize,
+    out_err: *mut *mut crate::handles::lk_error_t,
+) -> crate::abi::lk_status_t {
+    catch_status(out_err, || unsafe {
+        let builder =
+            crate::handles::require_handle_mut::<crate::handles::ClientBuilderHandle, _>(builder)?;
+        if path_len > 32 * 1024 {
+            return Err(FfiError::resource_limit_exceeded(
+                "preset path exceeds 32 KiB",
+            ));
+        }
+        let path = crate::conv::read_string_parts(path_ptr, path_len, "preset path")?;
+        if path.is_empty() || path.contains('\0') {
+            return Err(FfiError::invalid_argument(
+                "preset path is empty or contains NUL",
+            ));
+        }
+        let preset =
+            lkrequest::preset::ClientPreset::from_json_file(path).map_err(FfiError::from_preset)?;
+        builder.state.preset_override = Some(preset);
+        Ok(())
+    })
+}
+
+/// Export a built-in preset as a complete, reloadable v2 document.
+/// Query with NULL/0 output; out_json_len excludes NUL. Copy requires length+1
+/// bytes; an undersized buffer returns RESOURCE_LIMIT_EXCEEDED without a partial
+/// document. The caller owns the buffer. No network or file I/O is performed.
+#[no_mangle]
+pub extern "C" fn lk_preset_export_json(
+    name_ptr: *const c_char,
+    name_len: usize,
+    out_json: *mut c_char,
+    out_json_capacity: usize,
+    out_json_len: *mut usize,
+    out_err: *mut *mut crate::handles::lk_error_t,
+) -> crate::abi::lk_status_t {
+    catch_status(out_err, || unsafe {
+        if !out_json.is_null() && out_json_capacity > 0 {
+            *out_json = 0;
+        }
+        if out_json_len.is_null() {
+            return Err(FfiError::invalid_argument("out_json_len is null"));
+        }
+        *out_json_len = 0;
+        if out_json.is_null() && out_json_capacity > 0 {
+            return Err(FfiError::invalid_argument(
+                "out_json is null while capacity > 0",
+            ));
+        }
+        if name_len > 256 {
+            return Err(FfiError::invalid_argument("preset name exceeds 256 bytes"));
+        }
+        let name = crate::conv::read_string_parts(name_ptr, name_len, "preset name")?;
+        let preset = preset_bundle(parse_preset_name(&name)?);
+        let document = lkrequest::preset::PresetDocument::from_preset(name, &preset)
+            .map_err(FfiError::from_preset)?;
+        let json = document.to_json_string().map_err(FfiError::from_preset)?;
+        *out_json_len = json.len();
+        if out_json.is_null() {
+            return Ok(());
+        }
+        if out_json_capacity <= json.len() {
+            return Err(FfiError::resource_limit_exceeded(
+                "preset output requires JSON length + 1 bytes",
+            ));
+        }
+        ptr::copy_nonoverlapping(json.as_ptr(), out_json.cast::<u8>(), json.len());
+        *out_json.add(json.len()) = 0;
+        Ok(())
+    })
+}
+
 fn preset_names() -> &'static [&'static str] {
     &[
         "chrome_131",
@@ -24,6 +137,7 @@ fn preset_names() -> &'static [&'static str] {
         "chrome_155",
         "chrome_156",
         "chrome_157",
+        "chrome_158",
         "firefox_133",
         "firefox_147",
         "firefox_156",

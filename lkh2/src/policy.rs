@@ -1,4 +1,4 @@
-//! Customisation traits for the h2-native engine.
+//! Customisation traits for the lkh2 engine.
 //!
 //! Four layers of control over HTTP/2 wire behaviour that affect
 //! deep-inspection fingerprinting beyond the Akamai H2 hash:
@@ -15,6 +15,9 @@
 pub const CHROMIUM_MAX_DATA_FRAME_PAYLOAD: usize = 16_384 - 9;
 
 use crate::frame::H2Frame;
+
+pub mod config;
+pub use config::{FlowControlConfig, H2BehaviorConfig, HpackPolicyConfig, WritePolicyConfig};
 
 // ─── Frame Write Policy ──────────────────────────────────────────────────────
 
@@ -35,6 +38,10 @@ pub type FrameGroup = Vec<H2Frame>;
 /// into a single write, which is functionally correct but may not match
 /// browser write boundaries.
 pub trait FrameWritePolicy: Send + Sync + std::fmt::Debug {
+    /// Stable descriptor for bundle export, if this policy supports it.
+    fn config(&self) -> Option<WritePolicyConfig> {
+        None
+    }
     /// Split a sequence of outbound frames into groups.
     ///
     /// Each group will be encoded and flushed as a single `write_all` call.
@@ -63,6 +70,11 @@ struct DataFramePayloadOverridePolicy {
 }
 
 impl FrameWritePolicy for DataFramePayloadOverridePolicy {
+    fn config(&self) -> Option<WritePolicyConfig> {
+        let mut config = self.inner.config()?;
+        config.max_data_frame_payload = self.max_data_frame_payload;
+        Some(config)
+    }
     fn group_frames(&self, frames: Vec<H2Frame>) -> Vec<FrameGroup> {
         self.inner.group_frames(frames)
     }
@@ -99,6 +111,7 @@ pub struct ConfigurableWritePolicy {
     split_data: bool,
     max_data_frame_payload: Option<usize>,
     send_goaway_on_close: bool,
+    separate_end_stream_data: bool,
 }
 
 impl ConfigurableWritePolicy {
@@ -108,6 +121,7 @@ impl ConfigurableWritePolicy {
             split_data,
             max_data_frame_payload: None,
             send_goaway_on_close: false,
+            separate_end_stream_data: false,
         }
     }
 
@@ -138,7 +152,41 @@ impl ConfigurableWritePolicy {
 }
 
 impl FrameWritePolicy for ConfigurableWritePolicy {
+    fn config(&self) -> Option<WritePolicyConfig> {
+        Some(WritePolicyConfig {
+            split_headers: self.split_headers,
+            split_data: self.split_data,
+            max_data_frame_payload: self.max_data_frame_payload,
+            send_goaway_on_close: self.send_goaway_on_close,
+            separate_end_stream_data: self.separate_end_stream_data,
+        })
+    }
+
     fn group_frames(&self, frames: Vec<H2Frame>) -> Vec<FrameGroup> {
+        let frames = if self.separate_end_stream_data {
+            frames
+                .into_iter()
+                .flat_map(|frame| {
+                    if let H2Frame::Data(mut data) = frame {
+                        if data.end_stream && !data.data.is_empty() {
+                            data.end_stream = false;
+                            let end = crate::frame::DataFrame {
+                                stream_id: data.stream_id,
+                                data: bytes::Bytes::new(),
+                                end_stream: true,
+                                padding: None,
+                            };
+                            return vec![H2Frame::Data(data), H2Frame::Data(end)];
+                        }
+                        vec![H2Frame::Data(data)]
+                    } else {
+                        vec![frame]
+                    }
+                })
+                .collect()
+        } else {
+            frames
+        };
         if frames.is_empty() {
             return vec![];
         }
@@ -203,6 +251,10 @@ pub type SafariWritePolicy = ConfigurableWritePolicy;
 /// the consumed amount exceeds a threshold (typically half the initial
 /// window size).
 pub trait FlowControlPolicy: Send + Sync + std::fmt::Debug {
+    /// Stable descriptor for bundle export, if this policy supports it.
+    fn config(&self) -> Option<FlowControlConfig> {
+        None
+    }
     /// Called when `data_len` bytes of DATA have been received on the
     /// connection (stream_id=0) or a specific stream.
     ///
@@ -232,6 +284,9 @@ pub trait FlowControlPolicy: Send + Sync + std::fmt::Debug {
 pub struct ImmediateFlowControl;
 
 impl FlowControlPolicy for ImmediateFlowControl {
+    fn config(&self) -> Option<FlowControlConfig> {
+        Some(FlowControlConfig::Immediate)
+    }
     fn on_data_received(
         &mut self,
         _stream_id: u32,
@@ -284,6 +339,11 @@ impl ThresholdFlowControl {
 }
 
 impl FlowControlPolicy for ThresholdFlowControl {
+    fn config(&self) -> Option<FlowControlConfig> {
+        Some(FlowControlConfig::Threshold {
+            ratio: self.threshold_ratio,
+        })
+    }
     fn on_data_received(
         &mut self,
         stream_id: u32,
@@ -352,6 +412,10 @@ pub enum HpackFieldEncoding {
 /// By implementing this trait you can control exactly which encoding
 /// is used for each header field.
 pub trait HpackEncodePolicy: Send + Sync + std::fmt::Debug {
+    /// Stable descriptor for bundle export, if this policy supports it.
+    fn config(&self) -> Option<HpackPolicyConfig> {
+        None
+    }
     /// Decide how a header field should be encoded.
     ///
     /// `name` is the lowercase header name (e.g. `:method`, `user-agent`).
@@ -371,6 +435,9 @@ pub trait HpackEncodePolicy: Send + Sync + std::fmt::Debug {
 pub struct DefaultHpackPolicy;
 
 impl HpackEncodePolicy for DefaultHpackPolicy {
+    fn config(&self) -> Option<HpackPolicyConfig> {
+        Some(HpackPolicyConfig::Indexed)
+    }
     fn encoding_for(&self, _name: &str, _value: &str) -> HpackFieldEncoding {
         HpackFieldEncoding::Indexed
     }
@@ -389,6 +456,9 @@ impl HpackEncodePolicy for DefaultHpackPolicy {
 pub struct ChromeHpackPolicy;
 
 impl HpackEncodePolicy for ChromeHpackPolicy {
+    fn config(&self) -> Option<HpackPolicyConfig> {
+        Some(HpackPolicyConfig::Chromium)
+    }
     fn encoding_for(&self, name: &str, _value: &str) -> HpackFieldEncoding {
         if name.starts_with(':') {
             HpackFieldEncoding::Indexed
@@ -413,6 +483,9 @@ impl HpackEncodePolicy for ChromeHpackPolicy {
 pub struct FirefoxHpackPolicy;
 
 impl HpackEncodePolicy for FirefoxHpackPolicy {
+    fn config(&self) -> Option<HpackPolicyConfig> {
+        Some(HpackPolicyConfig::Firefox)
+    }
     fn encoding_for(&self, name: &str, _value: &str) -> HpackFieldEncoding {
         if name.starts_with(':') {
             HpackFieldEncoding::Indexed
@@ -437,6 +510,9 @@ impl HpackEncodePolicy for FirefoxHpackPolicy {
 pub struct SafariHpackPolicy;
 
 impl HpackEncodePolicy for SafariHpackPolicy {
+    fn config(&self) -> Option<HpackPolicyConfig> {
+        Some(HpackPolicyConfig::Safari)
+    }
     fn encoding_for(&self, name: &str, value: &str) -> HpackFieldEncoding {
         if name.starts_with(':') {
             HpackFieldEncoding::Indexed
@@ -458,14 +534,14 @@ impl HpackEncodePolicy for SafariHpackPolicy {
 
 // ─── Composite Behavior ──────────────────────────────────────────────────────
 
-/// Bundled behaviour strategies for the h2-native engine.
+/// Bundled behaviour strategies for the lkh2 engine.
 ///
 /// `H2Profile` describes *what* to send (SETTINGS values, pseudo-header order,
 /// WINDOW_UPDATE size — the "Akamai fingerprint dimensions").
 ///
 /// `H2Behavior` describes *how* to send it (frame grouping across TLS records,
 /// WINDOW_UPDATE timing, HPACK encoding choices — deeper behavioural traits
-/// that only the h2-native engine can control).
+/// that only the lkh2 engine can control).
 ///
 /// Together they form the full browser impersonation:
 /// - `H2Profile`  = **identity** (declarative, serialisable)

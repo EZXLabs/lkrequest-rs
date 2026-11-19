@@ -1,8 +1,9 @@
-# HTTP/2 client performance benchmark
+# HTTP client performance benchmark
 
-This tool compares `lkrequest`, Hyper, and reqwest using the same HTTP/2
-prior-knowledge workload. It intentionally excludes browser fingerprint and
-protocol-conformance testing.
+The default workload compares `lkrequest`, Hyper, and reqwest using HTTP/2
+prior knowledge. Additional lkrequest-only fixtures cover HTTP/1, HTTP/3,
+and TLS-H2/QUIC-H3 acquisition races. This is a performance harness, not a
+browser fingerprint or protocol-conformance test.
 
 ## Scope
 
@@ -11,20 +12,23 @@ protocol-conformance testing.
 - The server runs in a separate process.
 - Accepted server sockets use `TCP_NODELAY`, matching every benchmark client
   and avoiding server-side Nagle/delayed-ACK artifacts.
-- Each client is created once, warmed up, and reused for the measured workload.
+- By default each client/session is created once, warmed up, and reused.
+- Cold workloads retain the client and construct a new Session for each request.
 - The runner creates a fixed number of workers rather than one task per request.
 - Every response body is fully consumed and its size is validated.
 - The server returns `x-bench-connection-id`, allowing reports to show how many
-  H2 connections were actually observed.
-
-The initial suite does not measure fresh TCP/TLS/H2 setup. That requires a
-separate TLS fixture with identical trust and crypto settings for every client.
+  physical connections delivered responses. TCP and QUIC share one ID namespace.
+- Negotiated protocol, status, body size, and connection ID are validated.
 
 ## Build
 
 ```bash
 cargo build --release -p http-client-bench
 ```
+
+Add `--features quic-h3` for the local HTTP/3 and race fixtures. Use the same
+harness sources, feature flags, compiler, and dependencies in baseline and
+candidate binaries.
 
 ## Run one benchmark
 
@@ -54,9 +58,25 @@ target/release/http-client-bench run \
 
 Repeat with `--client hyper` and `--client reqwest`.
 
-`--sessions` creates independent clients/sessions and distributes workers
-across them. Warm-up requests are applied to every session so every measured
-session has an established H2 connection before timing begins.
+Use `--client lkrequest-streaming` to measure the public `send_streaming()` path.
+It drains `chunk()` to EOF, counting and immediately dropping each chunk without
+collecting a buffered body. Status, total body bytes, connection ID, and protocol
+use the same report fields and validation as the buffered client. This mode
+supports all lkrequest protocols and both lifecycle settings below.
+
+`StreamingResponse` does not expose a protocol-version getter, so streaming
+samples require the fixture's `x-bench-protocol` header (`h1`, `h2`, or `h3`).
+The fixture records the protocol actually handling the request, including the
+winning race transport. Missing or unknown protocol markers fail the request;
+the client does not infer a race winner from its configuration. Use the updated
+fixture and identical harness sources for both baseline and candidate binaries.
+
+`--sessions` creates independent client groups and distributes workers across
+them. In the default `--lifecycle warm` mode each group retains one Session;
+warm-up requests are applied to every group before timing begins. In
+`--lifecycle cold` mode every request creates and drops a Session from its
+group's retained Client. Client construction is excluded; Session creation,
+connection setup, request, full body consumption, and Session drop are included.
 
 Two diagnostic clients are also available for bottleneck isolation:
 
@@ -75,6 +95,95 @@ The default dispatch batch size is one. Values above one can change TLS record
 boundaries, TCP segmentation, and timing behavior, so browser-fingerprint
 profiles must keep the default unless the resulting capture is independently
 validated.
+
+## Additional lkrequest workloads
+
+For cleartext HTTP/1, start `serve --protocol h1 --listen 127.0.0.1:18481` and
+run with `--protocol h1`. Use `--lifecycle cold --warmup-requests 0` to measure
+new Sessions and connections. `h2c` supports the same lifecycle selection.
+Non-lkrequest clients reject modes other than `h2c` and `warm`.
+
+Build the QUIC-enabled binary, then run an HTTP/3 fixture:
+
+```bash
+cargo build --release -p http-client-bench --features quic-h3
+target/release/http-client-bench serve --protocol h3 \
+  --listen 127.0.0.1:18483 --stats-output benchmark-results/h3-server.json
+```
+
+In another terminal:
+
+```bash
+target/release/http-client-bench run --client lkrequest --protocol h3 \
+  --url https://localhost:18483/ --lifecycle cold --warmup-requests 0 \
+  --requests 1000 --concurrency 8 \
+  --server-stats benchmark-results/h3-server.json \
+  --output benchmark-results/h3-cold.json
+```
+
+For a real acquisition race, the fixture listens on TCP and UDP at the same
+address and port. TCP serves TLS-H2 and UDP serves QUIC-H3:
+
+```bash
+target/release/http-client-bench serve --protocol race \
+  --listen 127.0.0.1:18484 --stats-output benchmark-results/race-server.json
+```
+
+In another terminal:
+
+```bash
+target/release/http-client-bench run --client lkrequest --protocol race \
+  --url https://localhost:18484/ --lifecycle cold --warmup-requests 0 \
+  --requests 1000 --concurrency 8 \
+  --server-stats benchmark-results/race-server.json \
+  --output benchmark-results/race-cold.json
+```
+
+TLS fixtures use a generated localhost certificate and disabled client
+certificate verification, and are restricted to loopback. The client uses a
+Chrome 155 preset, disables TLS session resumption, and supplies an explicit
+resolver mapping the URL to the fixture address and port with an HTTPS RR
+advertising `h3` and `h2`. Race policy enables both jobs with zero delay and
+disables sequential fallback and detached probes. The winner may be H2 or H3.
+These controlled settings do not reproduce browser or internet timing.
+
+Race mode requires `--server-stats`. The runner accepts only fresh, complete
+snapshots for the configured address/protocol, retries reads for up to two
+seconds, and rejects server restarts or counter regressions. Reports separate
+warm-up and measured deltas. Cold race qualification requires both TCP accepts
+and QUIC Initial arrivals in the measured delta; warm race qualification can
+use either window because measured requests may reuse a pooled winner.
+Missing evidence fails the run even when every HTTP response succeeded.
+Counts prove both transports started during the selected window, not that
+every request started both or that both handshakes completed. `observed_protocols`
+records only successful response protocols. Race cancellation can increase
+`connection_failures` on the losing transport.
+
+Use a dedicated server instance and stats file for one benchmark at a time.
+Counters cannot attribute concurrent unrelated traffic. Stats snapshots are
+sampled every 100 ms; final measured deltas can include connection cleanup
+between the last response and the next snapshot. Response connection IDs count
+only connections delivering successful responses, while server counters also
+include losing/failed connections. Start cold experiments with zero warm-up.
+
+## Allocation samples
+
+Throughput runs default to `--allocations false`. Run separate allocation
+samples using the same configuration with `--allocations true`; do not compare
+their throughput against uninstrumented samples. The System allocator wrapper
+counts allocation/zeroed-allocation calls, reallocations, and requested bytes.
+Reallocation bytes are the full requested new size, not the growth amount.
+These are process-wide cumulative counts, not live or peak allocated memory.
+
+Counters reset after warm-up and all workers reach the ready barrier, then
+stop after workers finish. Client setup, initial worker buffers, server-stat
+reads, CPU sampling, result aggregation, percentile calculation, and report
+JSON are outside this window. Runtime work, request bookkeeping, buffer growth,
+and background connection cleanup during the window remain included. Clock
+reads do not allocate. Allocations already entering the wrapper at a boundary
+can straddle the window, so use multiple runs and sufficiently large samples.
+The disabled wrapper still performs one boolean load per allocation/reallocation;
+baseline and candidate must contain identical instrumentation code.
 
 ## Standard matrix
 
@@ -114,7 +223,8 @@ Each JSON report contains:
 - Successful and failed requests.
 - Requests per second and MiB per second.
 - Minimum, mean, p50, p90, p95, p99, and maximum latency.
-- Observed H2 connection IDs and count.
+- Observed physical connection IDs/count and successful response protocols.
+- Protocol/lifecycle, optional allocation counts, and optional server evidence.
 - User/system CPU time consumed during the measured interval.
 - Process peak resident set size.
 - Workload, runtime-worker, OS, and architecture metadata.

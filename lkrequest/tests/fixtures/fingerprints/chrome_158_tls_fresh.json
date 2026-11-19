@@ -1,0 +1,218 @@
+{
+  "legacy_version": 771,
+  "cipher_suites": [
+    2570,
+    4865,
+    4866,
+    4867,
+    49195,
+    49199,
+    49196,
+    49200,
+    52393,
+    52392,
+    49171,
+    49172,
+    156,
+    157,
+    47,
+    53
+  ],
+  "extensions": [
+    {
+      "extension_type": 2570,
+      "source": {
+        "type": "grease"
+      }
+    },
+    {
+      "extension_type": 0,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 5,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 10,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 11,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 13,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 16,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 18,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 23,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 27,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 35,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 43,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 45,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 51,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 17613,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 51764,
+      "source": {
+        "type": "trust_anchor_ids",
+        "ids": [
+          "82df130201",
+          "82df130206",
+          "82df13020d",
+          "82df13020e",
+          "82df13020f",
+          "82df130212",
+          "82df130213",
+          "82df130214",
+          "839a648c9b2d0107",
+          "839a648c9b2d0108",
+          "839a648c9b2d0109",
+          "839a648c9b2d010a",
+          "839a648c9b2d010b",
+          "839a648c9b2d010c",
+          "839a648c9b2d010d",
+          "839a648c9b2d0112",
+          "839a648c9b2d0113",
+          "d6790901",
+          "d6790904",
+          "d6790905",
+          "d6790906",
+          "d6790907",
+          "d6790908",
+          "d679090a",
+          "d679090b",
+          "d679090c",
+          "d679090d",
+          "d679090f"
+        ]
+      }
+    },
+    {
+      "extension_type": 65037,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 65281,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 2570,
+      "source": {
+        "type": "grease"
+      }
+    }
+  ],
+  "supported_groups": [
+    2570,
+    4588,
+    29,
+    23,
+    24
+  ],
+  "signature_algorithms": [
+    2570,
+    2308,
+    2309,
+    2310,
+    1027,
+    2052,
+    1025,
+    1283,
+    2053,
+    1281,
+    2054,
+    1537
+  ],
+  "ec_point_formats": [
+    0
+  ],
+  "compression_methods": [
+    0
+  ],
+  "supported_versions": [
+    2570,
+    772,
+    771
+  ],
+  "key_share_curves": [
+    2570,
+    4588,
+    29
+  ],
+  "alpn_protocols": [
+    "h2",
+    "http/1.1"
+  ],
+  "alps_protocols": [
+    "h2"
+  ],
+  "compress_cert_algorithms": [
+    2
+  ],
+  "record_size_limit": null,
+  "session_id_length": 32,
+  "has_padding": false,
+  "has_ech": true
+}

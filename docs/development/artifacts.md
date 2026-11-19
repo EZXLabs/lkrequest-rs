@@ -25,10 +25,14 @@
 
 ## FFI header
 
-`lkrequest-ffi/include/lkrequest.h` 必须由 CI/发布 workspace 自行生成：
+`lkrequest-ffi/include/lkrequest.h` 必须由 CI/发布 workspace 自行生成。三个发布平台
+统一使用 cbindgen `0.29.2`，并在打包前重新生成 header，避免构建缓存或工具版本不同
+导致同名发布文件的内容和校验值不一致：
 
 ```bash
+cargo install cbindgen --version 0.29.2 --locked
 cd lkrequest-ffi
+mkdir -p include
 cbindgen . --config cbindgen.toml > include/lkrequest.h
 ```
 
@@ -40,18 +44,18 @@ GitLab 流水线目前产出的内容如下，可作为上表的现状对照：
 
 | Job | 产物 | 触发条件 |
 |---|---|---|
-| `build-ffi-linux` | `artifacts/linux-x86_64/` | 常规流水线 |
-| `build-ffi-windows` | `artifacts/windows-x86_64/` | 常规流水线 |
-| `build-ffi-linux-musl` | `artifacts/linux-x86_64-musl/` | 常规流水线 |
+| `build-ffi-linux` | `artifacts/linux-x86_64/` | `main`/`master` 分支或 `v*`/`public-v*` tag |
+| `build-ffi-windows` | `artifacts/windows-x86_64/` | `main`/`master` 分支或 `v*`/`public-v*` tag |
+| `build-ffi-linux-musl` | `artifacts/linux-x86_64-musl/` | `main`/`master` 分支或 `v*`/`public-v*` tag |
 | `release` | 三个平台的动态库加 `lkrequest.h` | tag 匹配 `v*` |
 | `github-sync` | `release-assets/` | 公开同步 |
 | `crates-io-publish` | crates.io 发布 | tag 匹配 `public-v*`，手动触发 |
 | `doc` | `target/book/`、`target/doc/` | 见[文档维护与生成](documentation.md)，保留 7 天 |
 | `bench-*` | 各自的 `bench_*.txt` | benchmark 流水线 |
 
-`crates-io-publish` 先用 `tools/cleaner` 生成 sanitized 快照再发布，因此发布内容与
-仓库工作区不是同一棵树。当前只有 `lktls` 和 `lkh2` 能够通过打包检查，其余 crate 仍被
-patched `quinn`/`h3` fork 阻塞，详见内部发布记录。
+`crates-io-publish` 设计为先用 `tools/cleaner` 生成 sanitized 快照再发布，因此发布内容与
+仓库工作区不是同一棵树。0.3.0 的本地 Hickory 安全补丁会在 registry 打包时丢失，
+当前发布 job 因此主动拒绝执行；这不影响保留补丁源码的 Git/path 与 FFI 交付。
 
 签名与跨平台校验尚未纳入流水线，因此上表中的产物目前最高只能标记为 built 或
 smoke-tested，不能标记为 signed 或 published。

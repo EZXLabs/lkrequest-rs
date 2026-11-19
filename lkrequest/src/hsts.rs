@@ -13,7 +13,8 @@
 //! policy in via
 //! [`SessionBuilder::hsts_policy`](crate::session::SessionBuilder::hsts_policy).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
@@ -132,10 +133,17 @@ impl HstsPolicy for StaticHsts {
 
 /// Stateful policy that learns HSTS hosts from `Strict-Transport-Security`
 /// response headers within the session, mirroring a browser's dynamic HSTS
-/// store. Host matching is suffix-aware (`includeSubDomains`).
+/// store. Entries expire after `max-age`; subdomains are covered only when
+/// `includeSubDomains` was received.
 #[derive(Debug, Default)]
 pub struct DynamicHsts {
-    hosts: RwLock<HashSet<String>>,
+    hosts: RwLock<HashMap<String, HstsEntry>>,
+}
+
+#[derive(Debug)]
+struct HstsEntry {
+    expires: Option<Instant>,
+    include_subdomains: bool,
 }
 
 impl DynamicHsts {
@@ -145,7 +153,8 @@ impl DynamicHsts {
     }
 
     /// Pre-seed the store with known HSTS hosts — e.g. replaying the learned
-    /// state of a prior browser session.
+    /// state of a prior browser session. Seeds do not expire and include
+    /// subdomains until replaced or removed by a valid response header.
     pub fn with_seed<I, S>(hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -153,7 +162,15 @@ impl DynamicHsts {
     {
         let set = hosts
             .into_iter()
-            .map(|h| normalize_host(&h.into()))
+            .map(|h| {
+                (
+                    normalize_host(&h.into()),
+                    HstsEntry {
+                        expires: None,
+                        include_subdomains: true,
+                    },
+                )
+            })
             .collect();
         Self {
             hosts: RwLock::new(set),
@@ -164,22 +181,47 @@ impl DynamicHsts {
 impl HstsPolicy for DynamicHsts {
     fn should_upgrade(&self, host: &str) -> bool {
         let host = normalize_host(host);
-        self.hosts.read().iter().any(|h| host_matches(&host, h))
+        let now = Instant::now();
+        let entries = self.hosts.read();
+        let mut suffix = host.as_str();
+        loop {
+            if entries.get(suffix).is_some_and(|entry| {
+                entry.expires.is_none_or(|expires| now < expires)
+                    && (suffix.len() == host.len() || entry.include_subdomains)
+            }) {
+                return true;
+            }
+            match suffix.split_once('.') {
+                Some((_, parent)) => suffix = parent,
+                None => return false,
+            }
+        }
     }
 
     fn record_sts(&self, host: &str, sts_header: &str) {
         let host = normalize_host(host);
-        match parse_max_age(sts_header) {
-            // max-age > 0: remember this host as HTTPS-only.
-            Some(max_age) if max_age > 0 => {
-                self.hosts.write().insert(host);
-            }
-            // max-age = 0: the host is clearing its HSTS assertion.
-            Some(_) => {
-                self.hosts.write().remove(&host);
-            }
-            // Missing/malformed max-age: ignore the header (RFC 6797 §8.1).
-            None => {}
+        if host.is_empty() || crate::dns::literal_ip(&host).is_some() {
+            return;
+        }
+        let Some((max_age, include_subdomains)) = parse_sts(sts_header) else {
+            return;
+        };
+        let now = Instant::now();
+        let Some(expires) = now.checked_add(Duration::from_secs(max_age)) else {
+            return;
+        };
+        let mut hosts = self.hosts.write();
+        hosts.retain(|_, entry| entry.expires.is_none_or(|expires| now < expires));
+        if max_age == 0 {
+            hosts.remove(&host);
+        } else {
+            hosts.insert(
+                host,
+                HstsEntry {
+                    expires: Some(expires),
+                    include_subdomains,
+                },
+            );
         }
     }
 }
@@ -199,16 +241,40 @@ fn host_matches(host: &str, entry: &str) -> bool {
 
 /// Parse the `max-age` directive from a `Strict-Transport-Security` header
 /// value. Returns `None` if it is absent or unparseable.
-fn parse_max_age(header: &str) -> Option<u64> {
+fn parse_sts(header: &str) -> Option<(u64, bool)> {
+    let mut max_age = None;
+    let mut include_subdomains = false;
+    let mut seen = HashSet::new();
     for directive in header.split(';') {
-        if let Some((name, value)) = directive.split_once('=') {
-            if name.trim().eq_ignore_ascii_case("max-age") {
-                // RFC 6797 allows the value to be quoted: max-age="31536000".
-                return value.trim().trim_matches('"').parse::<u64>().ok();
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        let (name, value) = directive
+            .split_once('=')
+            .map_or((directive, None), |(n, v)| (n.trim(), Some(v.trim())));
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("max-age") {
+            let value = value?;
+            let value = if let Some(quoted) = value.strip_prefix('"') {
+                quoted.strip_suffix('"')?
+            } else {
+                value
+            };
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
             }
+            max_age = Some(value.parse().ok()?);
+        } else if name.eq_ignore_ascii_case("includeSubDomains") {
+            if value.is_some() {
+                return None;
+            }
+            include_subdomains = true;
         }
     }
-    None
+    Some((max_age?, include_subdomains))
 }
 
 #[cfg(test)]
@@ -281,6 +347,7 @@ mod tests {
 
     #[test]
     fn parse_max_age_cases() {
+        let parse_max_age = |header: &str| parse_sts(header).map(|(age, _)| age);
         assert_eq!(parse_max_age("max-age=600"), Some(600));
         assert_eq!(parse_max_age("max-age=0"), Some(0));
         assert_eq!(
@@ -291,5 +358,25 @@ mod tests {
         assert_eq!(parse_max_age("max-age=\"42\""), Some(42));
         assert_eq!(parse_max_age("includeSubDomains"), None);
         assert_eq!(parse_max_age("max-age=abc"), None);
+        assert_eq!(parse_max_age("max-age=1; max-age=2"), None);
+        assert_eq!(parse_max_age("max-age=\"42"), None);
+        assert_eq!(parse_max_age("max-age=+42"), None);
+        assert_eq!(parse_max_age("max-age=42; includeSubDomains=1"), None);
+    }
+
+    #[test]
+    fn dynamic_scope_expiry_and_parent_policy_are_independent() {
+        let p = DynamicHsts::new();
+        p.record_sts("example.com", "max-age=600");
+        assert!(p.should_upgrade("example.com"));
+        assert!(!p.should_upgrade("a.example.com"));
+        p.record_sts("example.com", "max-age=600; includeSubDomains");
+        p.record_sts("a.example.com", "max-age=0");
+        assert!(p.should_upgrade("a.example.com"));
+        p.hosts.write().get_mut("example.com").unwrap().expires = Some(Instant::now());
+        assert!(!p.should_upgrade("example.com"));
+        assert!(!p.should_upgrade("a.example.com"));
+        p.record_sts("127.0.0.1", "max-age=600");
+        assert!(!p.should_upgrade("127.0.0.1"));
     }
 }

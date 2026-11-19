@@ -60,6 +60,11 @@ and ECH configuration. Direct target addresses are pinned across attempts;
 remote DNS remains the proxy's responsibility. Both attempts share the
 connection deadline and physical connection budget.
 
+Both actual connection starts also count against the operation's optional
+`AttemptLimits::with_connect_attempts` ceiling. A finite ceiling can prevent the
+recovery start; it does not enable TAI recovery by itself. See
+[connection-attempt limits](../client-session.md#建链次数上限).
+
 There is at most one TAI recovery per request, shared by protocol alternatives
 and redirects. Failed recovery is terminal for automatic HTTP retries. A
 preconnect operation independently permits one recovery. No HTTP bytes are

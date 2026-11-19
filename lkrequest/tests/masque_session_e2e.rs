@@ -44,7 +44,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::task::JoinHandle;
 
 use lkrequest::proxy::{MasqueConnection, MasqueOuterConfig, ProxyConfig};
-use lkrequest::{Client, HttpVersion};
+use lkrequest::{AttemptDenialReason, AttemptLimits, AttemptSummary, Client, HttpVersion};
 
 const TUNNEL_TEMPLATE_PREFIX: &str = "/.well-known/masque/udp/";
 const CAPSULE_PROTOCOL: &str = "capsule-protocol";
@@ -680,6 +680,25 @@ async fn get(
         .expect("request timed out")
 }
 
+async fn get_with_connect_limit(
+    session: &lkrequest::Session,
+    url: &str,
+    limit: u64,
+) -> (
+    lkrequest::error::Result<lkrequest::Response>,
+    AttemptSummary,
+) {
+    tokio::time::timeout(
+        TIMEOUT,
+        session
+            .get(url)
+            .attempt_limits(AttemptLimits::default().with_connect_attempts(limit))
+            .send_with_attempt_summary(),
+    )
+    .await
+    .expect("request timed out")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -750,6 +769,154 @@ async fn one_session_shares_one_outer_connection_across_targets() {
         2,
         "each target still needs its own CONNECT-UDP tunnel"
     );
+}
+
+#[tokio::test]
+async fn connect_counts_distinguish_outer_inner_and_pooled_reuse() {
+    let cert = self_signed_localhost();
+    let first = spawn_origin(&cert, "first-origin");
+    let second = spawn_origin(&cert, "second-origin");
+    let proxy = spawn_proxy(ProxyMode::Relay);
+    let client = client_for(&cert, Some(&proxy));
+    let session = client.session().proxy_config(proxy.config()).build();
+
+    let (result, first_summary) = get_with_connect_limit(&session, &first.url("/a"), 2).await;
+    assert_eq!(result.unwrap().text().unwrap(), "first-origin");
+    assert_eq!(first_summary.connect_initiations(), 2);
+    let (result, second_summary) = get_with_connect_limit(&session, &second.url("/b"), 1).await;
+    assert_eq!(result.unwrap().text().unwrap(), "second-origin");
+    assert_eq!(second_summary.connect_initiations(), 1);
+    let (result, pooled_summary) = get_with_connect_limit(&session, &second.url("/c"), 0).await;
+    assert_eq!(result.unwrap().text().unwrap(), "second-origin");
+    assert_eq!(pooled_summary.connect_initiations(), 0);
+    assert_eq!(pooled_summary.http_submissions(), 1);
+    assert_eq!(proxy.outer_connections(), 1);
+    assert_eq!(proxy.tunnel_requests(), 2);
+}
+
+#[tokio::test]
+async fn connect_limit_denials_preserve_a_healthy_masque_outer_connection() {
+    let cert = self_signed_localhost();
+    let origin = spawn_origin(&cert, "survived-denial");
+    let proxy = spawn_proxy(ProxyMode::Relay);
+    let client = client_for(&cert, Some(&proxy));
+    let session = client.session().proxy_config(proxy.config()).build();
+
+    let (result, summary) = get_with_connect_limit(&session, &origin.url("/zero"), 0).await;
+    assert!(result.is_err());
+    assert_eq!(summary.connect_initiations(), 0);
+    assert_eq!(summary.http_submissions(), 0);
+    assert_eq!(
+        summary.denial_reason(),
+        Some(AttemptDenialReason::ConnectLimit)
+    );
+    assert_eq!(proxy.outer_connections(), 0);
+    assert_eq!(proxy.tunnel_requests(), 0);
+
+    let (result, summary) = get_with_connect_limit(&session, &origin.url("/one"), 1).await;
+    assert!(result.is_err());
+    assert_eq!(summary.connect_initiations(), 1);
+    assert_eq!(summary.http_submissions(), 0);
+    assert_eq!(
+        summary.denial_reason(),
+        Some(AttemptDenialReason::ConnectLimit)
+    );
+    assert_eq!(proxy.outer_connections(), 1);
+    assert_eq!(proxy.tunnel_requests(), 1);
+    assert!(proxy.first_inner_datagram.lock().unwrap().is_empty());
+
+    let (result, summary) = get_with_connect_limit(&session, &origin.url("/reused"), 1).await;
+    assert_eq!(result.unwrap().text().unwrap(), "survived-denial");
+    assert_eq!(summary.connect_initiations(), 1);
+    assert_eq!(summary.denial_reason(), None);
+    assert_eq!(
+        proxy.outer_connections(),
+        1,
+        "outer connection was discarded"
+    );
+    assert_eq!(
+        proxy.tunnel_requests(),
+        2,
+        "route was quarantined after denial"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_masque_requests_charge_the_outer_only_to_its_initializer() {
+    let cert = self_signed_localhost();
+    let first = spawn_origin(&cert, "first-origin");
+    let second = spawn_origin(&cert, "second-origin");
+    let proxy = spawn_proxy(ProxyMode::Relay);
+    let client = client_for(&cert, Some(&proxy));
+    let session = client.session().proxy_config(proxy.config()).build();
+    let first_url = first.url("/a");
+    let second_url = second.url("/b");
+
+    let ((first_result, first_summary), (second_result, second_summary)) = tokio::join!(
+        get_with_connect_limit(&session, &first_url, 2),
+        get_with_connect_limit(&session, &second_url, 2),
+    );
+    assert_eq!(first_result.unwrap().text().unwrap(), "first-origin");
+    assert_eq!(second_result.unwrap().text().unwrap(), "second-origin");
+    let mut counts = [
+        first_summary.connect_initiations(),
+        second_summary.connect_initiations(),
+    ];
+    counts.sort();
+    assert_eq!(counts, [1, 2]);
+    assert_eq!(proxy.outer_connections(), 1);
+    assert_eq!(proxy.tunnel_requests(), 2);
+}
+
+#[tokio::test]
+async fn masque_local_preparation_failures_do_not_consume_connect_budget() {
+    let cert = self_signed_localhost();
+    let proxy = spawn_proxy(ProxyMode::Relay);
+    let occupied = std::net::UdpSocket::bind(localhost_addr(0)).unwrap();
+    let mut no_trust = proxy.outer_config();
+    no_trust.extra_roots.clear();
+    let mut bind_conflict = proxy.outer_config();
+    bind_conflict.bind_addr = Some(occupied.local_addr().unwrap());
+
+    for outer_config in [no_trust, bind_conflict] {
+        let client = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_144())
+            .quic_profile(lkh3::chrome_quic())
+            .add_ca_cert_der(cert.der.as_ref())
+            .dns_resolver(Arc::new(LoopbackDns))
+            .masque(outer_config)
+            .build();
+        let session = client.session().proxy_config(proxy.config()).build();
+        let (result, summary) = get_with_connect_limit(&session, "https://localhost:443/", 0).await;
+        assert!(result.is_err());
+        assert_eq!(summary.connect_initiations(), 0);
+        assert_eq!(summary.http_submissions(), 0);
+        assert_ne!(
+            summary.denial_reason(),
+            Some(AttemptDenialReason::ConnectLimit)
+        );
+    }
+    assert_eq!(proxy.outer_connections(), 0);
+}
+
+#[tokio::test]
+async fn masque_immediate_backend_rejection_consumes_one_connect_attempt() {
+    let cert = self_signed_localhost();
+    let proxy = spawn_proxy(ProxyMode::Relay);
+    let client = client_for(&cert, Some(&proxy));
+    let session = client
+        .session()
+        .proxy_config(ProxyConfig::parse("masque://127.0.0.1:0").unwrap())
+        .build();
+    let (result, summary) = get_with_connect_limit(&session, "https://localhost:443/", 1).await;
+    assert!(result.is_err());
+    assert_eq!(summary.connect_initiations(), 1);
+    assert_eq!(summary.http_submissions(), 0);
+    assert_ne!(
+        summary.denial_reason(),
+        Some(AttemptDenialReason::ConnectLimit)
+    );
+    assert_eq!(proxy.outer_connections(), 0);
 }
 
 /// Two sessions never meet on the same outer connection, even from one client

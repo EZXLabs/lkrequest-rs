@@ -215,6 +215,86 @@ async fn timely_tcp_headers_allow_body_slower_than_ttfb() {
     }
 }
 
+#[tokio::test]
+async fn tcp_body_reads_obey_idle_and_total_deadlines() {
+    for h2 in [false, true] {
+        for streaming in [false, true] {
+            for idle in [false, true] {
+                let server = tcp_server(h2).await;
+                let mut config = lkrequest::TimeoutConfig::default();
+                if idle {
+                    config.total_timeout = None;
+                    config.read_idle_timeout = Some(TTFB);
+                } else {
+                    config.total_timeout = Some(TTFB);
+                }
+                let client = Client::builder()
+                    .fingerprint(lktls::profile::presets::chrome_144())
+                    .h2_profile(lkrequest::h2::profile::chrome_144_h2())
+                    .verify(false)
+                    .timeout_config(config)
+                    .build();
+                let builder = client.session();
+                let session = if h2 {
+                    builder.http2_only()
+                } else {
+                    builder.http1_only()
+                }
+                .build();
+                let error = fetch(&session, &format!("{}/slow-body", server.url), streaming)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.is_timeout(),
+                    "h2={h2}, streaming={streaming}, idle={idle}: {error:?}"
+                );
+                assert_eq!(
+                    error.phase(),
+                    if idle {
+                        Some(ConnectionPhase::HttpRequest)
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "quic-h3")]
+#[tokio::test]
+async fn h3_body_reads_obey_idle_and_total_deadlines() {
+    let (endpoint, task) = quic_server().await;
+    let url = format!("https://{}/slow-body", endpoint.local_addr().unwrap());
+    for streaming in [false, true] {
+        for idle in [false, true] {
+            let mut config = lkrequest::TimeoutConfig::default();
+            if idle {
+                config.total_timeout = None;
+                config.read_idle_timeout = Some(TTFB);
+            } else {
+                config.total_timeout = Some(TTFB);
+            }
+            let session = Client::builder()
+                .fingerprint(lktls::profile::presets::chrome_144())
+                .quic_profile(lkh3::chrome_quic())
+                .verify(false)
+                .timeout_config(config)
+                .build()
+                .session()
+                .http3_only()
+                .build();
+            let error = fetch(&session, &url, streaming).await.unwrap_err();
+            assert!(
+                error.is_timeout(),
+                "streaming={streaming}, idle={idle}: {error:?}"
+            );
+        }
+    }
+    endpoint.close(0u32.into(), b"done");
+    task.abort();
+}
+
 #[cfg(feature = "quic-h3")]
 async fn quic_server() -> (quinn::Endpoint, tokio::task::JoinHandle<()>) {
     let config = quinn::ServerConfig::with_crypto(Arc::new(
@@ -254,6 +334,40 @@ async fn quic_server() -> (quinn::Endpoint, tokio::task::JoinHandle<()>) {
         }
     });
     (endpoint, task)
+}
+
+#[cfg(feature = "quic-h3")]
+#[tokio::test]
+async fn h3_diagnostics_report_fresh_and_reused_connections() {
+    let (endpoint, task) = quic_server().await;
+    let address = endpoint.local_addr().unwrap();
+    let url = format!("https://{address}/fast");
+    for streaming in [false, true] {
+        let session = Client::builder()
+            .fingerprint(lktls::profile::presets::chrome_158())
+            .quic_profile(lkh3::chrome_quic())
+            .verify(false)
+            .build()
+            .session()
+            .http3_only()
+            .build();
+        for reused in [false, true] {
+            let (result, diagnostics) = lkrequest::diagnostics::capture_request_diagnostics(fetch(
+                &session, &url, streaming,
+            ))
+            .await;
+            assert_eq!(result.unwrap(), "ok");
+            assert_eq!(diagnostics.protocol.as_deref(), Some("h3"));
+            assert_eq!(diagnostics.remote_addr, Some(address.to_string()));
+            assert!(diagnostics.cipher_suite.is_some());
+            assert_eq!(diagnostics.dns_ms.is_some(), !reused);
+            assert_eq!(diagnostics.quic_ms.is_some(), !reused);
+            assert_eq!(diagnostics.tcp_ms, None);
+            assert_eq!(diagnostics.tls_ms, None);
+        }
+    }
+    endpoint.close(0u32.into(), b"done");
+    task.abort();
 }
 
 #[cfg(feature = "quic-h3")]

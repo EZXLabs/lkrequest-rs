@@ -6,6 +6,18 @@
 
 use super::Extension;
 
+pub(super) fn parse_tls12_server(
+    data: &[u8],
+) -> crate::error::Result<super::tls12::ServerValue<'_>> {
+    if data != [0] {
+        return Err(crate::error::TlsError::local_alert(
+            crate::error::AlertDescription::HandshakeFailure,
+            "initial renegotiated_connection must be empty",
+        ));
+    }
+    Ok(super::tls12::ServerValue::SecureRenegotiation)
+}
+
 /// Renegotiation Info extension.
 pub struct RenegotiationInfo {
     /// The `renegotiated_connection` opaque data.

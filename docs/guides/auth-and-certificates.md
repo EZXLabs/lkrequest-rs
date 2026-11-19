@@ -28,10 +28,12 @@ let response = session
 需要让**所有**请求都带同一个凭据时，把它放到 `Client` 的默认请求头上，而不是在每个请求
 重复：
 
-```rust,ignore
+```rust
+# use lkrequest::{Client, preset};
+# let token = "access-token";
 let client = Client::builder()
     .preset(preset::chrome_153())
-    .default_header("authorization", format!("Bearer {token}"))
+    .default_header("authorization", &format!("Bearer {token}"))
     .build();
 ```
 
@@ -81,5 +83,16 @@ let client = Client::builder()
 
 ## 客户端证书（mTLS）
 
-协议层支持 mTLS，但客户端证书的配置入口需要按当前的 Rust API 与 C ABI 逐一核对，不能
-假设默认提供。现状见[功能与协议能力](../reference/capabilities.md)。
+当前高层 `ClientBuilder` 和 C ABI 没有配置客户端证书链及私钥的入口。`add_ca_*` 只增加
+服务端校验的信任锚，不能用来提供 mTLS 客户端身份；要求客户端证书的站点不能按普通 CA
+配置处理。
+
+## TLS 关闭通知
+
+`.require_close_notify(true)` 要求 TLS 连接结束时收到 `close_notify`；默认 `false`，
+以兼容直接关闭连接的服务器。它主要影响以连接关闭作为正文结束标志的 H1 响应：严格模式
+可以发现缺少认证关闭通知的 EOF，但也可能拒绝浏览器通常接受的服务器行为。
+Content-Length/chunked 响应的截断另有 HTTP framing 检查。此开关当前是 Rust API。
+
+服务端证书选择协商见 [Trust Anchor Identifiers](networking/trust-anchor-identifiers.md)；
+它有独立的 Rust policy 和 C JSON 配置入口，不等于客户端证书认证。

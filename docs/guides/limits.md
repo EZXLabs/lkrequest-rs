@@ -1,6 +1,6 @@
 # 资源限制与安全边界
 
-本页覆盖四类与"防护"相关的配置：响应资源上限、HSTS、TLS 会话恢复，以及会话票据的分区。
+本页覆盖响应资源上限、请求次数上限、HSTS、TLS 会话恢复，以及会话票据的分区。
 它们默认值都可用，但在高并发抓取、对抗恶意响应和多身份隔离场景下需要显式设置。
 
 ## 响应资源上限
@@ -30,6 +30,12 @@ let client = Client::builder()
 需要整体替换时用 `resource_limits(ResourceLimits { .. })`。抓取未知站点时建议至少设置
 响应体上限：默认值不会替你判断某个响应是不是异常。
 
+## 请求次数与超时
+
+`AttemptLimits` 可限制一次请求的额外 HTTP 提交和实际建链次数，两个上限默认都不启用。Client、Session、Request 可以逐层继承或收紧；它们不改变 `ResourceLimits`，也不限制整个 Session 的累计请求量。
+
+零额外 HTTP 次数仍允许初次请求和合法重定向；零建链次数仍允许池复用或等待已有共享建链。开启次数上限不会授权重试，也不会隐式增加 timeout。计数规则和配置示例见[请求重发上限与统计](client-session.md#请求重发上限与统计)，总时长与阶段限制见[超时与显式重试](networking/timeouts.md)。
+
 ## HSTS
 
 HSTS 决定客户端是否把对某个主机的 `http://` 请求自动升级为 `https://`。三种策略：
@@ -56,6 +62,8 @@ HSTS 状态属于 Session，不同 Session 之间不共享，这与 Cookie jar �
 | `Disabled` | 不存储也不提供票据，每次都是完整握手 |
 | `Enabled { max_tickets_per_server }` | 显式指定每个服务端的票据容量 |
 
+仅需控制启停或有效期时，可用 `.tls_session_cache_enabled(...)`、`.tls_session_cache_ttl(...)` 和 `.default_tls_session_cache_ttl()`。启停与 TTL 独立，关闭缓存不影响已有连接复用。默认期限、服务端期限和 C ABI 对应入口见[会话缓存](client-session.md#tlsquic-会话缓存)与[C ABI 指南](ffi.md)。
+
 0-RTT（early data）能进一步省掉一个往返，但 early data 可能被重放。是否允许由请求的
 幂等性决定，规则与 Chromium 一致：
 
@@ -67,6 +75,8 @@ can_send_early_data = idempotency == IDEMPOTENT
 因此 `GET`、`HEAD` 默认可以走 0-RTT，而 `POST` 不会，除非显式把请求标记为
 `Idempotency::Idempotent`。只有在确认服务端对重复请求免疫时才这样标记。
 
+0-RTT 和早期数据拒绝恢复不依赖 `.retry_on_connection_close(true)`。收到正常早期数据拒绝与已接受请求随后失败是不同情况，后者仍遵守重试授权、body 可重放检查和次数上限。详见[HTTP 协议策略](protocols.md#alt-svc-与-broken-quic)。
+
 ## 会话票据分区
 
 浏览器会按顶层站点隔离 TLS 会话缓存，避免第三方通过票据复用做跨站跟踪。
@@ -77,11 +87,17 @@ can_send_early_data = idempotency == IDEMPOTENT
 | `Unpartitioned`（默认） | 只按服务端，传统 HTTP 客户端行为 |
 | `TopLevelSite` | 加上顶层 schemeful site |
 | `TopLevelAndFrameSite` | 顶层与 frame 两级 site |
-| Chromium 2.5-key 模型 | 顶层 site 加上同站/跨站标记 |
+| `Chromium` | 2.5-key：顶层 site 加上同站/跨站标记 |
+| `Firefox` | 顶层 site 加上 `browser_context`（OriginAttributes scope） |
 
 策略在 Client 上选择，具体上下文由 Session 提供：
 
-```rust,ignore
+```rust
+use lkrequest::{Client, NetworkPartitionContext, TlsSessionCachePartitionPolicy};
+
+let client = Client::builder()
+    .tls_session_cache_partition_policy(TlsSessionCachePartitionPolicy::TopLevelAndFrameSite)
+    .build();
 let session = client
     .session()
     .network_partition_context(NetworkPartitionContext::new(
@@ -91,11 +107,16 @@ let session = client
     .build();
 ```
 
+这里的 site 字符串应是调用方已经规范化的 schemeful site，不是任意页面 URL；构造函数
+不会替你做公共后缀解析。`NetworkPartitionContext::nonce()` 增加临时分区标识，
+`.browser_context()` 提供 Firefox OriginAttributes 等不透明上下文。指定分区策略时应
+同时提供 Session 上下文；策略名称本身不会创建浏览器标签页或存储隔离环境。
+
 顶层浏览上下文发生变化时应新建 Session，而不是在同一个 Session 上改上下文——这与浏览器
 换标签页的语义一致。
 
 ## 与其他页面的关系
 
-- 超时（连接、TLS 握手、TTFB、总时长）见 [Client、Session 与连接复用](client-session.md)；
+- 超时（连接、TLS 握手、TTFB、总时长）见[超时与显式重试](networking/timeouts.md)；
 - 代理侧的并发与拉黑见 [ProxyPool 轮转与动态生成](advanced/proxy-pool.md)；
 - 证书信任与校验开关见[认证与证书](auth-and-certificates.md)。

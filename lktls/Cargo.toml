@@ -1,6 +1,6 @@
 [package]
 name = "lktls"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 description = "Sans-I/O TLS fingerprint protocol engine for lkrequest"
 license.workspace = true
@@ -12,7 +12,7 @@ keywords = ["tls", "fingerprint", "clienthello", "browser", "sans-io"]
 categories = ["cryptography", "network-programming"]
 
 [dependencies]
-aws-lc-rs = { workspace = true }
+aws-lc-rs = { workspace = true, features = ["legacy-des"] }
 aes = { workspace = true }
 cbc = { workspace = true }
 hpke = { workspace = true }

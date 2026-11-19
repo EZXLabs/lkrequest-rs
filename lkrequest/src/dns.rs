@@ -762,6 +762,10 @@ impl DnsResolver for CachedSystemDns {
 // HickoryDns — hickory-resolver based resolver
 // ---------------------------------------------------------------------------
 
+/// The resolver dependency used by [`HickoryDns`], including compatible config types.
+/// Prefer this re-export when constructing a custom resolver or its options.
+pub use hickory_resolver as hickory;
+
 use hickory_resolver::config::{
     NameServerConfig, ResolverConfig, ResolverOpts, CLOUDFLARE, GOOGLE, QUAD9,
 };

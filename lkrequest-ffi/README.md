@@ -4,6 +4,17 @@
 
 It exposes the high-value parts of the Rust client to C/C++/Go/Python style bindings without leaking Rust async, ownership, or internal transport details across the ABI boundary.
 
+Compatibility covers the documented C ABI and opaque handles. Exported Rust
+handle/state types in this facade are unstable implementation details and may
+gain fields. Rust applications should use the public API of `lkrequest`.
+
+Version 0.3.0 retains C ABI version 1. Check `lk_library_version()` and
+`lk_abi_version()` when loading a library, and use `lk_feature_supported()` for
+optional APIs. HTTP/2 is always built through `lkh2`, including when default
+Cargo features are disabled. See the [migration guide](../docs/guides/upgrading.md)
+for Cargo changes and the explicit connection-replay and H2-to-H1 fallback
+settings.
+
 ## Build Output
 
 `lkrequest-ffi` builds both:
@@ -79,6 +90,68 @@ Implemented ABI surface includes:
 - DNS preset / custom socket address / native cert toggle
 - File logging and callback logging
 - Fingerprint randomization policy (`lk_client_builder_set_randomize`)
+- Custom TLS / HTTP/2 / QUIC TLS profile JSON and complete profile bundle loading
+
+## Attempt Limits And Summaries
+
+`lk_feature_supported("extra-http-attempt-limit")`,
+`lk_feature_supported("connect-attempt-limit")`, and
+`lk_feature_supported("attempt-summary")` identify these additive APIs.
+
+Client builders, session builders, and requests expose
+`lk_*_set_extra_http_attempt_limit` and `lk_*_clear_extra_http_attempt_limit`.
+The corresponding `lk_*_get_extra_http_attempt_limit` functions return a
+`lk_attempt_limit_view_t`; Client and Session handles also provide this getter.
+The view separates the configured override from its effective value and scope.
+An absent client limit adds no aggregate ceiling. Absent session/request limits
+inherit their parent; a child cannot relax a finite parent. Zero is finite and
+forbids extra HTTP submissions while allowing the initial request and permitted
+redirects. Setter failures leave the previous configuration unchanged. Existing
+retry, idempotency, protocol, and replay restrictions still apply.
+
+The same handles expose `lk_*_set_connect_attempt_limit`,
+`lk_*_clear_connect_attempt_limit`, and `lk_*_get_connect_attempt_limit`, using
+the same view and inheritance rules. This independent limit counts actual TCP
+and QUIC backend starts, including failed starts and race losers. Endpoint
+preparation and pooled connection reuse consume no connection allowance. Zero
+therefore permits only requests that need no new connection. MASQUE outer and
+inner QUIC starts count separately; reusing an outer connection does not count.
+A finite connection limit suppresses optional detached probes. Shared
+establishment is counted by the request that starts it; waiters use their own
+deadlines and charge their own allowance only if they later start a connection.
+Each operation has independent counters even when it shares a Client or Session.
+
+Call `lk_request_enable_attempt_summary(request, true, &error)` before sending
+to collect a summary. Collection is disabled by default and is independent of
+the existing diagnostics JSON. A summary records effective limits, committed
+HTTP and extra HTTP submissions, redirects, recovery authorizations,
+`connect_initiations`, `probe_suppressed_by_connect_limit`, outcome, and the
+final denial reason. Its `effective_limits` includes `connect_attempts` and
+`connect_scope` alongside the HTTP limit. It contains no URLs, headers,
+credentials, or bodies.
+
+Read a fresh snapshot using `lk_response_copy_attempt_summary_json`,
+`lk_error_copy_attempt_summary_json`,
+`lk_streaming_response_copy_attempt_summary_json`, or
+`lk_op_copy_attempt_summary_json`. Pass a NULL buffer and zero capacity to query
+the required byte length, then supply caller-owned storage. The JSON has no
+trailing NUL. Insufficient capacity returns `LK_ERR`, reports the new required
+length, and leaves the buffer untouched. An active snapshot can grow between
+calls, so callers should retry if necessary. A getter returns `LK_ERR` if summary
+collection was not enabled for that operation.
+
+Operation summaries remain available after result consumption and cancellation
+until `lk_op_free`. Cancellation requests stop the task asynchronously: the
+snapshot's `final` field becomes true when root execution has actually ended.
+The retained observer grants no send authority. Streaming summaries become final
+when response headers are returned; subsequent body errors and chunk operations
+retain that request summary without authorizing another HTTP submission.
+
+Configuration and observers live in the existing internal state behind C opaque
+handles. Rust Handle/State types exported by this FFI crate are implementation
+details and may gain fields. The formal `lkrequest` Rust API and C ABI retain
+their compatibility guarantees. Only handles returned by the library's
+constructors are accepted.
 
 ## MASQUE outer configuration
 
@@ -194,7 +267,7 @@ Pass a canonical preset name to `lk_client_builder_set_preset`:
 
 | Family | Names | TLS/H2 | QUIC/H3 |
 |---|---|---|---|
-| Chrome | `chrome_131`, `chrome_144` through `chrome_157` | Yes | Requires `quic-h3` |
+| Chrome | `chrome_131`, `chrome_144` through `chrome_158` | Yes | Requires `quic-h3` |
 | Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Yes | Not provided |
 | Safari | `safari_18`, `safari_26` | Yes | Not provided |
 
@@ -222,6 +295,89 @@ the `default` alias remains `chrome_155`.
 `chrome_157` adds Windows Chrome 157.0.8103.39 with public TLS/H2/QUIC/H3
 captures and HTTP 200. Stable fields match 156; transport and response
 edge-case policies inherit its model. Header values remain caller supplied.
+
+`chrome_158` is available through preset listing, detail/export and builder
+selection APIs. Windows Chrome 158.0.8127.37 public TLS/H2/QUIC/H3 captures on
+2026-11-18 returned HTTP 200; stable fields match 157. The `default` alias
+remains `chrome_155`, and application header values remain caller supplied.
+
+## TLS/QUIC Session Cache
+
+Session caching is enabled by default. These setters configure the cache
+independently of the profile's session-resumption extension settings:
+
+```c
+lk_client_builder_set_tls_session_cache_enabled(builder, true);
+lk_client_builder_set_tls_session_cache_ttl(builder, 7200000); /* milliseconds */
+lk_client_builder_set_tls_session_cache_enabled(builder, false);
+lk_client_builder_reset_tls_session_cache_ttl(builder); /* preserves disabled */
+```
+
+Without an override, TLS 1.2 uses one hour and TLS 1.3/QUIC up to seven days.
+A custom TTL may shorten or extend the local default, but shorter server
+lifetimes and TLS 1.3's seven-day protocol cap still apply. Zero prevents
+caching. Setting or resetting TTL does not change the enable switch. TLS 1.2
+renewal retains the original secret age. Disabling caching forces full
+handshakes on new connections; it does not disable existing connection reuse
+or rewrite profile extensions. Enabling caching cannot override a profile
+that disables resumption.
+
+`lk_feature_supported("tls-session-cache")` discovers these APIs.
+`lk_client_fingerprint_info_json` includes `tls_session_cache` with `enabled`
+and `ttl_ms` (`null` means version-specific defaults). These fields describe
+the cache policy; the profile can further restrict resumption.
+
+## Custom Fingerprint Components
+
+The builder exposes independent profile overrides:
+
+| Rust builder method | C ABI entry point | Availability |
+|---|---|---|
+| `.fingerprint(profile)` | `lk_client_builder_set_tls_profile_json(builder, json, len)` | Always |
+| `.h2_profile(profile)` | `lk_client_builder_set_h2_profile_json(builder, json, len)` | Always |
+| `.quic_fingerprint(profile)` | `lk_client_builder_set_quic_tls_profile_json(builder, json, len)` | `quic-h3` |
+| `.clear_quic_fingerprint()` | `lk_client_builder_clear_quic_fingerprint(builder)` | `quic-h3` |
+| `.quic_profile(profile)` | `lk_client_builder_set_quic_profile_json(builder, json, len)` | `quic-h3` |
+
+All JSON setters copy at most 1 MiB of UTF-8 input and validate before replacing
+the previous value. A failed call preserves the previous configuration. The TLS,
+H2 and QUIC TLS overrides take precedence over preset setters regardless of call
+order. They do not change other protocol profiles or header-order settings.
+
+For TLS, H2 and QUIC TLS, `NULL, 0` removes the custom override and restores the
+selected preset for that component. H2 restores `set_h2_preset` when one was
+selected, otherwise the main preset. By contrast, `clear_quic_fingerprint`
+explicitly makes QUIC use the effective TCP TLS profile, even when the preset
+provides a separate QUIC TLS profile. Setting a QUIC TLS profile requires TLS 1.3
+and does not enable HTTP/3; select a QUIC/H3 preset or configure a QUIC profile
+separately. Calls requiring `quic-h3` return an error when it is not compiled in.
+The existing QUIC transport setter does not accept `NULL, 0`; use
+`lk_client_builder_disable_http3` to disable that component.
+
+The H2 setter accepts a serialized native `H2Profile`. It checks SETTINGS,
+windows, pseudo-header order, initial stream ID, priority stream IDs and default
+urgency. This JSON carries data fields only and uses baseline runtime behavior:
+it cannot encode `FrameWritePolicy`, `FlowControlPolicy` or `HpackEncodePolicy`.
+An explicit `behavior` field is rejected. Use `lk_client_builder_set_h2_preset`
+for a built-in browser's complete H2 behavior; adding a custom JSON override
+replaces that H2 profile, including its runtime behavior, until cleared.
+
+```c
+/* h2_json is a serialized native H2Profile, not a full preset bundle. */
+if (lk_client_builder_set_h2_profile_json(builder, h2_json, h2_json_len) != LK_OK) {
+    /* The previous H2 configuration is still in effect. */
+}
+lk_client_builder_set_h2_profile_json(builder, NULL, 0); /* restore preset */
+```
+
+Feature discovery adds `h2-profile-json` and `quic-tls-profile-json`. Fingerprint
+diagnostics include `quic_tls`: `null` means QUIC uses the TCP TLS profile.
+These component APIs use native profile JSON types. For a complete versioned
+bundle including runtime behavior, use `lk_client_builder_set_preset_json` or
+`lk_client_builder_set_preset_file`; export one with `lk_preset_export_json`.
+See [Loading Profile Bundles](../docs/guides/loading-profiles.md) for limits,
+error diagnostics, override precedence and the v2 format. Feature discovery is
+`preset-bundle-v2`. Importing fields does not establish browser wire equivalence.
 
 ## Fingerprint Randomization
 

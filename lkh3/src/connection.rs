@@ -149,8 +149,8 @@ pub async fn connect_h3(
     tracing::debug!(remote = %quic_conn.remote_address(), "h3.connect_ready");
     Ok(H3Connection {
         profile: h3_profile.clone(),
+        sender: H3Sender::new(h3_profile.clone(), sender, quic_conn.clone()),
         quic_conn,
-        sender: H3Sender::new(h3_profile.clone(), sender),
         driver,
     })
 }
@@ -193,8 +193,8 @@ pub async fn connect_h3_0rtt(
     Ok(H3ZeroRttConnection {
         inner: H3Connection {
             profile: h3_profile.clone(),
+            sender: H3Sender::new(h3_profile.clone(), sender, quic_conn.clone()),
             quic_conn,
-            sender: H3Sender::new(h3_profile.clone(), sender),
             driver,
         },
         accepted,

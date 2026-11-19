@@ -349,7 +349,8 @@ pub(crate) struct ConnectConfig {
     /// Target scheme (Http or Https).
     pub scheme: Scheme,
     /// TLS fingerprint profile (ignored for Http scheme).
-    pub tls_profile: lktls::profile::types::TlsProfile,
+    pub tls_config: lktls::config::ClientConfigTemplate,
+    pub required_alpn: Option<Vec<String>>,
     /// ALPS state for the TLS handshake (ignored for Http scheme).
     ///
     /// `None` => do not advertise ALPS (e.g. H1-only). `Some(bytes)` => advertise
@@ -366,13 +367,29 @@ pub(crate) struct ConnectConfig {
 
 impl ConnectConfig {
     /// Create config for a standard HTTPS connection.
+    #[cfg(test)]
     pub fn https(
         tls_profile: lktls::profile::types::TlsProfile,
         alps_payload: Option<Vec<u8>>,
     ) -> Self {
+        Self::https_template(
+            lktls::config::ClientConfigTemplate::new(
+                tls_profile,
+                lktls::config::Transport::Tcp,
+                lktls::config::CompileOptions::compatibility(),
+            ),
+            alps_payload,
+        )
+    }
+
+    pub fn https_template(
+        tls_config: lktls::config::ClientConfigTemplate,
+        alps_payload: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             scheme: Scheme::Https,
-            tls_profile,
+            tls_config,
+            required_alpn: None,
             alps_payload,
             proxy_to_direct_fallback: false,
             fallback_time_budget: None,
@@ -382,6 +399,11 @@ impl ConnectConfig {
     /// Convert to cleartext HTTP config (no TLS handshake).
     pub fn into_http(mut self) -> Self {
         self.scheme = Scheme::Http;
+        self
+    }
+
+    pub fn require_profile_alpn(mut self) -> Self {
+        self.required_alpn = Some(self.tls_config.profile().alpn_protocols.clone());
         self
     }
 
@@ -412,9 +434,10 @@ pub(crate) async fn connect_tcp(
     proxy: Option<&ProxyConfig>,
     tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
-    tcp_timeout: Duration,
+    tcp_timeout: Option<Duration>,
     connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     config: &ConnectConfig,
+    execution: &crate::session::execution::ConnectionExecution,
 ) -> Result<TcpStream> {
     if let Some(proxy_cfg) = proxy {
         let direct_fallback =
@@ -422,7 +445,7 @@ pub(crate) async fn connect_tcp(
         let proxy_timeout = if direct_fallback {
             if let Some((start, total)) = config.fallback_time_budget {
                 let remaining = total.saturating_sub(start.elapsed());
-                tcp_timeout.min(remaining / 2)
+                tcp_timeout.map(|timeout| timeout.min(remaining / 2))
             } else {
                 tcp_timeout
             }
@@ -433,11 +456,11 @@ pub(crate) async fn connect_tcp(
         tracing::debug!(
             proxy = %proxy_cfg,
             phase = "proxy_tunnel",
-            timeout_ms = proxy_timeout.as_millis() as u64,
+            timeout_ms = ?proxy_timeout.map(|timeout| timeout.as_millis() as u64),
             "http.connect.phase_start",
         );
 
-        let proxy_result = tokio::time::timeout(
+        let proxy_result = crate::timeout::optional(
             proxy_timeout,
             proxy_cfg.connect_with_budget(
                 host,
@@ -446,21 +469,30 @@ pub(crate) async fn connect_tcp(
                 resolver,
                 proxy_timeout,
                 connection_budget.clone(),
+                execution,
             ),
         )
         .await
         .map_err(|_| {
             Error::timeout(
-                format!("proxy tunnel timed out after {proxy_timeout:?}"),
+                format!(
+                    "proxy tunnel timed out after {}",
+                    crate::timeout::display_duration(proxy_timeout)
+                ),
                 Some(ConnectionPhase::ProxyTunnel),
-                Some(proxy_timeout),
+                proxy_timeout,
             )
         })
         .and_then(|r| r);
 
         match proxy_result {
             Ok(tcp) => Ok(tcp),
-            Err(e) if direct_fallback && !e.is_address_family_mismatch() => {
+            Err(e)
+                if direct_fallback
+                    && !e.is_address_family_mismatch()
+                    && !e.is_connect_attempt_denied() =>
+            {
+                execution.ensure_active()?;
                 tracing::warn!(
                     error = %e,
                     fallback = "proxy_to_direct",
@@ -473,8 +505,10 @@ pub(crate) async fn connect_tcp(
                     resolver,
                     tcp_timeout,
                     connection_budget,
+                    execution,
                 )
                 .await
+                .map_err(|error| error.with_connect_prior(e))
             }
             Err(e) => {
                 if config.proxy_to_direct_fallback {
@@ -497,6 +531,7 @@ pub(crate) async fn connect_tcp(
             resolver,
             tcp_timeout,
             connection_budget,
+            execution,
         )
         .await
     }
@@ -508,17 +543,18 @@ async fn connect_tcp_direct(
     port: u16,
     tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
-    tcp_timeout: Duration,
+    tcp_timeout: Option<Duration>,
     connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+    execution: &crate::session::execution::ConnectionExecution,
 ) -> Result<TcpStream> {
     tracing::debug!(
         addr = %format_args!("{}:{}", host, port),
         phase = "tcp_connect",
-        timeout_ms = tcp_timeout.as_millis() as u64,
+        timeout_ms = ?tcp_timeout.map(|timeout| timeout.as_millis() as u64),
         "http.connect.phase_start",
     );
 
-    tokio::time::timeout(
+    crate::timeout::optional(
         tcp_timeout,
         crate::tcp_fingerprint::connect_tcp_with_fingerprint(
             host,
@@ -527,33 +563,45 @@ async fn connect_tcp_direct(
             resolver,
             tcp_timeout,
             connection_budget,
+            execution,
         ),
     )
     .await
     .map_err(|_| {
         Error::timeout(
-            format!("TCP connect timed out after {tcp_timeout:?}"),
+            format!(
+                "TCP connect timed out after {}",
+                crate::timeout::display_duration(tcp_timeout)
+            ),
             Some(ConnectionPhase::TcpConnect),
-            Some(tcp_timeout),
+            tcp_timeout,
         )
     })?
-    .map_err(|e| {
-        if let Some(timeout) = e
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<crate::dns::DnsTimeout>())
-        {
-            return Error::timeout(
-                timeout.to_string(),
-                Some(ConnectionPhase::DnsResolution),
-                Some(timeout.0),
-            );
-        }
-        Error::connection(
-            ConnectionPhase::TcpConnect,
-            format!("TCP connect to {host}:{port} failed: {e}"),
-            Some(Box::new(e)),
-        )
+    .map_err(|e| match crate::error::take_connect_execution_io(e) {
+        Ok(error) => error.map_connect_prior(|prior| match prior {
+            Error::Io(error) => direct_tcp_error(host, port, error),
+            other => other,
+        }),
+        Err(error) => direct_tcp_error(host, port, error),
     })
+}
+
+fn direct_tcp_error(host: &str, port: u16, e: std::io::Error) -> Error {
+    if let Some(timeout) = e
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<crate::dns::DnsTimeout>())
+    {
+        return Error::timeout(
+            timeout.to_string(),
+            Some(ConnectionPhase::DnsResolution),
+            Some(timeout.0),
+        );
+    }
+    Error::connection(
+        ConnectionPhase::TcpConnect,
+        format!("TCP connect to {host}:{port} failed: {e}"),
+        Some(Box::new(e)),
+    )
 }
 /// Perform TLS handshake on a TCP stream and return an `EstablishedConnection`.
 pub(crate) async fn wrap_tls(
@@ -561,23 +609,26 @@ pub(crate) async fn wrap_tls(
     host: &str,
     port: u16,
     tls_connector: &TlsConnector,
-    tls_timeout: Duration,
+    tls_timeout: Option<Duration>,
 ) -> Result<EstablishedConnection> {
     let remote_addr = tcp.peer_addr().ok();
     let tls_start = Instant::now();
     tracing::debug!(
         phase = "tls_handshake",
-        timeout_ms = tls_timeout.as_millis() as u64,
+        timeout_ms = ?tls_timeout.map(|timeout| timeout.as_millis() as u64),
         "http.connect.phase_start",
     );
 
-    let tls_stream = tokio::time::timeout(tls_timeout, tls_connector.connect(host, port, tcp))
+    let tls_stream = crate::timeout::optional(tls_timeout, tls_connector.connect(host, port, tcp))
         .await
         .map_err(|_| {
             Error::timeout(
-                format!("TLS handshake timed out after {tls_timeout:?}"),
+                format!(
+                    "TLS handshake timed out after {}",
+                    crate::timeout::display_duration(tls_timeout)
+                ),
                 Some(ConnectionPhase::TlsHandshake),
-                Some(tls_timeout),
+                tls_timeout,
             )
         })?
         .map_err(Error::Tls)?;

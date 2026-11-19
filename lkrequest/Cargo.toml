@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 description = "HTTP client with fine-grained TLS fingerprint control"
 license.workspace = true
@@ -12,12 +12,9 @@ keywords = ["http", "client", "tls", "fingerprint", "http3"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [features]
-default = ["h2-native"]
+default = []
 
 doh = ["hickory-resolver/https-aws-lc-rs"]
-# Deprecated backward-compatible alias. HTTP/2 always uses lkh2 and no longer
-# has an alternate backend. Remove this feature completely in 0.3.0.
-h2-native = ["lkh2/h2-native"]
 quic-h3 = ["dep:lktls-quic", "dep:lkh3", "dep:lkquic", "dep:quinn", "dep:h3", "dep:h3-quinn"]
 # MASQUE (RFC 9298 CONNECT-UDP) proxy support. Off by default: it pulls in the
 # tunnel layer and only helps deployments that actually have a MASQUE proxy.
@@ -36,12 +33,12 @@ bench-internals = []
 synthetic-fp = ["dep:rand_chacha", "dep:rand_core"]
 
 [dependencies]
-lktls = { path = "../lktls", version = "0.2.5" }
-lktls-quic = { path = "../lktls-quic", version = "0.2.5", optional = true }
-lkh2 = { path = "../lkh2", version = "0.2.5", default-features = false }
-lkh3 = { path = "../lkh3", version = "0.2.5", optional = true }
-lkquic = { path = "../lkquic", version = "0.2.5", optional = true }
-lkmasque = { path = "../lkmasque", version = "0.2.5", optional = true }
+lktls = { path = "../lktls", version = "0.3.0" }
+lktls-quic = { path = "../lktls-quic", version = "0.3.0", optional = true }
+lkh2 = { path = "../lkh2", version = "0.3.0" }
+lkh3 = { path = "../lkh3", version = "0.3.0", optional = true }
+lkquic = { path = "../lkquic", version = "0.3.0", optional = true }
+lkmasque = { path = "../lkmasque", version = "0.3.0", optional = true }
 quinn = { workspace = true, optional = true, features = ["runtime-tokio", "ring", "rustls"] }
 # The MASQUE bridge speaks the outer HTTP/3 connection directly: it must issue
 # an extended CONNECT with `:protocol = connect-udp` and read datagrams off the
@@ -64,9 +61,12 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 http-body = "1"
 futures-core = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_ignored = "0.1"
+serde_path_to_error = "0.1"
 serde_urlencoded = { workspace = true }
 url = { workspace = true }
 cookie_store = { workspace = true }
@@ -81,6 +81,7 @@ zstd = { workspace = true }
 base64 = { workspace = true }
 bitflags = { workspace = true }
 fastwebsockets = { workspace = true }
+yawc = { version = "0.5", default-features = false, features = ["zlib"] }
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
@@ -89,7 +90,7 @@ h2 = { workspace = true }
 lkprofile = { path = "../lkprofile" }
 fpverify = { path = "../tools/fpverify" }
 criterion = { version = "0.5", features = ["async_tokio"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 urlencoding = "2"
 tracing-subscriber = { version = "0.3", features = ["registry", "fmt", "env-filter"] }

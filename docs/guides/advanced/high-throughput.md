@@ -69,3 +69,28 @@ let session = fresh_session(&client, &guard);
 固定列表的 `RoundRobin` / `Random`、动态用户名生成、buffer、cooldown、health check 和 `acquire_fresh()` 的完整配置见 [ProxyPool 轮转与动态生成](proxy-pool.md)。
 
 完整示例见公开仓库中的 `lkrequest/examples/session_pool.rs` 和 `lkrequest/examples/proxy_pool.rs`。
+
+## H2 排队与写入配置
+
+```rust
+use lkrequest::{Client, H2DataFramePolicy};
+
+let client = Client::builder()
+    .max_pending_h2_requests(128)
+    .h2_dispatch_batch_size(1)
+    .h2_data_frame_policy(H2DataFramePolicy::BrowserDefault)
+    .build();
+```
+
+| 设置 | 默认 | 作用 |
+|---|---|---|
+| `max_pending_h2_requests(n)` | 无界 | 限制每条 H2 连接内等待远端 stream slot 的排队请求；满时异步等待，不立即返回容量错误 |
+| `unbounded_pending_h2_requests()` | 同默认 | 恢复无界等待队列；不解除物理连接上限 |
+| `h2_dispatch_batch_size(n)` | 1 | 大于 1 时合并 ready 请求的 socket write，可能改变 TLS record、TCP 分段与时序 |
+| `h2_data_frame_policy(policy)` | `BrowserDefault` | 保留 profile 行为，或改为 `PeerMaxFrameSize`、`FixedPayload(bytes)`、`SocketWriteAligned { max_write_size }` |
+
+排队上限和 batch size 必须大于零；固定 payload 必须大于零，socket write 大小必须大于
+9 字节的 H2 frame header，否则 setter 会 panic。DATA 仍受 peer frame size 和流控限制，
+显式分帧不等于实际 socket/TLS 写入边界保证。这三个维度与 `AttemptLimits`、Session
+连接数及应用任务并发数分别配置，当前没有对应 C setter。性能和指纹验证方法见
+[H2 write batching](../../development/h2-write-batching.md)。

@@ -330,6 +330,7 @@ async fn accepted_zero_rtt(end: EarlyEnd) -> usize {
         // Share the test ticket across fresh Sessions to require a new transport
         // without waiting for a pooled connection's idle timeout.
         let client = Client::builder()
+            .retry_on_connection_close(true)
             .preset(lkrequest::preset::chrome_155())
             .tls_session_cache_partition_policy(
                 lkrequest::TlsSessionCachePartitionPolicy::Unpartitioned,
@@ -352,7 +353,7 @@ async fn accepted_zero_rtt(end: EarlyEnd) -> usize {
         let leader = tokio::spawn({
             let session = session.clone();
             let url = format!("{url}/slow");
-            async move { session.get(&url).send().await }
+            async move { session.get(&url).collect_diagnostics(true).send().await }
         });
         assert_eq!(seen.recv().await.unwrap(), ("/slow".to_owned(), 1));
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -367,12 +368,17 @@ async fn accepted_zero_rtt(end: EarlyEnd) -> usize {
             session
                 .post(&format!("{url}/fast"))
                 .idempotency(lkrequest::Idempotency::NotIdempotent)
+                .collect_diagnostics(true)
                 .send(),
         )
         .await
         .expect("confirmed 0-RTT connection must be reusable before its response completes")
         .unwrap();
         assert_eq!(fast.bytes(), b"ok");
+        let diagnostics = fast.diagnostics().unwrap();
+        assert!(diagnostics.quic_ms.is_none());
+        assert!(diagnostics.dns_ms.is_none());
+        assert!(diagnostics.cipher_suite.is_some());
         assert_eq!(seen.recv().await.unwrap(), ("/fast".to_owned(), 1));
         assert!(!leader.is_finished());
         assert_eq!(session.pool_stats().total, 1);
@@ -401,7 +407,11 @@ async fn accepted_zero_rtt(end: EarlyEnd) -> usize {
                 assert!(!error.is_safe_to_replay());
             }
         } else {
-            assert_eq!(result.unwrap().bytes(), b"ok");
+            let response = result.unwrap();
+            assert_eq!(response.bytes(), b"ok");
+            let diagnostics = response.diagnostics().unwrap();
+            assert!(diagnostics.quic_ms.is_some());
+            assert!(diagnostics.cipher_suite.is_some());
         }
         let replayed = matches!(
             end,

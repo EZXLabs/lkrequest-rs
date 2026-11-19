@@ -42,11 +42,13 @@ impl AeadAlgorithm {
 
     /// Resolve from a TLS 1.3 cipher suite code point.
     pub fn from_cipher_suite(suite: u16) -> Option<Self> {
-        match suite {
-            0x1301 => Some(AeadAlgorithm::Aes128Gcm),
-            0x1302 => Some(AeadAlgorithm::Aes256Gcm),
-            0x1303 => Some(AeadAlgorithm::Chacha20Poly1305),
-            _ => None,
+        super::suites::tls13_suite(suite).map(|descriptor| descriptor.aead)
+    }
+
+    pub(crate) const fn tls_record_limits(self) -> super::suites::TlsRecordLimits {
+        match self {
+            Self::Aes128Gcm | Self::Aes256Gcm => super::suites::TlsRecordLimits::AES_GCM,
+            Self::Chacha20Poly1305 => super::suites::TlsRecordLimits::SEQUENCE_ONLY,
         }
     }
 
@@ -66,10 +68,8 @@ impl AeadAlgorithm {
 /// nonce construction and delegates to aws-lc-rs for the actual cryptography.
 pub struct Aead {
     algorithm: AeadAlgorithm,
-    /// The opening (decryption) key.
-    opening_key: aead::LessSafeKey,
-    /// The sealing (encryption) key — separate instance for the same key material.
-    sealing_key: aead::LessSafeKey,
+    /// One backend key; the owning record direction chooses its operation.
+    key: aead::LessSafeKey,
     /// The 12-byte IV (used to construct per-record nonces via XOR with seq num).
     iv: [u8; 12],
 }
@@ -97,16 +97,13 @@ impl Aead {
         let ring_algo = algorithm.aead_algorithm_ref();
         let unbound_key1 = aead::UnboundKey::new(ring_algo, key)
             .map_err(|_| TlsError::CryptoError("Failed to create AEAD key".to_string()))?;
-        let unbound_key2 = aead::UnboundKey::new(ring_algo, key)
-            .map_err(|_| TlsError::CryptoError("Failed to create AEAD key".to_string()))?;
 
         let mut iv_arr = [0u8; 12];
         iv_arr.copy_from_slice(iv);
 
         Ok(Self {
             algorithm,
-            opening_key: aead::LessSafeKey::new(unbound_key1),
-            sealing_key: aead::LessSafeKey::new(unbound_key2),
+            key: aead::LessSafeKey::new(unbound_key1),
             iv: iv_arr,
         })
     }
@@ -141,7 +138,7 @@ impl Aead {
         let mut in_out = Vec::with_capacity(plaintext.len() + self.algorithm.tag_len());
         in_out.extend_from_slice(plaintext);
 
-        self.sealing_key
+        self.key
             .seal_in_place_append_tag(nonce, aad, &mut in_out)
             .map_err(|_| TlsError::CryptoError("AEAD encryption failed".to_string()))?;
 
@@ -158,13 +155,33 @@ impl Aead {
 
         let mut in_out = ciphertext.to_vec();
         let plaintext = self
-            .opening_key
+            .key
             .open_in_place(nonce, aad, &mut in_out)
             .map_err(|_| TlsError::CryptoError("AEAD decryption failed".to_string()))?;
 
         let len = plaintext.len();
         in_out.truncate(len);
         Ok(in_out)
+    }
+
+    /// Seal a caller-owned payload in place, returning the separate tag.
+    pub fn seal_in_place(&self, seq_num: u64, aad: &[u8], payload: &mut [u8]) -> Result<[u8; 16]> {
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(self.make_nonce(seq_num), aead::Aad::from(aad), payload)
+            .map_err(|_| TlsError::CryptoError("AEAD encryption failed".into()))?;
+        Ok(tag.as_ref().try_into().unwrap())
+    }
+
+    /// Authenticate/decrypt a reusable ciphertext buffer and remove its tag.
+    pub fn open_in_place(&self, seq_num: u64, aad: &[u8], payload: &mut Vec<u8>) -> Result<()> {
+        let len = self
+            .key
+            .open_in_place(self.make_nonce(seq_num), aead::Aad::from(aad), payload)
+            .map_err(|_| TlsError::CryptoError("AEAD decryption failed".into()))?
+            .len();
+        payload.truncate(len);
+        Ok(())
     }
 }
 

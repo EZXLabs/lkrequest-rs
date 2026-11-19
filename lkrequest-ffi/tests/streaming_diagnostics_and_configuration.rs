@@ -52,6 +52,494 @@ struct TestServer {
     thread: Option<JoinHandle<()>>,
 }
 
+fn builder_fingerprint(builder: *mut lkrequest_ffi::lk_client_builder_t) -> serde_json::Value {
+    use lkrequest_ffi::*;
+    let mut client = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    assert_eq!(
+        lk_client_builder_build(builder, &mut client, &mut error),
+        lk_status_t::LK_OK
+    );
+    assert!(error.is_null());
+    let mut output = ptr::null();
+    let mut len = 0;
+    assert_eq!(
+        lk_client_fingerprint_info_json(client, &mut output, &mut len, &mut error),
+        lk_status_t::LK_OK
+    );
+    let value =
+        serde_json::from_slice(unsafe { slice::from_raw_parts(output.cast::<u8>(), len) }).unwrap();
+    lk_client_free(client);
+    value
+}
+
+#[test]
+fn full_preset_bundle_export_load_reset_and_atomic_failure() {
+    use lkrequest_ffi::*;
+    let mut len = usize::MAX;
+    let mut error = ptr::null_mut();
+    assert_eq!(
+        lk_preset_export_json(
+            c"firefox_156".as_ptr(),
+            11,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut error
+        ),
+        lk_status_t::LK_OK
+    );
+    assert!(error.is_null());
+    assert!(len > 100);
+    let mut small = [123_i8; 8];
+    assert_eq!(
+        lk_preset_export_json(
+            c"firefox_156".as_ptr(),
+            11,
+            small.as_mut_ptr(),
+            small.len(),
+            &mut len,
+            &mut error
+        ),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(small[0], 0);
+    assert_eq!(
+        lk_error_code(error),
+        lk_error_code_t::LK_ERR_RESOURCE_LIMIT_EXCEEDED
+    );
+    lk_error_free(error);
+    let mut bytes = vec![0_u8; len + 1];
+    assert_eq!(
+        lk_preset_export_json(
+            c"firefox_156".as_ptr(),
+            11,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            &mut len,
+            &mut error
+        ),
+        lk_status_t::LK_OK
+    );
+    assert!(error.is_null());
+    assert_eq!(bytes[len], 0);
+    let builder = lk_client_builder_new();
+    assert_eq!(
+        lk_client_builder_set_preset_json(builder, bytes.as_ptr().cast(), len, &mut error),
+        lk_status_t::LK_OK
+    );
+    assert!(error.is_null());
+    drop(bytes);
+    assert_eq!(builder_fingerprint(builder)["tls"]["name"], "Firefox 156");
+    let invalid =
+        br#"{"schema_version":2,"format":"lkrequest-profile-bundle","name":"a","name":"b"}"#;
+    assert_eq!(
+        lk_client_builder_set_preset_json(
+            builder,
+            invalid.as_ptr().cast(),
+            invalid.len(),
+            &mut error
+        ),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(lk_error_code(error), lk_error_code_t::LK_ERR_INVALID_CONFIG);
+    let mut diagnostics = ptr::null();
+    assert_eq!(
+        lk_error_get_diagnostics_json(error, &mut diagnostics),
+        lk_status_t::LK_OK
+    );
+    let diagnostics: serde_json::Value =
+        serde_json::from_str(unsafe { CStr::from_ptr(diagnostics) }.to_str().unwrap()).unwrap();
+    assert_eq!(diagnostics["preset_error"]["code"], "duplicate_key");
+    assert_eq!(diagnostics["preset_error"]["path"], "/name");
+    lk_error_free(error);
+    assert_eq!(builder_fingerprint(builder)["tls"]["name"], "Firefox 156");
+    assert_eq!(
+        lk_client_builder_set_preset_file(builder, c"missing-preset.json".as_ptr(), 19, &mut error),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(lk_error_code(error), lk_error_code_t::LK_ERR_IO);
+    lk_error_free(error);
+    assert_eq!(builder_fingerprint(builder)["tls"]["name"], "Firefox 156");
+    assert_eq!(
+        lk_client_builder_set_preset_json(builder, ptr::null(), 0, &mut error),
+        lk_status_t::LK_OK
+    );
+    assert!(error.is_null());
+    assert_eq!(builder_fingerprint(builder)["tls"]["name"], "Chrome 155");
+    assert_eq!(
+        lk_client_builder_set_preset_json(builder, c"x".as_ptr(), 1024 * 1024 + 1, &mut error),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_error_code(error),
+        lk_error_code_t::LK_ERR_RESOURCE_LIMIT_EXCEEDED
+    );
+    lk_error_free(error);
+    assert!(lk_feature_supported(c"preset-bundle-v2".as_ptr()));
+    lk_client_builder_free(builder);
+}
+
+#[test]
+fn full_preset_file_and_explicit_component_precedence() {
+    use lkrequest_ffi::*;
+    let text = lkrequest::preset::PresetDocument::from_preset(
+        "ffi-file",
+        &lkrequest::preset::firefox_156(),
+    )
+    .unwrap()
+    .to_json_string()
+    .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "lkrequest-ffi-profile-{}-\u{4e2d}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, text).unwrap();
+    let filename = path.to_str().unwrap();
+    let builder = lk_client_builder_new();
+    let profile = lkrequest::preset::chrome_150().tls_profile;
+    let component = serde_json::to_string(&profile).unwrap();
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(builder, component.as_ptr().cast(), component.len()),
+        lk_status_t::LK_OK
+    );
+    let mut error = ptr::null_mut();
+    assert_eq!(
+        lk_client_builder_set_preset_file(
+            builder,
+            filename.as_ptr().cast(),
+            filename.len(),
+            &mut error
+        ),
+        lk_status_t::LK_OK
+    );
+    assert!(error.is_null());
+    let info = builder_fingerprint(builder);
+    assert_eq!(info["tls"]["name"], "Chrome 150");
+    assert_eq!(
+        info["h2"],
+        serde_json::to_value(lkrequest::preset::firefox_156().h2_profile).unwrap()
+    );
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(builder, ptr::null(), 0),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(builder_fingerprint(builder)["tls"]["name"], "Firefox 156");
+    assert_eq!(
+        lk_client_builder_set_preset(builder, c"chrome_157".as_ptr()),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(builder_fingerprint(builder)["tls"]["name"], "Chrome 157");
+    lk_client_builder_free(builder);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn custom_h2_profile_is_copied_overrides_presets_and_can_be_cleared() {
+    use lkrequest_ffi::*;
+    let builder = lk_client_builder_new();
+    let mut profile = lkrequest::preset::firefox_156().h2_profile;
+    profile.window_update = 123_456;
+    let expected = serde_json::to_value(&profile).unwrap();
+    let serialized = expected.to_string();
+    assert_eq!(
+        lk_client_builder_set_h2_profile_json(
+            builder,
+            serialized.as_ptr().cast(),
+            serialized.len()
+        ),
+        lk_status_t::LK_OK
+    );
+    drop(serialized);
+    assert_eq!(
+        lk_client_builder_set_preset(builder, c"firefox_147".as_ptr()),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        lk_client_builder_set_h2_preset(builder, c"chrome_150".as_ptr()),
+        lk_status_t::LK_OK
+    );
+    let info = builder_fingerprint(builder);
+    assert_eq!(info["h2"], expected);
+    assert_eq!(info["tls"]["name"], "Firefox 147");
+    assert_eq!(
+        lk_client_builder_set_h2_profile_json(builder, ptr::null(), 0),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        builder_fingerprint(builder)["h2"],
+        serde_json::to_value(lkrequest::preset::chrome_150().h2_profile).unwrap()
+    );
+    assert!(lk_feature_supported(c"h2-profile-json".as_ptr()));
+    lk_client_builder_free(builder);
+}
+
+#[test]
+fn custom_tls_profile_rejects_invalid_input_without_replacing_override() {
+    use lkrequest_ffi::*;
+    use serde_json::json;
+    let builder = lk_client_builder_new();
+    let valid = serde_json::to_value(lkrequest::lktls::profile::presets::chrome_155()).unwrap();
+    let set = |value: &serde_json::Value| {
+        let serialized = value.to_string();
+        lk_client_builder_set_tls_profile_json(
+            builder,
+            serialized.as_ptr().cast(),
+            serialized.len(),
+        )
+    };
+    assert_eq!(set(&valid), lk_status_t::LK_OK);
+    for (field, value) in [
+        ("cipher_suites", json!([])),
+        ("session_id_length", json!(33)),
+        ("supported_groups", json!([])),
+        ("key_share_curves", json!([0xffff])),
+        ("client_hello_mirror", json!({"input": "00"})),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        assert_eq!(set(&invalid), lk_status_t::LK_ERR);
+    }
+    for data in ["x0".to_string(), "0".into(), "00".repeat(65_536)] {
+        let mut invalid = valid.clone();
+        invalid["extensions"][0]["source"] = json!({"type": "raw_bytes", "data": data});
+        assert_eq!(set(&invalid), lk_status_t::LK_ERR);
+    }
+    let duplicate = format!("{{\"session_id_length\":0,{}", &valid.to_string()[1..]);
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(builder, duplicate.as_ptr().cast(), duplicate.len()),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(builder, ptr::null(), 1),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(builder, [0xffu8].as_ptr().cast(), 1),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(ptr::null_mut(), ptr::null(), 0),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(builder_fingerprint(builder)["tls"], valid);
+    lk_client_builder_free(builder);
+}
+
+#[test]
+fn custom_h2_profile_rejects_invalid_input_without_replacing_override() {
+    use lkrequest_ffi::*;
+    use serde_json::json;
+    let builder = lk_client_builder_new();
+    let valid = serde_json::to_value(lkrequest::preset::chrome_155().h2_profile).unwrap();
+    let set = |json: &str| {
+        lk_client_builder_set_h2_profile_json(builder, json.as_ptr().cast(), json.len())
+    };
+    assert_eq!(set(&valid.to_string()), lk_status_t::LK_OK);
+    let mut cases = vec![json!({})];
+    for (field, value) in [
+        ("initial_stream_id", json!(0)),
+        ("initial_stream_id", json!(2)),
+        ("initial_stream_id", json!(0x8000_0001u32)),
+        ("window_update", json!(u32::MAX)),
+        ("pseudo_header_order", json!(["method"])),
+        ("behavior", json!({"write_policy": "chrome"})),
+        (
+            "headers_priority",
+            json!({"stream_dependency": 1, "weight": 0}),
+        ),
+        (
+            "priority_frames",
+            json!([{"stream_id": 3, "dependency": 3, "weight": 16}]),
+        ),
+        (
+            "settings",
+            json!([{"id": "enable_push", "value": 1}, {"id": "enable_push", "value": 1}]),
+        ),
+        (
+            "settings",
+            json!([{"id": "enable_connect_protocol", "value": 2}]),
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        cases.push(invalid);
+    }
+    let mut invalid = valid.clone();
+    invalid["priority_config"]["default_urgency"] = json!(8);
+    cases.push(invalid);
+    for invalid in cases {
+        assert_eq!(set(&invalid.to_string()), lk_status_t::LK_ERR, "{invalid}");
+    }
+    for invalid in ["", "{", "null"] {
+        assert_eq!(set(invalid), lk_status_t::LK_ERR);
+    }
+    let duplicate = format!("{{\"window_update\":0,{}", &valid.to_string()[1..]);
+    assert_eq!(set(&duplicate), lk_status_t::LK_ERR);
+    for (data, len) in [(ptr::null(), 1), ([0xffu8].as_ptr().cast(), 1)] {
+        assert_eq!(
+            lk_client_builder_set_h2_profile_json(builder, data, len),
+            lk_status_t::LK_ERR
+        );
+    }
+    for setter in [
+        lk_client_builder_set_tls_profile_json,
+        lk_client_builder_set_h2_profile_json,
+        lk_client_builder_set_quic_profile_json,
+    ] {
+        assert_eq!(
+            setter(builder, c"{}".as_ptr(), usize::MAX),
+            lk_status_t::LK_ERR
+        );
+    }
+    assert_eq!(
+        lk_client_builder_set_h2_profile_json(ptr::null_mut(), ptr::null(), 0),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(builder_fingerprint(builder)["h2"], valid);
+    lk_client_builder_free(builder);
+}
+
+#[test]
+fn tls_session_cache_switch_ttl_reset_and_diagnostics() {
+    use lkrequest_ffi::*;
+
+    assert!(lk_feature_supported(c"tls-session-cache".as_ptr()));
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_enabled(ptr::null_mut(), false),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_ttl(ptr::null_mut(), 1),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_client_builder_reset_tls_session_cache_ttl(ptr::null_mut()),
+        lk_status_t::LK_ERR
+    );
+    let builder = lk_client_builder_new();
+    let check = |enabled: bool, ttl: Option<u64>| {
+        assert_eq!(
+            builder_fingerprint(builder)["tls_session_cache"],
+            serde_json::json!({
+                "enabled": enabled, "ttl_ms": ttl,
+            })
+        );
+    };
+    check(true, None);
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_enabled(builder, false),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_ttl(builder, 7_200_000),
+        lk_status_t::LK_OK
+    );
+    check(false, Some(7_200_000));
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_enabled(builder, true),
+        lk_status_t::LK_OK
+    );
+    check(true, Some(7_200_000));
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_ttl(builder, 0),
+        lk_status_t::LK_OK
+    );
+    check(false, Some(0));
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_ttl(builder, u64::MAX),
+        lk_status_t::LK_OK
+    );
+    check(true, Some(u64::MAX));
+    assert_eq!(
+        lk_client_builder_set_tls_session_cache_enabled(builder, false),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        lk_client_builder_reset_tls_session_cache_ttl(builder),
+        lk_status_t::LK_OK
+    );
+    check(false, None);
+    lk_client_builder_free(builder);
+}
+
+#[test]
+fn streaming_body_obeys_configured_total_and_idle_timeouts() {
+    use lkrequest_ffi::*;
+
+    assert!(lk_feature_supported(c"read-idle-timeout".as_ptr()));
+    for name in [c"optional-total-timeout", c"optional-phase-timeouts"] {
+        assert!(lk_feature_supported(name.as_ptr()));
+    }
+    for idle in [false, true] {
+        let server = TestServer::start();
+        let builder = lk_client_builder_new();
+        if idle {
+            assert_eq!(
+                lk_client_builder_disable_timeout_total(builder),
+                lk_status_t::LK_OK
+            );
+            assert_eq!(
+                lk_client_builder_set_timeout_read_idle(builder, 200),
+                lk_status_t::LK_OK
+            );
+        } else {
+            assert_eq!(
+                lk_client_builder_set_timeout_total(builder, 200),
+                lk_status_t::LK_OK
+            );
+        }
+        let mut error = ptr::null_mut();
+        let mut client = ptr::null_mut();
+        assert_eq!(
+            lk_client_builder_build(builder, &mut client, &mut error),
+            lk_status_t::LK_OK
+        );
+        lk_client_builder_free(builder);
+        let session_builder = lk_session_builder_new(client);
+        assert_eq!(
+            lk_session_builder_set_http1_only(session_builder),
+            lk_status_t::LK_OK
+        );
+        let mut session = ptr::null_mut();
+        assert_eq!(
+            lk_session_builder_build(session_builder, &mut session, &mut error),
+            lk_status_t::LK_OK
+        );
+        lk_session_builder_free(session_builder);
+        let url = cstring(&server.url("/stream-timeout"));
+        let mut request = ptr::null_mut();
+        assert_eq!(
+            lk_request_new(
+                session,
+                c"GET".as_ptr(),
+                3,
+                url.as_ptr(),
+                url.as_bytes().len(),
+                &mut request,
+                &mut error
+            ),
+            lk_status_t::LK_OK
+        );
+        let mut response = ptr::null_mut();
+        assert_eq!(
+            lk_request_send_streaming(request, &mut response, &mut error),
+            lk_status_t::LK_OK
+        );
+        let mut chunk = lk_chunk_view_t::default();
+        assert_eq!(
+            lk_stream_read(response, &mut chunk, &mut error),
+            lk_status_t::LK_ERR
+        );
+        assert_eq!(lk_error_code(error), lk_error_code_t::LK_ERR_TIMEOUT);
+        lk_error_free(error);
+        lk_streaming_response_free(response);
+        lk_request_free(request);
+        lk_session_free(session);
+        lk_client_free(client);
+    }
+}
+
 #[test]
 fn trust_anchor_configuration_checks_ids_roots_and_verification() {
     use lkrequest_ffi::*;
@@ -231,6 +719,13 @@ fn handle_connection(mut stream: TcpStream) {
         // made the assertion fail about one run in six. Delaying the first
         // chunk instead makes the read pending for a known 150ms while the
         // second call happens microseconds later.
+        "/stream-timeout" => write_chunked_response_after(
+            &mut stream,
+            "200 OK",
+            &[("Content-Type", "text/plain")],
+            &[b"late".as_ref()],
+            700,
+        ),
         "/stream-slow" => write_chunked_response_after(
             &mut stream,
             "200 OK",

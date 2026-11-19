@@ -28,6 +28,7 @@
 //! ```
 
 pub mod builder;
+mod deflate;
 pub(crate) mod upgrade;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,10 +66,17 @@ pub enum WsMessage {
 /// By default, incoming Ping frames are automatically answered with Pong
 /// (`auto_pong` is enabled).
 pub struct WsConnection<S: AsyncRead + AsyncWrite + Unpin> {
-    reader: Mutex<FragmentCollectorRead<ReadHalf<S>>>,
-    writer: Mutex<WebSocketWrite<WriteHalf<S>>>,
+    backend: Backend<S>,
     closed: AtomicBool,
     url: String,
+}
+
+enum Backend<S: AsyncRead + AsyncWrite + Unpin> {
+    Plain {
+        reader: Mutex<FragmentCollectorRead<ReadHalf<S>>>,
+        writer: Mutex<WebSocketWrite<WriteHalf<S>>>,
+    },
+    Deflate(deflate::Connection<S>),
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WsConnection<S> {
@@ -81,11 +89,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConnection<S> {
         ws.set_writev(false);
         let (reader, writer) = ws.split(tokio::io::split);
         Self {
-            reader: Mutex::new(FragmentCollectorRead::new(reader)),
-            writer: Mutex::new(writer),
+            backend: Backend::Plain {
+                reader: Mutex::new(FragmentCollectorRead::new(reader)),
+                writer: Mutex::new(writer),
+            },
             closed: AtomicBool::new(false),
             url,
         }
+    }
+
+    pub(crate) fn with_deflate(stream: S, url: String, negotiated: &str) -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Deflate(deflate::Connection::new(stream, negotiated)?),
+            closed: AtomicBool::new(false),
+            url,
+        })
     }
 
     /// Returns the URL of this WebSocket connection.
@@ -143,11 +161,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConnection<S> {
     /// partial frame. Keep an in-flight receive alive while sending concurrently;
     /// dropping and restarting it may lose framing state.
     pub async fn recv(&self) -> Result<WsMessage> {
-        let mut reader = self.reader.lock().await;
+        let (reader, writer) = match &self.backend {
+            Backend::Deflate(connection) => {
+                let result = connection.recv().await;
+                if result.is_err() || matches!(result, Ok(WsMessage::Close(..))) {
+                    self.closed.store(true, Ordering::Release);
+                }
+                return result;
+            }
+            Backend::Plain { reader, writer } => (reader, writer),
+        };
+        let mut reader = reader.lock().await;
         loop {
             let frame = reader
                 .read_frame(&mut |frame| async move {
-                    let mut writer = self.writer.lock().await;
+                    let mut writer = writer.lock().await;
                     if writer.is_closed() {
                         return Ok(());
                     }
@@ -243,15 +271,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConnection<S> {
         Ok(())
     }
 
-    async fn write_frame(
-        &self,
-        frame: Frame<'_>,
-    ) -> std::result::Result<(), fastwebsockets::WebSocketError> {
-        let mut writer = self.writer.lock().await;
+    async fn write_frame(&self, frame: Frame<'_>) -> Result<()> {
+        if let Backend::Deflate(connection) = &self.backend {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Http("WebSocket connection closed".into()));
+            }
+            if frame.opcode == OpCode::Close {
+                self.closed.store(true, Ordering::Release);
+            }
+            return connection.send(frame).await;
+        }
+        let Backend::Plain { writer, .. } = &self.backend else {
+            unreachable!()
+        };
+        let mut writer = writer.lock().await;
         if frame.opcode == OpCode::Close {
             self.closed.store(true, Ordering::Release);
         }
-        writer.write_frame(frame).await
+        writer
+            .write_frame(frame)
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket write error: {e}")))
     }
 }
 

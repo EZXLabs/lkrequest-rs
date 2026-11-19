@@ -3,12 +3,48 @@
 本页只记录**会改变应用行为**的变更，以及升级时需要动手的地方。完整条目见仓库根的
 [CHANGELOG](https://github.com/EZXLabs/lkrequest-rs/blob/main/CHANGELOG.md)。
 
-## 需要动手改的
+## 从 0.2.5 升级到 0.3.0
 
-### `h2-native` feature 已弃用
+0.3.0 重构请求执行与恢复授权，并新增可选的 HTTP 重发和建链总上限。现有请求构造方法继续可用，C ABI 版本仍为 1；Cargo feature 的移除与以下默认行为变化需要检查。
 
-HTTP/2 始终使用 `lkh2` 引擎，`h2-native` 在 0.2.x 中只是一个 no-op 兼容别名，**0.3.0
-会从 `lkrequest` 和 `lkh2` 中彻底删除**。显式写了这个 feature 的应用现在就应该移除：
+### 自定义 Hickory 配置的类型来源
+
+0.3.0 使用包含分配边界修复的 Hickory 0.26.3 源码。普通 `DnsConfig`
+和 C ABI 不变；调用 `HickoryDns::try_with_config`、`with_config` 或
+`from_resolver` 的高级 Rust 用户应改从 `lkrequest::dns::hickory` 导入
+`config::ResolverConfig`、`config::ResolverOpts`、`TokioResolver` 等类型，
+避免与另一个 crates.io 来源的同名类型混用。
+
+### 连接关闭重发与协议回退改为显式开启
+
+连接池连接关闭后的自动重发，以及 H2-to-H1 回退默认关闭。依赖这些行为的应用可显式配置：
+
+```rust
+use lkrequest::Client;
+
+let client = Client::builder()
+    .retry_on_connection_close(true)
+    .h2_fallback_h1(true)
+    .build();
+```
+
+C 调用方使用 `lk_client_builder_set_retry_on_connection_close` 和
+`lk_client_builder_set_fallback_h2_to_h1`。这些开关不会绕过方法幂等性或 body 可重放检查；应用 retry policy 仍独立配置。安全的 HTTP/3 0-RTT 与早期数据拒绝恢复不依赖连接关闭重试开关。
+
+### 新增上限默认不启用
+
+`AttemptLimits` 分别限制额外 HTTP 提交和实际 TCP/QUIC 建链启动次数，同一次请求的重试、重定向和竞速共享预算；同一 Session 的其他请求不共享计数。Client、Session 和 Request 可分层配置，子级只能继承或收紧有限上限。
+
+零额外 HTTP 次数仍允许初次提交和合法重定向；零建链次数仍允许复用连接和等待共享建链。次数上限不能代替 timeout。配置示例、取消观察以及 Rust/C 诊断入口见[请求重发上限与统计](client-session.md#请求重发上限与统计)。
+
+### TLS/QUIC 缓存可以关闭或调整有效期
+
+使用 `.tls_session_cache_enabled(...)`、`.tls_session_cache_ttl(...)` 和
+`.default_tls_session_cache_ttl()`，或相应 C setter。TLS 1.2 默认一小时，TLS 1.3/QUIC 最长七天，并遵守更短的服务端期限。关闭缓存不影响已有连接池复用，设置 TTL 也不会重新打开已关闭的缓存。详见[会话缓存](client-session.md#tlsquic-会话缓存)。
+
+### `h2-native` feature 已删除
+
+HTTP/2 始终使用 `lkh2` 引擎。0.3.0 已从 `lkrequest` 和 `lkh2` 删除旧 no-op 别名及转发配置，显式启用它会导致 Cargo 解析失败。直接依赖这两个 crate 的项目，以及再次转发该 feature 的 wrapper crate，都需要移除旧名称：
 
 ```toml
 # 改前
@@ -17,7 +53,46 @@ lkrequest = { git = "...", features = ["h2-native", "quic-h3"] }
 lkrequest = { git = "...", features = ["quic-h3"] }
 ```
 
-删掉它不会改变任何行为。
+删掉它不会关闭 HTTP/2，也不需要替换 `lkh2` 依赖；默认构建与 `default-features = false` 均保留 H2。
+
+### Rust 与 C 兼容边界
+
+常用请求 builder 方法和 C ABI 继续保留；这不表示所有 Rust 结构体字面量都无需修改。
+`TimeoutConfig` 新增 `read_idle_timeout` 字段，列出全部旧字段的字面量必须补上它，或使用
+`..TimeoutConfig::default()`。旧低层 `ConnectionPool` 方法仍保留为 deprecated 包装，
+移除计划延后。FFI crate 的内部 Handle/State 结构增加了字段，直接构造这些内部结构的
+Rust 代码需调整；C 调用方继续使用 opaque handle。
+
+### 超时默认值与关闭语义
+
+总超时从 60 秒改为 120 秒，并覆盖完整 HTTP 操作，包括重试等待和流式响应读取。
+需要保持旧总时长时显式设置 `.total_timeout(Duration::from_secs(60))`。
+`None` 现在表示关闭该 deadline，不再替换为有限默认值；`TimeoutConfig::none()`
+关闭全部客户端请求期限。新读取空闲超时默认关闭，可以独立限制长连接等待数据的时间：
+
+```rust
+use lkrequest::{Client, TimeoutConfig};
+use std::time::Duration;
+
+let timeouts = TimeoutConfig {
+    total_timeout: Some(Duration::from_secs(60)),
+    read_idle_timeout: Some(Duration::from_secs(15)),
+    ..TimeoutConfig::default()
+};
+let client = Client::builder().timeout_config(timeouts).build();
+```
+
+C ABI 新增各阶段的 `disable_timeout_*`，已有 setter 的零毫秒仍表示立即超时，不能用来
+关闭。完整默认值和同步阻塞边界见[超时指南](networking/timeouts.md)。
+
+### 外部 profile 的加载与导出
+
+完整配置使用 v2 bundle 和 `ClientPreset::from_json_*` / `PresetDocument`，C ABI 使用
+`lk_client_builder_set_preset_json` / `lk_preset_export_json`。诊断用的 preset detail JSON
+以及旧 `policy_snapshot` 不能直接当作可执行 bundle；已有旧文件需显式迁移 runtime
+策略。单独 TLS/H2/QUIC JSON 的范围和覆盖规则见[加载指南](loading-profiles.md)。
+
+## 较早版本迁移
 
 ### `ProxyConfig` 与 `HealthCheckConfig` 变成 `#[non_exhaustive]`
 
@@ -98,13 +173,15 @@ preset 升级是显式的代码改动，不是运行时概念。步骤和验证�
 此前 jar 的遍历顺序来自哈希表，同一批 cookie 在不同 Session 中顺序不同。现在按 Chrome
 规则排序：path 长的在前，长度相同则先创建的在前。这让顺序变得确定且与浏览器一致，属于
 指纹相关的行为改进。如果应用此前用 `cookie_order()` 绕过顺序不确定性，那段配置仍然有效，
-但通常已经不再必要。细节见[请求配置的 Cookie 小节](requests/README.md#cookie)。
+但通常已经不再必要。细节见[请求配置的 Cookie 小节](requests/#cookie)。
 
 ### 新增的 Cookie 读取 API
 
 `get_cookies_with_attrs(url)` 和 `get_all_cookies()` 返回带完整属性的 `CookieInfo`，
 用于同步到浏览器上下文、持久化登录态，以及排查“jar 里有这个 cookie，为什么没带上”。
-旧的 `get_cookies` 行为不变。这两个方法目前**尚未导出到 C ABI**。
+旧的 `get_cookies` 行为不变。C ABI 对应入口为 `lk_session_get_cookies_with_attrs_json` 和
+`lk_session_get_all_cookies_json`，返回由 Session 持有的借用 JSON 字符串，调用方不得释放。
+重复查询、修改 Cookie 或释放 Session 会使对应缓冲区失效，绑定需遵守 header 中的生命周期规则。
 
 ### ECH 被拒绝时不再降级
 

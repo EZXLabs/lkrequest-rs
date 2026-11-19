@@ -31,6 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Features
 
+Complete JSON presets can be loaded with `ClientPreset::from_json_file` (or the
+string/byte variants), then applied with `.preset(preset).try_build()`.
+See [Loading Profile Bundles](../docs/guides/loading-profiles.md) for the v2
+format, validated import/export, legacy migration and matching C ABI.
+
 - `quic-h3` — HTTP/3 and QUIC transport support;
 - `masque` — experimental MASQUE CONNECT-UDP proxy support; implies `quic-h3`. MASQUE-specific APIs and proxy interoperability may change;
 - `doh` — DNS over HTTPS through Hickory;
@@ -38,16 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `telemetry` — aggregate operational counters;
 - `network-e2e` — test-only public-network integration targets.
 
-HTTP/2 always uses the fingerprint-controlled `lkh2` engine. The default
-`h2-native` feature is a deprecated no-op alias: it will be removed from both
-`lkrequest` and `lkh2` in 0.3.0, so applications that list it explicitly should
-drop it now.
+HTTP/2 always uses the fingerprint-controlled `lkh2` engine, including builds
+with `default-features = false`. No H2 backend feature is needed. For upgrading
+older Cargo configurations, see the [0.3.0 migration notes](../CHANGELOG.md#upgrade-from-025).
 
 ## Browser fidelity
 
 | Family | Preset names | QUIC/H3 |
 |---|---|---|
-| Chrome | `chrome_131`, `chrome_144` through `chrome_157` | Requires `quic-h3` |
+| Chrome | `chrome_131`, `chrome_144` through `chrome_158` | Requires `quic-h3` |
 | Firefox | `firefox_133`, `firefox_147`, `firefox_156` | Not provided |
 | Safari | `safari_18`, `safari_26` | Not provided |
 
@@ -69,6 +73,10 @@ preset remains Chrome 155.
 Public TLS/H2/QUIC/H3 samples confirm stable fields matching 156, navigation
 and favicon priorities, and HTTP 200. Transport and response edge-case
 policies inherit 156. Application header values remain caller supplied.
+
+`chrome_158()` adds Windows Chrome 158.0.8127.37, captured on 2026-11-18.
+Public Cloudflare TLS/H2/QUIC/H3 samples returned HTTP 200. Stable fields match
+157; timing, loss, resumption and response edge-case policies inherit 157.
 
 Presets combine TLS, H2, optional QUIC/H3, protocol policy, and header ordering. Browser behavior can vary by version, platform, GREASE, Finch configuration, and request context. Treat committed fixtures as regression evidence, not as proof of every live-browser behavior.
 

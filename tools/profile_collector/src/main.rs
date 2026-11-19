@@ -327,6 +327,8 @@ enum ChromePresetVersion {
     Chrome156,
     #[value(name = "chrome_157")]
     Chrome157,
+    #[value(name = "chrome_158")]
+    Chrome158,
 }
 
 struct CaptureChromeOptions {
@@ -2318,6 +2320,7 @@ fn chrome_base_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome155 => lktls::profile::presets::chrome_155(),
         ChromePresetVersion::Chrome156 => lktls::profile::presets::chrome_156(),
         ChromePresetVersion::Chrome157 => lktls::profile::presets::chrome_157(),
+        ChromePresetVersion::Chrome158 => lktls::profile::presets::chrome_158(),
     }
 }
 
@@ -2334,6 +2337,7 @@ fn chrome_quic_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome155 => return lktls::profile::presets::chrome_155_quic(),
         ChromePresetVersion::Chrome156 => return lktls::profile::presets::chrome_156_quic(),
         ChromePresetVersion::Chrome157 => return lktls::profile::presets::chrome_157_quic(),
+        ChromePresetVersion::Chrome158 => return lktls::profile::presets::chrome_158_quic(),
         _ => {}
     }
 
@@ -2417,6 +2421,7 @@ fn chrome_h2_profile(version: ChromePresetVersion) -> lkh2::profile::H2Profile {
         ChromePresetVersion::Chrome155 => lkh2::profile::chrome_155_h2(),
         ChromePresetVersion::Chrome156 => lkh2::profile::chrome_156_h2(),
         ChromePresetVersion::Chrome157 => lkh2::profile::chrome_157_h2(),
+        ChromePresetVersion::Chrome158 => lkh2::profile::chrome_158_h2(),
     }
 }
 
@@ -2431,6 +2436,7 @@ fn chrome_quic_profile(version: ChromePresetVersion) -> lkh3::QuicProfile {
         ChromePresetVersion::Chrome155 => lkh3::chrome_155_quic(),
         ChromePresetVersion::Chrome156 => lkh3::chrome_156_quic(),
         ChromePresetVersion::Chrome157 => lkh3::chrome_157_quic(),
+        ChromePresetVersion::Chrome158 => lkh3::chrome_158_quic(),
         _ => lkh3::chrome_quic(),
     }
 }

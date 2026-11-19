@@ -170,6 +170,52 @@ async fn h2c_prior_knowledge() {
     assert_eq!(resp.version().to_string(), "h2");
 }
 
+#[tokio::test]
+async fn h2c_preconnect_and_concurrent_requests_share_the_single_connection_budget() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let server = start_h2c_server().await;
+        let session = chrome_client()
+            .session()
+            .http2_only()
+            .max_connections(1)
+            .build();
+        let url = format!("http://{}/", server.addr);
+        let mut tasks = Vec::new();
+        for index in 0..20 {
+            let session = session.clone();
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                if index % 3 == 0 {
+                    session.preconnect(&url).await.unwrap();
+                } else if index % 3 == 1 {
+                    assert_eq!(
+                        session.get(&url).send().await.unwrap().version(),
+                        lkrequest::HttpVersion::H2
+                    );
+                } else {
+                    assert_eq!(
+                        session
+                            .get(&url)
+                            .send_streaming()
+                            .await
+                            .unwrap()
+                            .bytes()
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        b"version=HTTP/2.0"
+                    );
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
 /// Plain HTTP/1.1 cleartext:
 /// Client speaks HTTP/1.1 over cleartext TCP, no upgrade attempt.
 #[tokio::test]

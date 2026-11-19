@@ -339,6 +339,10 @@ impl TrustAnchorObserver {
 pub struct WithoutEarlyData(pub Arc<dyn crate::session_store::SessionStore>);
 
 impl crate::session_store::SessionStore for WithoutEarlyData {
+    fn session_cache_ttl(&self) -> Option<std::time::Duration> {
+        self.0.session_cache_ttl()
+    }
+
     fn store(&self, host: &str, ticket: crate::session_store::SessionTicketData) {
         self.0.store(host, ticket);
     }
@@ -347,6 +351,30 @@ impl crate::session_store::SessionStore for WithoutEarlyData {
             ticket.max_early_data_size = 0;
             ticket
         })
+    }
+
+    fn client_sessions(&self) -> Option<&dyn crate::session_store::ClientSessionStore> {
+        self.0
+            .client_sessions()
+            .map(|_| self as &dyn crate::session_store::ClientSessionStore)
+    }
+}
+
+impl crate::session_store::ClientSessionStore for WithoutEarlyData {
+    fn store_session(&self, host: &str, session: crate::session_store::ClientSession) {
+        if let Some(store) = self.0.client_sessions() {
+            store.store_session(host, session);
+        }
+    }
+
+    fn take_session(&self, host: &str) -> Option<crate::session_store::ClientSession> {
+        self.0
+            .client_sessions()?
+            .take_session(host)
+            .map(|mut session| {
+                session.disable_early_data();
+                session
+            })
     }
 }
 

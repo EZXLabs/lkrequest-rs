@@ -1,9 +1,20 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::allocations::AllocationSummary;
+use crate::client::ObservedProtocol;
 use crate::config::RunConfig;
+use crate::fixture_server::ServerActivity;
+
+#[derive(Debug, Serialize)]
+pub struct ServerEvidence {
+    pub instance_id: String,
+    pub address: std::net::SocketAddr,
+    pub warmup: ServerActivity,
+    pub measured: ServerActivity,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessUsage {
@@ -33,6 +44,11 @@ pub struct BenchmarkReport {
     pub benchmark_version: &'static str,
     pub url: String,
     pub protocol: &'static str,
+    pub lifecycle: crate::config::Lifecycle,
+    pub allocations: Option<AllocationSummary>,
+    pub observed_protocols: BTreeMap<ObservedProtocol, u64>,
+    pub server_evidence: Option<ServerEvidence>,
+    pub race_starts_verified: Option<bool>,
     pub requests: u64,
     pub concurrency: usize,
     pub sessions: usize,
@@ -66,6 +82,10 @@ pub struct ReportInput {
     pub connection_ids: BTreeSet<u64>,
     pub usage_before: ProcessUsage,
     pub usage_after: ProcessUsage,
+    pub allocations: Option<AllocationSummary>,
+    pub observed_protocols: BTreeMap<ObservedProtocol, u64>,
+    pub server_evidence: Option<ServerEvidence>,
+    pub race_starts_verified: Option<bool>,
     pub errors: Vec<String>,
 }
 
@@ -86,7 +106,12 @@ impl BenchmarkReport {
             tokio_version: env!("BENCH_TOKIO_VERSION"),
             benchmark_version: env!("CARGO_PKG_VERSION"),
             url: config.url.clone(),
-            protocol: "h2c-prior-knowledge",
+            protocol: config.protocol.report_name(),
+            lifecycle: config.lifecycle,
+            allocations: input.allocations,
+            observed_protocols: input.observed_protocols,
+            server_evidence: input.server_evidence,
+            race_starts_verified: input.race_starts_verified,
             requests: config.requests,
             concurrency: config.concurrency,
             sessions: config.sessions,
@@ -125,7 +150,8 @@ fn client_version(client: crate::config::ClientName) -> &'static str {
         crate::config::ClientName::Lkrequest | crate::config::ClientName::LkrequestBatch64 => {
             env!("BENCH_LKREQUEST_VERSION")
         }
-        crate::config::ClientName::LkrequestTransport => env!("BENCH_LKREQUEST_VERSION"),
+        crate::config::ClientName::LkrequestTransport
+        | crate::config::ClientName::LkrequestStreaming => env!("BENCH_LKREQUEST_VERSION"),
         crate::config::ClientName::Lkh2
         | crate::config::ClientName::Lkh2Drain64
         | crate::config::ClientName::Lkh2Batch64 => {

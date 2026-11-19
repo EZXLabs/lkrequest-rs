@@ -1,23 +1,5 @@
 use crate::error::{Error, Result};
 use lktls::trust_anchor::{TrustAnchorInfo, TrustAnchorObserver};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
-tokio::task_local! { static RECOVERY_USED: Arc<AtomicBool>; }
-
-pub(crate) async fn scope<F: std::future::Future>(future: F) -> F::Output {
-    RECOVERY_USED
-        .scope(Arc::new(AtomicBool::new(false)), future)
-        .await
-}
-
-pub(crate) fn consume_recovery_budget() -> bool {
-    RECOVERY_USED
-        .try_with(|used| !used.swap(true, Ordering::AcqRel))
-        .unwrap_or(true)
-}
 
 pub(crate) fn finish_recovery<T>(
     result: Result<T>,
@@ -81,43 +63,51 @@ fn record_quic_close(error: &quinn::ConnectionError, observer: &TrustAnchorObser
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::execution::RequestExecution;
+    use crate::timeout::RequestTimeout;
 
     #[tokio::test]
     async fn protocol_alternatives_share_one_request_budget() {
-        let (tcp, quic) = scope(async {
-            tokio::join!(async { consume_recovery_budget() }, async {
-                consume_recovery_budget()
-            })
-        })
-        .await;
+        let (execution, _guard) = RequestExecution::new(RequestTimeout::default());
+        let tcp_connection = execution.connection();
+        let quic_connection = execution.connection();
+        let (tcp, quic) = tokio::join!(async { tcp_connection.consume_tai_budget() }, async {
+            quic_connection.consume_tai_budget()
+        });
         assert_ne!(tcp, quic);
-        assert!(scope(async { consume_recovery_budget() }).await);
+        let (independent, _independent_guard) = RequestExecution::new(RequestTimeout::default());
+        assert!(independent.connection().consume_tai_budget());
     }
 
     #[tokio::test]
     async fn cancelled_and_concurrent_requests_keep_independent_budgets_and_hints() {
-        let blocked = tokio::spawn(scope(async {
-            assert!(consume_recovery_budget());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let blocked = tokio::spawn(async move {
+            let (execution, _guard) = RequestExecution::new(RequestTimeout::default());
+            assert!(execution.connection().consume_tai_budget());
+            started.send(()).unwrap();
             std::future::pending::<()>().await;
-        }));
-        tokio::task::yield_now().await;
+        });
+        ready.await.unwrap();
         blocked.abort();
         assert!(blocked.await.unwrap_err().is_cancelled());
         let requests: Vec<_> = (0..16)
             .map(|number| {
-                tokio::spawn(scope(async move {
+                tokio::spawn(async move {
+                    let (execution, _guard) = RequestExecution::new(RequestTimeout::default());
                     let observer = TrustAnchorObserver::default();
                     observer.update(|info| info.failure = Some(number.to_string()));
                     tokio::task::yield_now().await;
-                    assert!(consume_recovery_budget());
-                    assert!(!consume_recovery_budget());
+                    assert!(execution.connection().consume_tai_budget());
+                    assert!(!execution.connection().consume_tai_budget());
                     assert_eq!(observer.snapshot().failure, Some(number.to_string()));
-                }))
+                })
             })
             .collect();
         for request in requests {
             request.await.unwrap();
         }
-        assert!(scope(async { consume_recovery_budget() }).await);
+        let (independent, _independent_guard) = RequestExecution::new(RequestTimeout::default());
+        assert!(independent.connection().consume_tai_budget());
     }
 }

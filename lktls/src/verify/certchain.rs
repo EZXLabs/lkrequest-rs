@@ -6,7 +6,6 @@
 //! - [`verify_certificate_chain`]: Verifies the server's certificate chain
 //!   against the Mozilla CA root store using `rustls-webpki`.
 
-use aws_lc_rs::signature;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::error::{Result, TlsError};
@@ -43,83 +42,14 @@ pub fn verify_certificate_verify(
     content.push(0x00);
     content.extend_from_slice(transcript_hash);
 
-    // Extract the SubjectPublicKeyInfo from the certificate
-    let spki = extract_spki_from_cert(cert_der)?;
-
-    // Map TLS signature scheme to ring verification algorithm + extract raw key
-    match signature_scheme {
-        // RSA-PSS schemes (TLS 1.3 only uses PSS for RSA)
-        0x0804 => {
-            // rsa_pss_rsae_sha256
-            let rsa_pk = extract_rsa_public_key_from_spki(spki)?;
-            let pk =
-                signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA256, rsa_pk);
-            pk.verify(&content, sig_bytes).map_err(|_| {
-                TlsError::CertificateError(
-                    "RSA-PSS-SHA256 signature verification failed".to_string(),
-                )
-            })
-        }
-        0x0805 => {
-            // rsa_pss_rsae_sha384
-            let rsa_pk = extract_rsa_public_key_from_spki(spki)?;
-            let pk =
-                signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA384, rsa_pk);
-            pk.verify(&content, sig_bytes).map_err(|_| {
-                TlsError::CertificateError(
-                    "RSA-PSS-SHA384 signature verification failed".to_string(),
-                )
-            })
-        }
-        0x0806 => {
-            // rsa_pss_rsae_sha512
-            let rsa_pk = extract_rsa_public_key_from_spki(spki)?;
-            let pk =
-                signature::UnparsedPublicKey::new(&signature::RSA_PSS_2048_8192_SHA512, rsa_pk);
-            pk.verify(&content, sig_bytes).map_err(|_| {
-                TlsError::CertificateError(
-                    "RSA-PSS-SHA512 signature verification failed".to_string(),
-                )
-            })
-        }
-
-        // ECDSA schemes
-        0x0403 => {
-            // ecdsa_secp256r1_sha256
-            let ec_point = extract_ec_point_from_spki(spki)?;
-            let pk =
-                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, ec_point);
-            pk.verify(&content, sig_bytes).map_err(|_| {
-                TlsError::CertificateError(
-                    "ECDSA-P256-SHA256 signature verification failed".to_string(),
-                )
-            })
-        }
-        0x0503 => {
-            // ecdsa_secp384r1_sha384
-            let ec_point = extract_ec_point_from_spki(spki)?;
-            let pk =
-                signature::UnparsedPublicKey::new(&signature::ECDSA_P384_SHA384_ASN1, ec_point);
-            pk.verify(&content, sig_bytes).map_err(|_| {
-                TlsError::CertificateError(
-                    "ECDSA-P384-SHA384 signature verification failed".to_string(),
-                )
-            })
-        }
-
-        // Ed25519
-        0x0807 => {
-            let raw_key = extract_ec_point_from_spki(spki)?;
-            let pk = signature::UnparsedPublicKey::new(&signature::ED25519, raw_key);
-            pk.verify(&content, sig_bytes).map_err(|_| {
-                TlsError::CertificateError("Ed25519 signature verification failed".to_string())
-            })
-        }
-
-        _ => Err(TlsError::CertificateError(format!(
-            "unsupported signature scheme: 0x{signature_scheme:04x}"
-        ))),
-    }
+    super::signature::verify(
+        super::signature::SignaturePurpose::Tls13CertificateVerify,
+        signature_scheme,
+        cert_der,
+        &content,
+        sig_bytes,
+    )
+    .map_err(TlsError::CertificateError)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +68,9 @@ static SUPPORTED_SIG_ALGS: &[&dyn rustls_pki_types::SignatureVerificationAlgorit
     webpki::aws_lc_rs::ECDSA_P256_SHA384,
     webpki::aws_lc_rs::ECDSA_P384_SHA256,
     webpki::aws_lc_rs::ECDSA_P384_SHA384,
+    webpki::aws_lc_rs::ECDSA_P521_SHA256,
+    webpki::aws_lc_rs::ECDSA_P521_SHA384,
+    webpki::aws_lc_rs::ECDSA_P521_SHA512,
     webpki::aws_lc_rs::ED25519,
 ];
 
@@ -422,6 +355,7 @@ pub(crate) fn extract_spki_from_cert(cert_der: &[u8]) -> Result<&[u8]> {
 ///   BIT STRING { 0x00, RSAPublicKey... }
 /// }
 /// ```
+#[cfg(test)]
 fn extract_rsa_public_key_from_spki(spki: &[u8]) -> Result<&[u8]> {
     // Parse SPKI SEQUENCE
     let (_tag, content_start, _content_len) = parse_der_tl(spki)?;
@@ -453,6 +387,7 @@ fn extract_rsa_public_key_from_spki(spki: &[u8]) -> Result<&[u8]> {
 ///
 /// Similar to RSA extraction, but for EC keys the BIT STRING directly
 /// contains the uncompressed point (0x04 || x || y).
+#[cfg(test)]
 fn extract_ec_point_from_spki(spki: &[u8]) -> Result<&[u8]> {
     // Same structure as RSA — the raw key is in the BIT STRING
     extract_rsa_public_key_from_spki(spki)
@@ -479,64 +414,14 @@ pub fn verify_server_key_exchange_signature(
     signed_data: &[u8],
     signature: &[u8],
 ) -> Result<()> {
-    // Extract SPKI from the certificate
-    let spki = extract_spki_from_cert(server_cert_der)?;
-
-    // Map the TLS signature algorithm to a ring verification algorithm
-    match sig_algorithm {
-        // RSA-PKCS1 schemes — extract RSAPublicKey from SPKI
-        0x0401 | 0x0501 | 0x0601 | 0x0804 => {
-            let rsa_pk = extract_rsa_public_key_from_spki(spki)?;
-            let ring_algo: &dyn aws_lc_rs::signature::VerificationAlgorithm = match sig_algorithm {
-                0x0401 => &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256,
-                0x0501 => &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA384,
-                0x0601 => &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA512,
-                0x0804 => &aws_lc_rs::signature::RSA_PSS_2048_8192_SHA256,
-                _ => unreachable!(),
-            };
-            let pk = aws_lc_rs::signature::UnparsedPublicKey::new(ring_algo, rsa_pk);
-            pk.verify(signed_data, signature).map_err(|_| {
-                TlsError::CryptoError("ServerKeyExchange RSA signature verification failed".into())
-            })
-        }
-        // ECDSA schemes — extract EC point from SPKI
-        0x0403 => {
-            let ec_point = extract_ec_point_from_spki(spki)?;
-            let pk = aws_lc_rs::signature::UnparsedPublicKey::new(
-                &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
-                ec_point,
-            );
-            pk.verify(signed_data, signature).map_err(|_| {
-                TlsError::CryptoError(
-                    "ServerKeyExchange ECDSA-P256 signature verification failed".into(),
-                )
-            })
-        }
-        0x0503 => {
-            let ec_point = extract_ec_point_from_spki(spki)?;
-            let pk = aws_lc_rs::signature::UnparsedPublicKey::new(
-                &aws_lc_rs::signature::ECDSA_P384_SHA384_ASN1,
-                ec_point,
-            );
-            pk.verify(signed_data, signature).map_err(|_| {
-                TlsError::CryptoError(
-                    "ServerKeyExchange ECDSA-P384 signature verification failed".into(),
-                )
-            })
-        }
-        // RSA-PKCS1 with SHA-1 (legacy, still used by some servers).
-        // ring does not support SHA-1 signature verification; return an explicit
-        // error so the caller's VerificationPolicy can decide how to handle it
-        // (Strict rejects; Insecure skips verification entirely).
-        0x0201 => Err(TlsError::CryptoError(
-            "ServerKeyExchange uses legacy RSA-PKCS1-SHA1 (0x0201) which is not supported \
-             for verification"
-                .into(),
-        )),
-        other => Err(TlsError::CryptoError(format!(
-            "unsupported ServerKeyExchange signature algorithm: 0x{other:04x}"
-        ))),
-    }
+    super::signature::verify(
+        super::signature::SignaturePurpose::Tls12ServerKeyExchange,
+        sig_algorithm,
+        server_cert_der,
+        signed_data,
+        signature,
+    )
+    .map_err(TlsError::CryptoError)
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_ske_sha1_unsupported() {
+    fn test_verify_ske_rsa_sha1_rejects_ecdsa_key_and_invalid_signature() {
         let cert_der = generate_ec_cert_der();
         let result = verify_server_key_exchange_signature(
             &cert_der, 0x0201, // rsa_pkcs1_sha1

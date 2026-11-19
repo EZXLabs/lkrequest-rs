@@ -39,15 +39,19 @@ use aws_lc_rs::digest;
 
 use std::sync::Arc;
 
-use crate::crypto::kx::{self, EphemeralKeyPair, KxGroup};
+use crate::crypto::kx::{self, KxGroup};
 use crate::crypto::prf::{self, PrfAlgorithm};
-use crate::crypto::tls12_cipher::{Tls12CipherSuite, Tls12KeyExchange};
+use crate::crypto::tls12_cipher::{CbcMacMode, Tls12CipherSuite, Tls12KeyExchange};
 use crate::error::{AlertDescription, Result, TlsError};
-use crate::extensions::record_size_limit::parse_peer_record_size_limit;
+use crate::extensions::tls12::ServerExtensions;
 use crate::handshake::handshake_type;
 use crate::handshake::tls13::{client_hello_extensions, client_hello_legacy_offer};
 use crate::profile::types::ext_type;
 use crate::verify::policy::VerificationPolicy;
+
+mod client;
+mod state;
+use state::Phase;
 
 // ---------------------------------------------------------------------------
 // Transcript Hash (for TLS 1.2 Finished verify_data)
@@ -197,6 +201,16 @@ impl Tls12TrafficKeys {
         &self,
         client_side: bool,
     ) -> crate::error::Result<crate::record::Tls12RecordCipher> {
+        self.to_record_cipher_with_mode(client_side, CbcMacMode::MacThenEncrypt)
+    }
+
+    /// Create record protection using this connection's negotiated CBC mode.
+    /// The original constructor retains MAC-then-encrypt for compatibility.
+    pub fn to_record_cipher_with_mode(
+        &self,
+        client_side: bool,
+        mode: CbcMacMode,
+    ) -> crate::error::Result<crate::record::Tls12RecordCipher> {
         let (key, iv, mac_key) = if client_side {
             (
                 &self.client_write_key[..],
@@ -210,7 +224,9 @@ impl Tls12TrafficKeys {
                 &self.server_write_mac_key[..],
             )
         };
-        create_tls12_record_cipher(&self.cipher_suite, key, iv, mac_key)
+        self.cipher_suite
+            .descriptor()
+            .record_cipher_with_mode(key, iv, mac_key, mode)
     }
 
     /// Install the client-side write keys on a [`crate::record::writer::RecordWriter`].
@@ -239,73 +255,7 @@ pub fn create_tls12_record_cipher(
     iv: &[u8],
     mac_key: &[u8],
 ) -> crate::error::Result<crate::record::Tls12RecordCipher> {
-    use crate::crypto::tls12_cipher::{Tls12Chacha20Cipher, Tls12GcmCipher};
-    use crate::error::TlsError;
-    use crate::record::Tls12RecordCipher;
-
-    match suite {
-        Tls12CipherSuite::EcdheEcdsaChacha20Poly1305
-        | Tls12CipherSuite::EcdheRsaChacha20Poly1305 => {
-            if iv.len() != 12 {
-                return Err(TlsError::CryptoError(format!(
-                    "ChaCha20-Poly1305 IV must be 12 bytes, got {}",
-                    iv.len()
-                )));
-            }
-            if key.len() != 32 {
-                return Err(TlsError::CryptoError(format!(
-                    "ChaCha20-Poly1305 key must be 32 bytes, got {}",
-                    key.len()
-                )));
-            }
-            let iv_arr: [u8; 12] = iv.try_into().unwrap();
-            let key_arr: [u8; 32] = key.try_into().unwrap();
-            Ok(Tls12RecordCipher::Chacha20(Tls12Chacha20Cipher::new(
-                &key_arr, &iv_arr,
-            )?))
-        }
-        _ if suite.is_aead() => {
-            if iv.len() != 4 {
-                return Err(TlsError::CryptoError(format!(
-                    "GCM implicit IV must be 4 bytes, got {}",
-                    iv.len()
-                )));
-            }
-            let iv_arr: [u8; 4] = iv.try_into().unwrap();
-            let is_aes_256 = key.len() == 32;
-            Ok(Tls12RecordCipher::Gcm(Tls12GcmCipher::new(
-                key, &iv_arr, is_aes_256,
-            )?))
-        }
-        _ if suite.is_cbc() => {
-            use crate::crypto::tls12_cipher::{CbcMacAlgorithm, Tls12CbcCipher};
-
-            let mac_algo = match suite {
-                Tls12CipherSuite::EcdheRsaAes128CbcSha
-                | Tls12CipherSuite::EcdheRsaAes256CbcSha
-                | Tls12CipherSuite::RsaAes128CbcSha
-                | Tls12CipherSuite::RsaAes256CbcSha => CbcMacAlgorithm::HmacSha1,
-                Tls12CipherSuite::EcdheRsaAes128CbcSha256
-                | Tls12CipherSuite::RsaAes128CbcSha256
-                | Tls12CipherSuite::RsaAes256CbcSha256 => CbcMacAlgorithm::HmacSha256,
-                Tls12CipherSuite::EcdheRsaAes256CbcSha384 => CbcMacAlgorithm::HmacSha384,
-                _ => {
-                    return Err(TlsError::CryptoError(format!(
-                        "Unknown CBC MAC algorithm for suite {:?}",
-                        suite
-                    )))
-                }
-            };
-
-            Ok(Tls12RecordCipher::Cbc(Tls12CbcCipher::new(
-                key, mac_key, mac_algo,
-            )))
-        }
-        _ => Err(TlsError::NotImplemented(format!(
-            "Unsupported TLS 1.2 cipher suite: {:?}",
-            suite
-        ))),
-    }
+    suite.descriptor().record_cipher(key, iv, mac_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,62 +266,11 @@ pub fn create_tls12_record_cipher(
 ///
 /// Processes incoming handshake records and produces actions for the caller.
 pub struct Tls12Handshake {
-    state: Tls12State,
-    /// Transcript hash of all handshake messages.
-    transcript: Option<TranscriptHash>,
-    /// Raw ClientHello bytes — saved so we can re-hash if the cipher suite
-    /// requires a different hash algorithm (e.g. SHA-384 instead of SHA-256).
-    client_hello_bytes: Vec<u8>,
-    /// Client random (from our ClientHello).
+    state: Phase,
     client_random: [u8; 32],
-    /// Server random (from ServerHello).
-    server_random: [u8; 32],
-    /// Negotiated cipher suite.
-    cipher_suite: Option<Tls12CipherSuite>,
-    /// PRF algorithm for this cipher suite.
-    prf_algorithm: PrfAlgorithm,
-    /// Server certificate DER bytes.
-    server_certificates: Vec<Vec<u8>>,
-    /// Whether the server requested a client certificate.
-    client_certificate_requested: bool,
-    /// ECDHE server key exchange parameters.
-    server_kx_params: Option<ServerKxParams>,
-    /// Our ephemeral key pair for ECDHE (consumed during key exchange).
-    #[allow(dead_code)]
-    key_pair: Option<EphemeralKeyPair>,
-    /// Master secret (48 bytes).
-    master_secret: Option<Vec<u8>>,
-    /// Server hostname (for certificate verification).
     hostname: String,
-    /// Certificate and signature verification policy.
     verification_policy: VerificationPolicy,
-    /// Custom CA trust anchors (merged with Mozilla root store).
     custom_ca_anchors: Option<Arc<Vec<rustls_pki_types::TrustAnchor<'static>>>>,
-    /// ALPN protocol negotiated in ServerHello extensions.
-    negotiated_alpn: Option<String>,
-    /// The server's RFC 8449 `record_size_limit`, from the ServerHello.
-    ///
-    /// TLS 1.3 carries this in EncryptedExtensions; RFC 8449 §4 restricts that
-    /// placement to TLS 1.3, so under TLS 1.2 it rides in the ServerHello.
-    /// It bounds the records we send, not the ones we receive.
-    peer_record_size_limit: Option<u16>,
-    /// Whether the server agreed to use extended master secret (RFC 7627).
-    /// When true, master_secret is derived using the session hash (transcript)
-    /// instead of client_random + server_random.
-    use_extended_master_secret: bool,
-    /// Master secret from a previous session ticket (for abbreviated handshake).
-    /// When set, we attempt session resumption.
-    resumed_master_secret: Option<Vec<u8>>,
-    /// Whether the *original* session — the one the ticket in
-    /// `resumed_master_secret` came from — used `extended_master_secret`.
-    ///
-    /// RFC 7627 §5.3 compares this against the ServerHello of the abbreviated
-    /// handshake; see [`Tls12Handshake::check_abbreviated_extended_master_secret`].
-    /// `None` means the ticket carries no record of it, in which case the
-    /// comparison cannot be made.
-    resumed_session_used_ems: Option<bool>,
-    /// Whether the current handshake is abbreviated (session ticket resumption).
-    abbreviated: bool,
     /// Named groups advertised in the `supported_groups` extension of the
     /// ClientHello we sent, read back off the bytes in `feed_client_hello`.
     ///
@@ -415,174 +314,7 @@ const TLS12_DEFAULT_SIGNATURE_ALGORITHMS: [u16; 3] = [
     0x0203, // ecdsa_sha1
 ];
 
-/// Parsed ServerKeyExchange parameters for ECDHE.
-#[allow(dead_code)]
-struct ServerKxParams {
-    /// Named curve (e.g. 0x0017 = P-256, 0x001D = X25519).
-    curve: u16,
-    /// Server's ephemeral public key bytes.
-    public_key: Vec<u8>,
-    /// Signature algorithm (2 bytes).
-    signature_algorithm: u16,
-    /// Signature bytes.
-    signature: Vec<u8>,
-    /// The signed data: curve_type(1) + named_curve(2) + pubkey_len(1) + pubkey
-    signed_params: Vec<u8>,
-}
-
 impl Tls12Handshake {
-    /// Create a new TLS 1.2 handshake processor.
-    ///
-    /// `client_random` is the 32-byte random from the ClientHello we sent.
-    /// `hostname` is the server name for certificate verification.
-    pub fn new(
-        client_random: [u8; 32],
-        hostname: &str,
-        verification_policy: VerificationPolicy,
-    ) -> Self {
-        Self {
-            state: Tls12State::WaitServerHello,
-            transcript: None,
-            client_hello_bytes: Vec::new(),
-            client_random,
-            server_random: [0u8; 32],
-            cipher_suite: None,
-            prf_algorithm: PrfAlgorithm::Sha256,
-            server_certificates: Vec::new(),
-            client_certificate_requested: false,
-            server_kx_params: None,
-            key_pair: None,
-            master_secret: None,
-            hostname: hostname.to_string(),
-            verification_policy,
-            custom_ca_anchors: None,
-            negotiated_alpn: None,
-            peer_record_size_limit: None,
-            use_extended_master_secret: false,
-            resumed_master_secret: None,
-            resumed_session_used_ems: None,
-            abbreviated: false,
-            offered_groups: None,
-            offered_signature_algorithms: None,
-            offered_extensions: None,
-            offered_alpn_protocols: None,
-            offered_cipher_suites: None,
-            offered_compression_methods: None,
-        }
-    }
-
-    /// Returns the ALPN protocol negotiated during the handshake (if any).
-    pub fn negotiated_alpn(&self) -> Option<&str> {
-        self.negotiated_alpn.as_deref()
-    }
-
-    /// The server's RFC 8449 `record_size_limit`, if the ServerHello carried one.
-    ///
-    /// `None` means the extension was not negotiated and records are chunked at
-    /// the protocol maximum, exactly as if RFC 8449 did not exist.
-    pub fn peer_record_size_limit(&self) -> Option<u16> {
-        self.peer_record_size_limit
-    }
-
-    /// Returns the master secret (if computed).
-    pub fn master_secret(&self) -> Option<&[u8]> {
-        self.master_secret.as_deref()
-    }
-
-    /// Returns the negotiated TLS 1.2 cipher suite (if ServerHello was processed).
-    pub fn negotiated_cipher_suite(&self) -> Option<Tls12CipherSuite> {
-        self.cipher_suite
-    }
-
-    /// The server's certificate chain (DER, leaf first) from the Certificate
-    /// message. Empty on an abbreviated (resumption) handshake.
-    pub fn server_certificates(&self) -> &[Vec<u8>] {
-        &self.server_certificates
-    }
-
-    /// Whether the server agreed to `extended_master_secret` (RFC 7627) for
-    /// the session established by this handshake.
-    ///
-    /// Whoever stores a session ticket issued on this connection must record
-    /// this alongside it: RFC 7627 §5.4 — "they need to differentiate between
-    /// sessions that use legacy and extended master secrets by adding a flag
-    /// to the session state" — and §5.3's abbreviated-handshake checks are
-    /// unrunnable without it. Feed it back in through
-    /// [`Self::set_session_ticket_resumption`] on the resuming handshake.
-    pub fn used_extended_master_secret(&self) -> bool {
-        self.use_extended_master_secret
-    }
-
-    /// Set the master secret from a stored session ticket for resumption.
-    ///
-    /// When set, the handshake will attempt abbreviated handshake (RFC 5077).
-    /// If the server rejects the ticket (sends Certificate instead of CCS),
-    /// the handshake falls back to full handshake automatically.
-    ///
-    /// The ticket's `extended_master_secret` state is left unknown, which
-    /// disables the RFC 7627 §5.3 checks for this handshake. Prefer
-    /// [`Self::set_session_ticket_resumption`], which carries it.
-    pub fn set_session_ticket_master_secret(&mut self, master_secret: Vec<u8>) {
-        self.set_session_ticket_resumption(master_secret, None);
-    }
-
-    /// Set up session-ticket resumption, carrying the original session's
-    /// `extended_master_secret` (RFC 7627) state along with its master secret.
-    ///
-    /// `original_used_extended_master_secret` is what
-    /// [`Self::used_extended_master_secret`] reported on the handshake that
-    /// issued the ticket. `None` means the stored ticket predates that
-    /// bookkeeping; the handshake then proceeds exactly as before, with the
-    /// §5.3 checks skipped, because assuming either answer would be wrong:
-    /// assuming `false` would abort every resumption against the (near
-    /// universal) servers that do negotiate EMS, and assuming `true` would
-    /// abort every resumption of a legacy non-EMS session.
-    pub fn set_session_ticket_resumption(
-        &mut self,
-        master_secret: Vec<u8>,
-        original_used_extended_master_secret: Option<bool>,
-    ) {
-        self.resumed_master_secret = Some(master_secret);
-        self.resumed_session_used_ems = original_used_extended_master_secret;
-    }
-
-    /// Set custom CA trust anchors (merged with Mozilla root store).
-    pub fn set_custom_ca_anchors(
-        &mut self,
-        anchors: Arc<Vec<rustls_pki_types::TrustAnchor<'static>>>,
-    ) {
-        self.custom_ca_anchors = Some(anchors);
-    }
-
-    /// Whether the handshake is using abbreviated mode (session ticket resumption).
-    ///
-    /// Only valid after `process_server_hello()` has been called and the
-    /// server accepted the session ticket.
-    pub fn is_abbreviated(&self) -> bool {
-        self.abbreviated
-    }
-
-    /// Feed the original ClientHello bytes into the transcript.
-    ///
-    /// Must be called before processing any server messages.
-    /// The bytes are also saved so we can re-hash if the ServerHello
-    /// selects a cipher suite that requires SHA-384 instead of SHA-256.
-    pub fn feed_client_hello(&mut self, ch_bytes: &[u8]) {
-        // We don't know the PRF algorithm yet (determined by ServerHello).
-        // Start with SHA-256 as default, will reset if needed.
-        self.client_hello_bytes = ch_bytes.to_vec();
-        self.record_offer(ch_bytes);
-        let mut t = TranscriptHash::new(PrfAlgorithm::Sha256);
-        t.update(ch_bytes);
-        self.transcript = Some(t);
-    }
-
-    /// Read the extension types, `supported_groups` and `signature_algorithms`
-    /// we advertised back off the ClientHello bytes we sent.
-    ///
-    /// The offer is taken from the wire rather than from the profile so it stays
-    /// exact under GREASE and extension permutation, and so the TLS 1.2 state
-    /// machine does not need to carry a profile it otherwise has no use for.
     fn record_offer(&mut self, ch_bytes: &[u8]) {
         let Some(extensions) = client_hello_extensions(ch_bytes) else {
             // Not a parseable ClientHello (unit tests feed placeholder bytes);
@@ -649,1104 +381,6 @@ impl Tls12Handshake {
         }
         self.offered_extensions = Some(offered_extensions);
     }
-
-    /// Reject a ServerHello extension we never offered (RFC 5246 §7.4.1.4).
-    ///
-    /// Mirrors `Tls13Handshake::check_encrypted_extension_offered`: when the
-    /// offer is unknown the check stays out of the way rather than rejecting
-    /// everything.
-    fn check_server_hello_extension_offered(&self, extension_type: u16) -> Result<()> {
-        let Some(ref offered) = self.offered_extensions else {
-            return Ok(());
-        };
-        if offered.contains(&extension_type) {
-            return Ok(());
-        }
-        Err(TlsError::local_alert(
-            AlertDescription::UnsupportedExtension,
-            format!("server sent unsolicited ServerHello extension 0x{extension_type:04x}"),
-        ))
-    }
-
-    /// Process an incoming handshake record.
-    ///
-    /// The `record` is the raw handshake payload (after record-layer decapsulation).
-    /// For TLS 1.2, handshake messages before CCS are not encrypted.
-    pub fn process_handshake_record(&mut self, record: &[u8]) -> Result<Tls12HandshakeAction> {
-        let mut offset = 0;
-
-        while offset < record.len() {
-            if offset + 4 > record.len() {
-                return Err(TlsError::HandshakeFailure(
-                    "handshake message too short for header".into(),
-                ));
-            }
-
-            let msg_type = record[offset];
-            let msg_len = ((record[offset + 1] as usize) << 16)
-                | ((record[offset + 2] as usize) << 8)
-                | (record[offset + 3] as usize);
-
-            if offset + 4 + msg_len > record.len() {
-                return Err(TlsError::HandshakeFailure(format!(
-                    "handshake message truncated: type={:#04x}, len={}, available={}",
-                    msg_type,
-                    msg_len,
-                    record.len() - offset - 4
-                )));
-            }
-
-            let msg_bytes = &record[offset..offset + 4 + msg_len];
-            let msg_body = &record[offset + 4..offset + 4 + msg_len];
-
-            let action = self.process_single_message(msg_type, msg_body, msg_bytes)?;
-
-            offset += 4 + msg_len;
-
-            // If an action needs to be returned, return it immediately.
-            match action {
-                Tls12HandshakeAction::ContinueReading => continue,
-                other => return Ok(other),
-            }
-        }
-
-        Ok(Tls12HandshakeAction::ContinueReading)
-    }
-
-    /// Process the server's Finished message (after CCS, so it's encrypted).
-    ///
-    /// The caller decrypts the record and passes the plaintext here.
-    pub fn process_server_finished(
-        &mut self,
-        finished_body: &[u8],
-    ) -> Result<Tls12HandshakeAction> {
-        if self.state != Tls12State::WaitServerFinished {
-            return Err(TlsError::HandshakeFailure(format!(
-                "unexpected server Finished in state {:?}",
-                self.state
-            )));
-        }
-
-        // Verify server Finished
-        let master_secret = self.master_secret.as_ref().ok_or_else(|| {
-            TlsError::HandshakeFailure("no master secret for Finished verification".into())
-        })?;
-
-        let transcript = self.transcript.as_ref().ok_or_else(|| {
-            TlsError::HandshakeFailure("no transcript for Finished verification".into())
-        })?;
-
-        let expected_verify_data = prf::compute_verify_data(
-            self.prf_algorithm,
-            master_secret,
-            "server finished",
-            &transcript.current_hash(),
-        )?;
-
-        // The finished_body should be: handshake_type(1) + length(3) + verify_data(12)
-        // Or just the verify_data if already parsed.
-        let verify_data =
-            if finished_body.len() == 16 && finished_body[0] == handshake_type::FINISHED {
-                // Full handshake message: type(1) + len(3) + verify_data(12)
-                &finished_body[4..]
-            } else if finished_body.len() == 12 {
-                finished_body
-            } else {
-                return Err(TlsError::HandshakeFailure(format!(
-                    "unexpected Finished length: {}",
-                    finished_body.len()
-                )));
-            };
-
-        if verify_data != expected_verify_data.as_slice() {
-            return Err(TlsError::HandshakeFailure(
-                "server Finished verify_data mismatch".into(),
-            ));
-        }
-
-        tracing::debug!("TLS 1.2 server Finished verified successfully");
-        self.state = Tls12State::Connected;
-
-        // Return the traffic keys (already computed when sending client flight)
-        let suite = self
-            .cipher_suite
-            .ok_or_else(|| TlsError::HandshakeFailure("no cipher suite".into()))?;
-
-        // Re-derive keys for the complete action
-        let ms = master_secret.clone();
-        let kb = prf::expand_key_block(
-            self.prf_algorithm,
-            &ms,
-            &self.server_random,
-            &self.client_random,
-            suite.mac_key_len(),
-            suite.enc_key_len(),
-            suite.fixed_iv_len(),
-        )?;
-
-        Ok(Tls12HandshakeAction::Complete(Tls12TrafficKeys {
-            cipher_suite: suite,
-            client_write_key: kb.client_write_key,
-            server_write_key: kb.server_write_key,
-            client_write_iv: kb.client_write_iv,
-            server_write_iv: kb.server_write_iv,
-            client_write_mac_key: kb.client_write_mac_key,
-            server_write_mac_key: kb.server_write_mac_key,
-        }))
-    }
-
-    /// Current handshake state.
-    pub fn state(&self) -> Tls12State {
-        self.state
-    }
-
-    /// Feed a raw handshake message into the transcript hash.
-    ///
-    /// Used for messages that arrive between our Client Finished and the
-    /// server's CCS — typically NewSessionTicket (RFC 5077). These messages
-    /// are not processed by the handshake state machine but must be included
-    /// in the transcript for the server's Finished verification.
-    pub fn feed_handshake_message(&mut self, msg_bytes: &[u8]) {
-        if let Some(ref mut t) = self.transcript {
-            t.update(msg_bytes);
-        }
-    }
-
-    /// Notify the handshake that the server's ChangeCipherSpec has been received.
-    ///
-    /// Called by the connector after reading the CCS record (which is handled
-    /// at the record layer, not the handshake layer).
-    pub fn notify_server_ccs_received(&mut self) {
-        if self.state == Tls12State::WaitServerChangeCipherSpec {
-            self.state = Tls12State::WaitServerFinished;
-        }
-    }
-
-    /// Accept the abbreviated handshake when CCS is received from the server.
-    ///
-    /// Called by the connector when it receives a CCS record while in the
-    /// `WaitCertificateOrAbbreviated` state. This confirms that the server
-    /// accepted our session ticket.
-    ///
-    /// Returns the traffic keys derived from the restored master secret.
-    /// The connector should install read keys, then read + verify server Finished.
-    pub fn accept_abbreviated_ccs(&mut self) -> Result<Tls12TrafficKeys> {
-        if self.state != Tls12State::WaitCertificateOrAbbreviated {
-            return Err(TlsError::HandshakeFailure(format!(
-                "accept_abbreviated_ccs called in wrong state: {:?}",
-                self.state
-            )));
-        }
-
-        // The server has just committed to resuming (CCS with no Certificate),
-        // so this is the moment RFC 7627 §5.3 describes as "a ServerHello that
-        // accepts an abbreviated handshake". Check before any key derivation.
-        self.check_abbreviated_extended_master_secret()?;
-
-        let master_secret = self.resumed_master_secret.take().ok_or_else(|| {
-            TlsError::HandshakeFailure("no resumed master_secret for abbreviated handshake".into())
-        })?;
-
-        let suite = self.cipher_suite.ok_or_else(|| {
-            TlsError::HandshakeFailure("no cipher suite for abbreviated handshake".into())
-        })?;
-
-        // Derive key block from restored master_secret + new randoms
-        let key_block = prf::expand_key_block(
-            self.prf_algorithm,
-            &master_secret,
-            &self.server_random,
-            &self.client_random,
-            suite.mac_key_len(),
-            suite.enc_key_len(),
-            suite.fixed_iv_len(),
-        )?;
-
-        self.master_secret = Some(master_secret);
-        self.abbreviated = true;
-        self.state = Tls12State::WaitServerFinished;
-
-        tracing::debug!(
-            cipher = ?suite,
-            "tls12.abbreviated_handshake_accepted",
-        );
-
-        Ok(Tls12TrafficKeys {
-            cipher_suite: suite,
-            client_write_key: key_block.client_write_key,
-            server_write_key: key_block.server_write_key,
-            client_write_iv: key_block.client_write_iv,
-            server_write_iv: key_block.server_write_iv,
-            client_write_mac_key: key_block.client_write_mac_key,
-            server_write_mac_key: key_block.server_write_mac_key,
-        })
-    }
-
-    /// RFC 7627 §5.3 — the client's half of the triple-handshake defence, run
-    /// once the server has accepted an abbreviated (resumption) handshake.
-    ///
-    /// The RFC gives the client exactly two rules, and they point in opposite
-    /// directions; both are `MUST abort`:
-    ///
-    /// - "If the original session did not use the `extended_master_secret`
-    ///   extension but the new ServerHello contains the extension, the client
-    ///   MUST abort the handshake." A server cannot upgrade a legacy session's
-    ///   security by asserting EMS after the fact — the master secret being
-    ///   resumed was still computed the old way, so the claim is either a bug
-    ///   or an attacker splicing in a different session.
-    ///
-    /// - "If the original session used the extension but the new ServerHello
-    ///   does not contain the extension, the client MUST abort the handshake."
-    ///   This is the downgrade direction, and §5.4 closes the obvious escape
-    ///   hatch: even though continuing "MAY be safe" because the original
-    ///   session's extended master secret still protects it, "this document
-    ///   recommends that the client and server MUST abort such handshakes".
-    ///
-    /// Matching state in either direction (both EMS, or neither) continues.
-    ///
-    /// The extension is a bare flag, so "the new ServerHello contains the
-    /// extension" is [`Self::use_extended_master_secret`], set while parsing
-    /// the ServerHello.
-    ///
-    /// Not implemented here: §5.3's *first* client rule, "the client SHOULD NOT
-    /// offer an abbreviated handshake to resume a session that does not use an
-    /// extended master secret". That one changes what the ClientHello puts on
-    /// the wire, which this crate deliberately does not decide for itself.
-    fn check_abbreviated_extended_master_secret(&self) -> Result<()> {
-        let Some(original_used_ems) = self.resumed_session_used_ems else {
-            tracing::debug!(
-                "tls12.resumption_ems_state_unknown — RFC 7627 §5.3 checks skipped for this ticket"
-            );
-            return Ok(());
-        };
-
-        match (original_used_ems, self.use_extended_master_secret) {
-            (false, true) => Err(TlsError::local_alert(
-                AlertDescription::HandshakeFailure,
-                "RFC 7627 §5.3: server accepted an abbreviated handshake with \
-                 extended_master_secret, but the session being resumed was \
-                 established without it",
-            )),
-            (true, false) => Err(TlsError::local_alert(
-                AlertDescription::HandshakeFailure,
-                "RFC 7627 §5.3: server accepted an abbreviated handshake without \
-                 extended_master_secret, but the session being resumed was \
-                 established with it",
-            )),
-            _ => Ok(()),
-        }
-    }
-
-    /// Process the server's Finished in abbreviated handshake and compute
-    /// the client Finished.
-    ///
-    /// Called after `accept_abbreviated_ccs()` + reading the encrypted server Finished.
-    /// Returns the client Finished bytes and traffic keys for the connector to send.
-    pub fn process_abbreviated_server_finished(
-        &mut self,
-        finished_body: &[u8],
-    ) -> Result<Tls12AbbreviatedFlight> {
-        if self.state != Tls12State::WaitServerFinished || !self.abbreviated {
-            return Err(TlsError::HandshakeFailure(format!(
-                "process_abbreviated_server_finished called in wrong state: {:?}, abbreviated={}",
-                self.state, self.abbreviated
-            )));
-        }
-
-        let master_secret = self.master_secret.as_ref().ok_or_else(|| {
-            TlsError::HandshakeFailure("no master secret for abbreviated Finished".into())
-        })?;
-
-        let transcript = self.transcript.as_ref().ok_or_else(|| {
-            TlsError::HandshakeFailure("no transcript for abbreviated Finished".into())
-        })?;
-
-        // Verify server Finished
-        let expected_verify_data = prf::compute_verify_data(
-            self.prf_algorithm,
-            master_secret,
-            "server finished",
-            &transcript.current_hash(),
-        )?;
-
-        let verify_data =
-            if finished_body.len() == 16 && finished_body[0] == handshake_type::FINISHED {
-                &finished_body[4..]
-            } else if finished_body.len() == 12 {
-                finished_body
-            } else {
-                return Err(TlsError::HandshakeFailure(format!(
-                    "unexpected abbreviated Finished length: {}",
-                    finished_body.len()
-                )));
-            };
-
-        if verify_data != expected_verify_data.as_slice() {
-            return Err(TlsError::HandshakeFailure(
-                "server Finished verify_data mismatch (abbreviated)".into(),
-            ));
-        }
-
-        tracing::debug!("tls12.abbreviated_server_finished_verified");
-
-        // Feed server Finished into transcript for client Finished computation
-        // (server Finished message = type(1) + len(3) + verify_data)
-        let server_finished_msg = build_handshake_message(handshake_type::FINISHED, verify_data);
-        if let Some(ref mut t) = self.transcript {
-            t.update(&server_finished_msg);
-        }
-
-        // Compute client Finished
-        let client_transcript_hash = self
-            .transcript
-            .as_ref()
-            .ok_or_else(|| TlsError::HandshakeFailure("no transcript for client Finished".into()))?
-            .current_hash();
-
-        let client_verify_data = prf::compute_verify_data(
-            self.prf_algorithm,
-            master_secret,
-            "client finished",
-            &client_transcript_hash,
-        )?;
-
-        let client_finished =
-            build_handshake_message(handshake_type::FINISHED, &client_verify_data);
-
-        self.state = Tls12State::Connected;
-
-        // Re-derive keys for the flight
-        let suite = self
-            .cipher_suite
-            .ok_or_else(|| TlsError::HandshakeFailure("no cipher suite".into()))?;
-
-        let key_block = prf::expand_key_block(
-            self.prf_algorithm,
-            master_secret,
-            &self.server_random,
-            &self.client_random,
-            suite.mac_key_len(),
-            suite.enc_key_len(),
-            suite.fixed_iv_len(),
-        )?;
-
-        Ok(Tls12AbbreviatedFlight {
-            client_finished,
-            traffic_keys: Tls12TrafficKeys {
-                cipher_suite: suite,
-                client_write_key: key_block.client_write_key,
-                server_write_key: key_block.server_write_key,
-                client_write_iv: key_block.client_write_iv,
-                server_write_iv: key_block.server_write_iv,
-                client_write_mac_key: key_block.client_write_mac_key,
-                server_write_mac_key: key_block.server_write_mac_key,
-            },
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal message processing
-    // -----------------------------------------------------------------------
-
-    fn process_single_message(
-        &mut self,
-        msg_type: u8,
-        body: &[u8],
-        full_msg: &[u8],
-    ) -> Result<Tls12HandshakeAction> {
-        match self.state {
-            Tls12State::WaitServerHello => {
-                if msg_type != handshake_type::SERVER_HELLO {
-                    return Err(TlsError::HandshakeFailure(format!(
-                        "expected ServerHello, got type {:#04x}",
-                        msg_type
-                    )));
-                }
-                self.process_server_hello(body, full_msg)
-            }
-            Tls12State::WaitCertificateOrAbbreviated => {
-                if msg_type == handshake_type::CERTIFICATE {
-                    // Server rejected our session ticket → fall back to full handshake
-                    tracing::debug!("tls12.abbreviated_rejected — falling back to full handshake");
-                    self.resumed_master_secret = None;
-                    // The old session is out of the picture; the new one's EMS
-                    // state is whatever this full handshake negotiates.
-                    self.resumed_session_used_ems = None;
-                    self.process_certificate(body, full_msg)
-                } else if msg_type == 0x04 {
-                    // NewSessionTicket — server accepted ticket and is issuing a new one.
-                    // Feed into transcript and continue waiting for CCS.
-                    if let Some(ref mut t) = self.transcript {
-                        t.update(full_msg);
-                    }
-                    tracing::debug!(len = body.len(), "tls12.abbreviated_new_session_ticket",);
-                    Ok(Tls12HandshakeAction::ContinueReading)
-                } else {
-                    Err(TlsError::HandshakeFailure(format!(
-                        "expected Certificate or NewSessionTicket in abbreviated handshake, got type {:#04x}",
-                        msg_type
-                    )))
-                }
-            }
-            Tls12State::WaitCertificate => {
-                if msg_type != handshake_type::CERTIFICATE {
-                    return Err(TlsError::HandshakeFailure(format!(
-                        "expected Certificate, got type {:#04x}",
-                        msg_type
-                    )));
-                }
-                self.process_certificate(body, full_msg)
-            }
-            Tls12State::WaitServerKeyExchange => {
-                if msg_type == 0x0C {
-                    // ServerKeyExchange
-                    self.process_server_key_exchange(body, full_msg)
-                } else if msg_type == handshake_type::CERTIFICATE_STATUS {
-                    // CertificateStatus (OCSP Stapling, RFC 6066 Section 8).
-                    // Sent between Certificate and ServerKeyExchange when the
-                    // server includes an OCSP staple response. We don't validate
-                    // the staple but must include it in the transcript hash.
-                    if let Some(ref mut t) = self.transcript {
-                        t.update(full_msg);
-                    }
-                    tracing::debug!(
-                        len = body.len(),
-                        "tls12.certificate_status_received (OCSP staple)",
-                    );
-                    Ok(Tls12HandshakeAction::ContinueReading)
-                } else if msg_type == 0x0E {
-                    // ServerHelloDone without ServerKeyExchange — RSA key exchange
-                    self.process_server_hello_done(body, full_msg)
-                } else {
-                    Err(TlsError::HandshakeFailure(format!(
-                        "expected ServerKeyExchange or ServerHelloDone, got type {:#04x}",
-                        msg_type
-                    )))
-                }
-            }
-            Tls12State::WaitServerHelloDone => {
-                if msg_type == 0x0D {
-                    // CertificateRequest — no client certificate is configured,
-                    // so send an empty Certificate message in the client flight.
-                    self.client_certificate_requested = true;
-                    if let Some(ref mut t) = self.transcript {
-                        t.update(full_msg);
-                    }
-                    tracing::debug!(
-                        "tls12.certificate_request_received — will send empty client certificate"
-                    );
-                    Ok(Tls12HandshakeAction::ContinueReading)
-                } else if msg_type == 0x0E {
-                    // ServerHelloDone
-                    self.process_server_hello_done(body, full_msg)
-                } else {
-                    Err(TlsError::HandshakeFailure(format!(
-                        "expected ServerHelloDone, got type {:#04x}",
-                        msg_type
-                    )))
-                }
-            }
-            _ => Err(TlsError::HandshakeFailure(format!(
-                "unexpected handshake message type {:#04x} in state {:?}",
-                msg_type, self.state
-            ))),
-        }
-    }
-
-    fn process_server_hello(
-        &mut self,
-        body: &[u8],
-        full_msg: &[u8],
-    ) -> Result<Tls12HandshakeAction> {
-        if body.len() < 38 {
-            return Err(TlsError::local_alert(
-                AlertDescription::DecodeError,
-                "TLS 1.2 ServerHello too short",
-            ));
-        }
-
-        // server_version (2) + random (32) + session_id_len (1) + ...
-        let server_version = u16::from_be_bytes([body[0], body[1]]);
-        if server_version != 0x0303 {
-            return Err(TlsError::local_alert(
-                AlertDescription::ProtocolVersion,
-                "TLS 1.2 ServerHello has an unsupported server_version",
-            ));
-        }
-        self.server_random.copy_from_slice(&body[2..34]);
-
-        let session_id_len = body[34] as usize;
-        if session_id_len > 32 {
-            return Err(TlsError::local_alert(
-                AlertDescription::DecodeError,
-                "TLS 1.2 ServerHello session ID exceeds 32 bytes",
-            ));
-        }
-        let offset = 35 + session_id_len;
-
-        if offset + 3 > body.len() {
-            return Err(TlsError::local_alert(
-                AlertDescription::DecodeError,
-                "TLS 1.2 ServerHello truncated",
-            ));
-        }
-
-        let cipher_suite_code = u16::from_be_bytes([body[offset], body[offset + 1]]);
-        let compression = body[offset + 2];
-        if compression != 0
-            || self
-                .offered_compression_methods
-                .as_ref()
-                .is_some_and(|offered| !offered.contains(&compression))
-        {
-            return Err(TlsError::local_alert(
-                AlertDescription::IllegalParameter,
-                "TLS 1.2 server selected unsupported or unoffered compression",
-            ));
-        }
-        if self
-            .offered_cipher_suites
-            .as_ref()
-            .is_some_and(|offered| !offered.contains(&cipher_suite_code))
-        {
-            return Err(TlsError::local_alert(
-                AlertDescription::IllegalParameter,
-                "TLS 1.2 server selected an unoffered cipher suite",
-            ));
-        }
-
-        // Resolve cipher suite
-        let suite = Tls12CipherSuite::from_code_point(cipher_suite_code).ok_or_else(|| {
-            TlsError::local_alert(
-                AlertDescription::IllegalParameter,
-                format!("unsupported TLS 1.2 cipher suite: 0x{cipher_suite_code:04x}"),
-            )
-        })?;
-
-        tracing::debug!(
-            "TLS 1.2 ServerHello: cipher_suite=0x{:04x} ({:?})",
-            cipher_suite_code,
-            suite
-        );
-
-        self.cipher_suite = Some(suite);
-        self.prf_algorithm = suite.prf_algorithm();
-
-        // Parse extensions (if present) to extract ALPN, etc.
-        let ext_start = offset + 3; // after cipher_suite(2) + compression(1)
-        if body.len() == ext_start + 1 {
-            return Err(TlsError::local_alert(
-                AlertDescription::DecodeError,
-                "truncated TLS 1.2 ServerHello extension length",
-            ));
-        }
-        if ext_start + 2 <= body.len() {
-            let extensions_len =
-                u16::from_be_bytes([body[ext_start], body[ext_start + 1]]) as usize;
-            let mut ext_offset = ext_start + 2;
-            let ext_end = ext_offset + extensions_len;
-            if ext_end != body.len() {
-                return Err(TlsError::local_alert(
-                    AlertDescription::DecodeError,
-                    "TLS 1.2 ServerHello extension length mismatch",
-                ));
-            }
-            let mut seen_extensions: Vec<u16> = Vec::new();
-
-            while ext_offset < ext_end {
-                if ext_offset + 4 > ext_end {
-                    return Err(TlsError::local_alert(
-                        AlertDescription::DecodeError,
-                        "truncated TLS 1.2 ServerHello extension header",
-                    ));
-                }
-                let ext_type = u16::from_be_bytes([body[ext_offset], body[ext_offset + 1]]);
-                let ext_len =
-                    u16::from_be_bytes([body[ext_offset + 2], body[ext_offset + 3]]) as usize;
-                ext_offset += 4;
-
-                if ext_offset + ext_len > ext_end {
-                    return Err(TlsError::local_alert(
-                        AlertDescription::DecodeError,
-                        "truncated TLS 1.2 ServerHello extension payload",
-                    ));
-                }
-
-                // RFC 5246 §7.4.1.4: "There MUST NOT be more than one extension
-                // of the same type." A duplicate is how a parser and a peer end
-                // up disagreeing about which copy counted, so refuse it before
-                // any copy is honoured.
-                if seen_extensions.contains(&ext_type) {
-                    return Err(TlsError::local_alert(
-                        AlertDescription::IllegalParameter,
-                        format!("duplicate ServerHello extension 0x{ext_type:04x}"),
-                    ));
-                }
-                seen_extensions.push(ext_type);
-
-                // RFC 5246 §7.4.1.4: "the extension type MUST NOT appear in the
-                // extended server hello unless the same extension type appeared
-                // in the corresponding client hello", and a client that sees one
-                // MUST abort with `unsupported_extension`. Checked before the
-                // extension is acted on, so an unsolicited `record_size_limit`
-                // never gets to bound the records we send.
-                self.check_server_hello_extension_offered(ext_type)?;
-
-                // extended_master_secret extension (type 0x0017 = 23)
-                if ext_type == 0x0017 {
-                    tracing::debug!("TLS 1.2 server agreed to extended_master_secret (RFC 7627)");
-                    self.use_extended_master_secret = true;
-                }
-
-                // record_size_limit extension (type 0x001c = 28, RFC 8449).
-                // The server's receive limit bounds the records we send once
-                // the cipher is installed; below 64 is a fatal
-                // illegal_parameter, so this parse is allowed to fail.
-                if ext_type == 0x001c {
-                    let limit =
-                        parse_peer_record_size_limit(&body[ext_offset..ext_offset + ext_len])?;
-                    tracing::debug!("TLS 1.2 server record_size_limit: {limit}");
-                    self.peer_record_size_limit = Some(limit);
-                }
-
-                // ALPN extension (type 0x0010)
-                if ext_type == ext_type::ALPN {
-                    let alpn_data = &body[ext_offset..ext_offset + ext_len];
-                    let selected = crate::extensions::alpn::parse_server_alpn_bytes(alpn_data)
-                        .ok_or_else(|| {
-                            TlsError::local_alert(
-                                AlertDescription::DecodeError,
-                                "invalid TLS 1.2 server ALPN protocol list",
-                            )
-                        })?;
-                    if self.offered_alpn_protocols.as_ref().is_some_and(|offered| {
-                        !offered
-                            .iter()
-                            .any(|protocol| protocol.as_slice() == selected)
-                    }) {
-                        return Err(TlsError::local_alert(
-                            AlertDescription::IllegalParameter,
-                            "TLS 1.2 server selected an unoffered ALPN protocol",
-                        ));
-                    }
-                    let protocol = String::from_utf8_lossy(selected).into_owned();
-                    tracing::debug!("TLS 1.2 ALPN negotiated: {}", protocol);
-                    self.negotiated_alpn = Some(protocol);
-                }
-
-                ext_offset += ext_len;
-            }
-        }
-
-        // If the cipher suite requires SHA-384, re-create the transcript hash
-        // with SHA-384 and re-feed the saved ClientHello + this ServerHello.
-        if suite.prf_algorithm() != PrfAlgorithm::Sha256 {
-            tracing::debug!(
-                "TLS 1.2: cipher suite requires {:?}, restarting transcript hash",
-                suite.prf_algorithm()
-            );
-            let mut new_transcript = TranscriptHash::new(suite.prf_algorithm());
-            new_transcript.update(&self.client_hello_bytes);
-            new_transcript.update(full_msg);
-            self.transcript = Some(new_transcript);
-        } else if let Some(ref mut t) = self.transcript {
-            t.update(full_msg);
-        }
-
-        // If we have a stored master secret from a session ticket, attempt
-        // abbreviated handshake. The server will either:
-        // - Accept: send [NewSessionTicket] + CCS + Finished (no Certificate)
-        // - Reject: send Certificate + SKE + SHD (full handshake)
-        if self.resumed_master_secret.is_some() {
-            self.state = Tls12State::WaitCertificateOrAbbreviated;
-            tracing::debug!("tls12.attempting_abbreviated_handshake");
-        } else {
-            self.state = Tls12State::WaitCertificate;
-        }
-        Ok(Tls12HandshakeAction::ContinueReading)
-    }
-
-    fn process_certificate(
-        &mut self,
-        body: &[u8],
-        full_msg: &[u8],
-    ) -> Result<Tls12HandshakeAction> {
-        if body.len() < 3 {
-            return Err(TlsError::HandshakeFailure(
-                "Certificate message too short".into(),
-            ));
-        }
-
-        let total_len = ((body[0] as usize) << 16) | ((body[1] as usize) << 8) | (body[2] as usize);
-        let mut offset = 3;
-        let mut certs = Vec::new();
-
-        while offset < 3 + total_len {
-            if offset + 3 > body.len() {
-                break;
-            }
-            let cert_len = ((body[offset] as usize) << 16)
-                | ((body[offset + 1] as usize) << 8)
-                | (body[offset + 2] as usize);
-            offset += 3;
-
-            if offset + cert_len > body.len() {
-                return Err(TlsError::HandshakeFailure("Certificate truncated".into()));
-            }
-
-            certs.push(body[offset..offset + cert_len].to_vec());
-            offset += cert_len;
-        }
-
-        tracing::debug!("TLS 1.2 received {} certificate(s)", certs.len());
-
-        if certs.is_empty() {
-            return Err(TlsError::CertificateError(
-                "server sent no certificates".into(),
-            ));
-        }
-
-        // Verify the certificate chain
-        self.verification_policy.verify_certificate_chain(
-            &certs,
-            &self.hostname,
-            std::time::SystemTime::now(),
-            self.custom_ca_anchors.as_deref().map(|v| v.as_slice()),
-        )?;
-
-        self.server_certificates = certs;
-
-        if let Some(ref mut t) = self.transcript {
-            t.update(full_msg);
-        }
-
-        let suite = self
-            .cipher_suite
-            .ok_or_else(|| TlsError::HandshakeFailure("no cipher suite".into()))?;
-
-        if suite.key_exchange() == Tls12KeyExchange::Rsa {
-            self.state = Tls12State::WaitServerHelloDone;
-        } else {
-            self.state = Tls12State::WaitServerKeyExchange;
-        }
-        Ok(Tls12HandshakeAction::ContinueReading)
-    }
-
-    fn process_server_key_exchange(
-        &mut self,
-        body: &[u8],
-        full_msg: &[u8],
-    ) -> Result<Tls12HandshakeAction> {
-        // Parse ECDHE ServerKeyExchange (RFC 4492 Section 5.4)
-        // ECParameters:
-        //   curve_type (1) = 0x03 (named_curve)
-        //   named_curve (2)
-        // ECPoint:
-        //   length (1)
-        //   point (variable)
-        // Signature:
-        //   signature_algorithm (2)
-        //   signature_length (2)
-        //   signature (variable)
-
-        if body.len() < 5 {
-            return Err(TlsError::HandshakeFailure(
-                "ServerKeyExchange too short".into(),
-            ));
-        }
-
-        let curve_type = body[0];
-        if curve_type != 0x03 {
-            return Err(TlsError::HandshakeFailure(format!(
-                "unsupported curve type: 0x{curve_type:02x} (only named_curve supported)"
-            )));
-        }
-
-        let named_curve = u16::from_be_bytes([body[1], body[2]]);
-
-        // RFC 8422 §5.4: the server selects the curve, but only from the
-        // client's `supported_groups`. Whether *we* implement the curve is a
-        // separate question, asked later in `build_ecdhe_key_exchange`; a curve
-        // we never advertised has to be refused even if we could do the math,
-        // because completing a handshake on it contradicts the ClientHello the
-        // server just saw.
-        if let Some(ref offered) = self.offered_groups {
-            if !offered.contains(&named_curve) {
-                return Err(TlsError::local_alert(
-                    AlertDescription::IllegalParameter,
-                    format!(
-                        "server selected ECDHE curve 0x{named_curve:04x}, which the client did not offer"
-                    ),
-                ));
-            }
-        }
-
-        let pubkey_len = body[3] as usize;
-
-        if 4 + pubkey_len + 4 > body.len() {
-            return Err(TlsError::HandshakeFailure(
-                "ServerKeyExchange truncated".into(),
-            ));
-        }
-
-        let public_key = body[4..4 + pubkey_len].to_vec();
-
-        // The signed params = everything up to the signature
-        let signed_params = body[..4 + pubkey_len].to_vec();
-
-        let sig_offset = 4 + pubkey_len;
-        let sig_algorithm = u16::from_be_bytes([body[sig_offset], body[sig_offset + 1]]);
-        let sig_len = u16::from_be_bytes([body[sig_offset + 2], body[sig_offset + 3]]) as usize;
-
-        if sig_offset + 4 + sig_len > body.len() {
-            return Err(TlsError::HandshakeFailure(
-                "ServerKeyExchange signature truncated".into(),
-            ));
-        }
-
-        let signature = body[sig_offset + 4..sig_offset + 4 + sig_len].to_vec();
-
-        // RFC 5246 §7.4.1.4.1: the server must sign with an algorithm the client
-        // advertised in `signature_algorithms` (or, if the client sent none, one
-        // of the SHA-1 defaults).
-        if let Some(ref offered) = self.offered_signature_algorithms {
-            if !offered.contains(&sig_algorithm) {
-                return Err(TlsError::local_alert(
-                    AlertDescription::IllegalParameter,
-                    format!(
-                        "server signed ServerKeyExchange with algorithm                          0x{sig_algorithm:04x}, which the client did not offer"
-                    ),
-                ));
-            }
-        }
-
-        tracing::debug!(
-            "TLS 1.2 ServerKeyExchange: curve=0x{:04x}, pubkey_len={}, sig_algo=0x{:04x}",
-            named_curve,
-            pubkey_len,
-            sig_algorithm
-        );
-
-        // Verify the signature over client_random + server_random + signed_params
-        if !self.server_certificates.is_empty() {
-            let mut signed_data = Vec::new();
-            signed_data.extend_from_slice(&self.client_random);
-            signed_data.extend_from_slice(&self.server_random);
-            signed_data.extend_from_slice(&signed_params);
-
-            self.verification_policy
-                .verify_server_key_exchange_signature(
-                    &self.server_certificates[0],
-                    sig_algorithm,
-                    &signed_data,
-                    &signature,
-                )?;
-        }
-
-        self.server_kx_params = Some(ServerKxParams {
-            curve: named_curve,
-            public_key,
-            signature_algorithm: sig_algorithm,
-            signature,
-            signed_params,
-        });
-
-        if let Some(ref mut t) = self.transcript {
-            t.update(full_msg);
-        }
-
-        self.state = Tls12State::WaitServerHelloDone;
-        Ok(Tls12HandshakeAction::ContinueReading)
-    }
-
-    fn process_server_hello_done(
-        &mut self,
-        _body: &[u8],
-        full_msg: &[u8],
-    ) -> Result<Tls12HandshakeAction> {
-        tracing::debug!("TLS 1.2 ServerHelloDone received");
-
-        if let Some(ref mut t) = self.transcript {
-            t.update(full_msg);
-        }
-
-        let suite = self
-            .cipher_suite
-            .ok_or_else(|| TlsError::HandshakeFailure("no cipher suite".into()))?;
-
-        let (pre_master_secret, client_key_exchange) = match suite.key_exchange() {
-            Tls12KeyExchange::Ecdhe => self.build_ecdhe_key_exchange()?,
-            Tls12KeyExchange::Rsa => self.build_rsa_key_exchange()?,
-        };
-
-        let client_certificate = self
-            .client_certificate_requested
-            .then(|| build_handshake_message(handshake_type::CERTIFICATE, &[0, 0, 0]));
-        if let Some(ref certificate) = client_certificate {
-            if let Some(ref mut t) = self.transcript {
-                t.update(certificate);
-            }
-        }
-
-        // Feed CKE into transcript
-        if let Some(ref mut t) = self.transcript {
-            t.update(&client_key_exchange);
-        }
-
-        // Compute master secret
-        let master_secret = if self.use_extended_master_secret {
-            let session_hash = self
-                .transcript
-                .as_ref()
-                .ok_or_else(|| {
-                    TlsError::HandshakeFailure("no transcript for extended master secret".into())
-                })?
-                .current_hash();
-            tracing::debug!(
-                session_hash_len = session_hash.len(),
-                "tls12.computing_extended_master_secret",
-            );
-            prf::compute_extended_master_secret(
-                self.prf_algorithm,
-                &pre_master_secret,
-                &session_hash,
-            )?
-        } else {
-            prf::compute_master_secret(
-                self.prf_algorithm,
-                &pre_master_secret,
-                &self.client_random,
-                &self.server_random,
-            )?
-        };
-
-        // Derive key block
-        let key_block = prf::expand_key_block(
-            self.prf_algorithm,
-            &master_secret,
-            &self.server_random,
-            &self.client_random,
-            suite.mac_key_len(),
-            suite.enc_key_len(),
-            suite.fixed_iv_len(),
-        )?;
-
-        // Build client Finished
-        let transcript_hash = self
-            .transcript
-            .as_ref()
-            .ok_or_else(|| TlsError::HandshakeFailure("no transcript".into()))?
-            .current_hash();
-
-        let verify_data = prf::compute_verify_data(
-            self.prf_algorithm,
-            &master_secret,
-            "client finished",
-            &transcript_hash,
-        )?;
-
-        let client_finished = build_handshake_message(handshake_type::FINISHED, &verify_data);
-
-        // Feed client Finished into transcript (for server Finished verification)
-        if let Some(ref mut t) = self.transcript {
-            t.update(&client_finished);
-        }
-
-        self.master_secret = Some(master_secret);
-        self.state = Tls12State::WaitServerChangeCipherSpec;
-
-        Ok(Tls12HandshakeAction::SendClientFlight(Tls12ClientFlight {
-            client_certificate,
-            client_key_exchange,
-            client_finished,
-            traffic_keys: Tls12TrafficKeys {
-                cipher_suite: suite,
-                client_write_key: key_block.client_write_key,
-                server_write_key: key_block.server_write_key,
-                client_write_iv: key_block.client_write_iv,
-                server_write_iv: key_block.server_write_iv,
-                client_write_mac_key: key_block.client_write_mac_key,
-                server_write_mac_key: key_block.server_write_mac_key,
-            },
-        }))
-    }
-
-    /// ECDHE key exchange: generate ephemeral key pair, compute shared secret.
-    /// Returns (pre_master_secret, client_key_exchange_message).
-    fn build_ecdhe_key_exchange(&self) -> Result<(Vec<u8>, Vec<u8>)> {
-        let kx_params = self
-            .server_kx_params
-            .as_ref()
-            .ok_or_else(|| TlsError::HandshakeFailure("no ServerKeyExchange received".into()))?;
-
-        let kx_group = KxGroup::from_code_point(kx_params.curve).ok_or_else(|| {
-            TlsError::HandshakeFailure(format!(
-                "unsupported ECDHE curve: 0x{:04x}",
-                kx_params.curve
-            ))
-        })?;
-
-        let key_pair = kx::generate_key_pair(kx_group)?;
-        let our_public_key = key_pair.public_key.clone();
-        let pre_master_secret = kx::compute_shared_secret(key_pair, &kx_params.public_key)?;
-
-        let cke_body = {
-            let mut buf = Vec::new();
-            buf.push(our_public_key.len() as u8);
-            buf.extend_from_slice(&our_public_key);
-            buf
-        };
-        let client_key_exchange = build_handshake_message(0x10, &cke_body);
-
-        Ok((pre_master_secret, client_key_exchange))
-    }
-
-    /// RSA key exchange: generate random pre-master secret, encrypt with server's
-    /// RSA public key using RSAES-PKCS1-v1_5 (RFC 5246 Section 7.4.7.1).
-    /// Returns (pre_master_secret, client_key_exchange_message).
-    fn build_rsa_key_exchange(&self) -> Result<(Vec<u8>, Vec<u8>)> {
-        if self.server_certificates.is_empty() {
-            return Err(TlsError::HandshakeFailure(
-                "no server certificate for RSA key exchange".into(),
-            ));
-        }
-
-        // Build 48-byte pre_master_secret: version(2) + random(46)
-        let mut pre_master_secret = vec![0u8; 48];
-        pre_master_secret[0] = 0x03; // TLS 1.2 major
-        pre_master_secret[1] = 0x03; // TLS 1.2 minor
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        aws_lc_rs::rand::SecureRandom::fill(&rng, &mut pre_master_secret[2..]).map_err(|_| {
-            TlsError::CryptoError("failed to generate RSA pre_master_secret".into())
-        })?;
-
-        // Extract SPKI from server certificate and create RSA public key
-        let spki = crate::verify::certchain::extract_spki_from_cert(&self.server_certificates[0])?;
-        let pub_key = aws_lc_rs::rsa::PublicEncryptingKey::from_der(spki).map_err(|_| {
-            TlsError::CryptoError("failed to parse RSA public key from certificate".into())
-        })?;
-        let pkcs1_key = aws_lc_rs::rsa::Pkcs1PublicEncryptingKey::new(pub_key)
-            .map_err(|_| TlsError::CryptoError("failed to create PKCS1 encrypting key".into()))?;
-
-        let mut encrypted = vec![0u8; pkcs1_key.ciphertext_size()];
-        let encrypted = pkcs1_key
-            .encrypt(&pre_master_secret, &mut encrypted)
-            .map_err(|_| {
-                TlsError::CryptoError("RSA PKCS1 encryption of pre_master_secret failed".into())
-            })?;
-
-        // RFC 5246 Section 7.4.7.1: ClientKeyExchange for RSA is length-prefixed
-        let enc_len = encrypted.len();
-        let mut cke_body = Vec::with_capacity(2 + enc_len);
-        cke_body.push((enc_len >> 8) as u8);
-        cke_body.push(enc_len as u8);
-        cke_body.extend_from_slice(encrypted);
-        let client_key_exchange = build_handshake_message(0x10, &cke_body);
-
-        tracing::debug!(encrypted_len = enc_len, "tls12.rsa_key_exchange",);
-
-        Ok((pre_master_secret, client_key_exchange))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,6 +435,37 @@ fn build_handshake_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_resumption(hs: &Tls12Handshake) -> Option<&state::Resumption> {
+        match &hs.state {
+            Phase::Initial(initial) => initial.resumption.as_ref(),
+            Phase::ServerFlight(state::ServerFlight {
+                step: state::ServerFlightStep::CertificateOrResume(resumption),
+                ..
+            }) => Some(resumption),
+            _ => None,
+        }
+    }
+
+    fn transcript_hash(hs: &Tls12Handshake) -> Vec<u8> {
+        match &hs.state {
+            Phase::ServerFlight(flight) => flight.transcript.current_hash(),
+            Phase::Finishing(finish) => finish.transcript.current_hash(),
+            _ => panic!("fixture needs an active negotiated transcript"),
+        }
+    }
+
+    fn full_handshake_waiting_for_ccs() -> Tls12Handshake {
+        let mut hs = new_test_handshake();
+        hs.feed_client_hello(b"ch");
+        setup_to_wait_shd(&mut hs);
+        assert!(matches!(
+            hs.process_handshake_record(&build_handshake_message(14, &[]))
+                .unwrap(),
+            Tls12HandshakeAction::SendClientFlight(_)
+        ));
+        hs
+    }
 
     // -- build_handshake_message -----------------------------------------------
 
@@ -2012,7 +677,7 @@ mod tests {
         body.push(server_pub_key.len() as u8);
         body.extend_from_slice(server_pub_key);
         // Dummy signature (Insecure policy skips verification)
-        body.extend_from_slice(&[0x04, 0x03]); // sig_algo = ecdsa_secp256r1_sha256
+        body.extend_from_slice(&[0x04, 0x01]); // RSA/SHA-256 for the ECDHE_RSA fixture
         let dummy_sig = [0u8; 8];
         body.push(0x00);
         body.push(dummy_sig.len() as u8);
@@ -2051,7 +716,7 @@ mod tests {
         );
         hs.feed_client_hello(&client_hello);
 
-        let sh_body = make_server_hello_body(0xC02F, &[0x11u8; 32]);
+        let sh_body = make_server_hello_body(0xC02B, &[0x11u8; 32]);
         hs.process_handshake_record(&build_handshake_message(
             handshake_type::SERVER_HELLO,
             &sh_body,
@@ -2150,7 +815,8 @@ mod tests {
     #[test]
     fn ske_accepts_signature_algorithm_the_client_offered() {
         let profile = crate::profile::presets::chrome_150();
-        let offered = profile.signature_algorithms[0];
+        let offered = 0x0403;
+        assert!(profile.signature_algorithms.contains(&offered));
         let mut hs = handshake_awaiting_ske(&profile);
 
         let ske = make_ske_body_with(0x0017, offered, &generate_p256_public_key());
@@ -2160,6 +826,21 @@ mod tests {
 
         assert!(matches!(action, Tls12HandshakeAction::ContinueReading));
         assert_eq!(hs.state(), Tls12State::WaitServerHelloDone);
+    }
+
+    #[test]
+    fn ske_rejects_signature_family_from_another_suite_even_when_insecure() {
+        let profile = crate::profile::presets::chrome_150();
+        let mut hs = handshake_awaiting_ske(&profile);
+        let ske = make_ske_body_with(0x0017, 0x0401, &generate_p256_public_key());
+        let error = hs
+            .process_handshake_record(&build_handshake_message(0x0c, &ske))
+            .unwrap_err();
+        assert_eq!(
+            error.as_alert().unwrap().description,
+            AlertDescription::IllegalParameter
+        );
+        assert_eq!(hs.state(), Tls12State::WaitServerKeyExchange);
     }
 
     #[test]
@@ -2305,7 +986,7 @@ mod tests {
         );
         feed_server_hello(&mut hs, &sh).expect("extensions we offered must still be accepted");
 
-        assert!(hs.use_extended_master_secret);
+        assert!(hs.used_extended_master_secret());
         assert_eq!(hs.negotiated_alpn(), Some("h2"));
         assert_eq!(hs.state(), Tls12State::WaitCertificate);
     }
@@ -2482,7 +1163,7 @@ mod tests {
     fn set_session_ticket_master_secret_enables_resumption() {
         let mut hs = new_test_handshake();
         hs.set_session_ticket_master_secret(vec![0xAA; 48]);
-        assert!(hs.resumed_master_secret.is_some());
+        assert!(pending_resumption(&hs).is_some());
     }
 
     #[test]
@@ -2500,26 +1181,31 @@ mod tests {
     #[test]
     fn feed_client_hello_initializes_transcript() {
         let mut hs = new_test_handshake();
-        assert!(hs.transcript.is_none());
+        assert!(matches!(&hs.state, Phase::Initial(initial) if initial.client_hello.is_empty()));
         hs.feed_client_hello(b"fake-client-hello");
-        assert!(hs.transcript.is_some());
-        assert_eq!(hs.client_hello_bytes, b"fake-client-hello");
+        assert!(
+            matches!(&hs.state, Phase::Initial(initial) if initial.client_hello == b"fake-client-hello")
+        );
     }
 
     #[test]
     fn feed_handshake_message_updates_transcript() {
         let mut hs = new_test_handshake();
         hs.feed_client_hello(b"ch");
-        let hash_before = hs.transcript.as_ref().unwrap().current_hash();
+        hs.process_handshake_record(&build_handshake_message(
+            2,
+            &make_server_hello_body(0xc02f, &[0x11; 32]),
+        ))
+        .unwrap();
+        let hash_before = transcript_hash(&hs);
         hs.feed_handshake_message(b"extra-data");
-        let hash_after = hs.transcript.as_ref().unwrap().current_hash();
+        let hash_after = transcript_hash(&hs);
         assert_ne!(hash_before, hash_after);
     }
 
     #[test]
     fn notify_server_ccs_in_correct_state() {
-        let mut hs = new_test_handshake();
-        hs.state = Tls12State::WaitServerChangeCipherSpec;
+        let mut hs = full_handshake_waiting_for_ccs();
         hs.notify_server_ccs_received();
         assert_eq!(hs.state(), Tls12State::WaitServerFinished);
     }
@@ -2622,7 +1308,7 @@ mod tests {
             }
             let body = make_server_hello_body_with_alpn(0xc02f, &[0x55; 32], "h3");
             assert!(
-                matches!(handshake.process_server_hello(&body, &[]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
+                matches!(handshake.process_handshake_record(&build_handshake_message(2, &body)), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::IllegalParameter)
             );
         }
     }
@@ -2644,7 +1330,7 @@ mod tests {
             body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
             body.extend_from_slice(&payload);
             assert!(
-                matches!(handshake.process_server_hello(&body, &[]), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
+                matches!(handshake.process_handshake_record(&build_handshake_message(2, &body)), Err(TlsError::LocalAlert { alert, .. }) if alert.description == AlertDescription::DecodeError)
             );
         }
     }
@@ -2755,7 +1441,7 @@ mod tests {
         let body = make_server_hello_body_with_ems(0xC02F, &[0u8; 32]);
         let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
         hs.process_handshake_record(&record).unwrap();
-        assert!(hs.use_extended_master_secret);
+        assert!(hs.used_extended_master_secret());
     }
 
     /// RFC 8449 §4 puts `record_size_limit` in EncryptedExtensions only for TLS
@@ -2814,8 +1500,11 @@ mod tests {
         let body = make_server_hello_body(0xC030, &[0u8; 32]);
         let record = build_handshake_message(handshake_type::SERVER_HELLO, &body);
         hs.process_handshake_record(&record).unwrap();
-        assert_eq!(hs.prf_algorithm, PrfAlgorithm::Sha384);
-        let hash = hs.transcript.as_ref().unwrap().current_hash();
+        assert_eq!(
+            hs.negotiated_cipher_suite().unwrap().prf_algorithm(),
+            PrfAlgorithm::Sha384
+        );
+        let hash = transcript_hash(&hs);
         assert_eq!(hash.len(), 48);
     }
 
@@ -2860,7 +1549,7 @@ mod tests {
         let record = build_handshake_message(handshake_type::CERTIFICATE, &cert_body);
         hs.process_handshake_record(&record).unwrap();
         assert_eq!(hs.state(), Tls12State::WaitServerKeyExchange);
-        assert_eq!(hs.server_certificates.len(), 1);
+        assert_eq!(hs.server_certificates().len(), 1);
     }
 
     #[test]
@@ -2924,7 +1613,16 @@ mod tests {
         let record = build_handshake_message(0x0C, &ske_body);
         hs.process_handshake_record(&record).unwrap();
         assert_eq!(hs.state(), Tls12State::WaitServerHelloDone);
-        assert!(hs.server_kx_params.is_some());
+        assert!(matches!(
+            hs.state,
+            Phase::ServerFlight(state::ServerFlight {
+                step: state::ServerFlightStep::RequestOrDone {
+                    exchange: state::Exchange::Ecdhe { .. },
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2945,12 +1643,15 @@ mod tests {
     }
 
     #[test]
-    fn certificate_status_in_ske_state_continues() {
+    fn negotiated_certificate_status_advances_to_ske() {
         let mut hs = new_test_handshake();
-        setup_to_wait_ske(&mut hs);
-        // CertificateStatus (0x16) should be accepted and state remains WaitServerKeyExchange
-        let record =
-            build_handshake_message(handshake_type::CERTIFICATE_STATUS, &[0x01, 0x00, 0x00]);
+        let hello = make_server_hello_body_with_extensions(0xc02f, &[0x11; 32], &[(5, Vec::new())]);
+        hs.process_handshake_record(&build_handshake_message(2, &hello))
+            .unwrap();
+        let cert = make_certificate_body(&[&[0x30, 0x00]]);
+        hs.process_handshake_record(&build_handshake_message(11, &cert))
+            .unwrap();
+        let record = build_handshake_message(handshake_type::CERTIFICATE_STATUS, &[1, 0, 0, 1, 0]);
         let action = hs.process_handshake_record(&record).unwrap();
         assert!(matches!(action, Tls12HandshakeAction::ContinueReading));
         assert_eq!(hs.state(), Tls12State::WaitServerKeyExchange);
@@ -3002,7 +1703,7 @@ mod tests {
     fn certificate_request_produces_empty_client_certificate() {
         let mut hs = new_test_handshake();
         setup_to_wait_shd(&mut hs);
-        let cr_record = build_handshake_message(0x0D, &[0x01, 0x01, 0x00, 0x00, 0x00]);
+        let cr_record = build_handshake_message(0x0D, &[1, 1, 0, 2, 4, 1, 0, 0]);
         let action = hs.process_handshake_record(&cr_record).unwrap();
         assert!(matches!(action, Tls12HandshakeAction::ContinueReading));
         assert_eq!(hs.state(), Tls12State::WaitServerHelloDone);
@@ -3095,22 +1796,16 @@ mod tests {
 
     #[test]
     fn server_finished_bad_length() {
-        let mut hs = new_test_handshake();
-        hs.state = Tls12State::WaitServerFinished;
-        hs.master_secret = Some(vec![0u8; 48]);
-        hs.transcript = Some(TranscriptHash::new(PrfAlgorithm::Sha256));
-        hs.cipher_suite = Some(Tls12CipherSuite::EcdheRsaAes128GcmSha256);
+        let mut hs = full_handshake_waiting_for_ccs();
+        hs.notify_server_ccs_received();
         let result = hs.process_server_finished(&[0u8; 7]); // bad length
         assert!(result.is_err());
     }
 
     #[test]
     fn server_finished_verify_data_mismatch() {
-        let mut hs = new_test_handshake();
-        hs.state = Tls12State::WaitServerFinished;
-        hs.master_secret = Some(vec![0u8; 48]);
-        hs.transcript = Some(TranscriptHash::new(PrfAlgorithm::Sha256));
-        hs.cipher_suite = Some(Tls12CipherSuite::EcdheRsaAes128GcmSha256);
+        let mut hs = full_handshake_waiting_for_ccs();
+        hs.notify_server_ccs_received();
         let result = hs.process_server_finished(&[0xFFu8; 12]); // wrong verify_data
         assert!(result.is_err());
     }
@@ -3129,8 +1824,11 @@ mod tests {
     #[test]
     fn abbreviated_accept_ccs_no_master_secret() {
         let mut hs = new_test_handshake();
-        hs.state = Tls12State::WaitCertificateOrAbbreviated;
-        hs.cipher_suite = Some(Tls12CipherSuite::EcdheRsaAes128GcmSha256);
+        hs.process_handshake_record(&build_handshake_message(
+            2,
+            &make_server_hello_body(0xc02f, &[0x11; 32]),
+        ))
+        .unwrap();
         let result = hs.accept_abbreviated_ccs();
         assert!(result.is_err());
     }
@@ -3240,7 +1938,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(hs.state(), Tls12State::WaitServerKeyExchange);
-        assert!(hs.resumed_master_secret.is_none());
+        assert!(pending_resumption(&hs).is_none());
     }
 
     #[test]
@@ -3249,7 +1947,8 @@ mod tests {
         hs.set_session_ticket_master_secret(vec![0xBB; 48]);
         hs.feed_client_hello(b"ch");
 
-        let sh_body = make_server_hello_body(0xC02F, &[0u8; 32]);
+        let mut sh_body = make_server_hello_body(0xC02F, &[0u8; 32]);
+        sh_body.extend_from_slice(&[0, 4, 0, 35, 0, 0]);
         hs.process_handshake_record(&build_handshake_message(
             handshake_type::SERVER_HELLO,
             &sh_body,
@@ -3279,7 +1978,7 @@ mod tests {
             &sh_body,
         ))
         .unwrap();
-        assert!(hs.use_extended_master_secret);
+        assert!(hs.used_extended_master_secret());
 
         let cert_body = make_certificate_body(&[&[0xDE, 0xAD]]);
         hs.process_handshake_record(&build_handshake_message(
@@ -3444,9 +2143,11 @@ mod tests {
     fn rsa_key_exchange_without_certificate_fails() {
         let mut hs = new_test_handshake();
         hs.feed_client_hello(b"ch");
-        hs.cipher_suite = Some(Tls12CipherSuite::RsaAes256CbcSha);
-        hs.state = Tls12State::WaitServerHelloDone;
-        hs.transcript = Some(TranscriptHash::new(PrfAlgorithm::Sha256));
+        hs.process_handshake_record(&build_handshake_message(
+            2,
+            &make_server_hello_body(0x0035, &[0x11; 32]),
+        ))
+        .unwrap();
 
         let shd_record = build_handshake_message(0x0E, &[]);
         let result = hs.process_handshake_record(&shd_record);
@@ -3571,8 +2272,8 @@ mod tests {
     fn set_session_ticket_master_secret_leaves_ems_state_unknown() {
         let mut hs = new_test_handshake();
         hs.set_session_ticket_master_secret(vec![0xBB; 48]);
-        assert!(hs.resumed_master_secret.is_some());
-        assert_eq!(hs.resumed_session_used_ems, None);
+        assert!(pending_resumption(&hs).is_some());
+        assert_eq!(pending_resumption(&hs).and_then(|r| r.used_ems), None);
     }
 
     /// The flag a ticket store needs to persist (RFC 7627 §5.4) is whatever the
@@ -3610,7 +2311,7 @@ mod tests {
             &sh_body,
         ))
         .expect("ServerHello parses");
-        assert_eq!(hs.resumed_session_used_ems, Some(true));
+        assert_eq!(pending_resumption(&hs).and_then(|r| r.used_ems), Some(true));
 
         let cert_body = make_certificate_body(&[&[0xDE, 0xAD]]);
         hs.process_handshake_record(&build_handshake_message(
@@ -3618,7 +2319,7 @@ mod tests {
             &cert_body,
         ))
         .expect("Certificate parses");
-        assert!(hs.resumed_master_secret.is_none());
-        assert_eq!(hs.resumed_session_used_ems, None);
+        assert!(pending_resumption(&hs).is_none());
+        assert_eq!(pending_resumption(&hs).and_then(|r| r.used_ems), None);
     }
 }

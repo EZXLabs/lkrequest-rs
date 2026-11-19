@@ -12,21 +12,34 @@
 //! - TLS 1.2 GCM: nonce = implicit_iv(4) || explicit_nonce(8), original content type
 //! - TLS 1.2 ChaCha20: nonce = IV XOR seq_num (like TLS 1.3), original content type
 
+pub mod buffer;
+#[cfg(test)]
+mod measurement;
+mod protection;
 pub mod reader;
 pub mod writer;
+pub use protection::{ReadKeys, WriteKeys};
 
-use crate::crypto::tls12_cipher::{Tls12CbcCipher, Tls12Chacha20Cipher, Tls12GcmCipher};
+pub use crate::crypto::tls12_cipher::Tls12RecordCipher;
 
-/// TLS 1.2 record-layer cipher.
-///
-/// Wraps the GCM, ChaCha20-Poly1305, or CBC+HMAC cipher for the record reader/writer.
-pub enum Tls12RecordCipher {
-    /// AES-GCM (128 or 256): uses 4-byte implicit IV + 8-byte explicit nonce.
-    Gcm(Tls12GcmCipher),
-    /// ChaCha20-Poly1305: uses 12-byte IV XOR seq_num (same as TLS 1.3).
-    Chacha20(Tls12Chacha20Cipher),
-    /// AES-CBC + HMAC: legacy MAC-then-encrypt mode.
-    Cbc(Tls12CbcCipher),
+/// Observe only the explicit TLS 1.2 plaintext append, never backend movement.
+#[cfg(test)]
+pub(crate) fn measure_plaintext_copy(bytes: usize) {
+    measurement::copied(measurement::CopySite::PlaintextSeal, bytes);
+}
+
+/// Request geometric buffer growth within the caller's budget. Existing larger
+/// allocations are retained; allocator overhead and usable size are not bounded.
+pub(crate) fn reserve_bounded(bytes: &mut Vec<u8>, additional: usize, limit: usize) {
+    let required = bytes.len() + additional;
+    if required > bytes.capacity() {
+        let target = required.max(bytes.capacity().saturating_mul(2)).min(limit);
+        debug_assert!(
+            target >= required,
+            "record growth exceeds its checked budget"
+        );
+        bytes.reserve_exact(target - bytes.len());
+    }
 }
 
 /// Maximum TLS record payload size (2^14 = 16384 bytes).

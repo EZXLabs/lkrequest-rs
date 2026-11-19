@@ -51,6 +51,9 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::error::{connect_execution_io, take_connect_execution_io, Error};
+use crate::session::execution::ConnectionExecution;
+
 // ---------------------------------------------------------------------------
 // TcpOption — TCP option kinds for JA4T
 // ---------------------------------------------------------------------------
@@ -856,8 +859,9 @@ pub(crate) async fn connect_tcp_with_fingerprint(
     port: u16,
     fingerprint: Option<&TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
-    connect_timeout: Duration,
+    connect_timeout: Option<Duration>,
     connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+    execution: &ConnectionExecution,
 ) -> std::io::Result<tokio::net::TcpStream> {
     let dns_started = std::time::Instant::now();
     let resolved = resolver.resolve(host, port).await;
@@ -877,6 +881,10 @@ pub(crate) async fn connect_tcp_with_fingerprint(
         fingerprint.cloned(),
         connect_timeout,
         connection_budget,
+        execution,
+        |address, fingerprint, execution| async move {
+            dial_tcp_address(address, fingerprint.as_ref(), &execution).await
+        },
     )
     .await
 }
@@ -898,15 +906,26 @@ struct DialAttemptResult {
     _speculative_permit: Option<crate::connection_pool::ConnectionPermit>,
 }
 
-async fn dial_tcp_addresses(
+#[allow(clippy::too_many_arguments)]
+async fn dial_tcp_addresses<D, F>(
     host: &str,
     port: u16,
     addresses: Vec<std::net::SocketAddr>,
     fingerprint: Option<TcpFingerprint>,
-    connect_timeout: Duration,
+    connect_timeout: Option<Duration>,
     connection_budget: Option<crate::connection_pool::ConnectionBudget>,
-) -> std::io::Result<tokio::net::TcpStream> {
-    let deadline = tokio::time::Instant::now() + connect_timeout;
+    execution: &ConnectionExecution,
+    dial: D,
+) -> std::io::Result<tokio::net::TcpStream>
+where
+    D: Fn(std::net::SocketAddr, Option<TcpFingerprint>, ConnectionExecution) -> F
+        + Clone
+        + Send
+        + 'static,
+    F: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>> + Send + 'static,
+{
+    let deadline =
+        connect_timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
     let mut attempts = tokio::task::JoinSet::new();
     let mut next_address = 0usize;
     let mut primary_active = false;
@@ -916,14 +935,17 @@ async fn dial_tcp_addresses(
     let mut primary_abort = None;
     let mut primary_address = None;
     let mut errors = Vec::new();
+    let mut admission_error = None;
 
     loop {
-        if !primary_active && next_address < addresses.len() {
+        if admission_error.is_none() && !primary_active && next_address < addresses.len() {
             let address = addresses[next_address];
             next_address += 1;
             let started = tokio::time::Instant::now();
             let remaining_candidates = addresses.len() - next_address + 1;
-            let remaining = deadline.saturating_duration_since(started);
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(started))
+                .unwrap_or(Duration::MAX);
             let fair_share = remaining / u32::try_from(remaining_candidates).unwrap_or(u32::MAX);
             let serial_window = fair_share.max(HAPPY_EYEBALLS_DELAY).min(MAX_SERIAL_ATTEMPT);
 
@@ -937,30 +959,37 @@ async fn dial_tcp_addresses(
                 address,
                 fingerprint.clone(),
                 None,
+                execution.clone(),
+                dial.clone(),
             ));
         }
 
-        if !primary_active && !speculative_active && next_address >= addresses.len() {
+        if !primary_active
+            && !speculative_active
+            && (admission_error.is_some() || next_address >= addresses.len())
+        {
             break;
         }
 
         let now = tokio::time::Instant::now();
-        if now >= deadline {
+        if deadline.is_some_and(|deadline| now >= deadline) {
             attempts.abort_all();
             while attempts.join_next().await.is_some() {}
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("TCP connect to {host}:{port} timed out after {connect_timeout:?}"),
+                format!(
+                    "TCP connect to {host}:{port} timed out after {}",
+                    crate::timeout::display_duration(connect_timeout)
+                ),
             ));
         }
 
         let fallback_at = primary_started.map(|started| started + HAPPY_EYEBALLS_DELAY);
-        let next_timer = [Some(deadline), fallback_at, primary_cutoff]
+        let next_timer = [deadline, fallback_at, primary_cutoff]
             .into_iter()
             .flatten()
             .filter(|instant| *instant > now)
-            .min()
-            .unwrap_or(deadline);
+            .min();
 
         tokio::select! {
             joined = attempts.join_next(), if !attempts.is_empty() => {
@@ -989,39 +1018,56 @@ async fn dial_tcp_addresses(
                         crate::diagnostics::record_remote_addr(attempt.address.to_string());
                         return Ok(stream);
                     }
-                    Err(error) => {
-                        tracing::debug!(
-                            address = %attempt.address,
-                            error = %error,
-                            attempt = ?attempt.kind,
-                            "tcp.connect_address_failed"
-                        );
-                        errors.push((attempt.address, error));
-                        if attempt.kind == DialAttemptKind::Speculative
-                            && primary_active
-                            && next_address < addresses.len()
-                        {
-                            let restarted = tokio::time::Instant::now();
-                            let remaining_candidates = addresses.len() - next_address + 1;
-                            let remaining = deadline.saturating_duration_since(restarted);
-                            let fair_share = remaining
-                                / u32::try_from(remaining_candidates).unwrap_or(u32::MAX);
-                            let serial_window = fair_share
-                                .max(HAPPY_EYEBALLS_DELAY)
-                                .min(MAX_SERIAL_ATTEMPT);
-                            primary_started = Some(restarted);
-                            primary_cutoff = Some(restarted + serial_window.min(remaining));
+                    Err(error) => match take_connect_execution_io(error) {
+                        Ok(error) => {
+                            // Admission closes only new candidates. An already
+                            // started competitor keeps its original deadline.
+                            admission_error = Some(error);
+                            primary_started = None;
+                            primary_cutoff = None;
                         }
-                    }
+                        Err(error) => {
+                            tracing::debug!(
+                                address = %attempt.address,
+                                error = %error,
+                                attempt = ?attempt.kind,
+                                "tcp.connect_address_failed"
+                            );
+                            errors.push((attempt.address, error));
+                            if attempt.kind == DialAttemptKind::Speculative
+                                && admission_error.is_none()
+                                && primary_active
+                                && next_address < addresses.len()
+                            {
+                                let restarted = tokio::time::Instant::now();
+                                let remaining_candidates = addresses.len() - next_address + 1;
+                                let remaining = deadline.map(|deadline| deadline.saturating_duration_since(restarted))
+                                    .unwrap_or(Duration::MAX);
+                                let fair_share = remaining
+                                    / u32::try_from(remaining_candidates).unwrap_or(u32::MAX);
+                                let serial_window = fair_share
+                                    .max(HAPPY_EYEBALLS_DELAY)
+                                    .min(MAX_SERIAL_ATTEMPT);
+                                primary_started = Some(restarted);
+                                primary_cutoff = Some(restarted + serial_window.min(remaining));
+                            }
+                        }
+                    },
                 }
             }
-            _ = tokio::time::sleep_until(next_timer) => {
+            _ = async {
+                match next_timer {
+                    Some(timer) => tokio::time::sleep_until(timer).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let now = tokio::time::Instant::now();
-                if now >= deadline {
+                if deadline.is_some_and(|deadline| now >= deadline) {
                     continue;
                 }
 
                 let fallback_due = primary_active
+                    && admission_error.is_none()
                     && !speculative_active
                     && next_address < addresses.len()
                     && fallback_at.is_some_and(|instant| now >= instant);
@@ -1043,16 +1089,25 @@ async fn dial_tcp_addresses(
                             address,
                             fingerprint.clone(),
                             speculative_permit,
+                            execution.clone(),
+                            dial.clone(),
                         );
                         continue;
                     }
                 }
 
                 let serial_cutoff_due = primary_active
+                    && admission_error.is_none()
                     && !speculative_active
                     && next_address < addresses.len()
                     && primary_cutoff.is_some_and(|instant| now >= instant);
                 if serial_cutoff_due {
+                    if let Err(error) = execution.check_start_allowed() {
+                        admission_error = Some(error);
+                        primary_started = None;
+                        primary_cutoff = None;
+                        continue;
+                    }
                     if let Some(abort) = primary_abort.take() {
                         abort.abort();
                     }
@@ -1072,6 +1127,11 @@ async fn dial_tcp_addresses(
         }
     }
 
+    if errors.is_empty() {
+        if let Some(error) = admission_error {
+            return Err(connect_execution_io(error));
+        }
+    }
     let last_kind = errors
         .last()
         .map(|(_, error)| error.kind())
@@ -1081,22 +1141,32 @@ async fn dial_tcp_addresses(
         .map(|(address, error)| format!("{address}: {error}"))
         .collect::<Vec<_>>()
         .join("; ");
-    Err(std::io::Error::new(
+    let error = std::io::Error::new(
         last_kind,
         format!("TCP connect to {host}:{port} failed for all addresses: {details}"),
-    ))
+    );
+    Err(match admission_error {
+        Some(denied) => connect_execution_io(denied.with_connect_prior(Error::Io(error))),
+        None => error,
+    })
 }
 
-fn spawn_dial_attempt(
+fn spawn_dial_attempt<D, F>(
     attempts: &mut tokio::task::JoinSet<DialAttemptResult>,
     kind: DialAttemptKind,
     address: std::net::SocketAddr,
     fingerprint: Option<TcpFingerprint>,
     speculative_permit: Option<crate::connection_pool::ConnectionPermit>,
-) -> tokio::task::AbortHandle {
+    execution: ConnectionExecution,
+    dial: D,
+) -> tokio::task::AbortHandle
+where
+    D: Fn(std::net::SocketAddr, Option<TcpFingerprint>, ConnectionExecution) -> F + Send + 'static,
+    F: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>> + Send + 'static,
+{
     attempts.spawn(async move {
         let started = std::time::Instant::now();
-        let result = dial_tcp_address(address, fingerprint.as_ref()).await;
+        let result = dial(address, fingerprint, execution).await;
         DialAttemptResult {
             kind,
             address,
@@ -1110,6 +1180,7 @@ fn spawn_dial_attempt(
 async fn dial_tcp_address(
     socket_addr: std::net::SocketAddr,
     fingerprint: Option<&TcpFingerprint>,
+    execution: &ConnectionExecution,
 ) -> std::io::Result<tokio::net::TcpStream> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -1137,6 +1208,9 @@ async fn dial_tcp_address(
 
     // Initiate non-blocking connect
     let sock_addr = socket2::SockAddr::from(socket_addr);
+    execution
+        .commit_start("tcp")
+        .map_err(connect_execution_io)?;
     match socket.connect(&sock_addr) {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(connect_in_progress_code()) => {
@@ -1218,6 +1292,22 @@ fn connect_in_progress_code() -> i32 {
 mod tests {
     use super::*;
 
+    fn limited_execution(
+        limit: u64,
+    ) -> (
+        crate::session::execution::RequestExecution,
+        crate::session::execution::ExecutionGuard,
+    ) {
+        let limits = crate::AttemptLimits::default()
+            .with_connect_attempts(limit)
+            .resolve(None, crate::AttemptLimitScope::Client)
+            .unwrap();
+        crate::session::execution::RequestExecution::with_limits(
+            crate::timeout::RequestTimeout::default(),
+            Some(limits),
+        )
+    }
+
     #[derive(Debug)]
     struct StaticResolver {
         addresses: Vec<std::net::SocketAddr>,
@@ -1253,14 +1343,16 @@ mod tests {
             .expect("primary dial reservation");
         let budget = pool.connection_budget();
         assert!(budget.try_reserve_speculative().is_none());
+        let (execution, _guard) = ConnectionExecution::new();
 
         let stream = connect_tcp_with_fingerprint(
             "multi-address.test",
             port,
             None,
             &resolver,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
             Some(budget),
+            &execution,
         )
         .await
         .expect("the IPv4 address should be tried after IPv6 fails");
@@ -1280,7 +1372,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
 
-        let stream = dial_tcp_address(address, None).await.unwrap();
+        let (execution, _guard) = ConnectionExecution::new();
+        let stream = dial_tcp_address(address, None, &execution).await.unwrap();
 
         assert!(stream.nodelay().unwrap());
         accept.await.unwrap();
@@ -1295,10 +1388,244 @@ mod tests {
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
         let fingerprint = TcpFingerprint::default().with_tcp_nodelay(false);
 
-        let stream = dial_tcp_address(address, Some(&fingerprint)).await.unwrap();
+        let (execution, _guard) = ConnectionExecution::new();
+        let stream = dial_tcp_address(address, Some(&fingerprint), &execution)
+            .await
+            .unwrap();
 
         assert!(!stream.nodelay().unwrap());
         accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_connect_limit_does_not_start_tcp() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (request, _guard) = limited_execution(0);
+        let error = dial_tcp_address(listener.local_addr().unwrap(), None, &request.connection())
+            .await
+            .unwrap_err();
+        assert!(take_connect_execution_io(error)
+            .unwrap()
+            .is_connect_attempt_denied());
+        assert_eq!(request.snapshot_summary().connect_initiations(), 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_socket_ttl_costs_no_connect_attempt() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (request, _guard) = limited_execution(1);
+        let fingerprint = TcpFingerprint::default().with_ttl(256);
+        let error = dial_tcp_address(
+            listener.local_addr().unwrap(),
+            Some(&fingerprint),
+            &request.connection(),
+        )
+        .await
+        .expect_err("IPv4 TTL above 255 must fail during socket preparation");
+        assert!(
+            take_connect_execution_io(error).is_err(),
+            "socket preparation must fail before admission is checked"
+        );
+        assert_eq!(request.snapshot_summary().connect_initiations(), 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn address_failover_charges_each_actual_tcp_start_and_preserves_first_failure() {
+        for limit in [1, 2] {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let resolver = StaticResolver {
+                addresses: vec![
+                    std::net::SocketAddr::from(([127, 0, 0, 2], address.port())),
+                    address,
+                ],
+            };
+            let (request, _guard) = limited_execution(limit);
+            let result = connect_tcp_with_fingerprint(
+                "multi-address.test",
+                address.port(),
+                None,
+                &resolver,
+                Some(Duration::from_secs(5)),
+                None,
+                &request.connection(),
+            )
+            .await;
+            assert_eq!(request.snapshot_summary().connect_initiations(), limit);
+            if limit == 1 {
+                let denial = take_connect_execution_io(result.unwrap_err()).unwrap();
+                assert!(denial.is_connect_attempt_denied());
+                let Error::Io(original) = denial.into_public_connect_error() else {
+                    panic!("TCP failure must survive admission denial");
+                };
+                assert_eq!(original.kind(), std::io::ErrorKind::ConnectionRefused);
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            } else {
+                assert_eq!(result.unwrap().peer_addr().unwrap(), address);
+                listener.accept().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_dns_result_costs_no_connect_attempt() {
+        let (request, _guard) = limited_execution(0);
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+        let error = connect_tcp_with_fingerprint(
+            "empty.test",
+            80,
+            None,
+            &resolver,
+            None,
+            None,
+            &request.connection(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert_eq!(request.snapshot_summary().connect_initiations(), 0);
+    }
+
+    async fn denied_secondary_keeps_primary(
+        primary_fails: bool,
+        physical_limit: bool,
+    ) -> (std::io::Result<tokio::net::TcpStream>, std::net::SocketAddr) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        // Establish test data before pausing time; only dial completion and
+        // admission are simulated, through the production scheduling loop.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        tokio::time::pause();
+        let stream = Arc::new(parking_lot::Mutex::new(Some(stream)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let primary_started = Arc::new(Notify::new());
+        let secondary_denied = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (request, _guard) = limited_execution(1);
+        let execution = request.connection();
+        let mut pool = crate::connection_pool::ConnectionPool::with_max_total(1);
+        let _primary_slot = physical_limit.then(|| pool.try_reserve_connection().unwrap());
+        let budget = physical_limit.then(|| pool.connection_budget());
+        let dial = {
+            let (stream, calls, primary_started, secondary_denied, release) = (
+                stream.clone(),
+                calls.clone(),
+                primary_started.clone(),
+                secondary_denied.clone(),
+                release.clone(),
+            );
+            move |_address, _fingerprint, execution: ConnectionExecution| {
+                let (stream, calls, primary_started, secondary_denied, release) = (
+                    stream.clone(),
+                    calls.clone(),
+                    primary_started.clone(),
+                    secondary_denied.clone(),
+                    release.clone(),
+                );
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if let Err(error) = execution.commit_start("tcp") {
+                        secondary_denied.notify_one();
+                        return Err(connect_execution_io(error));
+                    }
+                    primary_started.notify_one();
+                    release.notified().await;
+                    if primary_fails {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "admitted primary failed",
+                        ))
+                    } else {
+                        Ok(stream.lock().take().unwrap())
+                    }
+                }
+            }
+        };
+        let task = tokio::spawn(async move {
+            dial_tcp_addresses(
+                "fixture.test",
+                address.port(),
+                vec![address; 3],
+                None,
+                Some(Duration::from_secs(10)),
+                budget,
+                &execution,
+                dial,
+            )
+            .await
+        });
+        primary_started.notified().await;
+        tokio::time::advance(HAPPY_EYEBALLS_DELAY).await;
+        if !physical_limit {
+            secondary_denied.notified().await;
+        }
+        // Cross both fallback and serial-cutoff windows after the refusal.
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "admitted primary must remain active");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if physical_limit { 1 } else { 2 },
+            "no third candidate after refusal"
+        );
+        release.notify_one();
+        let result = task.await.unwrap();
+        assert_eq!(request.snapshot_summary().connect_initiations(), 1);
+        assert_eq!(
+            request.snapshot_summary().denial_reason(),
+            None,
+            "loser denial is not sticky"
+        );
+        (result, address)
+    }
+
+    #[tokio::test]
+    async fn denied_secondary_does_not_cancel_successful_primary() {
+        let (result, address) = denied_secondary_keeps_primary(false, false).await;
+        assert_eq!(result.unwrap().peer_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn denied_secondary_preserves_admitted_primary_error() {
+        let (result, _) = denied_secondary_keeps_primary(true, false).await;
+        let error = take_connect_execution_io(result.unwrap_err()).unwrap();
+        assert!(error.is_connect_attempt_denied());
+        let Error::Io(original) = error.into_public_connect_error() else {
+            panic!("real primary failure must survive denied secondary");
+        };
+        assert_eq!(original.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(original.to_string().contains("admitted primary failed"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_connect_budget_keeps_primary_when_physical_slot_blocks_speculation() {
+        let (result, address) = denied_secondary_keeps_primary(false, true).await;
+        assert_eq!(result.unwrap().peer_addr().unwrap(), address);
     }
 
     // -- JA4T parsing --

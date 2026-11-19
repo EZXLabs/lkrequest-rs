@@ -30,6 +30,127 @@ struct TestServer {
     thread: Option<JoinHandle<()>>,
 }
 
+#[test]
+fn quic_tls_profile_feature_gate_and_handle_validation() {
+    use lkrequest_ffi::*;
+    assert_eq!(
+        lk_feature_supported(c"quic-tls-profile-json".as_ptr()),
+        cfg!(feature = "quic-h3")
+    );
+    assert_eq!(
+        lk_client_builder_set_quic_tls_profile_json(ptr::null_mut(), ptr::null(), 0),
+        lk_status_t::LK_ERR
+    );
+    assert_eq!(
+        lk_client_builder_clear_quic_fingerprint(ptr::null_mut()),
+        lk_status_t::LK_ERR
+    );
+    let builder = lk_client_builder_new();
+    let expected = if cfg!(feature = "quic-h3") {
+        lk_status_t::LK_OK
+    } else {
+        lk_status_t::LK_ERR
+    };
+    assert_eq!(
+        lk_client_builder_set_quic_tls_profile_json(builder, ptr::null(), 0),
+        expected
+    );
+    assert_eq!(lk_client_builder_clear_quic_fingerprint(builder), expected);
+    assert_eq!(
+        lk_client_builder_set_quic_tls_profile_json(builder, c"{}".as_ptr(), usize::MAX),
+        lk_status_t::LK_ERR
+    );
+    lk_client_builder_free(builder);
+}
+
+#[cfg(feature = "quic-h3")]
+#[test]
+fn quic_tls_profile_is_independent_and_distinguishes_reset_from_tcp_fallback() {
+    use lkrequest_ffi::*;
+    use serde_json::{json, Value};
+
+    let info = |builder| -> Value {
+        let mut client = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        assert_eq!(
+            lk_client_builder_build(builder, &mut client, &mut error),
+            lk_status_t::LK_OK
+        );
+        assert!(error.is_null());
+        let mut output = ptr::null();
+        let mut len = 0;
+        assert_eq!(
+            lk_client_fingerprint_info_json(client, &mut output, &mut len, &mut error),
+            lk_status_t::LK_OK
+        );
+        let value =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(output.cast::<u8>(), len) })
+                .unwrap();
+        lk_client_free(client);
+        value
+    };
+    let builder = lk_client_builder_new();
+    let tcp = serde_json::to_value(lkrequest::preset::chrome_131().tls_profile).unwrap();
+    let tcp_json = tcp.to_string();
+    assert_eq!(
+        lk_client_builder_set_tls_profile_json(builder, tcp_json.as_ptr().cast(), tcp_json.len()),
+        lk_status_t::LK_OK
+    );
+    let mut quic_tls =
+        serde_json::to_value(lkrequest::preset::chrome_156().quic_tls_profile.unwrap()).unwrap();
+    quic_tls["name"] = json!("independent QUIC TLS");
+    let set = |value: &Value| {
+        let serialized = value.to_string();
+        lk_client_builder_set_quic_tls_profile_json(
+            builder,
+            serialized.as_ptr().cast(),
+            serialized.len(),
+        )
+    };
+    assert_eq!(set(&quic_tls), lk_status_t::LK_OK);
+    assert_eq!(
+        lk_client_builder_set_preset(builder, c"chrome_157".as_ptr()),
+        lk_status_t::LK_OK
+    );
+    for (field, value) in [
+        ("tls_max_version", json!("tls12")),
+        ("cipher_suites", json!([])),
+        ("client_hello_mirror", json!({"input": "00"})),
+    ] {
+        let mut invalid = quic_tls.clone();
+        invalid[field] = value;
+        assert_eq!(set(&invalid), lk_status_t::LK_ERR);
+    }
+    assert_eq!(
+        lk_client_builder_set_quic_tls_profile_json(builder, ptr::null(), 1),
+        lk_status_t::LK_ERR
+    );
+    let actual = info(builder);
+    assert_eq!(actual["tls"], tcp);
+    assert_eq!(actual["quic_tls"], quic_tls);
+    assert_eq!(
+        actual["quic"],
+        serde_json::to_value(lkrequest::preset::chrome_157().quic_profile).unwrap()
+    );
+    assert_eq!(
+        lk_client_builder_set_quic_tls_profile_json(builder, ptr::null(), 0),
+        lk_status_t::LK_OK
+    );
+    assert_eq!(
+        info(builder)["quic_tls"],
+        serde_json::to_value(lkrequest::preset::chrome_157().quic_tls_profile).unwrap()
+    );
+    assert_eq!(
+        lk_client_builder_clear_quic_fingerprint(builder),
+        lk_status_t::LK_OK
+    );
+    assert!(info(builder)["quic_tls"].is_null());
+    assert_eq!(info(builder)["tls"], tcp);
+    assert_eq!(set(&quic_tls), lk_status_t::LK_OK);
+    assert_eq!(info(builder)["quic_tls"], quic_tls);
+    lk_client_builder_free(builder);
+}
+
 impl TestServer {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
